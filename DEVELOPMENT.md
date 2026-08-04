@@ -532,12 +532,15 @@ store at boot:
 /samples/audios/   sample.wav  sample.mp3  sample.aac  jfk-speech.wav  sample.ogg*
 /samples/misc/     minimal.pdf  document.pdf  rfc1951-deflate.txt  cars.json
                    seattle-weather.csv  first-web-page.html
+/samples/js/       hello.js  argv.js  fib.js  math.js  class.js  json.js
 /samples/README.md provenance + licence of every file
 ```
 
 `/open /samples/images/fruits.jpg` works on the first boot, offline. `*` — the Ogg
 Vorbis file has **no decoder yet**; it is there as the next decoder's input and
-opens in the editor, not the player.
+opens in the editor, not the player. The `/samples/js/` scripts are **authored
+in-tree** (`assets/samples-src/js/`) and run with `/js /samples/js/hello.js`
+(Node-style CLI).
 
 - **It is opt-in, and on by default only for the dev flows.** `make run`,
   `make run-remote`, `make run-uefi`, `make image`, `make vbox` and `make e2e`
@@ -556,9 +559,12 @@ opens in the editor, not the player.
   durable, so a sample you edited stays edited across reboots; boot only writes
   paths that are absent.
 - The corpus is defined in one place — the `SAMPLE_FILES` table in
-  `xtask/src/main.rs` (URL, destination, provenance) — and `kernel/build.rs`
-  **walks the directory** rather than carrying a second list. To add a sample,
-  add a row and re-run the fetch. Set `SAMPLES=` for an image without any.
+  `xtask/src/main.rs` (URL or empty for local, destination, provenance) — and
+  `kernel/build.rs` **walks the directory** rather than carrying a second list.
+  To add a fetched sample, add a row with an `http(s)` URL and re-run the fetch.
+  To add an authored script, put the file under `assets/samples-src/<cat>/`,
+  add a row with an empty `url`, and re-run `cargo xtask sample-files`. Set
+  `SAMPLES=` for an image without any.
 
 ## Voice (`/voice`) — audio + models
 

@@ -105,6 +105,14 @@ pub mod fa {
     pub const HEADPHONES: char = '\u{f025}';
     /// music
     pub const MUSIC: char = '\u{f001}';
+    /// volume-high (status bar / media)
+    pub const VOLUME_HIGH: char = '\u{f028}';
+    /// volume-low
+    pub const VOLUME_LOW: char = '\u{f027}';
+    /// volume-off (0% but not muted)
+    pub const VOLUME_OFF: char = '\u{f026}';
+    /// volume-xmark (muted)
+    pub const VOLUME_XMARK: char = '\u{f6a9}';
     /// image
     pub const IMAGE: char = '\u{f03e}';
     /// video
@@ -147,6 +155,8 @@ pub mod fa {
     pub const SQUARE: char = '\u{f0c8}';
     /// minus
     pub const MINUS: char = '\u{f068}';
+    /// plus
+    pub const PLUS: char = '\u{f067}';
     /// chevron-right
     pub const CHEVRON_RIGHT: char = '\u{f054}';
     /// angle-right
@@ -291,6 +301,34 @@ pub fn status_net(up: bool) -> alloc::string::String {
     }
 }
 
+/// Status-bar **volume** chip: FA speaker glyph that reflects mute / level.
+/// Compact like macOS (icon only — percent lives in the dropdown).
+pub fn status_volume(muted: bool, pct: u32) -> alloc::string::String {
+    let icon = if muted {
+        fa::VOLUME_XMARK
+    } else if pct == 0 {
+        fa::VOLUME_OFF
+    } else if pct < 50 {
+        fa::VOLUME_LOW
+    } else {
+        fa::VOLUME_HIGH
+    };
+    icon.to_string()
+}
+
+/// FA speaker glyph for a given mute/level (menus, about panels).
+pub fn volume_icon(muted: bool, pct: u32) -> char {
+    if muted {
+        fa::VOLUME_XMARK
+    } else if pct == 0 {
+        fa::VOLUME_OFF
+    } else if pct < 50 {
+        fa::VOLUME_LOW
+    } else {
+        fa::VOLUME_HIGH
+    }
+}
+
 /// Icon for a package-UI vs shell agent class badge.
 pub fn ui_class_icon(canvas: bool) -> char {
     if canvas {
@@ -346,7 +384,7 @@ pub fn for_command(name: &str) -> char {
         "model" | "infer" | "perf" | "bench" | "think" | "mode" => fa::ROBOT,
         "redteam" | "audit" => fa::SHIELD,
         "ls" | "cat" | "open" | "mkdir" | "cp" | "mv" | "rm" | "touch" | "glob" | "grep"
-        | "pwd" | "decoder" => fa::FOLDER,
+        | "pwd" | "decoder" | "js" => fa::FOLDER,
         "disks" | "mounts" | "mount" | "umount" | "install" | "mkext4" => fa::HARD_DRIVE,
         "network" | "ping" | "wifi" | "http" | "ws" | "mcp" | "channel" | "browse" => fa::WIFI,
         "info" | "about" | "ui" | "shortcuts" | "help" => fa::CIRCLE_INFO,
@@ -451,6 +489,19 @@ mod tests {
         assert_eq!(status_mouse(true).chars().count(), 2);
         assert_eq!(status_net(true), fa::WIFI.to_string());
         assert_eq!(status_net(false), fa::NETWORK.to_string());
+    }
+
+    #[test_case]
+    fn status_volume_icon_tracks_mute_and_level() {
+        assert_eq!(volume_icon(true, 80), fa::VOLUME_XMARK);
+        assert_eq!(volume_icon(false, 0), fa::VOLUME_OFF);
+        assert_eq!(volume_icon(false, 25), fa::VOLUME_LOW);
+        assert_eq!(volume_icon(false, 50), fa::VOLUME_HIGH);
+        assert_eq!(volume_icon(false, 100), fa::VOLUME_HIGH);
+        assert!(is_icon(fa::VOLUME_HIGH));
+        assert!(is_icon(fa::VOLUME_XMARK));
+        assert_eq!(status_volume(false, 100), fa::VOLUME_HIGH.to_string());
+        assert_eq!(status_volume(true, 100), fa::VOLUME_XMARK.to_string());
     }
 
     #[test_case]

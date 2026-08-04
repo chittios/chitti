@@ -1,0 +1,1 @@
+[{"tool": "grep", "args": {"pattern": "pdf"}, "flags": ["-n", "-i"]}, {"tool": "ls", "args": "/mnt"}]

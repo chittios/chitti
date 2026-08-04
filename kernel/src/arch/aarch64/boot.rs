@@ -39,10 +39,40 @@ pub fn boot_x0() -> u64 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(BOOT_X0)) }
 }
 
+/// The UEFI stub's hosted-model boot seed (`\chitti-model.json` on the ESP),
+/// handed over in the boot-info page the same way the EDID is: length at
+/// offset 1024, the JSON bytes at 1028. `None` on the QEMU `-kernel` path
+/// (no boot page) or when the image carried no seed. The page is identity
+/// mapped LOADER_DATA RAM, still readable at shell start.
+#[cfg(not(feature = "boot-limine"))]
+pub fn boot_page_remote_cfg() -> Option<&'static [u8]> {
+    let bi = boot_x1();
+    if bi == 0 || bi >= crate::arch::aarch64::mmu::mapped_bytes() {
+        return None;
+    }
+    // SAFETY: identity-mapped RAM below the map limit; the magic + length are
+    // validated before the bytes are returned.
+    let magic = unsafe { core::slice::from_raw_parts(bi as *const u8, 8) };
+    if magic != b"CHITTIBI" {
+        return None;
+    }
+    let len = unsafe { core::ptr::read_volatile((bi + 1024) as *const u32) } as usize;
+    if len == 0 || len > 2048 {
+        return None;
+    }
+    // SAFETY: `len` bounded by the stub's 2048-byte cap; 1028 + len < 4096.
+    Some(unsafe { core::slice::from_raw_parts((bi + 1028) as *const u8, len) })
+}
+
 /// The Limine build has no `-kernel` boot-info page.
 #[cfg(feature = "boot-limine")]
 pub fn boot_x1() -> u64 {
     0
+}
+
+#[cfg(feature = "boot-limine")]
+pub fn boot_page_remote_cfg() -> Option<&'static [u8]> {
+    None
 }
 
 /// The Limine build discovers RAM from the Limine memory map, not a DTB.

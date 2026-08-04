@@ -753,7 +753,7 @@ pub struct Screen {
     /// the shell paint its gradient progress bar into the hint bar without the
     /// framebuffer knowing anything about the animation.
     composer_hint_l_lead: alloc::vec::Vec<Rgb>,
-    /// Slash-command / @file suggestion popup above the composer.
+    /// Slash-command / @file / path-argument suggestion popup above the composer.
     suggest_open: bool,
     suggest_items: alloc::vec::Vec<(String, String)>, // (label, detail)
     suggest_sel: usize,
@@ -1395,7 +1395,7 @@ impl Screen {
             composer_active: false,
             composer_line: String::new(),
             composer_cur: 0,
-            composer_hint_l: String::from("Tab select · ↑↓ menu · Enter send · /cmds · @files"),
+            composer_hint_l: String::from("↑↓ history · Tab select · Ctrl+P/N pick · Ctrl+R search · Enter send · /cmds · @files"),
             composer_hint_r: String::new(),
             composer_hint_l_lead: alloc::vec::Vec::new(),
             suggest_open: false,
@@ -4345,10 +4345,12 @@ pub enum StatusChip {
     Mem = 4,
     Cpu = 5,
     Battery = 6,
-    Clock = 7,
+    /// Software output volume (`sound::volume` / mute).
+    Volume = 7,
+    Clock = 8,
 }
 
-const STATUS_CHIP_N: usize = 8;
+const STATUS_CHIP_N: usize = 9;
 
 /// Hit rects for [`StatusChip`] (index = `chip as usize`). Zero-size = absent.
 static STATUS_CHIP_RECTS: Locked<[(u64, u64, u64, u64); STATUS_CHIP_N]> =
@@ -4390,6 +4392,7 @@ pub fn status_chip_hit(x: u64, y: u64) -> Option<StatusChip> {
                     4 => StatusChip::Mem,
                     5 => StatusChip::Cpu,
                     6 => StatusChip::Battery,
+                    7 => StatusChip::Volume,
                     _ => StatusChip::Clock,
                 });
             }
@@ -4449,6 +4452,11 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> 
             out.push((StatusChip::Battery, s));
         }
     }
+    // Volume always shown (software gain applies even with no PCM device yet).
+    out.push((
+        StatusChip::Volume,
+        crate::icons::status_volume(crate::sound::muted(), crate::sound::volume()),
+    ));
     // Compact macOS-style clock (no year / seconds / tz — dropdown has the rest).
     out.push((StatusChip::Clock, crate::clock::format_datetime_short()));
     out
@@ -4523,14 +4531,29 @@ impl Screen {
         ((self.width / self.cw()) * 3 / 5).clamp(28, 56)
     }
 
+    /// Content rows a centred modal can hold on this screen (title + separator
+    /// and the frame already deducted, one cell of margin kept top and bottom).
+    /// The math is pure and lives in `panes_layout` so it is unit-tested — this
+    /// module is `#[cfg(not(test))]`, so a test in here would never run.
+    fn modal_rows_budget(&self) -> usize {
+        crate::panes_layout::modal_max_rows(self.height, self.ch(), 2 * (BORDER + PAD)) as usize
+    }
+
     fn modal_box(&self, title: &str, rows: u64) -> (u64, u64, u64) {
         let cw = self.cw();
         let ch = self.ch();
         let cols = self.modal_cols();
         let bw = cols * cw + 2 * (BORDER + PAD);
         let bh = (rows + 2) * ch + 2 * (BORDER + PAD);
-        let bx = (self.width - bw) / 2;
-        let by = (self.height - bh) / 2;
+        // Saturating, never `self.height - bh`: a box taller than the screen
+        // wrapped that subtraction into a vast `by`, so every draw was clipped
+        // away and the modal painted **nothing** while still waiting for a key.
+        // An approval dialog that is invisible but live is the worst failure
+        // this code has — the human cannot see what they are approving, and it
+        // reads as a frozen shell. Callers must also budget their rows
+        // ([`modal_max_rows`]); this is the backstop.
+        let bx = self.width.saturating_sub(bw) / 2;
+        let by = self.height.saturating_sub(bh) / 2;
         self.drop_shadow(bx, by, bw, bh); // web-style elevation over the panes
         self.fill_rect(bx, by, bw, bh, self.theme.status_bg);
         self.rect_outline(bx, by, bw, bh, BORDER, self.theme.accent);
@@ -4583,6 +4606,12 @@ pub fn draw_choose(title: &str, msg: &str, options: &[&str], focus: usize) {
                 opt_lines.push(crate::textsel::ellipsize(&line, cols));
             }
             let foot = "Enter select  Esc cancel  arrows/click";
+            // The options are the actionable part and their rows are hit-tested
+            // 1:1 with indices, so the *message* absorbs the clamp, never them.
+            let pre = crate::panes_layout::clamp_modal_lines(
+                pre,
+                sc.modal_rows_budget().saturating_sub(opt_lines.len() + 1),
+            );
             let rows = pre.len() + opt_lines.len() + 1;
             let (ix, iy, mcols) = sc.modal_box(title, rows as u64);
             let ch = sc.ch();
@@ -4625,8 +4654,12 @@ pub fn draw_confirm(title: &str, msg: &str, focus_yes: bool) {
             LIST_BROWSER_GEOM.with(|g| *g = None);
             CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
             // Wrap first, then size the box to the wrapped line count + a gap +
-            // the button row, so a long consent message never overflows.
+            // the button row, so a long consent message never overflows. The
+            // budget leaves those two rows for the buttons — an agent's args can
+            // be kilobytes (a whole config file), and before the clamp that made
+            // the box taller than the screen and the dialog invisible.
             let lines = wrap(msg, sc.modal_cols() as usize);
+            let lines = crate::panes_layout::clamp_modal_lines(lines, sc.modal_rows_budget().saturating_sub(2));
             let (ix, iy, cols) = sc.modal_box(title, lines.len() as u64 + 2);
             let ch = sc.ch();
             let cw = sc.cw();
@@ -4782,9 +4815,10 @@ pub fn draw_status_menu(chip: StatusChip) {
         let bar = STATUS_BAR_RECT.with(|r| *r);
         let pos = sc.layout.status_pos;
 
-        // Menu size: clock is larger (analog face); others are compact lists.
+        // Menu size: clock is larger (analog face); volume is a compact control.
         let (cols, rows) = match chip {
             StatusChip::Clock => (32u64, 16u64),
+            StatusChip::Volume => (28, 12),
             StatusChip::Net => (36, 12),
             StatusChip::Mem | StatusChip::Cpu => (34, 10),
             StatusChip::Battery => (30, 9),
@@ -4846,6 +4880,7 @@ pub fn draw_status_menu(chip: StatusChip) {
             StatusChip::Mem => "Memory",
             StatusChip::Cpu => "Processor",
             StatusChip::Battery => "Battery",
+            StatusChip::Volume => "Sound",
             StatusChip::Clock => "Clock",
         };
         let icon = match chip {
@@ -4856,6 +4891,9 @@ pub fn draw_status_menu(chip: StatusChip) {
             StatusChip::Mem => crate::icons::fa::MEMORY,
             StatusChip::Cpu => crate::icons::fa::MICROCHIP,
             StatusChip::Battery => crate::icons::fa::BATTERY,
+            StatusChip::Volume => {
+                crate::icons::volume_icon(crate::sound::muted(), crate::sound::volume())
+            }
             StatusChip::Clock => crate::icons::fa::CLOCK,
         };
         sc.draw_str(
@@ -4898,6 +4936,9 @@ pub fn draw_status_menu(chip: StatusChip) {
             }
             StatusChip::Battery => {
                 y = draw_battery_menu_body(sc, ix, y, ch, bg);
+            }
+            StatusChip::Volume => {
+                y = draw_volume_menu_body(sc, ix, y, content_w, ch, cw, bg);
             }
             StatusChip::Kbd => {
                 y = draw_input_menu_body(sc, ix, y, ch, bg, true);
@@ -5075,6 +5116,91 @@ fn draw_line_i(sc: &Screen, x0: i64, y0: i64, x1: i64, y1: i64, c: Rgb) {
             y0 += sy;
         }
     }
+}
+
+/// Volume dropdown body. Registers three clickable [`ModalHit::Choose`] rows:
+/// `0` = mute toggle, `1` = −5%, `2` = +5%. Also paints a level bar.
+fn draw_volume_menu_body(
+    sc: &Screen,
+    ix: u64,
+    mut y: u64,
+    content_w: u64,
+    ch: u64,
+    cw: u64,
+    bg: Rgb,
+) -> u64 {
+    let muted = crate::sound::muted();
+    let pct = crate::sound::volume();
+    let icon = crate::icons::volume_icon(muted, pct);
+    let label = if muted {
+        alloc::format!("{icon}  Muted  ({pct}%)")
+    } else {
+        alloc::format!("{icon}  Output  {pct}%")
+    };
+    sc.draw_str(ix, y, &label, sc.theme.chat_fg, bg);
+    y += ch + 4;
+
+    // Level bar.
+    let bar_h = (ch / 2).max(6);
+    let bar_w = content_w;
+    sc.fill_rect(ix, y, bar_w, bar_h, sc.theme.border_dim);
+    let fill = (bar_w as u32 * pct / 100) as u64;
+    if fill > 0 && !muted {
+        sc.fill_rect(ix, y, fill, bar_h, sc.theme.accent);
+    } else if fill > 0 && muted {
+        sc.fill_rect(ix, y, fill, bar_h, sc.theme.title_dim);
+    }
+    y += bar_h + ch / 2;
+
+    // Device line.
+    let dev = if crate::sound::is_up() {
+        "Device  PCM ready"
+    } else {
+        "Device  none (software gain still applies)"
+    };
+    sc.draw_str(ix, y, dev, sc.theme.title_dim, bg);
+    y += ch + 4;
+
+    // Clickable action rows → Choose(0..2).
+    CHOOSE_RECTS.with(|c| *c = [(0, 0, 0, 0); 9]);
+    let actions: [(&str, bool); 3] = [
+        (
+            if muted { "Unmute" } else { "Mute" },
+            true,
+        ),
+        ("Volume  −5%", true),
+        ("Volume  +5%", true),
+    ];
+    CHOOSE_COUNT.store(actions.len(), core::sync::atomic::Ordering::Relaxed);
+    for (i, (text, _)) in actions.iter().enumerate() {
+        let row_bg = sc.theme.chat_bg;
+        sc.fill_rect(ix, y, content_w, ch, row_bg);
+        let prefix = match i {
+            0 => crate::icons::fa::VOLUME_XMARK,
+            1 => crate::icons::fa::MINUS,
+            _ => crate::icons::fa::PLUS,
+        };
+        sc.draw_str(
+            ix,
+            y,
+            &alloc::format!("{prefix}  {text}"),
+            sc.theme.chat_fg,
+            row_bg,
+        );
+        CHOOSE_RECTS.with(|c| c[i] = (ix, y, content_w, ch));
+        y += ch + 2;
+    }
+    y += ch / 2;
+    sc.draw_str(
+        ix,
+        y,
+        "Wheel / ←→  adjust · m mute",
+        sc.theme.title_dim,
+        bg,
+    );
+    // Silence unused cw (kept for API symmetry with other drawers).
+    let _ = cw;
+    y + ch
 }
 
 fn draw_net_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb) -> u64 {
@@ -5879,6 +6005,12 @@ pub fn composer_set_hint_right(s: &str) {
             }
         }
     });
+}
+
+/// The current right-hand composer hint (transient overlays like the reverse
+/// search save it and restore it on exit).
+pub fn composer_hint_right() -> String {
+    SCREEN.with(|slot| slot.as_ref().map(|sc| sc.composer_hint_r.clone()).unwrap_or_default())
 }
 
 /// Deactivate the composer (call when a line is submitted or the prompt ends).

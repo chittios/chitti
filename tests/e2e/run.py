@@ -62,7 +62,16 @@ def _openssl():
 
 def ensure_cert():
     if os.path.exists(CERT) and os.path.exists(KEY):
-        return True
+        # The e2e server is a fresh self-signed leaf every run; if the checked-in
+        # one is missing OR expired, regenerate it (an expired server cert is the
+        # usual silent way the wss/https scenarios start failing).
+        try:
+            out = subprocess.run([_openssl(), "x509", "-in", CERT, "-noout", "-checkend", "86400"],
+                                 capture_output=True, text=True)
+            if out.returncode == 0 and "will not expire" in out.stdout:
+                return True
+        except Exception:
+            pass
     os.makedirs(os.path.dirname(CERT), exist_ok=True)
     ossl = _openssl()
     try:
@@ -224,11 +233,15 @@ def s_session(g):
         return False, f"resume of {sid} failed"
     if not g.wait_for("messages reconstructed", 5, m):
         return False, "resume did not report message reconstruction"
-    # Store listing still names the sess key.
+    # The shell still works after resume: /session lists the saved sessions.
+    # (The older "saved in store:" line was dropped when the summary row
+    # format took over; the saved id appears in that listing.)
     m = g.mark()
     g.send("/session")
-    if not g.wait_for("saved in store:", 15, m):
-        return False, "no saved-in-store listing after resume"
+    if not g.wait_for("usage: /session", 15, m):
+        return False, "no /session banner after resume"
+    if not g.wait_for(f"{sid}  ", 5, m):
+        return False, f"saved session {sid} not listed after resume"
     return True, f"save/clear/resume session {sid}"
 
 
@@ -370,6 +383,92 @@ def s_fs_basic(g):
     return True, "fs: hierarchical ls + mkdir/touch/cat/cp/mv/glob/rm"
 
 
+def s_composer_path_complete(g):
+    """Filesystem commands auto-complete their path arguments: `/ls /t<TAB>`
+    fills in a store directory (trailing `/` kept so Tab drills), a file
+    completion ends at the exact path, and Enter runs the completed command.
+
+    The framebuffer suggestion popup is not serial-visible, but accepting a
+    suggestion re-echoes the rebuilt line, so Tab completion is. Uses a tree
+    created here so the test never depends on boot-time store contents."""
+    # Fresh tree: /tmp_e2e/sub/notes.md
+    m = g.mark()
+    g.send("/rm -r /tmp_e2e")
+    g.wait_for("rm>", 10, m)
+    g.send("/mkdir -p /tmp_e2e/sub")
+    if not g.wait_for("mkdir> /tmp_e2e/sub", 12, g.mark()):
+        return False, "mkdir -p failed (setup)"
+    g.send("/touch /tmp_e2e/sub/notes.md")
+    if not g.wait_for("touch> /tmp_e2e/sub/notes.md", 12, g.mark()):
+        return False, "touch failed (setup)"
+
+    # `/ls /tmp_e2e/s` Tab -> `/ls /tmp_e2e/sub/` (directory completion keeps
+    # the trailing slash, exactly the item the popup would have highlighted).
+    m = g.mark()
+    g.send_raw(b"/ls /tmp_e2e/s\t")
+    if not g.wait_for("/ls /tmp_e2e/sub/", 12, m):
+        return False, "Tab did not complete /s -> /sub/ (path suggestions not wired?)"
+
+    # Enter runs the completed command.
+    m = g.mark()
+    g.send_raw(b"\r")
+    if not g.wait_for("ls> /tmp_e2e/sub", 12, m):
+        return False, "Enter after dir completion did not run /ls /tmp_e2e/sub"
+
+    # File completion: `/cat /tmp_e2e/sub/n` Tab -> the exact file (no trailing
+    # space; the menu closes on the exact path, so Enter submits the command).
+    m = g.mark()
+    g.send_raw(b"/cat /tmp_e2e/sub/n\t")
+    if not g.wait_for("/cat /tmp_e2e/sub/notes.md", 12, m):
+        return False, "Tab did not complete /n -> /notes.md"
+    m = g.mark()
+    g.send_raw(b"\r")
+    if not g.wait_for("cat> /tmp_e2e/sub/notes.md", 12, m):
+        return False, "Enter after file completion did not run /cat"
+    return True, "path-argument Tab completion + Enter submit (dir + file)"
+
+
+def s_history_recall(g):
+    """Command history in the composer: Up recalls the previous command even
+    while a suggestion popup is open, and Ctrl+R reverse-searches. Both echo
+    the recalled line over serial, which is what this asserts."""
+    # Seed history with two distinct commands.
+    m = g.mark()
+    g.send("/pwd")
+    if not g.wait_for("pwd> /", 12, m):
+        return False, "/pwd did not run (seed)"
+    g.send("/datetime")
+    if not g.wait_for("datetime>", 12, g.mark()):
+        return False, "/datetime did not run (seed)"
+
+    # Up recalls /datetime (the newest). The suggestion popup opens on `/` —
+    # it must NOT eat the arrow (the old ↑↓-navigates-menu behaviour).
+    m = g.mark()
+    g.send_raw(b"\x1b[A")   # Up arrow
+    if not g.wait_for("/datetime", 8, m):
+        return False, "Up did not recall /datetime (suggestion menu ate the arrow?)"
+    m = g.mark()
+    g.send_raw(b"\r")       # Enter runs the recalled command
+    if not g.wait_for("datetime>", 10, m):
+        return False, "recalled /datetime did not run on Enter"
+
+    # Ctrl+R reverse search: type "pwd", Enter recalls /pwd, Enter runs it.
+    m = g.mark()
+    g.send_raw(b"\x12")     # Ctrl+R
+    g.send_raw(b"pwd")
+    if not (g.wait_for("(reverse-i-search)", 10, m) and g.wait_for("/pwd", 10, m)):
+        return False, "reverse search did not show the match"
+    m = g.mark()
+    g.send_raw(b"\r")       # Enter recalls the match into the composer
+    if not g.wait_for("/pwd", 12, m):
+        return False, "reverse search did not recall /pwd"
+    m = g.mark()
+    g.send_raw(b"\r")       # Enter runs it
+    if not g.wait_for("pwd> /", 25, m):
+        return False, "recalled /pwd did not run"
+    return True, "up-arrow history recall (with popup open) + Ctrl+R reverse search"
+
+
 def s_restart(g):
     """`/restart` reboots the machine via `arch::reboot`.
 
@@ -412,9 +511,14 @@ def s_nic_dispatch(g):
     and never receives a frame. The boot log must name the chosen driver, and it
     must be the family the emulated device actually belongs to.
 
-    Boot the guest with CHITTI_NIC=e1000e|igb|rtl8139|virtio-net-pci to exercise
-    the other families against the same assertion.
+    The by-device-ID dispatch is **PCI NIC discovery** (`net::pci`), and the
+    default aarch64 `-kernel` dev loop has no PCI (ECAM arrives from the UEFI
+    stub's ACPI) — the NIC there is virtio-net over virtio-mmio, which never
+    prints a dispatch line. So this runs on x86 (and UEFI boots); it skips on
+    aarch64 `-kernel`.
     """
+    if RUN_ARCH != "x86_64":
+        return None, f"skipped (PCI NIC dispatch is x86/UEFI; arch={RUN_ARCH})"
     txt = g.text()
     m = re.search(r"net: ([0-9a-f]{4}):([0-9a-f]{4}) at [\d:.]+ -> (\S+) driver", txt)
     if not m:
@@ -947,7 +1051,10 @@ def s_cancel(g):
     g.send_raw(b"\x03")  # Ctrl+C
     stopped = g.wait_for("cancelled", 8, m)
     dt = time.time() - t0
-    fast = stopped and dt < 5.0  # aborted well before the multi-second timeout
+    # Abort must be near-instant relative to the ~15 s connect timeout. 5 s was
+    # too tight under host load (a busy QEMU reports the cancel-poll slowly);
+    # 12 s still proves it fired well before the timeout ever would.
+    fast = stopped and dt < 12.0
     m2 = g.mark()
     g.send("/network")  # the next command must still be read
     followed = g.wait_for("10.0.2.15", 10, m2)
@@ -956,14 +1063,61 @@ def s_cancel(g):
 
 
 def s_wss(g):
+    # The e2e TLS server is a self-signed leaf; the in-kernel client verifies
+    # certs by default, so flip the documented escape hatch for this run only.
+    m = g.mark()
+    g.send("/tls insecure on")
+    if not g.wait_for("certificate verification OFF", 10, m):
+        return False, "/tls insecure on was not accepted"
     m = g.mark()
     g.send(f"/ws wss://{HOST}:{TLS_PORT}/ws secret-wss")
     ok = g.wait_for("echo:secret-wss", 30, m)
     g.wait_for("closed by peer", 5, m)
+    g.send("/tls insecure off")
+    g.wait_for("certificate verification ON", 5)
     return ok, "wss (TLS) echo round-trip" if ok else "no wss echo"
 
 
+def s_cancel_tls_wait(g):
+    # Ctrl+C while waiting for an **https response** must report a cancel, not a
+    # network fault. The existing `cancel` scenario aborts during *connect*, which
+    # is a different code path: this one gets past the TLS handshake and blocks in
+    # `TlsSession::read`, where the cancel is detected — and where embedded-tls
+    # used to swallow the reason, so a plain Ctrl+C surfaced as
+    # "no response head (connection closed early)". `/hang` accepts and never
+    # replies, which is also what a slow hosted model looks like.
+    m = g.mark()
+    g.send("/tls insecure on")
+    if not g.wait_for("certificate verification OFF", 10, m):
+        return False, "/tls insecure on was not accepted"
+    m = g.mark()
+    g.send(f"/http https://{HOST}:{TLS_PORT}/hang")
+    time.sleep(4.0)  # handshake done, now blocked waiting for the response head
+    t0 = time.time()
+    g.send_raw(b"\x03")  # Ctrl+C
+    stopped = g.wait_for("cancelled", 10, m)
+    dt = time.time() - t0
+    # The lie we are guarding against: a cancel reported as a closed connection.
+    lied = g.saw("connection closed early", m) or g.saw("no response", m)
+    m2 = g.mark()
+    g.send("/network")  # the next command must still be read
+    followed = g.wait_for("10.0.2.15", 10, m2)
+    g.send("/tls insecure off")
+    g.wait_for("certificate verification ON", 5)
+    ok = stopped and not lied and followed
+    return ok, (
+        f"Ctrl+C in a TLS read reported a cancel in {dt:.1f}s"
+        if ok
+        else f"cancel={stopped}/{dt:.1f}s misreported={lied} next-cmd={followed}"
+    )
+
+
 def s_model_remote_https(g):
+    # Self-signed e2e TLS server → the documented curl -k escape hatch first.
+    m = g.mark()
+    g.send("/tls insecure on")
+    if not g.wait_for("certificate verification OFF", 10, m):
+        return False, "/tls insecure on was not accepted"
     m = g.mark()
     g.send(f"/model remote https://{HOST}:{TLS_PORT} e2e-model")
     if not g.wait_for("remote backend active", 15, m):
@@ -973,6 +1127,8 @@ def s_model_remote_https(g):
     ok = g.wait_for("remote reply to: hello from e2e", 40, m2)
     g.send("/model local")  # switch back so later turns don't hit the net
     g.wait_for("local (embedded)", 5)
+    g.send("/tls insecure off")
+    g.wait_for("certificate verification ON", 5)
     return ok, "hosted-model chat over https" if ok else "no remote reply"
 
 
@@ -1334,6 +1490,12 @@ def s_open_media(_g):
             ok = g2.wait_for("audio stopped", 10, m2)
             if not ok:
                 return False, "media controls / Ctrl+C did not stop playback"
+            # A stopped media tab keeps its keys: the image tab still eats `-`
+            # (zoom) and `0` (reset), so typed commands lose those chars (a
+            # `/open /img0/chitti-e2e.pdf` came out as `/open /img/chittie2e.pdf`).
+            # Shift+Tab returns focus to the chat composer before the next command.
+            g2.send_raw(b"\x1b[Z")
+            g2.wait_quiet(0.4, 10)
             # The pdf agent's /open hook: wasm digest → page count + editor tab.
             m3 = g2.mark()
             g2.send(f"/open /img{d}/chitti-e2e.pdf")
@@ -1494,6 +1656,10 @@ def s_samples(g):
     g.send("/open /samples/misc/minimal.pdf")
     if not g.wait_for("page(s)", 30, m):
         return False, "sample PDF was not digested"
+    # The PDF opens an editor tab, which then holds keyboard focus — a `/cat`
+    # typed now would lose letters to the editor. Shift+Tab back to the chat.
+    g.send_raw(b"\x1b[Z")
+    g.wait_quiet(0.4, 10)
     # The corpus records its own provenance, which is what makes shipping an
     # image with it defensible.
     m = g.mark()
@@ -1567,9 +1733,9 @@ def s_open_video(_g):
                 continue
             # Decode + display of keyframes, then drive the transport controls
             # and prove the input loop stays responsive (Ctrl+C stops).
-            # Streaming decoder: reports "N frame(s), ready in X ms" (frames are
-            # decoded on demand during playback, not all up front).
-            if not (g2.wait_for("H.264", 5, m) and g2.wait_for("frame(s), ready", 8, m)):
+            # Streaming decoder: reports "N frame(s)  decoder=…  ready in X ms"
+            # (frames are decoded on demand during playback, not all up front).
+            if not (g2.wait_for("H.264", 5, m) and g2.wait_for("ready in", 8, m)):
                 return False, "probe/decode output missing"
             g2.send_raw(b"\x1b[T")   # Ctrl+Tab: focus the video tab
             g2.wait_quiet(0.3, 10)
@@ -1585,7 +1751,7 @@ def s_open_video(_g):
             if hi_path is not None:
                 m3 = g2.mark()
                 g2.send(f"/open /vid{d}/chitti-e2e-hi.mp4")
-                if not (g2.wait_for("profile 100", 15, m3) and g2.wait_for("frame(s), ready", 10, m3)):
+                if not (g2.wait_for("profile 100", 15, m3) and g2.wait_for("ready in", 10, m3)):
                     return False, "High-profile CABAC clip did not decode"
                 m4 = g2.mark()
                 g2.send_raw(b"\x03")
@@ -1725,12 +1891,15 @@ def s_display(g):
 def s_statusbar(g):
     """Status-bar position: reports the current edge, moves to each of the four,
     rejects a typo without moving, persists to ui.json, and the shell keeps working
-    after each move (every move is a full relayout of every pane)."""
+    after each move (every move is a full relayout of every pane).
+
+    `top` is the boot default (a recent change from `bottom`), so the restore
+    path and the refused-position check both expect `top`."""
     try:
         m = g.mark()
         g.send("/statusbar")
-        if not g.wait_for("statusbar> bottom", 10, m):
-            return False, "/statusbar did not report bottom as the default"
+        if not g.wait_for("statusbar> top", 10, m):
+            return False, "/statusbar did not report top as the default"
 
         for pos in ("top", "left", "right", "bottom"):
             g.wait_quiet(0.4, 10)
@@ -1872,10 +2041,15 @@ def s_pane_grid(g):
             return False, "/pane focus prev did not wrap back"
         return True, "grid shapes (max/explicit/clamped) and pane focus"
     finally:
-        # Always hand the next scenario the default 2-pane layout back.
+        # Always hand the next scenario the default 2-pane layout back — AND the
+        # keyboard focus: `/pane focus` deliberately moved it to an action pane,
+        # and a layout reset does not return it (every command after this then
+        # lost its keystrokes to the focused pane). Shift+Tab returns to the chat.
         m = g.mark()
         g.send("/pane reset")
         g.wait_for("pane> reset", 8, m)
+        g.send_raw(b"\x1b[Z")
+        g.wait_quiet(0.3, 10)
 
 
 # --- voice scenarios — slow, need assets/voice + a sound device -------------
@@ -1918,6 +2092,13 @@ def s_agents_install(g):
 
 
 def s_agents_uninstall(g):
+    # Self-contained so it is shard-safe under `--jobs`: the parallel run can
+    # place this in a guest where `agents_install` (a different scenario, a
+    # different shard) never ran — install report-writer here first, then remove.
+    m = g.mark()
+    g.send("/agents install report-writer --yes")
+    if not g.wait_for("installed; granted", 25, m):
+        return False, "setup install of report-writer did not complete"
     m = g.mark()
     g.send("/agents uninstall report-writer")
     ok = g.wait_for("removed", 15, m)
@@ -2089,12 +2270,12 @@ def s_doc_pipeline(g):
     # through the in-kernel loopback interface (never the NIC), so an in-OS client
     # can talk to an in-OS listener.
     m = g.mark()
-    g.send(f"/agents start doc {SVC_HTTP_PORT}")
+    g.send(f"/agents start doc {g.svc_http_port}")
     if not g.wait_for("web pipeline network->http->server", 15, m):
         return False, "web pipeline did not start"
     time.sleep(0.6)
     try:
-        resp = _http_get(SVC_HTTP_PORT, "/")
+        resp = _http_get(g.svc_http_port, "/")
     except OSError as e:
         return False, f"http request failed: {e}"
     ok = resp.startswith(b"HTTP/1.1 ") and _content_length_ok(resp)
@@ -2105,10 +2286,10 @@ def s_doc_pipeline(g):
     # prints "http> <status> (<n> bytes)"; a refused/timed-out connect takes the
     # error path ("http> error: …") and never prints "bytes)".
     lm = g.mark()
-    g.send(f"/http http://127.0.0.1:{SVC_HTTP_PORT}/")
+    g.send(f"/http http://127.0.0.1:{g.svc_http_port}/")
     lo_ip = g.wait_for("bytes)", 20, lm)
     nm = g.mark()
-    g.send(f"/http http://localhost:{SVC_HTTP_PORT}/")
+    g.send(f"/http http://localhost:{g.svc_http_port}/")
     lo_name = g.wait_for("bytes)", 20, nm)
     if not (lo_ip and lo_name):
         return False, f"loopback failed (127.0.0.1={lo_ip}, localhost={lo_name})"
@@ -2119,12 +2300,12 @@ def s_doc_website(g):
     # Doc agent ships tools.wasm: GET / → index.html, GET /docs → docs.html
     # without a model (deterministic route_request). Scope-gated asset read still
     # applies. Works on the fast path; --slow group may still run this.
-    g.send(f"/agents start doc {SVC_HTTP_PORT}")
+    g.send(f"/agents start doc {g.svc_http_port}")
     g.wait_for("web pipeline network->http->server", 15)
     time.sleep(0.6)
     try:
-        home = _http_get(SVC_HTTP_PORT, "/")
-        docs = _http_get(SVC_HTTP_PORT, "/docs")
+        home = _http_get(g.svc_http_port, "/")
+        docs = _http_get(g.svc_http_port, "/docs")
     except OSError as e:
         return False, f"http request failed: {e}"
     ok = (
@@ -2160,9 +2341,15 @@ def s_system_agents(g):
     # Only agents that reason from a SOUL are installed agents (doc, ssh); the
     # network/http stages are pure service-layer plumbing, not agents. The boot
     # log proves install_all ran (signs each package + places its SOUL/assets).
-    booted = g.wait_for("system agents installed (doc, ssh)", 5, 0)  # printed at boot
+    #
+    # NOTE the text form: bare `/agents` opens the framebuffer Agents browser,
+    # which captures every keystroke until Esc — sending it here left the modal
+    # open and silently swallowed the whole rest of the suite (surface, the net
+    # scenarios, package apps). `/agents list text` prints the same rows to
+    # serial, including each system agent's SOUL path.
+    booted = g.wait_for("system agents installed (builtin suite", 5, 0)  # printed at boot
     m = g.mark()
-    g.send("/agents")
+    g.send("/agents list text")
     listed = g.wait_for("system agents", 15, m) and g.wait_for("/agent/9001/SOUL.md", 3, m)
     ok = booted and listed
     return ok, "doc + ssh installed as system agents in /agent/ (network/http are plumbing)" if ok else "system agents not installed/listed"
@@ -2172,12 +2359,12 @@ def s_ssh_agent(g):
     # Start the SSH system agent and confirm it does the RFC 4253 version
     # exchange (sends its identification banner) on an inbound connection.
     m = g.mark()
-    g.send(f"/agents start ssh {SVC_SSH_PORT}")
+    g.send(f"/agents start ssh {g.svc_ssh_port}")
     if not g.wait_for("started 'ssh' service", 15, m):
         return False, "ssh agent did not start"
     time.sleep(0.5)
     try:
-        with socket.create_connection(("127.0.0.1", SVC_SSH_PORT), timeout=15) as s:
+        with socket.create_connection(("127.0.0.1", g.svc_ssh_port), timeout=15) as s:
             s.sendall(b"SSH-2.0-e2eClient\r\n")
             s.settimeout(15)
             banner = s.recv(64)
@@ -2271,6 +2458,8 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("memory", s_memory),
     ("memory_hierarchy", s_memory_hierarchy),
     ("fs_basic", s_fs_basic),
+    ("composer_path_complete", s_composer_path_complete),
+    ("history_recall", s_history_recall),
     ("install_plan", s_install_plan),
     ("synapse_bench", s_synapse_bench),
     ("redteam", s_redteam),
@@ -2308,12 +2497,16 @@ FLAKY = {"doc_pipeline", "ssh_agent"}
 # (model_load boots a --no-model guest with a model disk). Set by main().
 RUN_ARCH = "aarch64"
 RUN_VERBOSE = False
-NET_TLS = [("wss", s_wss), ("model_remote_https", s_model_remote_https)]
+NET_TLS = [
+    ("wss", s_wss),
+    ("cancel_tls_wait", s_cancel_tls_wait),
+    ("model_remote_https", s_model_remote_https),
+]
 MODEL = [("bench", s_bench), ("infer", s_infer), ("perf", s_perf), ("chat", s_chat), ("injection_in_the_loop", s_injection_in_the_loop), ("compact", s_compact), ("prefix_cache", s_prefix_cache), ("model_load", s_model_load), ("doc_website", s_doc_website)]
 VOICE = [("voice_models", s_voice_models), ("voice_say", s_voice_say)]
 
 
-def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3, disk=None, ready_timeout=120):
+def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3, disk=None, ready_timeout=120, smp=None):
     """Launch the guest and wait for it to reach networking, retrying if it dies
     early. aarch64 SMP bring-up (PSCI CPU_ON) very occasionally takes a data
     abort right after `smp: N cores online` — a rare hypervisor bring-up race,
@@ -2325,7 +2518,7 @@ def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3, dis
     mapping an oversized heap. Returns a booted Guest, or None if every attempt
     failed."""
     for attempt in range(1, attempts + 1):
-        g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd, no_model=no_model, disk=disk)
+        g = Guest(arch=arch, model=model, verbose=verbose, audio=audio, hostfwd=fwd, no_model=no_model, disk=disk, smp=smp)
         deadline = time.time() + ready_timeout
         outcome = "timeout"
         while time.time() < deadline:
@@ -2354,6 +2547,43 @@ def boot_guest(arch, model, verbose, audio, fwd, no_model=False, attempts=3, dis
     return None
 
 
+def run_scenario_list(g, scenarios, verbose=False):
+    """Run `scenarios` ([(name, fn), …]) against a booted guest, retrying known
+    flaky ones once, and return `[(name, tag, detail, elapsed_s), …]`.
+
+    Shared by the serial path and each parallel shard, so timing + flaky
+    handling live in one place.
+    """
+    results = []
+    time.sleep(1)  # settle after boot before the first keystroke
+    for name, fn in scenarios:
+        t0 = time.monotonic()
+        try:
+            ok, detail = fn(g)
+        except Exception as e:
+            ok, detail = False, f"exception: {e}"
+        elapsed = time.monotonic() - t0
+        if ok is False and name in FLAKY:
+            try:
+                ok, detail = fn(g)
+            except Exception as e:
+                ok, detail = False, f"exception: {e}"
+            if ok is False:
+                results.append((name, "FLAKY", detail, elapsed))
+                print(f"  [FLAKY] {name} ({elapsed:.0f}s): {detail} (known-flaky — not gating)")
+                if verbose:
+                    print("    " + g.tail(600).replace("\n", "\n    "))
+                continue
+            detail = f"{detail} (passed on retry)"
+            elapsed = time.monotonic() - t0
+        tag = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+        results.append((name, tag, detail, elapsed))
+        print(f"  [{tag}] {name} ({elapsed:.0f}s): {detail}")
+        if ok is False and verbose:
+            print("    " + g.tail(600).replace("\n", "\n    "))
+    return results
+
+
 def main():
     global RUN_ARCH, RUN_VERBOSE
     arch, model = "aarch64", "qwen3.5-0.8b"
@@ -2361,23 +2591,33 @@ def main():
     slow = "--slow" in sys.argv or "--full" in sys.argv
     args = [a for a in sys.argv[1:] if a not in ("-v", "--verbose", "--slow", "--full")]
     only = None
+    jobs = 1
+    smp = None
     for i, a in enumerate(args):
         if a == "-arch" and i + 1 < len(args):
             arch = args[i + 1]
         if a == "-model" and i + 1 < len(args):
             model = args[i + 1]
         # `--only a,b` runs just those scenarios. Development affordance: the full
-        # os+agents+net sweep is ~30 min, which is too slow a loop for iterating on
-        # one scenario, and an unrecognised flag used to be silently ignored — so a
-        # typo ran everything instead of saying so.
+        # os+agents+net sweep is ~30 min serially, which is too slow a loop for
+        # iterating on one scenario, and an unrecognised flag used to be silently
+        # ignored — so a typo ran everything instead of saying so.
         if a == "--only" and i + 1 < len(args):
             only = [n.strip() for n in args[i + 1].split(",") if n.strip()]
+        # `--jobs N` splits the scenarios across N concurrent guest boots (each
+        # on its own host-forwarded ports). `--smp N` caps each guest's vCPUs —
+        # for a parallel run, several VMs each requesting `-smp 8` oversubscribe
+        # the host and slow every shard down.
+        if a == "--jobs" and i + 1 < len(args):
+            jobs = int(args[i + 1])
+        if a == "--smp" and i + 1 < len(args):
+            smp = int(args[i + 1])
     RUN_ARCH, RUN_VERBOSE = arch, verbose
 
     have_tls = ssl.HAS_TLSv1_3 and ensure_cert()
     have_model = os.path.exists(os.path.join(ROOT, "assets", "model.gguf"))
     have_voice = os.path.isdir(os.path.join(ROOT, "assets", "voice")) and os.listdir(os.path.join(ROOT, "assets", "voice"))
-    print(f"e2e: arch={arch} model={model} tls={'yes' if have_tls else 'SKIP'} slow={'yes' if slow else 'no'}")
+    print(f"e2e: arch={arch} model={model} tls={'yes' if have_tls else 'SKIP'} slow={'yes' if slow else 'no'} jobs={jobs}")
 
     servers = [Server(PLAIN_PORT)]
     if have_tls:
@@ -2387,85 +2627,157 @@ def main():
         else:
             have_tls = False
 
-    # `FINAL` (`/restart`) is always last — it reboots/exits the guest.
-    scenarios = list(OS) + list(AGENTS) + list(NET) + (list(NET_TLS) if have_tls else [])
+    # `FINAL` (`/restart`) is always last — it reboots/exits its guest, so under
+    # both serial and --jobs it runs on its own boot after everything else.
+    final_names = {n for n, _ in FINAL}
+    all_scenarios = list(OS) + list(AGENTS) + list(NET) + (list(NET_TLS) if have_tls else [])
     if slow:
         if have_model:
-            scenarios += list(MODEL)
+            all_scenarios += list(MODEL)
         else:
             print("  (model scenarios skipped — assets/model.gguf absent)")
         if have_voice:
-            scenarios += list(VOICE)
+            all_scenarios += list(VOICE)
         else:
             print("  (voice scenarios skipped — assets/voice/ absent)")
-    scenarios += list(FINAL)
+    all_scenarios += list(FINAL)
 
     if only:
-        known = {n for n, _ in scenarios}
+        known = {n for n, _ in all_scenarios}
         unknown = [n for n in only if n not in known]
         if unknown:
             print(f"e2e: unknown scenario(s) {unknown}; known: {sorted(known)}")
             return 2
         # Keep the declared order (FINAL still last), not the order given.
-        scenarios = [(n, f) for (n, f) in scenarios if n in only]
-        print(f"e2e: --only {[n for n, _ in scenarios]}")
+        selected = [(n, f) for (n, f) in all_scenarios if n in only]
+        runnable = [(n, f) for (n, f) in selected if n not in final_names]
+        final = [(n, f) for (n, f) in selected if n in final_names]
+        print(f"e2e: --only {[n for n, _ in selected]}")
+    else:
+        runnable = [(n, f) for (n, f) in all_scenarios if n not in final_names]
+        final = list(FINAL)
 
     # Voice needs a sound device; give the guest a silent audio backend then.
     audio = "none" if (slow and have_voice) else "off"
-    fwd = f"{SVC_PORT},{SVC_HTTP_PORT},{SVC_SSH_PORT}"
-    print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={fwd})…")
-    # Non-slow groups (os/net/agents) never run inference, so boot the main
-    # guest model-less: it uses the small desktop heap and fits a CI runner
-    # instead of OOMing while mapping the model-sized heap. The slow group
-    # keeps the model loaded for the inference/chat scenarios.
     # An x86 guest has no hardware acceleration on an Apple-Silicon host — QEMU falls
     # back to TCG, where the same boot takes several minutes rather than seconds. The
     # 120 s default is an aarch64/HVF figure, and leaving it in place meant
     # `-arch x86_64` could never finish its first boot anywhere but a KVM machine.
     ready = 120 if arch == "aarch64" else 600
-    g = boot_guest(arch, model, verbose, audio, fwd, no_model=not slow, ready_timeout=ready)
-    if g is None:
-        print("e2e: FAILED — guest never booted (networking not configured after retries)")
-        return 1
-    def run_scenario(fn):
-        try:
-            return fn(g)
-        except Exception as e:
-            return False, f"exception: {e}"
 
     results = []
     try:
-        time.sleep(1)
-        for name, fn in scenarios:
-            ok, detail = run_scenario(fn)
-            # Known-flaky scenarios: retry once, then tolerate (report [FLAKY],
-            # don't gate the run) so their timing jitter can't fail an otherwise
-            # green run — while a consistently broken one still shows every time.
-            if ok is False and name in FLAKY:
-                ok, detail = run_scenario(fn)
-                if ok is False:
-                    results.append((name, "FLAKY"))
-                    print(f"  [FLAKY] {name}: {detail} (known-flaky — not gating)")
-                    if verbose:
-                        print("    " + g.tail(600).replace("\n", "\n    "))
-                    continue
-                detail = f"{detail} (passed on retry)"
-            tag = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
-            results.append((name, tag))
-            print(f"  [{tag}] {name}: {detail}")
-            if ok is False and verbose:
-                print("    " + g.tail(600).replace("\n", "\n    "))
+        if jobs <= 1:
+            fwd = f"{SVC_PORT},{SVC_HTTP_PORT},{SVC_SSH_PORT}"
+            print(f"e2e: booting guest (cargo xtask run, audio={audio}, hostfwd={fwd})…")
+            g = boot_guest(arch, model, verbose, audio, fwd, no_model=not slow, ready_timeout=ready)
+            if g is None:
+                print("e2e: FAILED — guest never booted (networking not configured after retries)")
+                return 1
+            try:
+                results = run_scenario_list(g, runnable, verbose)
+            finally:
+                g.close()
+            if final:
+                fg = boot_guest(arch, model, verbose, audio, fwd, no_model=True, ready_timeout=ready)
+                if fg is not None:
+                    try:
+                        results += run_scenario_list(fg, final, verbose)
+                    finally:
+                        fg.close()
+                else:
+                    results.append((final[0][0], "FAIL", "final guest never booted", 0))
+        else:
+            results = run_shards(runnable, jobs, smp, arch, model, verbose, audio, ready, slow)
+            if final:
+                fwd = f"{SVC_PORT},{SVC_HTTP_PORT},{SVC_SSH_PORT}"
+                fg = boot_guest(arch, model, verbose, audio, fwd, no_model=True, ready_timeout=ready)
+                if fg is not None:
+                    try:
+                        results += run_scenario_list(fg, final, verbose)
+                    finally:
+                        fg.close()
+                else:
+                    results.append((final[0][0], "FAIL", "final guest never booted", 0))
     finally:
-        g.close()
         for s in servers:
             s.stop()
 
-    passed = sum(1 for _, t in results if t == "PASS")
-    failed = sum(1 for _, t in results if t == "FAIL")
-    skipped = sum(1 for _, t in results if t == "SKIP")
-    flaky = sum(1 for _, t in results if t == "FLAKY")
+    passed = sum(1 for _, t, _, _ in results if t == "PASS")
+    failed = sum(1 for _, t, _, _ in results if t == "FAIL")
+    skipped = sum(1 for _, t, _, _ in results if t == "SKIP")
+    flaky = sum(1 for _, t, _, _ in results if t == "FLAKY")
     print(f"e2e: {passed} passed, {failed} failed, {skipped} skipped, {flaky} flaky ({len(results)} run)")
     return 1 if failed else 0  # FLAKY never sets the exit code
+
+
+def partition_scenarios(scenarios, jobs):
+    """Split a scenario list into `jobs` shards, round-robin by declared order
+    so the heavy runs (the AGENTS block, the NET block) land one-per-shard
+    rather than stacking. Returns `[shard0, shard1, …]` (empty shards at the
+    tail when there are fewer scenarios than jobs)."""
+    shards = [[] for _ in range(jobs)]
+    for i, sc in enumerate(scenarios):
+        shards[i % jobs].append(sc)
+    return shards
+
+
+def run_shards(scenarios, jobs, smp, arch, model, verbose, audio, ready, slow):
+    """Split `scenarios` across `jobs` concurrent guest boots.
+
+    Round-robin by declared order (see [`partition_scenarios`]), so the heavy
+    runs land one-per-shard. Each shard boots on its own host-forwarded port
+    triple so the doc/ssh service-agent scenarios can reach its guest's
+    listeners; the host test servers (plain + TLS) are shared — they already
+    handle a thread per connection.
+
+    Returns the concatenated [(name, tag, detail, elapsed), …] results.
+    """
+    import threading
+
+    if smp is None:
+        # A machine has ~8 cores; give each concurrent VM a fair slice so 4
+        # shards do not all demand `-smp 8` at once. `--smp N` overrides.
+        smp = max(2, 8 // jobs)
+    shards = partition_scenarios(scenarios, jobs)
+    print(f"e2e: --jobs {jobs}: shards {[len(s) for s in shards]} (smp={smp} each)")
+    for i, shard in enumerate(shards):
+        if shard:
+            print(f"  shard {i}: {', '.join(n for n, _ in shard)}")
+
+    results: "list" = []
+    results_lock = threading.Lock()
+    barrier_errors = []
+
+    def run_shard(i, shard):
+        base = SVC_PORT + i * 3
+        fwd = f"{base},{base + 1},{base + 2}"
+        g = boot_guest(arch, model, verbose, audio, fwd, no_model=not slow,
+                       ready_timeout=ready, smp=smp)
+        if g is None:
+            with results_lock:
+                barrier_errors.append((i, "guest never booted"))
+            return
+        try:
+            res = run_scenario_list(g, shard, verbose)
+            with results_lock:
+                results.extend(res)
+        finally:
+            g.close()
+
+    threads = []
+    for i, shard in enumerate(shards):
+        if not shard:
+            continue
+        t = threading.Thread(target=run_shard, args=(i, shard), name=f"shard{i}", daemon=False)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    for i, err in barrier_errors:
+        print(f"  [FAIL] shard {i}: {err}")
+        results.append((f"shard{i}_boot", "FAIL", err, 0))
+    return results
 
 
 if __name__ == "__main__":

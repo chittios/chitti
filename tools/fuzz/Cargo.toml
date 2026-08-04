@@ -1,0 +1,27 @@
+# Host-side mutational fuzzer for the kernel's pure, attacker-reachable parsers.
+#
+# Stand-alone (the `pngbench`/`onnxdiff`/`cortexdiff`/`h264diff` pattern): kernel
+# modules are mounted verbatim via `#[path]`, so the bytes exercised here are the
+# same source that runs in the OS — not a re-implementation. It needs no QEMU and
+# no kernel build; `cargo run --release -- <target> <seconds>` mutates seed inputs
+# from `corpus/<target>/` and reports any input that makes the parser panic.
+#
+# Deliberately dependency-free: a hand-rolled mutator (bit/byte flips, chunk
+# splice/drop/dup, random insert) instead of libFuzzer, so it builds anywhere the
+# host toolchain does (macOS + Linux, stable, no clang `-fsanitize=fuzzer`). It
+# catches *panics* — for pure parsers that is the bug class a `no_std` kernel can
+# hit (a kernel panic aborts the whole OS, so a parser that panics on hostile
+# input is a denial-of-service). Memory-safety bugs in `unsafe` code are out of
+# scope here; those are the ring-3 tenants' job (and the reason `png` decodes in
+# a sandboxed tenant).
+[package]
+name = "chitti-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Stand-alone: not part of the root workspace.
+[workspace]
+
+[profile.release]
+opt-level = 3

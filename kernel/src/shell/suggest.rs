@@ -1,4 +1,5 @@
-//! Slash-command and `@file` mention suggestions for the shell composer.
+//! Slash-command, `@file` mention, and **filesystem path-argument** suggestions
+//! for the shell composer.
 //!
 //! Pure filtering + ranking (no framebuffer). The line editor drives this on
 //! every edit; the compositor paints the popup.
@@ -7,6 +8,11 @@
 //! When you add or rename a `/command`, update that catalogue (title =
 //! suggestion detail). Do **not** maintain a parallel list here — unit tests
 //! fail if a catalogue entry is missing from suggestions.
+//!
+//! Path-argument completion (`/ls /configs`, `/open /samples/images/…`) is
+//! keyed on [`PATH_COMMANDS`] — the commands whose arguments are store/mount
+//! paths. The caller supplies the parent directory's `vfs::readdir` listing so
+//! this module stays pure (see [`path_items`] / [`path_parts`]).
 
 use crate::shell::catalog;
 use alloc::string::{String, ToString};
@@ -33,7 +39,18 @@ pub enum Kind {
     Command,
     /// `@path` mention anywhere in the line.
     File,
+    /// A filesystem path argument after a path-taking command (`/ls /configs/`).
+    Path,
 }
+
+/// Commands whose whitespace-delimited arguments are filesystem paths
+/// (`/ls /configs`, `/open /samples/images/x.png`, `/cp /a /b`, …). Typing an
+/// argument of one of these auto-suggests store / mount paths. Deliberately a
+/// small hand-list: every entry here must actually take a path (the catalogue
+/// is the source of truth for *names*, this is about *argument shape*).
+pub const PATH_COMMANDS: &[&str] = &[
+    "ls", "cat", "open", "mkdir", "rm", "cp", "mv", "touch", "glob", "grep",
+];
 
 /// Active completion context: kind, the typed prefix (without `/` or `@`),
 /// and the byte offset in the line where the token starts (`/` or `@`).
@@ -72,6 +89,25 @@ pub fn context(buf: &str, cur: usize) -> Option<Context> {
                 prefix: rest.to_string(),
                 token_start: lead,
             });
+        }
+        // Path argument after a path-taking command: `/ls /co`, `/ls /configs/`,
+        // `/cp /a /b`. The token is whatever follows the last whitespace.
+        if let Some(cmd) = rest.split_whitespace().next() {
+            let after_cmd = rest.as_bytes().get(cmd.len()).map(|&b| b == b' ' || b == b'\t');
+            if PATH_COMMANDS.contains(&cmd) && after_cmd == Some(true) {
+                let start = before
+                    .rfind(|c: char| c == ' ' || c == '\t')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let token = &before[start..];
+                if !token.contains(' ') && !token.contains('\t') {
+                    return Some(Context {
+                        kind: Kind::Path,
+                        prefix: token.to_string(),
+                        token_start: start,
+                    });
+                }
+            }
         }
     }
     None
@@ -156,11 +192,85 @@ fn file_item(path: &str) -> Item {
     }
 }
 
+/// Split a typed path prefix into the **parent directory to list** and the
+/// **partial final component**. `/configs/co` → (`/configs`, `co`);
+/// `/configs/` → (`/configs`, ``); `` → (`/`, ``); bare `co` → (`/`, `co`).
+/// Pure — the caller reads the parent via the VFS.
+pub fn path_parts(prefix: &str) -> (String, String) {
+    if prefix.is_empty() {
+        return (String::from("/"), String::new());
+    }
+    if prefix.ends_with('/') {
+        let parent = prefix.trim_end_matches('/');
+        return (
+            if parent.is_empty() { String::from("/") } else { parent.to_string() },
+            String::new(),
+        );
+    }
+    match prefix.rfind('/') {
+        Some(i) => (prefix[..i].to_string(), prefix[i + 1..].to_string()),
+        None => (String::from("/"), prefix.to_string()),
+    }
+}
+
+/// Path completions for a typed `prefix` against the parent directory's
+/// listing. Directories first (labelled with a trailing `/` and a `dir`
+/// detail), then files — same order as `/ls`. The insert keeps the directory
+/// suffix so Tab/Enter drills one level at a time. When the prefix is already
+/// an **exact file**, the item is dropped so the popup closes instead of
+/// echoing the completed path back at the caret (the shell analogue of bash's
+/// "nothing left to complete").
+pub fn path_items(prefix: &str, entries: &[crate::fs::vfs::DirEntry], max: usize) -> Vec<Item> {
+    let max = max.max(1).min(MAX_ITEMS);
+    let (parent, partial) = path_parts(prefix);
+    let norm = crate::synapse::vpath::normalize(prefix);
+    let mut out: Vec<Item> = Vec::new();
+    for e in entries {
+        if !e.name.starts_with(&partial) {
+            continue;
+        }
+        let full = if parent == "/" {
+            alloc::format!("/{}", e.name)
+        } else {
+            alloc::format!("{parent}/{}", e.name)
+        };
+        if !e.is_dir && norm == full {
+            continue; // already typed the whole file — nothing to complete
+        }
+        let display = if e.is_dir {
+            alloc::format!("{full}/")
+        } else {
+            full
+        };
+        out.push(Item {
+            insert: display.clone(),
+            label: display,
+            detail: if e.is_dir { String::from("dir") } else { String::new() },
+        });
+    }
+    out.sort_by(|a, b| {
+        let ad = a.detail == "dir";
+        let bd = b.detail == "dir";
+        bd.cmp(&ad).then_with(|| a.label.cmp(&b.label))
+    });
+    out.truncate(max);
+    out
+}
+
 /// Build the suggestion list for the current context.
-pub fn items_for(ctx: &Context, store_paths: &[String]) -> Vec<Item> {
+///
+/// `store_paths` feeds `@file` mentions; `dir_entries` feeds path-argument
+/// completion (`Kind::Path`) and is the caller's `vfs::readdir` of
+/// [`path_parts`]'s parent (fetched outside so this stays pure + testable).
+pub fn items_for(
+    ctx: &Context,
+    store_paths: &[String],
+    dir_entries: &[crate::fs::vfs::DirEntry],
+) -> Vec<Item> {
     match ctx.kind {
         Kind::Command => command_items(&ctx.prefix, MAX_ITEMS),
         Kind::File => file_items(&ctx.prefix, store_paths, MAX_ITEMS),
+        Kind::Path => path_items(&ctx.prefix, dir_entries, MAX_ITEMS),
     }
 }
 
@@ -272,5 +382,112 @@ mod tests {
         let items = command_items("", 8);
         assert_eq!(items.len(), 8);
         assert!(items.iter().any(|i| i.label.starts_with('/')));
+    }
+
+    #[test_case]
+    fn context_path_argument() {
+        // `/ls /co` — caret at end of the path token.
+        let c = context("/ls /co", 7).unwrap();
+        assert_eq!(c.kind, Kind::Path);
+        assert_eq!(c.prefix, "/co");
+        assert_eq!(c.token_start, 4);
+
+        // `/ls /configs/` — empty partial lists the dir's children.
+        let c = context("/ls /configs/", 13).unwrap();
+        assert_eq!(c.kind, Kind::Path);
+        assert_eq!(c.prefix, "/configs/");
+        assert_eq!(c.token_start, 4);
+
+        // Bare space after the command → root listing.
+        let c = context("/ls ", 4).unwrap();
+        assert_eq!(c.kind, Kind::Path);
+        assert_eq!(c.prefix, "");
+
+        // Second argument of a multi-arg command.
+        let c = context("/cp /a /b", 9).unwrap();
+        assert_eq!(c.kind, Kind::Path);
+        assert_eq!(c.prefix, "/b");
+
+        // Command name alone (no space) stays a command.
+        let c = context("/ls", 3).unwrap();
+        assert_eq!(c.kind, Kind::Command);
+
+        // A non-path command's arguments do not complete paths.
+        assert!(!matches!(context("/help thing", 11), Some(Context { kind: Kind::Path, .. })));
+
+        // Caret back in the command name — still a command.
+        let c = context("/ls /co", 3).unwrap();
+        assert_eq!(c.kind, Kind::Command);
+    }
+
+    #[test_case]
+    fn path_parts_split() {
+        assert_eq!(path_parts(""), (String::from("/"), String::new()));
+        assert_eq!(path_parts("/"), (String::from("/"), String::new()));
+        assert_eq!(path_parts("/configs/co"), (String::from("/configs"), String::from("co")));
+        assert_eq!(path_parts("/configs/"), (String::from("/configs"), String::new()));
+        assert_eq!(path_parts("co"), (String::from("/"), String::from("co")));
+        assert_eq!(path_parts("/agent/1/SOUL.m"), (String::from("/agent/1"), String::from("SOUL.m")));
+    }
+
+    /// Build `vfs::DirEntry` fixtures.
+    fn de(name: &str, is_dir: bool) -> crate::fs::vfs::DirEntry {
+        crate::fs::vfs::DirEntry {
+            name: String::from(name),
+            is_dir,
+            size: 0,
+        }
+    }
+
+    #[test_case]
+    fn path_items_filters_dirs_first_and_drills() {
+        let entries = [
+            de("agent", true),
+            de("configs", true),
+            de("downloads", true),
+            de("samples", true),
+        ];
+        let items = path_items("/sa", &entries, 8);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "/samples/");
+        assert_eq!(items[0].insert, "/samples/");
+        assert_eq!(items[0].detail, "dir");
+
+        // Root listing for a bare space: all dirs, dirs-first + alpha.
+        let items = path_items("", &entries, 8);
+        let labels: alloc::vec::Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["/agent/", "/configs/", "/downloads/", "/samples/"]);
+
+        // Files sort after dirs.
+        let mixed = [
+            de("note.txt", false),
+            de("img", true),
+            de("a.bin", false),
+        ];
+        let items = path_items("/", &mixed, 8);
+        let labels: alloc::vec::Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["/img/", "/a.bin", "/note.txt"]);
+        assert!(items[1].detail.is_empty(), "files carry no detail");
+    }
+
+    #[test_case]
+    fn path_items_drop_exact_typed_file() {
+        let entries = [de("ui.json", false), de("ui_old.json", false), de("core", true)];
+        // A prefix that is still partial keeps the candidate.
+        let items = path_items("/configs/ui", &entries, 8);
+        assert!(items.iter().any(|i| i.label == "/configs/ui.json"));
+        // The exact file path closes the menu (no item).
+        let items = path_items("/configs/ui.json", &entries, 8);
+        assert!(items.iter().all(|i| i.label != "/configs/ui.json"), "exact file must drop");
+        // A directory with the exact name still offers to drill in.
+        let items = path_items("/configs/core", &entries, 8);
+        assert!(items.iter().any(|i| i.label == "/configs/core/"));
+    }
+
+    #[test_case]
+    fn path_items_ignores_non_prefix_entries() {
+        let entries = [de("agent", true), de("configs", true)];
+        let items = path_items("/zz", &entries, 8);
+        assert!(items.is_empty());
     }
 }

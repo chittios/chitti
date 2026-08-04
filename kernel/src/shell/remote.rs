@@ -70,6 +70,13 @@ fn boot_seed() -> Option<(bool, Option<RemoteConfig>)> {
     {
         // boot-info present ⇒ UEFI/stub (VBox / real HW), not QEMU -kernel.
         if crate::arch::aarch64::boot::boot_x1() != 0 {
+            // The stub copies the ESP's `\chitti-model.json` (the `make vbox
+            // REMOTE_RUN_URL=…` channel) into the boot-info page — the ESP
+            // filesystem is gone after ExitBootServices, so it is handed over
+            // like the EDID. No seed file on the ESP → no seed.
+            if let Some(cfg) = crate::arch::aarch64::boot::boot_page_remote_cfg() {
+                return parse_config_json(cfg);
+            }
             return None;
         }
         // m1n1/Apple: x1==0 looks like QEMU `-kernel`, but there is no fw_cfg —
@@ -96,7 +103,7 @@ pub fn load() -> (bool, Option<RemoteConfig>) {
     if let Some((on, cfg)) = boot_seed() {
         if on {
             save(true, cfg.as_ref());
-            crate::ktrace::log("model", "remote seed from fw_cfg applied");
+            crate::ktrace::log("model", "remote seed applied (fw_cfg or ESP boot-info)");
         }
         return (on, cfg);
     }
@@ -272,7 +279,7 @@ impl RemoteChat {
             crate::shell::end_thinking();
             let reply = match result {
                 Ok(r) => r,
-                Err(e) if e == "cancelled" => {
+                Err(e) if e == crate::net::http::CANCELLED => {
                     crate::serial_println!("\x1b[33m[stopped]\x1b[0m");
                     let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                     super::print_turn_footer(0.0, worked);
@@ -292,7 +299,24 @@ impl RemoteChat {
             self.messages.push(("assistant".to_string(), reply.clone()));
             let batch = super::parse_tool_calls(&reply);
             if batch.is_empty() {
-                super::print_assistant_markdown("", &reply);
+                // No call parsed, so this is the answer — but a model that emitted
+                // a *malformed* call gets here too, and its raw tags would land in
+                // the chat as mojibake (the console has no glyph for DSML's `｜`).
+                // Show the prose, name the malformation, keep the raw text in
+                // history and the ktrace.
+                let shown = super::strip_tool_markup(&reply);
+                if shown.is_empty() && !reply.trim().is_empty() {
+                    crate::ktrace::log_fmt(format_args!(
+                        "remote: reply was tool-call markup only, nothing parsed ({} bytes): {:.160}",
+                        reply.len(),
+                        reply.trim()
+                    ));
+                    crate::serial_println!(
+                        "\x1b[33m[the model emitted a malformed tool call — nothing ran (see /ktrace)]\x1b[0m"
+                    );
+                } else {
+                    super::print_assistant_markdown("", &shown);
+                }
                 session.push_message(Role::Assistant, reply.clone(), Provenance::SystemTrusted, now());
                 let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                 super::print_turn_footer(0.0, worked);
@@ -437,7 +461,7 @@ pub fn oneshot_tools(
         crate::shell::end_thinking();
         let reply = match result {
             Ok(r) => r,
-            Err(e) if e == "cancelled" => {
+            Err(e) if e == crate::net::http::CANCELLED => {
                 crate::serial_println!("\x1b[33m[{log_label} cancelled]\x1b[0m");
                 return String::new();
             }

@@ -1,0 +1,1 @@
+{"name": "write", "arguments": {"path": "/agent/doc.pdf", "content": "# Plan\n\n1. parse the file\n2. extract the table\n"}}

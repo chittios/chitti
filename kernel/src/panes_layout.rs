@@ -161,6 +161,46 @@ pub fn status_lines_vertical(s: &str, cols: usize) -> Vec<alloc::string::String>
     out
 }
 
+/// Content rows a **centred modal** can show on a `height`-px screen with
+/// `ch`-px cells, given the box's total vertical `frame` (border + padding, top
+/// and bottom). The title and separator rows are deducted, and a cell of margin
+/// is kept top and bottom so the box never touches the screen edges.
+///
+/// Lives here rather than in the compositor because the compositor is
+/// `#[cfg(not(test))]`, and this is the arithmetic that decides whether a dialog
+/// **fits**: an over-tall box made `framebuffer`'s centring subtraction wrap, so
+/// every draw landed off-screen and an approval modal painted *nothing* while
+/// still waiting for a keypress — a consent prompt the human cannot read, and
+/// indistinguishable from a frozen shell. Nothing visual would have caught it;
+/// a test on this function does.
+pub fn modal_max_rows(height: u64, ch: u64, frame: u64) -> u64 {
+    if ch == 0 {
+        return 1;
+    }
+    let usable = height.saturating_sub(frame).saturating_sub(2 * ch);
+    (usable / ch).saturating_sub(2).max(1)
+}
+
+/// Trim `lines` to `budget` rows, replacing the tail with a count of what was
+/// dropped. Truncation is **stated**, never silent: a dialog that quietly hides
+/// half of what it is asking about is worse than one that admits the payload is
+/// too long to show.
+pub fn clamp_modal_lines(
+    mut lines: Vec<alloc::string::String>,
+    budget: usize,
+) -> Vec<alloc::string::String> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    if lines.len() <= budget {
+        return lines;
+    }
+    let dropped = lines.len() - (budget - 1);
+    lines.truncate(budget - 1);
+    lines.push(alloc::format!("... {dropped} more line(s) not shown"));
+    lines
+}
+
 /// Carve the status bar off one edge of a `w × h` desktop, returning
 /// `(bar, content)`.
 ///
@@ -609,6 +649,63 @@ pub fn move_tab<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A modal's box must fit the screen it is drawn on, at every font scale.
+    /// `framebuffer::modal_box` centres with `height - bh`, so a box taller than
+    /// the screen wrapped that subtraction and put every draw off-screen: the
+    /// approval dialog painted **nothing** while still waiting for a key — a
+    /// consent prompt the human cannot read, looking exactly like a hang. The
+    /// trigger was ordinary: an `Edit` whose args were a whole config file.
+    #[test_case]
+    fn modal_row_budget_keeps_the_box_on_screen() {
+        // The compositor's frame: 2 * (BORDER + PAD) = 2 * (2 + 10).
+        const FRAME: u64 = 24;
+        for height in [480u64, 600, 720, 900, 1080, 1440, 2160] {
+            for ch in [16u64, 32, 48, 64] {
+                let rows = modal_max_rows(height, ch, FRAME);
+                assert!(rows >= 1, "always room for one row ({height}, {ch})");
+                // The box `modal_box` builds for that many rows (`rows + 2` for
+                // the title + separator).
+                let bh = (rows + 2) * ch + FRAME;
+                assert!(bh <= height, "box {bh} > screen {height} at ch={ch}");
+                // …and is not needlessly small: one more row would encroach on
+                // the cell of margin reserved at each edge (2 * ch).
+                let bh_next = (rows + 3) * ch + FRAME;
+                assert!(
+                    bh_next + 2 * ch > height,
+                    "budget {rows} too conservative for {height}/{ch}"
+                );
+            }
+        }
+        // A degenerate cell height must not divide by zero.
+        assert_eq!(modal_max_rows(900, 0, 24), 1);
+        // A screen too small for any box still reports a usable row.
+        assert_eq!(modal_max_rows(8, 16, 24), 1);
+    }
+
+    /// Over-long content is truncated *and says so*.
+    #[test_case]
+    fn clamp_modal_lines_states_what_it_dropped() {
+        let mk = |n: usize| -> Vec<alloc::string::String> {
+            (0..n).map(|i| alloc::format!("line {i}")).collect()
+        };
+        // Fits: untouched.
+        let out = clamp_modal_lines(mk(5), 10);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[4], "line 4");
+        // Exactly at budget: untouched (no spurious marker).
+        let out = clamp_modal_lines(mk(10), 10);
+        assert_eq!(out.len(), 10);
+        assert!(!out[9].contains("more line"), "got {:?}", out[9]);
+        // Over budget: clamped to the budget, last row is the count, and the
+        // number accounts for the row the marker itself took.
+        let out = clamp_modal_lines(mk(100), 10);
+        assert_eq!(out.len(), 10, "never exceeds the budget");
+        assert_eq!(out[8], "line 8");
+        assert!(out[9].contains("91 more line(s)"), "got {:?}", out[9]);
+        // A zero budget draws nothing rather than panicking.
+        assert!(clamp_modal_lines(mk(3), 0).is_empty());
+    }
 
     #[test_case]
     fn clamp_max_panes_range() {

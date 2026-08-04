@@ -11,17 +11,25 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// activity indicator.
 static INPUT_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
 
-/// A one-byte pushback slot (`0x100` = empty), so a byte read speculatively —
-/// e.g. by the cancel-poll in a running command, checking for Ctrl+C — can be
-/// returned to the input stream if it isn't the one we wanted. Keeps a long
-/// command's cancel-poll from swallowing the *next* command's keystrokes.
-static PENDING: AtomicU64 = AtomicU64::new(EMPTY);
+/// A small pushback ring (bytes read speculatively — e.g. by a running
+/// command's cancel-poll checking for Ctrl+C — can be returned to the input
+/// stream if they aren't what was wanted). Multiple pushed bytes are kept in
+/// order, so the reverse-search and its tests can inject a whole keystroke
+/// sequence before reading it back.
+static PENDING_BUF: [AtomicU64; 8] = [const { AtomicU64::new(EMPTY) }; 8];
+static PENDING_HEAD: AtomicU64 = AtomicU64::new(0);
+static PENDING_TAIL: AtomicU64 = AtomicU64::new(0);
 const EMPTY: u64 = 0x100;
 
-/// Push a byte back so the next [`read_byte`] returns it. Only one byte is held;
-/// a second push overwrites the first (the poll loops only ever hold one).
+/// Push a byte back so the next [`read_byte`] returns it (FIFO). Dropped if
+/// the ring is full (8) — the poll loops never hold more than one.
 pub fn unread(byte: u8) {
-    PENDING.store(byte as u64, Ordering::Relaxed);
+    let head = PENDING_HEAD.load(Ordering::Relaxed);
+    if head - PENDING_TAIL.load(Ordering::Relaxed) >= PENDING_BUF.len() as u64 {
+        return; // full
+    }
+    PENDING_BUF[(head % PENDING_BUF.len() as u64) as usize].store(byte as u64, Ordering::Relaxed);
+    PENDING_HEAD.store(head + 1, Ordering::Relaxed);
 }
 
 /// When keyboard input was last seen (`arch::now_ms` timebase; 0 = never).
@@ -33,10 +41,12 @@ pub fn input_activity_ms() -> u64 {
 /// USB (xHCI/HID) → serial; aarch64: USB (xHCI/HID) → PL050 PS/2 → virtio-keyboard
 /// → PL011 serial -- or `None` if none is available.
 pub fn read_byte() -> Option<u8> {
-    // A pushed-back byte (see `unread`) takes priority over a fresh read.
-    let pending = PENDING.swap(EMPTY, Ordering::Relaxed);
-    if pending != EMPTY {
-        return Some(pending as u8);
+    // Pushed-back bytes (see `unread`) take priority over a fresh read.
+    let tail = PENDING_TAIL.load(Ordering::Relaxed);
+    if PENDING_HEAD.load(Ordering::Relaxed) > tail {
+        let b = PENDING_BUF[(tail % PENDING_BUF.len() as u64) as usize].swap(EMPTY, Ordering::Relaxed);
+        PENDING_TAIL.store(tail + 1, Ordering::Relaxed);
+        return Some(b as u8);
     }
     let b = read_byte_raw();
     if b.is_some() {

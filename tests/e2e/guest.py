@@ -15,6 +15,12 @@ import time
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
+# Default forwarded port set (matches run.py's SVC_PORT/SVC_HTTP_PORT/SVC_SSH_PORT).
+# A parallel run overrides these per shard.
+SVC_PORT_DEFAULT = 7099
+SVC_HTTP_PORT_DEFAULT = 7100
+SVC_SSH_PORT_DEFAULT = 7101
+
 
 def _repo_root():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +29,7 @@ def _repo_root():
 
 class Guest:
     def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off", hostfwd=None,
-                 no_model=False, model_disk=None, release=False, disk=None):
+                 no_model=False, model_disk=None, release=False, disk=None, smp=None):
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -33,10 +39,28 @@ class Guest:
         # enumerate); "off" omits audio entirely (faster; net/OS tests).
         env["CHITTI_DISPLAY"] = "none"
         env["CHITTI_AUDIO"] = audio
+        # Fewer vCPUs per guest for a *parallel* run (--jobs > 1): several VMs
+        # each asking for `-smp 8` oversubscribes the host and slows every shard.
+        if smp:
+            env["CHITTI_SMP"] = str(smp)
         # Opt-in slirp host-forward so the host can reach a guest TCP listener
         # (the Network-service-agent e2e). xtask adds hostfwd for this port.
         if hostfwd:
             env["CHITTI_HOSTFWD"] = str(hostfwd)
+        # The forwarded host-side ports, so scenarios reach THIS guest's
+        # listeners: under --jobs each shard boots on its own ports (the port
+        # number is both the guest listen port and the host forward, 1:1).
+        self.svc_http_port = SVC_HTTP_PORT_DEFAULT
+        self.svc_ssh_port = SVC_SSH_PORT_DEFAULT
+        self.svc_port = SVC_PORT_DEFAULT
+        if hostfwd:
+            fw = [p for p in (str(hostfwd).split(",")) if p.strip().isdigit()]
+            if len(fw) > 0:
+                self.svc_port = int(fw[0])
+            if len(fw) > 1:
+                self.svc_http_port = int(fw[1])
+            if len(fw) > 2:
+                self.svc_ssh_port = int(fw[2])
         # Opt-in FAT disk carrying `model_disk` as chat.gguf, for the runtime
         # `/model load` scenario; `no_model` boots with no model in RAM so the
         # runtime-load path is proven from nothing. Such guests boot *next to*
@@ -96,6 +120,16 @@ class Guest:
     def mark(self):
         """A cursor into the output stream, so `wait_for` ignores prior text."""
         return len(self.text())
+
+    def saw(self, pattern, since=0):
+        """True if `pattern` has already appeared after offset `since`.
+
+        Non-blocking, unlike `wait_for` — for asserting a message did **not**
+        happen (e.g. that a cancel was not reported as a network error). Waiting
+        for the absence of text can only ever be a timeout, so it needs its own
+        helper rather than a `wait_for` someone reads as a positive assertion.
+        """
+        return pattern in self.text()[since:]
 
     def wait_for(self, pattern, timeout=20.0, since=0):
         """Block until `pattern` appears after offset `since`, or timeout.

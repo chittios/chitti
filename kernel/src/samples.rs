@@ -13,6 +13,7 @@
 //! /samples/videos/   h.264 + aac in mp4
 //! /samples/audios/   wav, mp3 (with an id3 tag), adts aac
 //! /samples/misc/     pdf, txt, json, csv, html
+//! /samples/js/       scripts for the in-kernel `/js` CLI (authored in-tree)
 //! ```
 //!
 //! so `/open /samples/images/fruits.jpg` works on the first boot.

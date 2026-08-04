@@ -285,6 +285,98 @@ fn drop_running(run: Running) {
     crate::serial_println!("package_ui> stopped '{}'", run.name);
 }
 
+/// A [`Session`](crate::agent::types::Session) for one model-ask turn, carrying
+/// **the app agent's own identity** — built once per ask, not per tool call.
+///
+/// The identity matters: `storage_*` and `memory_*` are keyed on
+/// `session.agent.manifest_id`, so running them under the chat agent's session
+/// would put a game's saved position in the shell agent's store. Caps are the
+/// manifest's, narrowed by the install grant, exactly as `resolve_chat_agent`
+/// does for a chat agent — an app's model turn must not be able to do more than
+/// the human approved at install.
+///
+/// Per-ask rather than per-call because `grant_to_task` mints cap slots in the
+/// task's table; doing that on every tool call would grow it for the life of a
+/// long game.
+fn ask_session(agent_id: u64, task: TaskId) -> Option<crate::agent::types::Session> {
+    use crate::agent::types::AgentId;
+    let m = crate::skills::agent_skill::by_id(AgentId(agent_id))?;
+    let grant = crate::skills::agent_skill::install_grant(AgentId(agent_id))
+        .unwrap_or_else(|| m.capabilities.clone());
+    let bounded = crate::agent::types::intersect_caps(&m.capabilities, &grant);
+    let caps = crate::skills::install::with_home_sandbox(&bounded, AgentId(agent_id), m.kind);
+    let live = crate::agent::manifest::grant_to_task(task, &caps);
+    Some(crate::agent::types::Session::new(
+        &m,
+        agent_id,
+        live,
+        crate::agent::orchestrator::now(),
+    ))
+}
+
+/// Execute one tool call from an app agent's model turn, **as that agent**,
+/// through the ordinary [`Router`](crate::tools::Router).
+///
+/// Going through the Router rather than reimplementing the dispatch is the whole
+/// point: it already knows that `ui_draw`/`board_set` lower to Synapse
+/// primitives (gated + audited under `task`'s own caps, in ring 3),
+/// `storage_*`/`memory_*` are durable per-agent state, and a wasm-export tool
+/// like `chess_legal` runs in the owning package's module. This function
+/// therefore contains no tool names — the previous version contained a closure
+/// that refused everything, and before that a list that had drifted from both
+/// the prompt and the manifest.
+fn run_app_tool(
+    session: &mut crate::agent::types::Session,
+    task: TaskId,
+    surface: u32,
+    call_id: u64,
+    tool: &str,
+    args: &str,
+) -> String {
+    use crate::agent::agent_loop::{format_tool_result, ToolDispatch};
+    use crate::agent::types::ToolCall;
+    let args = with_surface(tool, args, surface);
+    let call = ToolCall {
+        call_id,
+        tool: tool.to_string(),
+        args,
+    };
+    let mut router = crate::tools::Router::taint_aware();
+    let out = router.call(session, task, &call);
+    let text = format_tool_result(out.is_error, out.result);
+    crate::ktrace::log_fmt(format_args!(
+        "package_ui: ask tool {tool} -> {}",
+        if text.len() > 80 { &text[..80] } else { text.as_str() }
+    ));
+    text
+}
+
+/// Fill in `surface` when the tool requires one and the model left it out.
+///
+/// Not a guess: a running app owns exactly one surface, and the Synapse UI
+/// primitives are ownership-gated anyway, so the only surface this call could
+/// legally name is the one it was told about in the prompt. Without this, a
+/// model that forgets the argument gets "missing required arg 'surface'" and
+/// usually forgets it again — a whole class of dead turns for a field the kernel
+/// already knows.
+fn with_surface(tool: &str, args: &str, surface: u32) -> String {
+    let requires_surface = crate::tools::registry::get(tool)
+        .map(|d| d.required.iter().any(|r| r == "surface"))
+        .unwrap_or(false);
+    if !requires_surface || args.contains("\"surface\"") {
+        return args.to_string();
+    }
+    let t = args.trim();
+    match t.strip_prefix('{').map(str::trim_start) {
+        // `{}` / empty → a fresh object; otherwise splice the field in front.
+        Some(rest) if rest.starts_with('}') || rest.is_empty() => {
+            format!("{{\"surface\":{surface}}}")
+        }
+        Some(rest) => format!("{{\"surface\":{surface},{rest}"),
+        None => format!("{{\"surface\":{surface}}}"),
+    }
+}
+
 /// Process a guest export's result for the app on `surface`.
 fn handle_result(surface: u32, out: String) -> String {
     let Some(prompt) = out.strip_prefix("ask:") else {
@@ -296,9 +388,9 @@ fn handle_result(surface: u32, out: String) -> String {
     }
     let meta = APPS.with(|m| {
         m.get(&surface)
-            .map(|x| (x.name.clone(), x.agent_id, x.surface))
+            .map(|x| (x.name.clone(), x.agent_id, x.surface, x.task))
     });
-    let Some((name, agent_id, surface)) = meta else {
+    let Some((name, agent_id, surface, task)) = meta else {
         ASKING_GLOBAL.store(false, Ordering::SeqCst);
         return out;
     };
@@ -317,9 +409,27 @@ fn handle_result(surface: u32, out: String) -> String {
         "package_ui: model ask from '{name}' ({} chars)",
         prompt.len()
     ));
-    let reply = crate::shell::ui_agent_reply(&soul, prompt, surface, |_cmd, _args| {
-        String::from("error:tools are unavailable here - answer directly")
-    });
+    // What this agent may call comes from its own manifest ∩ the registry, and
+    // the same list drives the prompt and the gate (`shell::ui_agent_reply`).
+    let tools = crate::shell::ui_agent_toolset(agent_id);
+    let reply = match ask_session(agent_id, task) {
+        Some(mut session) => {
+            crate::ktrace::log_fmt(format_args!(
+                "package_ui: ask from '{name}' with {} tool(s) as agent {agent_id} on task {task}",
+                tools.len()
+            ));
+            let mut call_id = 0u64;
+            crate::shell::ui_agent_reply(&soul, prompt, surface, &tools, |cmd, args| {
+                call_id += 1;
+                run_app_tool(&mut session, task, surface, call_id, cmd, args)
+            })
+        }
+        // No manifest (or none installed): the agent has no identity to run a
+        // tool under, so say that rather than pretending tools exist.
+        None => crate::shell::ui_agent_reply(&soul, prompt, surface, &[], |_cmd, _args| {
+            String::from("error: this app has no installed manifest, so it has no tools here")
+        }),
+    };
     ASKING_GLOBAL.store(false, Ordering::SeqCst);
     APPS.with(|m| {
         if let Some(r) = m.get_mut(&surface) {
@@ -726,6 +836,33 @@ pub fn key(c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app's model turn is told its surface id; when the model omits the
+    /// argument anyway the runtime fills it in. A running app owns exactly one
+    /// surface and the UI primitives are ownership-gated, so there is only one
+    /// value this call could legally name — and without it the turn dies on
+    /// "missing required arg 'surface'", usually repeatedly.
+    #[test_case]
+    fn with_surface_fills_only_when_required_and_absent() {
+        // `ui_draw` requires a surface: an object without one gets it, in front,
+        // with the rest of the JSON intact.
+        let out = with_surface("ui_draw", r#"{"ops":"clear 000000"}"#, 7);
+        assert_eq!(out, r#"{"surface":7,"ops":"clear 000000"}"#, "got {out}");
+        // Already present → untouched (never overwrite the model's own value:
+        // if it named another surface, the ownership gate must refuse it, not
+        // have it silently rewritten into a legal one).
+        let given = r#"{"surface":9,"ops":"clear 000000"}"#;
+        assert_eq!(with_surface("ui_draw", given, 7), given);
+        // Empty / `{}` args become a fresh object.
+        assert_eq!(with_surface("ui_draw", "{}", 3), r#"{"surface":3}"#);
+        assert_eq!(with_surface("ui_draw", "", 3), r#"{"surface":3}"#);
+        assert_eq!(with_surface("ui_draw", "{ }", 3), r#"{"surface":3}"#);
+        // A tool that takes no surface is never given one…
+        let a = r#"{"key":"fen","value":"8/8"}"#;
+        assert_eq!(with_surface("storage_set", a, 7), a);
+        // …nor is an unknown tool (no schema to consult → do not invent args).
+        assert_eq!(with_surface("no_such_tool", a, 7), a);
+    }
 
     #[test_case]
     fn click_event_parses_coords_and_rejects_noise() {

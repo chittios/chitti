@@ -48,6 +48,14 @@ pub const MAX_REDIRECTS: u32 = 10;
 /// Hostile peers must not be able to OOM the kernel via a single GET/POST.
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The error text a request aborted by Ctrl+C reports, as a shared constant
+/// because **two modules have to agree on it**: the transport produces it and
+/// `shell::remote` compares against it to print "[stopped]" instead of a red
+/// model error. When those were two independent string literals the comparison
+/// silently stopped matching, and a human's Ctrl+C was reported as
+/// "no response head (connection closed early)" — a network fault nobody had.
+pub const CANCELLED: &str = "cancelled";
+
 /// True for redirect statuses we follow on GET (RFC 9110).
 pub fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
@@ -139,7 +147,7 @@ pub fn get_follow_headers(
         // Cooperative: long redirect chains (and TLS handshakes) must not freeze UI.
         crate::shell::upkeep();
         if crate::shell::poll_interrupt() {
-            return Err("cancelled".into());
+            return Err(CANCELLED.into());
         }
     }
 }
@@ -298,12 +306,21 @@ impl Conn {
             Conn::Secure(t) => t.write_all(d),
         }
     }
-    /// Read up to `buf.len()` bytes; `0` = EOF / closed / timed out.
-    fn read(&mut self, buf: &mut [u8]) -> usize {
+    /// Read up to `buf.len()` bytes. `Ok(0)` = the peer closed cleanly; `Err`
+    /// carries **why** the read failed (timeout, cancel, TLS alert, reset).
+    ///
+    /// Both are reported rather than folded into `0`: whether a close is the
+    /// normal end of a `Connection: close` response depends on whether a response
+    /// had started, and only [`drive_stream`] knows that. Folding them made every
+    /// failure read as "connection closed early", which points a human at the
+    /// wrong thing — a timeout wants a longer deadline, an alert wants a look at
+    /// the endpoint, and a reset before any byte usually means the server rejected
+    /// the request outright.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, String> {
         match self {
             Conn::Plain(s) => {
                 use embedded_io::Read;
-                s.read(buf).unwrap_or(0)
+                s.read(buf).map_err(|e| alloc::format!("read: {:?}", e))
             }
             Conn::Secure(t) => t.read(buf),
         }
@@ -360,6 +377,8 @@ pub fn perform(
         Conn::Plain(super::tls::TcpStream::new(handle, deadline))
     };
 
+    // A cancel latched by an earlier request must not make this one look cancelled.
+    crate::net::tls::clear_cancelled();
     let result = drive_stream(&mut conn, &wire, deadline, on_head, on_body);
     NET.with(|n| {
         if let Some(s) = n.as_mut() {
@@ -385,12 +404,33 @@ fn drive_stream(conn: &mut Conn, wire: &[u8], deadline: u64, on_head: &mut dyn F
             return Err("HTTP timeout".into());
         }
         if crate::shell::poll_interrupt() {
-            return Err("cancelled".into());
+            return Err(CANCELLED.into());
         }
-        let k = conn.read(&mut buf);
-        if k == 0 {
-            break; // EOF / close
-        }
+        let k = match conn.read(&mut buf) {
+            Ok(k) if k > 0 => k,
+            // `Ok(0)` is a clean close; an error once the head is in **is** the
+            // normal end of a `Connection: close` response (the peer is done and
+            // drops the connection, sometimes without a tidy close_notify).
+            other => {
+                // A cancel is latched by the transport, because embedded-tls wraps
+                // our error and loses the reason. It must be reported as exactly
+                // `cancelled`: `shell::remote` compares the string to decide
+                // between "[stopped]" and a red model error, so any friendlier
+                // wording here turns a Ctrl+C back into a fake network fault.
+                if crate::net::tls::take_cancelled() {
+                    return Err(CANCELLED.into());
+                }
+                match other {
+                    Err(e) if head.is_none() => {
+                        // Nothing arrived at all: this is a genuine failure, and
+                        // which one it was is the difference between "raise the
+                        // timeout", "the endpoint rejected us" and "TLS broke".
+                        return Err(alloc::format!("no response ({e})"));
+                    }
+                    _ => break,
+                }
+            }
+        };
         if raw.len().saturating_add(k) > MAX_RESPONSE_BYTES {
             return Err(format!(
                 "HTTP response exceeds {} MiB cap",
@@ -522,7 +562,7 @@ pub(crate) fn tcp_connect_addr(
                     s.tcp_set(handle).remove(handle.handle);
                 }
             });
-            return Err(if cancelled { "cancelled".into() } else { "TCP connect timeout".into() });
+            return Err(if cancelled { CANCELLED.into() } else { "TCP connect timeout".into() });
         }
         super::poll();
         let st = NET.with(|n| n.as_mut().map(|s| s.tcp_set(handle).get_mut::<tcp::Socket>(handle.handle).state()));
@@ -672,6 +712,30 @@ mod tests {
         let (_, host, port, path) = parse_url("http://[2001:db8::1]:8080/v1").unwrap();
         assert_eq!((host.as_str(), port, path.as_str()), ("2001:db8::1", 8080, "/v1"));
         assert!(parse_url("http://[::1").is_err()); // unclosed
+    }
+
+    /// The transport latches a Ctrl+C because embedded-tls wraps our error type
+    /// and drops the reason. `drive_stream` consults that latch before
+    /// classifying a failed read, and must report the literal string
+    /// `cancelled` — `shell::remote` compares it to choose between "[stopped]"
+    /// and a red model error, so any friendlier wording turns a human's Ctrl+C
+    /// back into a fake network fault. This pins the latch's take-once
+    /// behaviour and the exact spelling the comparison depends on.
+    #[test_case]
+    fn cancel_latch_is_take_once_and_spelled_exactly() {
+        use crate::net::tls::{clear_cancelled, take_cancelled};
+        clear_cancelled();
+        assert!(!take_cancelled(), "starts clear");
+        crate::net::tls::latch_cancel_for_test();
+        assert!(take_cancelled(), "a latched cancel is observed once");
+        assert!(!take_cancelled(), "and cleared by the taking");
+        // A stale latch must not make the *next* request look cancelled — that
+        // is what `perform` clears before driving the exchange.
+        crate::net::tls::latch_cancel_for_test();
+        clear_cancelled();
+        assert!(!take_cancelled(), "clear_cancelled drops a stale latch");
+        // The spelling `shell::remote` matches on.
+        assert_eq!(CANCELLED, "cancelled", "the spelling shell::remote compares against");
     }
 
     #[test_case]

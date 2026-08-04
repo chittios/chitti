@@ -486,7 +486,15 @@ impl WebSocket {
                         r.store(now() + 3_000, core::sync::atomic::Ordering::Relaxed);
                     }
                     let mut buf = [0u8; 4096];
-                    let k = tls.read(&mut buf);
+                    // `TlsSession::read` reports *why* it failed now (so the HTTP
+                    // path can tell a Ctrl+C from a dropped connection). A long-
+                    // lived socket wants the old behaviour: any failure ends the
+                    // session, exactly as a zero-length read did — this loop polls
+                    // Ctrl+C on its own, so it needs no reason from here.
+                    let k = match tls.read(&mut buf) {
+                        Ok(k) => k,
+                        Err(_) => 0,
+                    };
                     if k == 0 {
                         mark_closed = true;
                     }

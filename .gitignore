@@ -2,6 +2,7 @@
 /kernel/target
 /xtask/target
 target/
+target-a64/
 .DS_Store
 assets/voice/
 assets/wifi/
@@ -15,8 +16,12 @@ assets/wifi/
 assets/samples/
 
 __pycache__/
-# e2e test-generated TLS certs
+# e2e test-generated TLS certs (regenerated at run time by run.py)
 tests/e2e/certs/
+# ...but the registry *signing* key must be checked in: the kernel's trust
+# store bakes its public point, so the harness cannot regenerate it at runtime.
+# It is a test-only key for the "chitti-publisher-test" publisher.
+!tests/e2e/certs/registry-key.pem
 
 .idea/
 # Full 16 MB Noto Sans CJK — NOT used (a ~1.7 MB subset, Noto-CJK.otf, is

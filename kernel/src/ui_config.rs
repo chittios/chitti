@@ -74,7 +74,7 @@ pub struct UiConfig {
     pub logs_title: String,
     pub status_left: String,  // template
     pub status_right: String, // template
-    /// Which desktop edge the status bar occupies: `top` | `bottom` (default) |
+    /// Which desktop edge the status bar occupies: `top` (default) | `bottom` |
     /// `left` | `right`. Stored as the string that appears in `ui.json`; parsed by
     /// `panes_layout::StatusPos::parse`, which rejects a typo rather than moving
     /// the bar somewhere unasked-for.

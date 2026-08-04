@@ -221,9 +221,9 @@ pub fn about() {
 #[cfg(test)]
 pub fn about() {}
 
-/// macOS-style **status-bar dropdown** for a chip (net / clock / mem / …).
-/// Live-refreshes the clock once a second. Dismiss with Esc, Ctrl+C, close
-/// mark, or a click outside the panel.
+/// macOS-style **status-bar dropdown** for a chip (net / clock / mem / volume …).
+/// Live-refreshes the clock once a second; the volume menu repaints on change.
+/// Dismiss with Esc, Ctrl+C, close mark, or a click outside the panel.
 #[cfg(not(test))]
 pub fn status_menu(chip: crate::framebuffer::StatusChip) {
     use crate::framebuffer::{self, ModalHit, StatusChip};
@@ -233,16 +233,19 @@ pub fn status_menu(chip: crate::framebuffer::StatusChip) {
         return;
     }
     let mut last_paint = 0u64;
+    let mut need_repaint = true;
     loop {
         let now = crate::arch::now_ms();
-        // Clock ticks every second; other menus paint once (and after open).
+        // Clock ticks every second; volume repaints after each adjust; others once.
         let due = match chip {
             StatusChip::Clock => now.saturating_sub(last_paint) >= 1000,
+            StatusChip::Volume => need_repaint || last_paint == 0,
             _ => last_paint == 0,
         };
         if due {
             framebuffer::draw_status_menu(chip);
             last_paint = now;
+            need_repaint = false;
         }
         if let Some(b) = crate::console::read_byte() {
             match b {
@@ -251,10 +254,37 @@ pub fn status_menu(chip: crate::framebuffer::StatusChip) {
                     return;
                 }
                 0x1b => {
-                    if esc_seq().is_none() {
+                    if let Some(fin) = esc_seq() {
+                        // Arrows adjust volume while the Sound menu is open.
+                        if chip == StatusChip::Volume {
+                            match fin {
+                                b'C' | b'A' => {
+                                    crate::sound::volume_adjust(5);
+                                    need_repaint = true;
+                                }
+                                b'D' | b'B' => {
+                                    crate::sound::volume_adjust(-5);
+                                    need_repaint = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else {
                         framebuffer::modal_dismiss();
                         return;
                     }
+                }
+                b'm' | b'M' if chip == StatusChip::Volume => {
+                    crate::sound::toggle_mute();
+                    need_repaint = true;
+                }
+                b'+' | b'=' if chip == StatusChip::Volume => {
+                    crate::sound::volume_adjust(5);
+                    need_repaint = true;
+                }
+                b'-' | b'_' if chip == StatusChip::Volume => {
+                    crate::sound::volume_adjust(-5);
+                    need_repaint = true;
                 }
                 _ => {}
             }
@@ -263,11 +293,33 @@ pub fn status_menu(chip: crate::framebuffer::StatusChip) {
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
         }
+        // Scroll wheel over the volume menu (or while it is open) adjusts level.
+        if chip == StatusChip::Volume && t.wheel != 0 {
+            // One notch = 5% (wheel > 0 = up / louder).
+            let delta = t.wheel * 5;
+            crate::sound::volume_adjust(delta);
+            need_repaint = true;
+        }
         if t.pressed {
             match framebuffer::modal_hit(t.x, t.y) {
                 ModalHit::Close | ModalHit::Ok => {
                     framebuffer::modal_dismiss();
                     return;
+                }
+                ModalHit::Choose(i) if chip == StatusChip::Volume => {
+                    match i {
+                        0 => {
+                            crate::sound::toggle_mute();
+                        }
+                        1 => {
+                            crate::sound::volume_adjust(-5);
+                        }
+                        2 => {
+                            crate::sound::volume_adjust(5);
+                        }
+                        _ => {}
+                    }
+                    need_repaint = true;
                 }
                 // Clicks on the panel body (slot 1) keep the menu open; anywhere
                 // else (including the status bar) dismisses.

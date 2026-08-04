@@ -1086,7 +1086,15 @@ FDT claims a GICv3 but carries no readable `reg`.
   complete` gates the Enter path on whether accepting would change anything beyond
   the trailing separator (Tab is untouched — completing is its job). This is what
   made the command after `/todos open` never execute, an e2e gap that sat unexplained
-  for a while; the `pane_grid` scenario now asserts it. mouse cursor + click, **mouse text selection in the
+  for a while; the `pane_grid` scenario now asserts it. Path-taking commands
+  (`/ls /cat /open /mkdir /rm /cp /mv /touch /glob /grep` — `suggest::PATH_COMMANDS`)
+  additionally get **path-argument autosuggest + completion**: as you type the
+  argument, the popup lists the parent directory's store/mount entries
+  (`suggest::path_items` over `vfs::readdir`), dirs first with a trailing `/`,
+  and Tab drills one level at a time. The same Enter gate is extended so a
+  *complete* path argument submits the command rather than completing or
+  drilling (the case that swallowed `/ls /tmp_e2e` into `/ls /tmp_e2e/`); Tab
+  remains the drill key. mouse cursor + click, **mouse text selection in the
   chat pane** (drag-to-copy → clipboard, paste with Ctrl+V; absolute-indexed
   over scrollback via `textsel`, like the editor's drag-select), a **host
   clipboard bridge** (`clipboard`: an in-OS copy emits an **OSC 52** escape so a
@@ -1620,12 +1628,14 @@ host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 cargo xtask test                       # in-kernel unit suite under QEMU (x86) — pure logic, no model
 cargo xtask ring-check                 # enforce the ring-3 rule: no direct synapse::executor
                                        #   calls outside the allowlist (xtask/src/rings.rs)
-make e2e                               # end-to-end: boot the kernel, drive the shell over serial,
-                                       #   exercise every OS command + the http/https/ws/wss/ping/
-                                       #   hosted-model flows vs local servers (tests/e2e/, stdlib-only
-                                       #   python; TLS scenarios need a TLS-1.3 python — Homebrew's)
-make e2e-full                          # + local inference (/infer,/perf,chat,/compact) and voice
-                                       #   (/voice say) — slow; needs assets/model.gguf + assets/voice/
+ make e2e                               # end-to-end: boot the kernel, drive the shell over serial,
+                                        #   exercise every OS command + the http/https/ws/wss/ping/
+                                        #   hosted-model flows vs local servers (tests/e2e/, stdlib-only
+                                        #   python; TLS scenarios need a TLS-1.3 python — Homebrew's)
+                                        #   `make e2e E2E_JOBS=3` splits the sweep across 3 concurrent
+                                        #   guest boots (~1 min vs ~13 min serial on a multicore Mac)
+ make e2e-full                          # + local inference (/infer,/perf,chat,/compact) and voice
+                                        #   (/voice say) — slow; needs assets/model.gguf + assets/voice/
 cargo xtask build -arch x86_64|aarch64 # cross-build the kernel
 cargo xtask run   -arch x86_64|aarch64 # boot in QEMU (aarch64 = native HVF on Apple Silicon)
 cargo xtask image -arch x86_64|aarch64 # assemble a bootable image/ISO
@@ -1637,7 +1647,8 @@ cargo xtask sample-files [--refresh]   # fetch the /samples corpus into assets/s
 stack (ring-3 PNG/JPEG, H.264+AAC, MP3/WAV/AAC, the PDF wasm, the editor's
 highlighters) awkward to even try without `/http -O` first. So a ~10 MiB corpus is
 embedded in the image and seeded into the store at boot — `/samples/images/`,
-`/samples/videos/`, `/samples/audios/`, `/samples/misc/`, plus a
+`/samples/videos/`, `/samples/audios/`, `/samples/misc/`, `/samples/js/`
+(authored scripts for `/js`, from `assets/samples-src/js/`), plus a
 `/samples/README.md` recording each file's source and licence — and
 `/open /samples/images/fruits.jpg` works offline on the first boot
 (`kernel/src/samples.rs`, `SAMPLE_FILES` in `xtask/src/main.rs`,

@@ -16,6 +16,32 @@ pub mod remote;
 pub mod suggest;
 pub mod voice_remote;
 
+// Private submodules carved out of this file when it was a 16k-line monolith.
+// Each is a cohesive subsystem; the parent re-exports their items with
+// `pub(crate) use <name>::*` so the rest of the shell (and the crate) is
+// unchanged. Keep new cohesive blocks here rather than growing mod.rs back.
+mod agents;
+mod browser;
+mod fs;
+mod install;
+mod media;
+mod system;
+mod tooljson;
+mod video;
+mod voice;
+// Items some modules keep `pub(crate)` because non-shell kernel code calls
+// them by path (`crate::shell::run_browser_tool`, `::find_on_disks`); the
+// rest are shell-internal and re-imported with a plain glob.
+pub(crate) use browser::*;
+pub(crate) use fs::*;
+pub(crate) use tooljson::*;
+pub(crate) use voice::*;
+use agents::*;
+use install::*;
+use media::*;
+use system::*;
+use video::*;
+
 use crate::mm::Locked;
 use crate::persona::{self, Agent, Planner, RulePlanner};
 use crate::{serial_print, serial_println};
@@ -886,22 +912,181 @@ fn decoder_cmd(arg: &str) {
     }
 }
 
-/// `/js <expression-or-program>` — evaluate JavaScript on the in-kernel `just`
-/// ES6 engine and print the result + any `console.*` output. Proves the ported
-/// engine end-to-end (parser + tree-walking interpreter + builtins) without the
-/// browser render path.
+/// `/js` — run JavaScript on the in-kernel `just` ES6 engine (Node-shaped CLI).
+///
+/// ```text
+/// /js -e "code" | -c "code"   evaluate a string (like node -e)
+/// /js -p "expr"               evaluate and always print the result
+/// /js script.js [args…]       run a file; process.argv / argv hold the args
+/// /js <expression>            bare snippet (compat): whole remainder is code
+/// ```
 fn run_js(arg: &str) {
-    let src = arg.trim();
+    let inv = match parse_js_cli(arg) {
+        Ok(i) => i,
+        Err(msg) => {
+            serial_println!("js> {msg}");
+            print_js_usage();
+            return;
+        }
+    };
+    match inv {
+        JsCli::Help => print_js_usage(),
+        JsCli::Eval { source, print, argv } => {
+            js_run_source(&source, print, &argv);
+        }
+        JsCli::File { path, argv } => {
+            let full = crate::synapse::vpath::normalize(&path);
+            let bytes = crate::fs::vfs::read(&full)
+                .ok()
+                .or_else(|| crate::synapse::fs::read(&full));
+            let Some(bytes) = bytes else {
+                serial_println!("js> cannot open '{full}' (store or mounts; try /ls, /cat)");
+                return;
+            };
+            let source = match core::str::from_utf8(&bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    serial_println!("js> {full}: not valid UTF-8");
+                    return;
+                }
+            };
+            serial_println!("js> running {full} ({} bytes)", bytes.len());
+            js_run_source(&source, false, &argv);
+        }
+    }
+}
+
+fn print_js_usage() {
+    serial_println!("js> usage (Node-style):");
+    serial_println!("  /js -e \"code\" | -c \"code\"   run a snippet (e.g. /js -c \"return 1;\")");
+    serial_println!("  /js -p \"expr\"                 evaluate and print the result");
+    serial_println!("  /js script.js [arg…]          run a .js file; process.argv has the args");
+    serial_println!("  /js <expression>              bare code (compat): /js 1+2  →  js= 3");
+}
+
+/// How `/js` was invoked after flag parsing.
+enum JsCli {
+    Help,
+    Eval {
+        source: String,
+        /// Always print the completion value (node `-p`).
+        print: bool,
+        argv: alloc::vec::Vec<String>,
+    },
+    File {
+        path: String,
+        argv: alloc::vec::Vec<String>,
+    },
+}
+
+/// Pure CLI parser for `/js` (unit-tested). Honours quotes via [`tokenize_args`].
+fn parse_js_cli(arg: &str) -> Result<JsCli, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Ok(JsCli::Help);
+    }
+    let tokens = tokenize_args(arg);
+    if tokens.is_empty() {
+        return Ok(JsCli::Help);
+    }
+    // Flag mode: first token is -e / -c / -p / -h / --help / --eval / --print / --check
+    let t0 = tokens[0].as_str();
+    if t0 == "-h" || t0 == "--help" || t0 == "help" {
+        return Ok(JsCli::Help);
+    }
+    if matches!(t0, "-e" | "-c" | "--eval" | "--check") {
+        // `-c` is Node's syntax-check flag; we treat it as eval (user-facing
+        // "code" short flag) so `/js -c "return 1;"` does what people expect.
+        let Some(code) = tokens.get(1) else {
+            return Err(alloc::format!("missing code after {t0}"));
+        };
+        let mut argv = alloc::vec!["js".to_string(), t0.to_string()];
+        argv.extend(tokens.iter().skip(2).cloned());
+        return Ok(JsCli::Eval {
+            source: code.clone(),
+            print: false,
+            argv,
+        });
+    }
+    if matches!(t0, "-p" | "--print") {
+        let Some(code) = tokens.get(1) else {
+            return Err(alloc::format!("missing expression after {t0}"));
+        };
+        let mut argv = alloc::vec!["js".to_string(), t0.to_string()];
+        argv.extend(tokens.iter().skip(2).cloned());
+        return Ok(JsCli::Eval {
+            source: code.clone(),
+            print: true,
+            argv,
+        });
+    }
+    if t0.starts_with('-') && t0 != "-" {
+        return Err(alloc::format!("unknown option '{t0}'"));
+    }
+    // File mode: path looks like a script, or exists on store/mounts.
+    if looks_like_js_script(t0) {
+        let mut argv = alloc::vec!["js".to_string(), t0.to_string()];
+        argv.extend(tokens.iter().skip(1).cloned());
+        return Ok(JsCli::File {
+            path: t0.to_string(),
+            argv,
+        });
+    }
+    // Compat: whole remainder is source code (no shell re-tokenizing of spaces
+    // inside unquoted snippets would split them — use -e for multi-token code).
+    // Prefer the original string so `/js 1 + 2` keeps spaces; if the user used
+    // quotes, tokenize_args already stripped them into a single token.
+    let source = if tokens.len() == 1 {
+        tokens[0].clone()
+    } else {
+        // Multi-token without -e: rejoin (best effort for bare `1 + 2`).
+        tokens.join(" ")
+    };
+    Ok(JsCli::Eval {
+        source,
+        print: true, // bare REPL form always shows the result
+        argv: alloc::vec!["js".to_string(), "-e".to_string()],
+    })
+}
+
+/// Heuristic: treat as a script path (not an expression).
+fn looks_like_js_script(tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    // Explicit path / extension.
+    if tok.ends_with(".js")
+        || tok.ends_with(".mjs")
+        || tok.starts_with('/')
+        || tok.starts_with("./")
+        || tok.starts_with("../")
+    {
+        return true;
+    }
+    // Exists in the store or on a mount.
+    let full = crate::synapse::vpath::normalize(tok);
+    crate::fs::vfs::read(&full).is_ok() || crate::synapse::fs::exists(&full)
+}
+
+fn js_run_source(source: &str, force_print: bool, argv: &[String]) {
+    let src = source.trim();
     if src.is_empty() {
-        serial_println!("js> usage: /js <expression>   e.g. /js 'class A{{f(){{return 42;}}}} new A().f()'");
+        serial_println!("js> empty program");
         return;
     }
-    match crate::browser::js_just::eval_program(src) {
+    match crate::browser::js_just::eval_program_with_argv(src, argv) {
         Ok(out) => {
             for line in &out.log {
                 serial_println!("js> {line}");
             }
-            serial_println!("js= {}", out.value);
+            // Always show the completion value for -p / bare REPL; for scripts
+            // and -e, print it unless it is bare `undefined` and console already
+            // produced output (avoid noisy scripts). Still print when silent so
+            // `/js -c "return 1;"` is never a no-op.
+            let silent_undef = out.value == "undefined" && !out.log.is_empty() && !force_print;
+            if force_print || !silent_undef {
+                serial_println!("js= {}", out.value);
+            }
         }
         Err(e) => serial_println!("js! {e}"),
     }
@@ -1833,10 +2018,14 @@ fn search_tools(query: &str) -> String {
     let mut toolset = chat_toolset();
     let q = {
         // Accept either a bare query string or `{"query":"..."}` / `{"args":"..."}`.
+        // `keyword` is DeepSeek-V4's habit for this argument; an unrecognised key
+        // silently searched for "" and listed everything, which looks like the
+        // tool working.
         let t = query.trim();
         if t.starts_with('{') {
             crate::session::todo::json_str(t, "query")
                 .or_else(|| crate::session::todo::json_str(t, "args"))
+                .or_else(|| crate::session::todo::json_str(t, "keyword"))
                 .unwrap_or_default()
         } else {
             t.to_string()
@@ -2168,401 +2357,7 @@ fn subagent_system_prompt(toolset: &[String]) -> String {
 /// Extract a string field's value from a small JSON object. Tolerant of
 /// whitespace; handles `\"`/`\n`/`\t` escapes. Returns `None` if the key is
 /// absent or its value is not a string.
-fn json_str(obj: &str, key: &str) -> Option<String> {
-    let pat = alloc::format!("\"{}\"", key);
-    let i = obj.find(&pat)?;
-    let rest = &obj[i + pat.len()..];
-    let colon = rest.find(':')?;
-    let rest = rest[colon + 1..].trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut esc = false;
-    for c in rest.chars() {
-        if esc {
-            out.push(match c {
-                'n' => '\n',
-                't' => '\t',
-                other => other,
-            });
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else if c == '"' {
-            return Some(out);
-        } else {
-            out.push(c);
-        }
-    }
-    None
-}
-
-/// Flatten a tool call's `"arguments"` into the single argument line our
-/// dispatchers take: a bare-string arguments value is used as-is; an object is
-/// probed for the conventional keys the builtin schemas use.
-///
-/// Memory tools encode multi-field args as `key\\x1fvalue` (unit separator) so
-/// both key and value survive the flatten step into `execute_chat_tool`.
-fn json_args(body: &str) -> String {
-    if let Some(i) = body.find("\"arguments\"") {
-        let rest = &body[i..];
-        // `"arguments": "..."` (string form).
-        if let Some(v) = json_str(rest, "arguments") {
-            return v;
-        }
-        // memory_add / memory_get: preserve key (+ value) as a structured line.
-        if let Some(k) = json_str(rest, "key") {
-            if let Some(v) = json_str(rest, "value") {
-                let mut s = k;
-                s.push('\u{1f}');
-                s.push_str(&v);
-                return s;
-            }
-            return k;
-        }
-        // `"arguments": {...}` (object form): first conventional key present.
-        for key in ["args", "task", "path", "host", "query", "text", "intent", "name"] {
-            if let Some(v) = json_str(rest, key) {
-                if !v.is_empty() {
-                    return v;
-                }
-            }
-        }
-    }
-    String::new()
-}
-
-/// Extract the `arguments` value from a tool-call body as a JSON object string
-/// suitable for the Synapse Router. Object form is preserved; a bare string
-/// form becomes `{"args":"…"}` so shell tools still work.
-fn extract_arguments_json(body: &str) -> String {
-    let Some(i) = body.find("\"arguments\"") else {
-        return String::from("{}");
-    };
-    let after_key = &body[i + "\"arguments\"".len()..];
-    let Some(colon) = after_key.find(':') else {
-        return String::from("{}");
-    };
-    let rest = after_key[colon + 1..].trim_start();
-    if rest.starts_with('"') {
-        // `"arguments": "flattened line"`
-        if let Some(v) = json_str(&body[i..], "arguments") {
-            return wrap_args_json(&v);
-        }
-        return String::from("{}");
-    }
-    if rest.starts_with('{') {
-        return extract_balanced_json_object(rest).unwrap_or_else(|| String::from("{}"));
-    }
-    String::from("{}")
-}
-
-/// Slice a balanced `{…}` JSON object from the start of `s` (string-aware).
-fn extract_balanced_json_object(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    if bytes.first() != Some(&b'{') {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut esc = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_str {
-            if esc {
-                esc = false;
-            } else if b == b'\\' {
-                esc = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(s[..=i].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn wrap_args_json(args_line: &str) -> String {
-    let mut out = String::from("{\"args\":\"");
-    for c in args_line.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out.push_str("\"}");
-    out
-}
-
-/// Normalize a chat-layer arg payload into Router JSON. Accepts a full object,
-/// a flattened shell line, or memory `key\\x1fvalue`.
-fn normalize_tool_args_json(name: &str, args: &str) -> String {
-    let t = args.trim();
-    if t.is_empty() {
-        return String::from("{}");
-    }
-    if t.starts_with('{') {
-        return t.to_string();
-    }
-    // Memory: structured unit-separator form from the older flattener.
-    if matches!(name, "memory_add" | "memory_get" | "memory_list" | "remember" | "recall") {
-        if name == "memory_list" {
-            return String::from("{}");
-        }
-        if let Some((k, v)) = t.split_once('\u{1f}') {
-            let mut o = String::from("{\"key\":\"");
-            json_escape_into(&mut o, k);
-            o.push_str("\",\"value\":\"");
-            json_escape_into(&mut o, v);
-            o.push_str("\"}");
-            return o;
-        }
-        let mut o = String::from("{\"key\":\"");
-        json_escape_into(&mut o, t);
-        o.push_str("\"}");
-        return o;
-    }
-    // Single-arg synapse conveniences (small models often flatten).
-    match name {
-        "read" | "delete" => {
-            let mut o = String::from("{\"path\":\"");
-            json_escape_into(&mut o, t);
-            o.push_str("\"}");
-            o
-        }
-        "search" | "grep" | "memory_search" | "search_tools" => {
-            let mut o = String::from("{\"query\":\"");
-            json_escape_into(&mut o, t);
-            o.push_str("\"}");
-            o
-        }
-        "skill" | "load_skill" => {
-            // name [asset]
-            if let Some((n, a)) = t.split_once(char::is_whitespace) {
-                let mut o = String::from("{\"name\":\"");
-                json_escape_into(&mut o, n.trim());
-                o.push_str("\",\"asset\":\"");
-                json_escape_into(&mut o, a.trim());
-                o.push_str("\"}");
-                return o;
-            }
-            let mut o = String::from("{\"name\":\"");
-            json_escape_into(&mut o, t);
-            o.push_str("\"}");
-            o
-        }
-        "glob" => {
-            let mut o = String::from("{\"pattern\":\"");
-            json_escape_into(&mut o, t);
-            o.push_str("\"}");
-            o
-        }
-        "console" => {
-            let mut o = String::from("{\"text\":\"");
-            json_escape_into(&mut o, t);
-            o.push_str("\"}");
-            o
-        }
-        "list" | "todo_write" => {
-            if name == "todo_write" && !t.is_empty() {
-                // Accept a bare todos array or object as the full args payload.
-                if t.starts_with('{') || t.starts_with('[') {
-                    if t.starts_with('[') {
-                        return alloc::format!(r#"{{"todos":{t}}}"#);
-                    }
-                    return t.to_string();
-                }
-            }
-            String::from("{}")
-        }
-        _ => wrap_args_json(t),
-    }
-}
-
-fn json_escape_into(out: &mut String, v: &str) {
-    for c in v.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-}
-
-/// Detect **all** tool calls in a model reply (multi-tool turn). Primary:
-/// Qwen3.5 `<tool_call>{…}</tool_call>` blocks (each block's own JSON only —
-/// never merge name from block 1 with arguments from block 2). Fallback: a
-/// single legacy `TOOL: /cmd args` line when no XML blocks are present.
-pub(crate) fn parse_tool_calls(
-    text: &str,
-) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
-    use alloc::string::ToString;
-    let mut out = alloc::vec::Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("<tool_call>") {
-        let after = &rest[start + "<tool_call>".len()..];
-        let close = after.find("</tool_call>").unwrap_or(after.len());
-        let next_open = after.find("<tool_call>").unwrap_or(after.len());
-        let block = &after[..close.min(next_open)];
-        let obj = block
-            .find('{')
-            .and_then(|b| extract_balanced_json_object(&block[b..]))
-            .unwrap_or_else(|| block.to_string());
-        let parsed = json_str(&obj, "name").map(|n| n.trim().trim_start_matches('/').to_string());
-        match parsed {
-            Some(name) if !name.is_empty() => out.push((name, extract_arguments_json(&obj))),
-            // The model *tried* and we could not read a tool name out of it.
-            // Without this trace that is indistinguishable from the model never
-            // calling a tool at all — which is exactly the wrong thing to be
-            // guessing about on a heavily-quantized model, where malformed JSON
-            // is the likely failure and "it ignores its tools" is the likely
-            // wrong conclusion. Truncated: a block can be long.
-            _ => crate::ktrace::log_fmt(format_args!(
-                "chat.toolcall: unparsable <tool_call> block ({} bytes), no usable \"name\": {:.160}",
-                block.len(),
-                obj.trim()
-            )),
-        }
-        // Advance past this block (prefer explicit close when present).
-        let advance = if after.find("</tool_call>").map(|c| c < next_open).unwrap_or(false) {
-            "<tool_call>".len() + close + "</tool_call>".len()
-        } else {
-            "<tool_call>".len() + next_open.min(after.len())
-        };
-        if advance == 0 {
-            break;
-        }
-        rest = &rest[start + advance..];
-    }
-    if !out.is_empty() {
-        return out;
-    }
-    // Legacy fallback → wrap the free-form line as shell `args`.
-    for line in text.lines() {
-        let l = line.trim();
-        let rest = ["TOOL:", "TOOLS:", "Tool:", "tool:", "TOOL "]
-            .iter()
-            .find_map(|p| l.strip_prefix(p))
-            .map(|r| r.trim().trim_start_matches('/').trim());
-        if let Some(rest) = rest {
-            if rest.is_empty() {
-                continue;
-            }
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            let cmd = parts.next().unwrap_or("").to_string();
-            let args = parts.next().unwrap_or("").trim().to_string();
-            if !cmd.is_empty() {
-                let json = normalize_tool_args_json(&cmd, &args);
-                out.push((cmd, json));
-                break;
-            }
-        }
-    }
-    out
-}
-
-/// First tool call only — compatibility wrapper (tests + oneshot paths).
-pub(crate) fn parse_tool_call(text: &str) -> Option<(alloc::string::String, alloc::string::String)> {
-    parse_tool_calls(text).into_iter().next()
-}
-
-/// A friendly verb + primary argument for an agent tool call, for the styled
-/// chat header (`◆ Edit  src/api/checkout.ts`). Unknown tools title-case their
-/// own name and show a compact arg summary.
-fn tool_header(cmd: &str, args: &str) -> (alloc::string::String, alloc::string::String) {
-    use crate::session::todo::json_str;
-    let pick = |keys: &[&str]| -> alloc::string::String {
-        keys.iter().find_map(|k| json_str(args, k)).unwrap_or_default()
-    };
-    let (verb, arg): (&str, alloc::string::String) = match cmd {
-        "read" | "cat" | "open" => ("Read", pick(&["path", "file", "args"])),
-        "write" | "edit" => ("Edit", pick(&["path", "file"])),
-        "list" | "ls" => ("List", {
-            let a = pick(&["path", "dir", "args"]);
-            if a.is_empty() { "/".into() } else { a }
-        }),
-        "glob" | "grep" | "search" => ("Search", pick(&["pattern", "query", "args"])),
-        "search_tools" => ("Search tools", pick(&["query", "args"])),
-        "http" => ("Fetch", pick(&["url", "args"])),
-        "download" => ("Download", pick(&["url", "args"])),
-        "mkdir" => ("Make dir", pick(&["path", "args"])),
-        "touch" => ("Create", pick(&["path", "args"])),
-        "rm" | "delete" => ("Delete", pick(&["path", "args"])),
-        "cp" => ("Copy", pick(&["args"])),
-        "mv" => ("Move", pick(&["args"])),
-        "memory_add" => ("Remember", pick(&["key", "args"])),
-        "memory_get" | "memory_search" | "memory_list" => ("Recall", pick(&["key", "query", "args"])),
-        "skill" => ("Skill", pick(&["name", "args"])),
-        "spawn_subagent" | "subagent" => ("Delegate", pick(&["task", "args"])),
-        _ => return (cap_first(cmd), compact_args(args)),
-    };
-    (alloc::string::String::from(verb), arg)
-}
-
-/// Title-case a tool name for the chat header ("browse" → "Browse").
-fn cap_first(s: &str) -> alloc::string::String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<alloc::string::String>() + c.as_str(),
-        None => alloc::string::String::new(),
-    }
-}
-
-/// A compact one-line argument summary for a tool header; empty `{}` → "".
-fn compact_args(args: &str) -> alloc::string::String {
-    let a = args.trim();
-    if a.is_empty() || a == "{}" {
-        return alloc::string::String::new();
-    }
-    let inner = a.trim_start_matches('{').trim_end_matches('}').trim();
-    inner.chars().take(56).collect()
-}
-
-/// A truecolor SGR (`ESC[38;2;R;G;Bm`) for a theme palette key, so chat styling
-/// follows the active theme instead of fixed ANSI colours. `def` is the fallback
-/// when the key/theme is unavailable (the pane renders `38;2` truecolor).
-pub(crate) fn theme_sgr(key: &str, def: (u8, u8, u8)) -> alloc::string::String {
-    #[cfg(test)]
-    {
-        let _ = key;
-        return alloc::format!("\x1b[38;2;{};{};{}m", def.0, def.1, def.2);
-    }
-    #[cfg(not(test))]
-    {
-        let cfg = crate::ui_config::current();
-        let hex = cfg.theme.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap_or_default();
-        let (r, g, b) = crate::framebuffer::parse_hex(&hex, def);
-        alloc::format!("\x1b[38;2;{};{};{}m", r, g, b)
-    }
-}
-
-/// Drop a `<think>…</think>` reasoning block from a (remote) model reply for
-/// display — the reasoning is summarized as a "Thought for Xs" line instead.
-pub(crate) fn strip_think(s: &str) -> alloc::string::String {
-    use alloc::string::ToString;
-    if let Some(end) = s.find("</think>") {
-        s[end + "</think>".len()..].trim_start().to_string()
-    } else if let Some(start) = s.find("<think>") {
-        s[..start].trim().to_string() // unterminated: keep the prefix
-    } else {
-        s.to_string()
-    }
-}
-
+// (moved to shell/tooljson.rs)
 /// Local time `"HH:MM"` for a turn timestamp (bordered).
 fn hhmm() -> alloc::string::String {
     // format_datetime() → "Wed 2026-07-04 13:45:02"; take the HH:MM.
@@ -2819,848 +2614,7 @@ pub fn is_plan_mode() -> bool {
 
 /// `/voice [test]` — the voice session (mic waveform modal + level-gated
 /// utterance capture) or a sound-hardware self-test (tone + 2 s mic sample).
-/// True if `/voice <arg>` names a stateless subcommand (test/models/stt/say) —
-/// i.e. not the bare conversation loop. Used by the shell to route bare `/voice`
-/// to the chat-driven `voice_talk` and everything else to `dispatch_system`.
-fn voice_is_subcommand(arg: &str) -> bool {
-    let a = arg.trim();
-    a == "test" || a == "models" || a.starts_with("models load") || a.starts_with("stt ") || a.starts_with("say ")
-}
-
-fn run_voice(arg: &str) {
-    // Only audio playback/capture needs a sound device; model loading and STT
-    // (which reads a WAV file) do not — so the check is per-branch, not here.
-    let arg = arg.trim();
-    if arg == "test" {
-        voice_test();
-    } else if arg == "models" {
-        voice_models();
-    } else if let Some(rest) = arg.strip_prefix("models load") {
-        // /voice models load <which> [path]   (path optional → default search)
-        let mut it = rest.trim().splitn(2, ' ');
-        match it.next().filter(|s| !s.is_empty()) {
-            Some(which) => {
-                let path = it.next().map(|s| s.trim());
-                match voice_load(which, path) {
-                    Ok((n, src)) => serial_println!("voice> loaded {} ({} bytes) from {}", which, n, src),
-                    Err(e) => serial_println!("voice> {}", e),
-                }
-            }
-            None => serial_println!("voice> usage: /voice models load parakeet|kitten [path]"),
-        }
-    } else if arg == "remote" || arg.starts_with("remote ") {
-        voice_remote_cmd(arg.strip_prefix("remote").unwrap_or("").trim());
-    } else if let Some(path) = arg.strip_prefix("stt ") {
-        voice_stt_file(path.trim());
-    } else if let Some(text) = arg.strip_prefix("say ") {
-        voice_say(text.trim());
-    } else {
-        // Bare `/voice` is the interactive conversation loop, which needs the
-        // shell's live ChatSession; the interactive loop intercepts it before
-        // reaching here (see `run_os`). Reaching this arm means the agent tool
-        // layer invoked it, where there is no chat to drive.
-        serial_println!("voice> conversation mode runs from the shell prompt (type /voice there); subcommands: test|models|stt <wav>|say <text>");
-    }
-}
-
-/// `/voice remote …` — configure a hosted TTS/STT provider (human-only, like
-/// `/model remote`). Subcommands: `tts <provider> <key> [voice] [model]`,
-/// `stt <provider> <key> [model]`, `off [tts|stt]`, or bare = show.
-fn voice_remote_cmd(rest: &str) {
-    use voice_remote::{Endpoint, Provider};
-    let mut cfg = voice_remote::load();
-    let show = |cfg: &voice_remote::VoiceConfig| {
-        let dir = |e: &Option<Endpoint>| match e {
-            Some(x) => alloc::format!("{} (voice='{}' model='{}')", x.provider.name(), x.voice, x.model),
-            None => "local".into(),
-        };
-        serial_println!("voice> remote tts: {}", dir(&cfg.tts));
-        serial_println!("voice> remote stt: {}", dir(&cfg.stt));
-        serial_println!("voice>   providers: elevenlabs cartesia inworld sarvam openai");
-        serial_println!("voice>   set: /voice remote tts <provider> <key> [voice] [model]");
-        serial_println!("voice>        /voice remote stt <provider> <key> [model]   |   /voice remote off [tts|stt]");
-    };
-    if rest.is_empty() {
-        show(&cfg);
-        return;
-    }
-    let mut it = rest.split_whitespace();
-    match it.next() {
-        Some("off") => {
-            match it.next() {
-                Some("tts") => cfg.tts = None,
-                Some("stt") => cfg.stt = None,
-                _ => {
-                    cfg.tts = None;
-                    cfg.stt = None;
-                }
-            }
-            voice_remote::save(&cfg);
-            serial_println!("voice> remote voice off (using local ONNX models)");
-        }
-        Some(dir @ ("tts" | "stt")) => {
-            let (Some(prov), Some(key)) = (it.next(), it.next()) else {
-                serial_println!("voice> usage: /voice remote {dir} <provider> <key> [voice] [model]");
-                return;
-            };
-            let Some(provider) = Provider::parse(prov) else {
-                serial_println!("voice> unknown provider '{prov}' (elevenlabs|cartesia|inworld|sarvam|openai)");
-                return;
-            };
-            // TTS: [voice] [model];  STT: [model].
-            let (voice, model) = if dir == "tts" {
-                (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
-            } else {
-                (String::new(), it.next().unwrap_or("").to_string())
-            };
-            let ep = Endpoint { provider, key: key.to_string(), voice, model };
-            if dir == "tts" {
-                cfg.tts = Some(ep);
-            } else {
-                cfg.stt = Some(ep);
-            }
-            voice_remote::save(&cfg);
-            serial_println!("voice> remote {dir} → {} (key hidden). `/voice {}` now goes through it.", provider.name(), if dir == "tts" { "say" } else { "stt" });
-            serial_println!("voice>   NB: HTTPS via the in-kernel TLS client; a provider that won't handshake reports a TLS error, not a wrong result.");
-        }
-        _ => show(&cfg),
-    }
-}
-
-/// Pending synthesized speech: PCM waiting for device slots. Fed by
-/// [`speech_pump`] from `ui_tick` (non-blocking — sized to the device's free
-/// periods), so playback continues while the next chunk synthesizes on the
-/// SMP fleet. Bounded: `voice_say` only enqueues one utterance.
-static SPEECH_Q: crate::mm::Locked<alloc::collections::VecDeque<i16>> = crate::mm::Locked::new(alloc::collections::VecDeque::new());
-
-/// Feed queued speech into free device periods (never blocks). Called from
-/// `ui_tick`, which the ONNX per-node loop pumps — that's what makes chunked
-/// TTS gapless: synthesis of chunk k+1 keeps chunk k's audio flowing.
-///
-/// Drivers that cannot report free slots (`out_free_bytes() == 0`, e.g. HDA /
-/// AC'97 single-shot DMA) fall back to: wait until not playing, then push a
-/// bounded batch. Without that fallback the queue never drains and
-/// `/voice say` hangs the shell forever after "speaking…".
-pub(crate) fn speech_pump() {
-    if SPEECH_Q.with(|q| q.is_empty()) {
-        return;
-    }
-    let free_bytes = crate::sound::out_free_bytes();
-    let free_samples = if free_bytes == 0 {
-        // Unknown free-slot accounting: only start a new play when the device
-        // is idle, then push up to ~1 s of 24 kHz mono.
-        if crate::sound::playing() {
-            return;
-        }
-        crate::sound::tts::RATE as usize // 1 second of samples
-    } else {
-        free_bytes / 2
-    };
-    if free_samples == 0 {
-        return;
-    }
-    let slice: alloc::vec::Vec<i16> = SPEECH_Q.with(|q| {
-        if q.is_empty() {
-            return alloc::vec::Vec::new();
-        }
-        let n = free_samples.min(q.len());
-        q.drain(..n).collect()
-    });
-    if !slice.is_empty() {
-        let _ = crate::sound::play(&slice, crate::sound::tts::RATE);
-    }
-}
-
-/// Split text into speakable chunks at sentence/clause boundaries, so
-/// synthesis can pipeline with playback: the first clause plays while the
-/// rest is still synthesizing. Pure — unit-tested. Chunks shorter than
-/// `MIN` merge forward (tiny fragments sound choppy and waste per-run cost).
-pub(crate) fn split_speech(text: &str) -> alloc::vec::Vec<alloc::string::String> {
-    // A sentence ender always splits (first audio = first sentence's synth
-    // time); long comma clauses split too so no chunk grows unbounded. Only
-    // near-empty fragments merge (they sound choppy and waste a graph run).
-    const MIN: usize = 8;
-    let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    let mut cur = alloc::string::String::new();
-    for ch in text.chars() {
-        cur.push(ch);
-        let boundary = matches!(ch, '.' | '!' | '?' | ';' | ':') || (ch == ',' && cur.len() >= 48);
-        if boundary && cur.trim().len() >= MIN {
-            out.push(core::mem::take(&mut cur).trim().into());
-        }
-    }
-    let tail = cur.trim();
-    if !tail.is_empty() {
-        match out.last_mut() {
-            Some(last) if tail.len() < MIN => {
-                last.push(' ');
-                last.push_str(tail);
-            }
-            _ => out.push(tail.into()),
-        }
-    }
-    out
-}
-
-/// Chunked TTS core shared by `/voice say` and the conversation loop.
-/// Returns total samples synthesized (0 on early failure).
-fn speak_text(text: &str) -> usize {
-    if !crate::sound::is_up() || text.trim().is_empty() {
-        return 0;
-    }
-    let remote_tts = voice_remote::load().tts;
-    if remote_tts.is_none() && !ensure_voice_model("kitten") {
-        serial_println!(
-            "voice> no kitten model found (bundle it in the image, /voice models load kitten <path>, or /voice remote tts …)"
-        );
-        return 0;
-    }
-    let chunks = split_speech(text);
-    let t0 = crate::arch::now_ms();
-    let mut total = 0usize;
-    let mut cancelled = false;
-    for (i, chunk) in chunks.iter().enumerate() {
-        let synth = match &remote_tts {
-            Some(e) => voice_remote::synth(e, chunk),
-            None => crate::sound::tts::synth(chunk),
-        };
-        match synth {
-            Ok(pcm) => {
-                total += pcm.len();
-                if i == 0 {
-                    serial_println!(
-                        "voice> speaking ({} chunk(s); first in {} ms)\u{2026}",
-                        chunks.len(),
-                        crate::arch::now_ms().saturating_sub(t0)
-                    );
-                }
-                SPEECH_Q.with(|q| q.extend(pcm.iter().copied()));
-                speech_pump();
-            }
-            Err(e) => {
-                serial_println!("voice> tts: {}", e);
-                break;
-            }
-        }
-        if poll_cancel() {
-            cancelled = true;
-            break;
-        }
-    }
-    // Drain: keep feeding until the queue and device empty (or Ctrl+C).
-    // Bound the wait so a stuck DMA completion (or free-bytes==0 bug) can never
-    // freeze the shell: audio_duration + 5 s grace, min 3 s.
-    let ms_audio = if total == 0 {
-        0
-    } else {
-        (total as u64)
-            .saturating_mul(1000)
-            .saturating_div(crate::sound::tts::RATE as u64)
-    };
-    let deadline = crate::arch::now_ms()
-        .saturating_add(ms_audio.saturating_add(5_000).max(3_000));
-    while SPEECH_Q.with(|q| !q.is_empty()) || crate::sound::playing() {
-        speech_pump();
-        // Full upkeep so USB keyboard / net / UI keep working during playback.
-        upkeep();
-        crate::sched::yield_now();
-        if poll_cancel() || poll_interrupt() {
-            cancelled = true;
-            SPEECH_Q.with(|q| q.clear());
-            break;
-        }
-        if crate::arch::now_ms() >= deadline {
-            serial_println!(
-                "voice> playback timeout (queue still {} samples) — giving up",
-                SPEECH_Q.with(|q| q.len())
-            );
-            SPEECH_Q.with(|q| q.clear());
-            break;
-        }
-    }
-    if cancelled {
-        serial_println!("voice> {} samples; cancelled", total);
-    }
-    total
-}
-
-/// `/voice say <text>` — text-to-speech via KittenTTS (G2P → model → playback),
-/// **chunked**: each clause plays as soon as it is synthesized while the next
-/// one runs on the SMP fleet, so speech starts in ~a second instead of after
-/// the whole utterance. Ctrl+C stops between chunks and drains the queue.
-fn voice_say(text: &str) {
-    if !crate::sound::is_up() {
-        serial_println!("voice> no sound device");
-        return;
-    }
-    let remote_tts = voice_remote::load().tts;
-    match &remote_tts {
-        Some(e) => serial_println!(
-            "voice> synthesizing via {} \u{201c}{}\u{201d}\u{2026}",
-            e.provider.name(),
-            text
-        ),
-        None => serial_println!("voice> synthesizing \u{201c}{}\u{201d}\u{2026}", text),
-    }
-    let total = speak_text(text);
-    if total > 0 {
-        serial_println!("voice> {} samples; done", total);
-    }
-}
-
-/// `/onnx info|run <path>` — the generic ONNX runtime surface: inspect or
-/// execute **any** ONNX model from a mounted volume. `run` feeds each graph
-/// input a zero tensor of its declared shape (dynamic dims → 1) unless the
-/// model needs real inputs, and reports each output's shape + a value preview.
-fn run_onnx(arg: &str) {
-    if arg.trim() == "bench" {
-        // Raw dot_f32 throughput: the inner kernel of every conv/matmul the
-        // voice models run — isolates SIMD/memory speed from graph overhead.
-        let n = 1408usize;
-        let a = alloc::vec![1.0f32; n];
-        let b = alloc::vec![0.5f32; n];
-        let iters = 200_000u64;
-        let t0 = crate::arch::now_ms();
-        let mut acc = 0f32;
-        for _ in 0..iters {
-            acc += crate::cortex::tensor::dot_f32(&a, &b);
-        }
-        let ms = crate::arch::now_ms().saturating_sub(t0).max(1);
-        let gmacs = (iters as f64 * n as f64) / (ms as f64 * 1e6);
-        serial_println!("onnx> dot_f32 (NEON) len {}: {} ms = {:.2} GMAC/s (acc {})", n, ms, gmacs, acc);
-        // Scalar f32 baseline: distinguishes "NEON is slow" from "all FP is slow".
-        let t1 = crate::arch::now_ms();
-        let mut acc2 = 0f32;
-        for _ in 0..iters / 10 {
-            let mut s = 0f32;
-            for i in 0..n {
-                s += a[i] * b[i];
-            }
-            acc2 += s;
-        }
-        let ms2 = crate::arch::now_ms().saturating_sub(t1).max(1);
-        let gm2 = (iters as f64 / 10.0 * n as f64) / (ms2 as f64 * 1e6);
-        serial_println!("onnx> dot scalar len {}: {} ms = {:.2} GMAC/s (acc {})", n, ms2, gm2, acc2);
-        return;
-    }
-    let (sub, path) = match arg.trim().split_once(' ') {
-        Some((s, p)) => (s, p.trim()),
-        None => {
-            serial_println!("onnx> usage: /onnx info <path> | /onnx run <path> | /onnx bench");
-            return;
-        }
-    };
-    let bytes = match crate::synapse::fs::read(path) {
-        Some(b) => b,
-        None => {
-            serial_println!("onnx> file not found: {} (mount a volume first, e.g. /mount 0)", path);
-            return;
-        }
-    };
-    let model = match crate::onnx::parse(&bytes) {
-        Some(m) => m,
-        None => {
-            serial_println!("onnx> failed to parse {} as ONNX", path);
-            return;
-        }
-    };
-    serial_println!("onnx> {}", crate::onnx::summary(&model));
-    if sub == "info" {
-        serial_println!("  ir_version {}", model.ir_version);
-        for i in &model.graph.inputs {
-            serial_println!("  input:  {}", i);
-        }
-        for o in &model.graph.outputs {
-            serial_println!("  output: {}", o);
-        }
-        return;
-    }
-    if sub != "run" {
-        serial_println!("onnx> unknown '{}' — use info|run", sub);
-        return;
-    }
-    // Feed zero tensors for graph inputs not already covered by initializers.
-    use crate::onnx::exec::Val;
-    let init_names: alloc::vec::Vec<&str> = model.graph.initializers.iter().map(|t| t.name).collect();
-    let mut feeds: alloc::vec::Vec<(&str, Val)> = alloc::vec::Vec::new();
-    for name in &model.graph.inputs {
-        if init_names.contains(name) {
-            continue;
-        }
-        // Without declared shapes here we default to a scalar zero; models with
-        // real input needs should be driven by their own command (e.g. /voice).
-        feeds.push((name, Val::new(alloc::vec![1], alloc::vec![0.0])));
-    }
-    serial_println!("onnx> running (zero inputs)\u{2026}");
-    match crate::onnx::exec::run(&model, &feeds) {
-        Ok(out) => {
-            for (name, v) in out.iter() {
-                let preview: alloc::vec::Vec<f32> = v.f.iter().take(4).copied().collect();
-                serial_println!("  {} {:?} = {:?}\u{2026}", name, v.dims, preview);
-            }
-        }
-        Err(e) => serial_println!("onnx> run error: {}", e),
-    }
-}
-
-/// Default filenames a voice model may be shipped under (checked in order,
-/// across the mounted `/` and common voice dirs, plus x86 Limine boot modules).
-fn voice_candidates(which: &str) -> &'static [&'static str] {
-    match which {
-        "kitten" => &["/voice/kitten_tts_mini.onnx", "/kitten_tts_mini.onnx", "/kitten.onnx", "/voice/kitten.onnx", "/mnt/kitten.onnx"],
-        "parakeet" => &["/voice/parakeet_ctc_int8.onnx", "/parakeet.onnx", "/voice/parakeet.onnx", "/mnt/parakeet.onnx"],
-        _ => &[],
-    }
-}
-
-/// Load a voice model. With an explicit `path`, read it from the mounts;
-/// otherwise search the default locations — a bundled x86 Limine boot module
-/// first, then the known filesystem paths on whatever is mounted. Returns
-/// `(bytes, source)`.
-fn voice_load(which: &str, path: Option<&str>) -> Result<(usize, alloc::string::String), alloc::string::String> {
-    if which != "kitten" && which != "parakeet" {
-        return Err("unknown model (parakeet|kitten)".into());
-    }
-    if let Some(p) = path {
-        serial_println!("voice> reading {} \u{2026}", p);
-        let bytes = read_mounted(p).ok_or_else(|| alloc::format!("{} not found on any mount (see /mounts)", p))?;
-        let n = crate::sound::model_store::load_bytes(which, bytes)?;
-        return Ok((n, p.into()));
-    }
-    // No path: a bundled boot module (x86 Limine) first, then any disk volume
-    // (the FAT ESP / ext4 data partition — aarch64 image), then the mounts.
-    #[cfg(target_arch = "x86_64")]
-    if let Some(m) = crate::cortex::find_module(which) {
-        let n = crate::sound::model_store::load_bytes(which, m.to_vec())?;
-        return Ok((n, alloc::format!("boot module ({which})")));
-    }
-    let fname = alloc::format!("{which}.onnx");
-    if let Some(bytes) = find_on_disks(&[&fname]) {
-        let n = crate::sound::model_store::load_bytes(which, bytes)?;
-        return Ok((n, alloc::format!("{fname} (disk)")));
-    }
-    for cand in voice_candidates(which) {
-        if let Some(bytes) = read_mounted(cand) {
-            let n = crate::sound::model_store::load_bytes(which, bytes)?;
-            return Ok((n, (*cand).into()));
-        }
-    }
-    Err(alloc::format!("no {which} model bundled or on disk (pass a path, or bundle via the image)"))
-}
-
-/// Ensure a voice model is loaded, searching the default locations on first use
-/// (lazy — reading the 78/131 MB models at boot would stall the shell). Returns
-/// true if loaded (already or just now).
-fn ensure_voice_model(which: &str) -> bool {
-    let loaded = match which {
-        "kitten" => crate::sound::model_store::kitten().is_some(),
-        "parakeet" => crate::sound::model_store::parakeet().is_some(),
-        _ => false,
-    };
-    if loaded {
-        return true;
-    }
-    match voice_load(which, None) {
-        Ok((n, src)) => {
-            serial_println!("voice> {} loaded ({} bytes) from {}", which, n, src);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-/// `/voice models` — show which voice models are loaded + how to get them.
-fn voice_models() {
-    let mk = |b: bool| if b { "\x1b[32mloaded\x1b[0m" } else { "not loaded" };
-    serial_println!("voice> models:");
-    serial_println!("  silero-vad   \x1b[32membedded\x1b[0m (VAD, 630 KB)");
-    serial_println!("  parakeet-stt {} (STT; /voice models load parakeet [path])", mk(crate::sound::model_store::parakeet().is_some()));
-    serial_println!("  kitten-tts   {} (TTS; /voice models load kitten [path])", mk(crate::sound::model_store::kitten().is_some()));
-    serial_println!("  (no path = search boot module + any disk for <model>.onnx; loaded on first /voice use)");
-    serial_println!("  host: cargo xtask voice-assets  (downloads into assets/voice/)");
-}
-
-/// `/voice stt </path/file.wav>` — transcribe a WAV from a mounted volume
-/// through the STT front-end. Mic-independent, so the mel + CTC path is
-/// exercisable without microphone hardware/permission. Any PCM rate is
-/// resampled to 16 kHz for the local parakeet front-end.
-fn voice_stt_file(path: &str) {
-    let remote_stt = voice_remote::load().stt;
-    if remote_stt.is_none() && !ensure_voice_model("parakeet") {
-        serial_println!("voice> no parakeet model found (bundle it in the image, /voice models load parakeet <path>, or /voice remote stt …)");
-        return;
-    }
-    let bytes = match read_mounted(path) {
-        Some(b) => b,
-        None => {
-            serial_println!("voice> file not found: {} (mount a volume first, e.g. /mount 0)", path);
-            return;
-        }
-    };
-    let (pcm_src, rate) = match wav_to_pcm16(&bytes) {
-        Some(p) => p,
-        None => {
-            serial_println!("voice> not a 16-bit PCM WAV: {}", path);
-            return;
-        }
-    };
-    // Local STT is hard-wired to 16 kHz mel; remote providers accept the
-    // source rate (they resample server-side) but we still normalise for
-    // consistent local behaviour.
-    let pcm = if rate != 16_000 {
-        serial_println!("voice> resampling {} Hz → 16 kHz ({} samples)", rate, pcm_src.len());
-        crate::sound::resample(&pcm_src, rate, 16_000)
-    } else {
-        pcm_src
-    };
-    match &remote_stt {
-        Some(e) => {
-            serial_println!(
-                "voice> {}: {} samples @16k; transcribing via {}\u{2026}",
-                path,
-                pcm.len(),
-                e.provider.name()
-            );
-            match voice_remote::transcribe(e, &pcm, 16_000) {
-                Ok(text) => serial_println!("voice> stt> {}", text),
-                Err(err) => serial_println!("voice> {}", err),
-            }
-        }
-        None => {
-            serial_println!("voice> {}: {} samples @16k; transcribing\u{2026}", path, pcm.len());
-            let text = crate::sound::stt::transcribe(&pcm);
-            serial_println!("voice> stt> {}", text);
-        }
-    }
-}
-
-/// Minimal RIFF/WAVE parser: returns mono S16LE samples (averaging stereo) and
-/// the source sample rate. Handles the standard 44-byte header; scans chunks
-/// for `fmt ` + `data`. Only 16-bit PCM is supported.
-fn wav_to_pcm16(b: &[u8]) -> Option<(alloc::vec::Vec<i16>, u32)> {
-    if b.len() < 12 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut pos = 12;
-    let mut channels = 1u16;
-    let mut rate = 16_000u32;
-    let mut bits = 16u16;
-    let mut data: Option<&[u8]> = None;
-    while pos + 8 <= b.len() {
-        let id = &b[pos..pos + 4];
-        let sz = u32::from_le_bytes([b[pos + 4], b[pos + 5], b[pos + 6], b[pos + 7]]) as usize;
-        let body = b.get(pos + 8..pos + 8 + sz)?;
-        if id == b"fmt " && body.len() >= 16 {
-            // audio format 1 = PCM
-            let fmt = u16::from_le_bytes([body[0], body[1]]);
-            if fmt != 1 {
-                return None;
-            }
-            channels = u16::from_le_bytes([body[2], body[3]]).max(1);
-            rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]).max(1);
-            bits = u16::from_le_bytes([body[14], body[15]]);
-        } else if id == b"data" {
-            data = Some(body);
-        }
-        pos += 8 + sz + (sz & 1); // chunks are word-aligned
-    }
-    if bits != 16 {
-        return None;
-    }
-    let data = data?;
-    let ch = channels as usize;
-    let mut out = alloc::vec::Vec::with_capacity(data.len() / 2 / ch);
-    for frame in data.chunks_exact(2 * ch) {
-        let mut acc = 0i32;
-        for c in 0..ch {
-            acc += i16::from_le_bytes([frame[c * 2], frame[c * 2 + 1]]) as i32;
-        }
-        out.push((acc / ch as i32) as i16);
-    }
-    Some((out, rate))
-}
-
-/// Sound self-test: play a short tone, then sample the mic for 2 s and report
-/// the peak level — proves playback and capture end-to-end.
-fn voice_test() {
-    if !crate::sound::is_up() {
-        serial_println!("voice> no sound device found");
-        return;
-    }
-    serial_println!("voice> playing test tone\u{2026}");
-    let tone = crate::sound::test_tone(440, 600, 16000);
-    match crate::sound::play(&tone, 16000) {
-        Ok(()) => {
-            while crate::sound::playing() {
-                ui_tick();
-                crate::sched::yield_now();
-            }
-            serial_println!("voice> tone done");
-        }
-        Err(e) => {
-            serial_println!("voice> play failed: {}", e);
-            return;
-        }
-    }
-    serial_println!("voice> capturing 2 s from the mic\u{2026}");
-    if let Err(e) = crate::sound::capture_start(16000) {
-        serial_println!("voice> capture failed: {}", e);
-        return;
-    }
-    let mut frame = [0i16; 1600]; // 100 ms at 16 kHz
-    let mut peak = 0f32;
-    let mut got = 0usize;
-    let t0 = crate::arch::now_ms();
-    while crate::arch::now_ms().saturating_sub(t0) < 2000 {
-        let n = crate::sound::capture_read(&mut frame);
-        if n > 0 {
-            got += n;
-            let r = crate::sound::rms(&frame[..n]);
-            if r > peak {
-                peak = r;
-            }
-        }
-        ui_tick();
-        crate::sched::yield_now();
-    }
-    crate::sound::capture_stop();
-    serial_println!("voice> captured {} samples, peak level {}%", got, (peak * 100.0) as u32);
-}
-
-/// The interactive voice session: live waveform modal driven by mic RMS, with
-/// level-based endpointing (speech starts above the threshold, an utterance
-/// ends after ~800 ms of silence). Esc / q / Ctrl+C or the Stop button end the
-/// session. The LLM backend matches shell chat: **remote** when `/model remote`
-/// is active, otherwise the local GGUF.
-fn voice_talk(
-    chat: &mut Option<ChatSession>,
-    session: &mut crate::agent::types::Session,
-    remote_on: bool,
-    remote_cfg: &Option<remote::RemoteConfig>,
-    remote_chat: &mut Option<remote::RemoteChat>,
-) {
-    if !crate::sound::is_up() {
-        serial_println!("voice> no sound device found");
-        return;
-    }
-    // The conversation loop needs STT (hear) and TTS (speak). Prefer a
-    // human-configured remote endpoint; otherwise load the local ONNX models.
-    // Missing backends degrade the loop rather than abort it.
-    let voice_cfg = voice_remote::load();
-    let have_stt = voice_cfg.stt.is_some() || ensure_voice_model("parakeet");
-    let have_tts = voice_cfg.tts.is_some() || ensure_voice_model("kitten");
-    if !have_stt {
-        serial_println!(
-            "voice> no STT backend — load parakeet (`/voice models load parakeet`) or `/voice remote stt …`"
-        );
-    } else if voice_cfg.stt.is_some() {
-        serial_println!("voice> STT: remote ({})", voice_cfg.stt.as_ref().unwrap().provider.name());
-    }
-    if !have_tts {
-        serial_println!(
-            "voice> no TTS backend — load kitten (`/voice models load kitten`) or `/voice remote tts …`"
-        );
-    } else if voice_cfg.tts.is_some() {
-        serial_println!("voice> TTS: remote ({})", voice_cfg.tts.as_ref().unwrap().provider.name());
-    }
-    // LLM: same backend as shell chat.
-    if remote_on {
-        if let Some(cfg) = remote_cfg {
-            let rc = remote_chat.get_or_insert_with(|| remote::RemoteChat::new(cfg.clone()));
-            if rc.is_empty() && session.messages.len() > 1 {
-                rc.hydrate_from_session(session);
-            }
-            serial_println!("voice> LLM backend: remote ({})", cfg.model);
-        } else {
-            serial_println!("voice> remote mode but no endpoint — /model remote <url>");
-            return;
-        }
-    } else if chat.is_none() {
-        let mut spin = Spinner::new("loading model");
-        *chat = ChatSession::load(&mut spin);
-        spin.clear();
-        if let Some(sess) = chat.as_mut() {
-            if session.messages.len() > 1 {
-                sess.hydrate_from_session(session);
-            }
-        }
-        if chat.is_none() {
-            serial_println!("voice> no local model — try /model remote or bundle a GGUF");
-            return;
-        }
-    }
-    serial_println!("voice> listening \u{2014} Esc (or the Stop button) ends the session");
-    if let Err(e) = crate::sound::capture_start(16000) {
-        serial_println!("voice> capture failed: {}", e);
-        return;
-    }
-    #[cfg(not(test))]
-    {
-        let mut levels: alloc::vec::Vec<f32> = alloc::vec::Vec::new();
-        let mut frame = [0i16; 1600];
-        // VAD works on 512-sample windows; capture chunks are re-framed here.
-        let mut vadbuf: alloc::vec::Vec<i16> = alloc::vec::Vec::new();
-        let mut utter: alloc::vec::Vec<i16> = alloc::vec::Vec::new();
-        let mut in_speech = false;
-        let mut silent_ms = 0u32;
-        crate::sound::vad::reset();
-        crate::framebuffer::draw_voice(&levels, "listening\u{2026}");
-        loop {
-            if let Some(b) = crate::console::read_byte() {
-                if b == 0x1b || b == b'q' || b == 3 {
-                    break;
-                }
-            }
-            let t = crate::mouse::tick();
-            if t.moved {
-                crate::framebuffer::cursor_move(t.x, t.y);
-            }
-            if t.pressed && matches!(crate::framebuffer::modal_hit(t.x, t.y), crate::framebuffer::ModalHit::Ok) {
-                break;
-            }
-            let n = crate::sound::capture_read(&mut frame);
-            if n > 0 {
-                let r = crate::sound::rms(&frame[..n]);
-                levels.push(r);
-                if levels.len() > 256 {
-                    levels.remove(0);
-                }
-                vadbuf.extend_from_slice(&frame[..n]);
-                // Run silero VAD over each complete 512-sample window (32 ms).
-                while vadbuf.len() >= 512 {
-                    let win: alloc::vec::Vec<i16> = vadbuf.drain(..512).collect();
-                    // Falls back to a simple level gate if the model failed.
-                    let speech = match crate::sound::vad::prob(&win) {
-                        Some(p) => p > 0.5,
-                        None => crate::sound::rms(&win) > 0.02,
-                    };
-                    if speech {
-                        in_speech = true;
-                        silent_ms = 0;
-                        utter.extend_from_slice(&win);
-                    } else if in_speech {
-                        silent_ms += 32;
-                        utter.extend_from_slice(&win);
-                        if silent_ms > 800 {
-                            let ms = utter.len() as u32 / 16;
-                            serial_println!("voice> utterance captured: {} ms ({} samples, silero-gated)", ms, utter.len());
-                            let clip = core::mem::take(&mut utter);
-                            in_speech = false;
-                            silent_ms = 0;
-                            // Full pipeline: hear -> think -> speak. Playback and
-                            // capture share the device, so stop capture first, run
-                            // the turn, then resume listening (VAD reset).
-                            crate::sound::capture_stop();
-                            voice_converse_turn(
-                                chat,
-                                session,
-                                remote_on,
-                                remote_cfg,
-                                remote_chat,
-                                &clip,
-                                have_stt,
-                                have_tts,
-                                &mut levels,
-                            );
-                            crate::sound::vad::reset();
-                            vadbuf.clear();
-                            let _ = crate::sound::capture_start(16000);
-                            crate::framebuffer::draw_voice(&levels, "listening\u{2026}");
-                        }
-                    }
-                }
-                let status = if in_speech { "listening\u{2026} (speech detected)" } else { "listening\u{2026} (Esc or Stop to end)" };
-                crate::framebuffer::draw_voice(&levels, status);
-            }
-            crate::net::poll();
-            crate::sched::yield_now();
-        }
-        crate::framebuffer::modal_dismiss();
-    }
-    crate::sound::capture_stop();
-    serial_println!("voice> session ended");
-}
-
-/// One voice-conversation turn: transcribe the captured `clip` (STT), feed the
-/// transcript to the LLM (remote or local, same as shell chat), then speak the
-/// reply (TTS). Each stage degrades independently.
-#[cfg(not(test))]
-fn voice_converse_turn(
-    chat: &mut Option<ChatSession>,
-    session: &mut crate::agent::types::Session,
-    remote_on: bool,
-    remote_cfg: &Option<remote::RemoteConfig>,
-    remote_chat: &mut Option<remote::RemoteChat>,
-    clip: &[i16],
-    have_stt: bool,
-    have_tts: bool,
-    levels: &mut alloc::vec::Vec<f32>,
-) {
-    // 1. Hear — remote STT if configured, else local parakeet.
-    let heard = if have_stt {
-        crate::framebuffer::draw_voice(levels, "transcribing\u{2026}");
-        let t = match voice_remote::load().stt {
-            Some(e) => match voice_remote::transcribe(&e, clip, 16_000) {
-                Ok(s) => s,
-                Err(err) => {
-                    serial_println!("voice> remote stt: {err}");
-                    alloc::string::String::new()
-                }
-            },
-            None => crate::sound::stt::transcribe(clip),
-        };
-        serial_println!("voice> you: {}", t);
-        t
-    } else {
-        alloc::string::String::new()
-    };
-    let heard = heard.trim();
-    // Treat diagnostic placeholders as "nothing heard".
-    if heard.is_empty() || (heard.starts_with('(') && heard.ends_with(')')) {
-        serial_println!("voice> (nothing to transcribe \u{2014} continuing to listen)");
-        return;
-    }
-    // 2. Think — same backend as shell chat.
-    crate::framebuffer::draw_voice(levels, "thinking\u{2026}");
-    let reply = if remote_on {
-        match (remote_cfg, remote_chat.as_mut()) {
-            (Some(cfg), Some(rc)) => {
-                let _ = cfg;
-                rc.turn(heard, session)
-            }
-            (Some(cfg), None) => {
-                let mut rc = remote::RemoteChat::new(cfg.clone());
-                if session.messages.len() > 1 {
-                    rc.hydrate_from_session(session);
-                }
-                let out = rc.turn(heard, session);
-                *remote_chat = Some(rc);
-                out
-            }
-            _ => {
-                serial_println!("voice> (remote mode misconfigured \u{2014} cannot reply)");
-                return;
-            }
-        }
-    } else {
-        match chat.as_mut() {
-            Some(sess) => sess.turn(heard, session),
-            None => {
-                serial_println!("voice> (no LLM loaded \u{2014} cannot reply)");
-                return;
-            }
-        }
-    };
-    let reply = reply.trim();
-    if reply.is_empty() {
-        return;
-    }
-    // 3. Speak — same chunked/remote path as `/voice say` (first audio ASAP).
-    if have_tts {
-        crate::framebuffer::draw_voice(levels, "speaking\u{2026}");
-        let _ = speak_text(reply);
-    }
-}
+// (moved to shell/voice.rs)
 
 fn run_effort(arg: &str) {
     let a = arg.trim();
@@ -4137,10 +3091,26 @@ fn execute_chat_tool_inner(
         } else {
             ""
         };
+        // Bound the args. A write's arguments can be a whole config file, and
+        // nobody audits 4 KB of JSON in a dialog — but more importantly the
+        // dialog has to *fit*: an over-long body used to size the box past the
+        // screen, and the modal then painted nothing while still waiting for a
+        // key (an invisible approval prompt, indistinguishable from a hang).
+        // The painter clamps too; this keeps the excerpt meaningful rather than
+        // letting the tail be cut arbitrarily.
+        const ARGS_IN_MODAL: usize = 480;
+        let args_shown = match args_json.char_indices().nth(ARGS_IN_MODAL) {
+            Some((cut, _)) => alloc::format!(
+                "{}... ({} bytes total)",
+                &args_json[..cut],
+                args_json.len()
+            ),
+            None => args_json.clone(),
+        };
         let body = alloc::format!(
             "The agent wants to run: {} {}\n(mode: {}){}{}",
             label,
-            args_json,
+            args_shown,
             if destructive { "destructive" } else { "manual approval" },
             why,
             planner
@@ -5430,15 +4400,19 @@ impl ChatSession {
         sampler::sample_topk_topp(logits, temp, TOP_K, TOP_P, &mut self.rng, None)
     }
 
-    /// One **UI-agent ReAct turn** (Chess etc.): SOUL + event, tools via `on_tool`
-    /// (`board_set` / `board_mark` / `chess_legal`). Greedy, thinking off,
-    /// Ctrl+C/Esc cancels. Fresh KV per event so game state does not bloat the
-    /// planner context (FEN is in the user message + agent memory).
+    /// One **UI-agent ReAct turn**: SOUL + event, tools via `on_tool`. Which
+    /// tools exist comes from the app's own manifest (`tools`, built by
+    /// [`ui_agent_toolset`]) — this loop knows no tool names, and the
+    /// membership check lives in the one gate in [`ui_agent_reply`] so the
+    /// hosted backend enforces the same set. Greedy, thinking off, Ctrl+C/Esc
+    /// cancels. Fresh KV per event so game state does not bloat the planner
+    /// context (FEN is in the user message + agent memory).
     fn ui_agent_loop(
         &mut self,
         soul: &str,
         user: &str,
         surface: u32,
+        tools: &[String],
         on_tool: &mut dyn FnMut(&str, &str) -> alloc::string::String,
     ) -> alloc::string::String {
         use core::sync::atomic::Ordering;
@@ -5448,7 +4422,7 @@ impl ChatSession {
         self.reset_context();
         // One ask per app interaction, all sharing this app's SOUL + protocol:
         // the prefix cache turns every ask after the first into a cache clone.
-        let sys = alloc::format!("{soul}\n\n{}", ui_agent_protocol(surface));
+        let sys = alloc::format!("{soul}\n\n{}", ui_agent_protocol(surface, tools));
         self.prefill_system_cached(&sys, false);
         self.prefill_turn("user\n", user, true);
         let mut last_call: Option<(alloc::string::String, alloc::string::String)> = None;
@@ -5462,23 +4436,13 @@ impl ChatSession {
                 break;
             }
             match parse_tool_call(&text) {
-                Some((cmd, args))
-                    if matches!(
-                        cmd.as_str(),
-                        "board_set"
-                            | "board_mark"
-                            | "chess_legal"
-                            | "chess_try_move"
-                            | "storage_get"
-                            | "storage_set"
-                            | "storage_list"
-                            | "storage_remove"
-                            | "memory_add"
-                            | "memory_get"
-                            | "memory_list"
-                            | "ui_draw"
-                    ) =>
-                {
+                // Every parsed call goes to `on_tool`, which is the gated
+                // wrapper from `ui_agent_reply`: a tool outside this agent's
+                // manifest comes back as an `error:` naming the allowed set, and
+                // that refusal reaches the model through the same
+                // `<tool_response>` channel as any other result. So there is no
+                // tool name in this loop, and nothing to keep in sync.
+                Some((cmd, args)) => {
                     if last_call.as_ref() == Some(&(cmd.clone(), args.clone())) {
                         self.prefill_turn(
                             "user\n",
@@ -5493,15 +4457,6 @@ impl ChatSession {
                     let obs = on_tool(&cmd, &args);
                     let fb = alloc::format!("<tool_response>\n{obs}\n</tool_response>");
                     self.prefill_turn("user\n", &fb, true);
-                }
-                Some((cmd, _)) => {
-                    self.prefill_turn(
-                        "user\n",
-                        &alloc::format!(
-                            "<tool_response>\nunknown tool '{cmd}'. Use board_set, board_mark, or chess_legal only.\n</tool_response>"
-                        ),
-                        true,
-                    );
                 }
                 None => {
                     result = text;
@@ -5729,13 +4684,94 @@ pub(crate) fn serve_reply(soul: &str, user: &str, home: &str) -> Option<(alloc::
 static UI_PLANNER: crate::mm::Locked<Option<ChatSession>> = crate::mm::Locked::new(None);
 
 /// Protocol appended to a UI-agent SOUL: which tools exist and the event shape.
-fn ui_agent_protocol(surface: u32) -> alloc::string::String {
-    alloc::format!(
-        "You control surface {surface} in the action pane. Tools (ONE tool call or a short status line):\n\
-         board_set / board_mark / chess_legal / chess_try_move / storage_get|set|list (scope session|durable).\n\
-         Prefer chess_legal before moving; chess_try_move from/to validates + paints.\n\
-         storage_set key=fen for durable position. When done, prose status only."
+fn ui_agent_protocol(surface: u32, tools: &[String]) -> alloc::string::String {
+    let mut s = alloc::format!(
+        "You control surface {surface} in the action pane. Reply with ONE tool call \
+         or a short prose status line.\n"
+    );
+    if tools.is_empty() {
+        s.push_str("You have no tools here — answer directly, in prose.\n");
+        return s;
+    }
+    s.push_str("Your tools (call as <tool_call>{\"name\":\"…\",\"arguments\":{…}}</tool_call>):\n");
+    for t in tools {
+        // The description comes from the registry, so a tool's own guidance
+        // ("prefer this over raw ui_draw for chess") reaches the model without
+        // this function knowing anything about chess — or about any app.
+        match crate::tools::registry::get(t) {
+            Some(def) => {
+                let d = def.description.trim();
+                let d = match d.char_indices().nth(120) {
+                    Some((cut, _)) => &d[..cut],
+                    None => d,
+                };
+                s.push_str(&alloc::format!("- {t}: {d}\n"));
+            }
+            None => s.push_str(&alloc::format!("- {t}\n")),
+        }
+    }
+    s.push_str(&alloc::format!(
+        "Pass surface={surface} where a tool takes one. When you are done, reply with a short status only.\n"
+    ));
+    s
+}
+
+/// The tools an **app agent's** model turn may call: the agent's own manifest
+/// `toolset` ∩ the live tool registry — the same intersection the chat loop
+/// makes (`chat_toolset` / `tools::registry`), for the same reason.
+///
+/// This replaced a hardcoded `matches!` of twelve tool names. That list was a
+/// copy of *chess's* manifest, so every other app (notes, paint, snake) was
+/// offered chess tools and gated on tools it does not have — and it had already
+/// drifted from the prompt beside it, which advertised a different set again.
+/// A manifest that adds a tool now advertises **and** executes it, with no
+/// second list to keep in step.
+pub(crate) fn ui_agent_toolset(agent_id: u64) -> alloc::vec::Vec<String> {
+    let declared = crate::skills::agent_skill::by_id(crate::agent::types::AgentId(agent_id))
+        .map(|m| m.toolset)
+        .unwrap_or_default();
+    toolset_intersection(&declared, |t| {
+        !runtime_owned_tool(t) && crate::tools::registry::get(t).is_some()
+    })
+}
+
+/// Tools that belong to the **package-UI runtime**, not to an app's model turn,
+/// even when the app's manifest declares them (chess declares all three, because
+/// its *wasm* side legitimately needs them).
+///
+/// This is not an authority narrowing — the app holds those caps and its wasm
+/// uses them. It is an ownership rule: `service::package_ui` requests the
+/// surface at start, drains the event queue in its pump, and closes on teardown.
+/// A model turn issuing the same primitives fights the runtime for one surface's
+/// lifecycle — `ui_event_poll` in particular would steal the very click the pump
+/// is mid-way through delivering, and `ui_surface_close` would close the window
+/// the human is looking at, mid-answer.
+pub(crate) fn runtime_owned_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "ui_surface_request" | "ui_event_poll" | "ui_surface_close"
     )
+}
+
+/// Pure half of [`ui_agent_toolset`]: declared names that are registered, in
+/// manifest order, deduplicated. A declared-but-unregistered tool is dropped
+/// rather than advertised — offering a tool that cannot dispatch teaches the
+/// model to keep trying it.
+pub(crate) fn toolset_intersection(
+    declared: &[String],
+    registered: impl Fn(&str) -> bool,
+) -> alloc::vec::Vec<String> {
+    let mut out: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+    for t in declared {
+        let t = t.trim();
+        if t.is_empty() || !registered(t) {
+            continue;
+        }
+        if !out.iter().any(|x| x == t) {
+            out.push(String::from(t));
+        }
+    }
+    out
 }
 
 /// One **UI-agent ReAct turn**: SOUL + event text, tools executed by `on_tool`.
@@ -5746,11 +4782,31 @@ pub(crate) fn ui_agent_reply(
     soul: &str,
     user: &str,
     surface: u32,
+    tools: &[String],
     mut on_tool: impl FnMut(&str, &str) -> alloc::string::String,
 ) -> Option<alloc::string::String> {
-    let sys = alloc::format!("{soul}\n\n{}", ui_agent_protocol(surface));
+    let sys = alloc::format!("{soul}\n\n{}", ui_agent_protocol(surface, tools));
+    // ONE gate, wrapping the caller's executor, so the local and hosted
+    // backends cannot disagree about what this agent may call. The check used to
+    // live inside the local loop only — a `matches!` of hardcoded names — so the
+    // remote path (`oneshot_tools`) applied no gate at all, and neither matched
+    // the prompt. The refusal names the allowed set, because a bare "no" teaches
+    // the model nothing and it retries the same call.
+    let mut gated = |cmd: &str, args: &str| -> alloc::string::String {
+        if !tools.iter().any(|t| t == cmd) {
+            crate::ktrace::log_fmt(format_args!(
+                "ui-agent: '{cmd}' is not in this agent's toolset ({} tool(s)) — refused",
+                tools.len()
+            ));
+            return alloc::format!(
+                "error: '{cmd}' is not one of your tools. You may call: {}. Use one of those, or answer in prose.",
+                tools.join(", ")
+            );
+        }
+        on_tool(cmd, args)
+    };
     if let Some(cfg) = remote::active_config() {
-        let out = remote::oneshot_tools(&cfg, &sys, user, &mut on_tool, 6, "ui-agent");
+        let out = remote::oneshot_tools(&cfg, &sys, user, &mut gated, 6, "ui-agent");
         return Some(out);
     }
 
@@ -5762,7 +4818,7 @@ pub(crate) fn ui_agent_reply(
         p.take()
     });
     let mut sess = taken?;
-    let out = sess.ui_agent_loop(soul, user, surface, &mut on_tool);
+    let out = sess.ui_agent_loop(soul, user, surface, tools, &mut gated);
     UI_PLANNER.with(|p| *p = Some(sess));
     Some(out)
 }
@@ -6496,811 +5552,7 @@ fn run_surface(_arg: &str) {
     serial_println!("surface> painted into the action pane (/close to hide)");
 }
 
-fn run_agents(
-    arg: &str,
-    chat: &mut Option<ChatSession>,
-    orch: &mut crate::agent::orchestrator::Orchestrator,
-) {
-    let (sub, sarg) = match arg.split_once(' ') {
-        Some((s, a)) => (s, a.trim()),
-        None => (arg.trim(), ""),
-    };
-    match sub {
-        "" | "list" => {
-            let force_text = matches!(sarg, "text" | "list" | "--text" | "-t");
-            // Framebuffer Agents browser (same UX as `/help`), unless forced
-            // to serial for e2e / scripting.
-            #[cfg(not(test))]
-            {
-                if !force_text && crate::framebuffer::composer_available() {
-                    serial_println!(
-                        "agents> opening browser… (also: Ctrl+Space; on Mac host ⌘+Space is often stolen by Spotlight)"
-                    );
-                    match crate::modal::browse_agents() {
-                        Some(pick) => agents_apply_pick(&pick, chat, orch),
-                        None => serial_println!(
-                            "agents> closed — type /agents text for the serial list"
-                        ),
-                    }
-                    return;
-                }
-            }
-            let _ = force_text;
-            print_agents_text();
-        }
-        "switch" => match sarg.parse::<u64>() {
-            Ok(id) => {
-                // Re-bind caps + toolset to this agent; drop live chat KV so
-                // the next turn loads the new SOUL under the new authority.
-                rebind_chat_agent(id, orch);
-                *chat = None;
-                serial_println!(
-                    "agents> chat now runs as agent {} (SOUL: /agent/{}/SOUL.md, {} caps, tools gated)",
-                    id,
-                    id,
-                    orch.session.capabilities.len()
-                );
-            }
-            Err(_) => serial_println!("usage: /agents switch <id>"),
-        },
-        "kill" => match sarg.parse::<u64>() {
-            Ok(id) => {
-                if id == active_agent_id() {
-                    // Don't leave the chat pointing at a dead agent — revert
-                    // tool authority to the shell orchestrator.
-                    rebind_chat_agent(crate::agent::manifest::ORCHESTRATOR_ID.0, orch);
-                    *chat = None;
-                    serial_println!("agents> was the active chat agent — chat reverts to shell agent (1)");
-                }
-                match crate::sched::kill(id) {
-                    Ok(()) => serial_println!("agents> task {} killed (capabilities revoked)", id),
-                    Err(e) => serial_println!("agents> cannot kill {}: {}", id, e),
-                }
-            }
-            Err(_) => serial_println!("usage: /agents kill <id>"),
-        },
-        "services" => {
-            let svcs = crate::service::list();
-            if svcs.is_empty() {
-                serial_println!("agents> no service agents running");
-            } else {
-                serial_println!("agents> service           task   state");
-                for (name, task, alive) in svcs {
-                    serial_println!("agents> {:<17} {:<6} {}", name, task, if alive { "running" } else { "dead" });
-                }
-            }
-        }
-        "search" => run_agent_search(sarg),
-        "install" => run_agent_install(sarg, chat),
-        "uninstall" => run_agent_uninstall(sarg),
-        "start" => run_agent_start(sarg, chat, orch),
-        // Back-compat aliases for the two originally-named service starters.
-        "start-net" => run_agent_start(&alloc::format!("network {}", sarg), chat, orch),
-        "start-http" => run_agent_start(&alloc::format!("http {}", sarg), chat, orch),
-        other => serial_println!(
-            "agents> unknown '{}' — usage: /agents [list|switch <id>|kill <id>|services|start <name> [port]|search <url> [q]|install <name> [--yes] [--registry <url>]|uninstall <name>]",
-            other
-        ),
-    }
-}
-
-/// Serial flat listing (also `/agents list text` / e2e).
-fn print_agents_text() {
-    // The `*chat` marker names the **task** the chat's tool calls run as, so it
-    // must be compared against the chat context's caller task — not
-    // `active_agent_id()`, which is an *agent* id from a different numbering. The
-    // two only ever agreed by accident, and the pump task taking task 1 made
-    // agent 1 collide with it, marking the pump as the chat agent.
-    let active = CHAT_TOOL_CTX.with(|slot| slot.as_ref().map(|c| c.caller));
-    // Real per-task CPU share, sampled once so the column sums to ~100%. The
-    // status bar's `cpu_percent` is a whole-system heuristic and cannot say which
-    // task was busy; this can. Reads 0% where there is no timer to charge ticks
-    // from (Apple-HVF aarch64 stays cooperative) — an honest zero, not an error.
-    let (ticks, total) = crate::sched::cpu_ticks();
-    serial_println!("agents> id   name              state     cpu%  (agent tasks are scheduler processes)");
-    for (id, name, state) in crate::sched::list() {
-        let marker = if Some(id) == active { " *chat" } else { "" };
-        let mine = ticks.iter().find(|&&(t, _)| t == id).map(|&(_, v)| v).unwrap_or(0);
-        let pct = if total > 0 { mine.saturating_mul(100) / total } else { 0 };
-        serial_println!("agents> {:<4} {:<17} {:<9} {:>3}%{}", id, name, state, pct, marker);
-    }
-    serial_println!("agents> system agents (UI canvas vs shell) — start with /agents start <name>:");
-    let autostart = crate::agent::system::autostart_names();
-    for (name, agent_id) in crate::agent::system::list() {
-        let class = crate::agent::system::ui_class(name);
-        let kind = crate::agent::system::ui_class_label(class);
-        let hooks = crate::agent::system::command_hook_summary(name);
-        let auto = if autostart.iter().any(|n| *n == name) {
-            "  [autostart]"
-        } else {
-            ""
-        };
-        if hooks.is_empty() {
-            serial_println!(
-                "agents>   {:<12} [{kind:<9}] /agent/{}/SOUL.md{}",
-                name,
-                agent_id,
-                auto
-            );
-        } else {
-            serial_println!(
-                "agents>   {:<12} [{kind:<9}] /agent/{}/SOUL.md  [hook: {}]{}",
-                name,
-                agent_id,
-                hooks,
-                auto
-            );
-        }
-    }
-    serial_println!("agents> /agents          — Agents browser (search + kind badges)");
-    serial_println!("agents> /agents text     — this serial list");
-    serial_println!("agents> /agents switch <id> | kill <id> | start <name>");
-}
-
-/// Apply a pick from the Agents browser (`switch:N` / `ui:name` / `shell:name`).
-fn agents_apply_pick(
-    pick: &str,
-    chat: &mut Option<ChatSession>,
-    orch: &mut crate::agent::orchestrator::Orchestrator,
-) {
-    if let Some(id_s) = pick.strip_prefix("switch:") {
-        match id_s.parse::<u64>() {
-            Ok(id) => {
-                rebind_chat_agent(id, orch);
-                *chat = None;
-                serial_println!(
-                    "agents> chat → agent {id} (SOUL /agent/{id}/SOUL.md)"
-                );
-            }
-            Err(_) => serial_println!("agents> bad pick {pick}"),
-        }
-        return;
-    }
-    if let Some(name) = pick.strip_prefix("ui:") {
-        // Launch package UI (canvas) — same path as `/agents start <name>`.
-        // Modal is already dismissed; print progress so a slow wasm load is not
-        // mistaken for a hang (chess/paint tools.wasm + surface init).
-        serial_println!("agents> starting package UI '{name}'…");
-        #[cfg(not(test))]
-        crate::framebuffer::redraw_all();
-        run_agent_start(name, chat, orch);
-        #[cfg(not(test))]
-        {
-            // Surface may have been created; force action-pane focus + a repaint
-            // so the app is visible immediately after the agents modal.
-            crate::framebuffer::focus_set(true);
-            crate::shell::repaint_active_tab();
-        }
-        return;
-    }
-    if let Some(name) = pick.strip_prefix("shell:") {
-        if let Some(id) = crate::agent::system::list()
-            .into_iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, id)| id)
-        {
-            rebind_chat_agent(id, orch);
-            *chat = None;
-            serial_println!(
-                "agents> chat → shell agent '{name}' (id {id}); /agents switch 1 for orchestrator"
-            );
-        } else {
-            serial_println!("agents> '{name}' not installed");
-        }
-        return;
-    }
-    serial_println!("agents> unknown pick {pick}");
-}
-
-/// The available installable agent packages (Phase 2 ships built-in signed
-/// samples; the public registry lands in a later phase). Returns a freshly-minted,
-/// signed package for `name`, or `None`.
-fn built_in_package(name: &str) -> Option<crate::skills::package::SkillPackage> {
-    use crate::agent::types::{next_agent_id, next_skill_id};
-    let mut pkg = match name {
-        "report-writer" => crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id()),
-        "note-summarizer" => crate::skills::package::sample_note_summarizer(next_skill_id()),
-        // A skill-agent that declares an MCP server in its manifest — the
-        // install consent screen shows it and connects it on approval. The URL
-        // is the e2e harness gateway (inert off-test; retryable via /mcp).
-        "mcp-agent" => {
-            let mut p = crate::skills::package::sample_report_agent(next_skill_id(), next_agent_id());
-            p.manifest.name = "mcp-agent".into();
-            if let Some(a) = p.manifest.agent.as_mut() {
-                a.name = "mcp-agent".into();
-                a.mcp_servers.push(crate::agent::types::McpServerSpec {
-                    name: "harness".into(),
-                    url: "http://10.0.2.2:8100/mcp".into(),
-                    bearer: None,
-                });
-            }
-            p
-        }
-        _ => return None,
-    };
-    pkg.sign(); // sign with the registry key so verify() passes (covers mcp_servers)
-    Some(pkg)
-}
-
-/// `/agents start <name> [port]` — launch a system agent. `network`/`http`/`doc`
-/// bring up the web pipeline (Network→HTTP→Doc serving the docs site); `ssh`
-/// starts the SSH transport service. Uses port 8080 (web) / 2222 (ssh) if none
-/// is given.
-fn run_agent_start(
-    arg: &str,
-    chat: &mut Option<ChatSession>,
-    orch: &mut crate::agent::orchestrator::Orchestrator,
-) {
-    let (name, port_str) = match arg.split_once(' ') {
-        Some((n, p)) => (n.trim(), p.trim()),
-        None => (arg.trim(), ""),
-    };
-    let port = port_str.parse::<u16>().ok().filter(|p| *p != 0);
-    match name {
-        "ssh" => {
-            if let Some(p) = port {
-                crate::service::ssh::set_port(p);
-            }
-            let task = crate::service::start(&crate::service::ssh::SSH_SERVICE);
-            serial_println!("agents> started 'ssh' service (task {})", task);
-        }
-        // Package UI apps: classified from each package's manifest
-        // (`wasm.module` + Ui EXEC) via `is_package_ui_app` — not a name list.
-        // Aliases map to the installed package name before the check.
-        _ if crate::agent::system::is_package_ui_app(match name {
-            "mines" => "minesweeper",
-            "ui-chess" => "chess",
-            "sandbox" => "sandbox-lab",
-            other => other,
-        }) => {
-            let pkg = match name {
-                "mines" => "minesweeper",
-                "ui-chess" => "chess",
-                "sandbox" => "sandbox-lab",
-                other => other,
-            };
-            match crate::service::package_ui::start(pkg) {
-                Ok(sid) => {
-                    #[cfg(not(test))]
-                    crate::framebuffer::focus_set(true);
-                    // Rebind chat tools to this package agent so tool calls hit its wasm.
-                    if let Some(id) = crate::agent::system::list()
-                        .into_iter()
-                        .find(|(n, _)| *n == pkg)
-                        .map(|(_, id)| id)
-                    {
-                        rebind_chat_agent(id, orch);
-                        *chat = None;
-                    }
-                    serial_println!(
-                        "agents> started package UI '{pkg}' (surface {sid}) — action pane focused; keys go to the app (Ctrl+Tab returns to shell)"
-                    );
-                }
-                Err(e) => serial_println!("agents> {pkg} start failed: {e}"),
-            }
-        }
-        "stop-chess" | "chess-stop" | "stop-paint" | "stop-slides" | "stop-minesweeper"
-        | "stop-snake" | "stop-synth" | "stop-package" | "stop-ui" => {
-            // Named stops kill only that app; stop-package / stop-ui kill all.
-            // Other package tabs keep running in parallel.
-            let prevs: alloc::vec::Vec<u32> = match name {
-                "stop-package" | "stop-ui" => crate::service::package_ui::stop_all(),
-                "stop-chess" | "chess-stop" => crate::service::package_ui::stop_named("chess")
-                    .into_iter()
-                    .collect(),
-                "stop-paint" => crate::service::package_ui::stop_named("paint")
-                    .into_iter()
-                    .collect(),
-                "stop-slides" => crate::service::package_ui::stop_named("slides")
-                    .into_iter()
-                    .collect(),
-                "stop-minesweeper" => crate::service::package_ui::stop_named("minesweeper")
-                    .into_iter()
-                    .collect(),
-                "stop-snake" => crate::service::package_ui::stop_named("snake")
-                    .into_iter()
-                    .collect(),
-                "stop-synth" => crate::service::package_ui::stop_named("synth")
-                    .into_iter()
-                    .collect(),
-                _ => crate::service::package_ui::stop().into_iter().collect(),
-            };
-            #[cfg(not(test))]
-            for id in prevs {
-                crate::framebuffer::close_tab_mode(crate::framebuffer::RightMode::Surface(id));
-            }
-            serial_println!("agents> package UI stopped");
-        }
-        "notes" | "download" | "todo" | "browser" | "librarian" | "researcher" | "ops"
-        | "onboard" | "store" | "mail" | "disk" | "pass" | "recorder" | "reader" | "media"
-        | "pdf" => {
-            // Chat-only (or SOUL+tools) package agents — no package_ui surface.
-            if let Some(id) = crate::agent::system::list()
-                .into_iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, id)| id)
-            {
-                rebind_chat_agent(id, orch);
-                *chat = None;
-                serial_println!(
-                    "agents> chat → '{name}' agent {} (SOUL + tools); /agents switch 1 for shell",
-                    id
-                );
-            } else {
-                serial_println!("agents> '{name}' not installed");
-            }
-        }
-        _ => {
-            // Serve a content agent over the web pipeline (network + http + the
-            // generic server stage). `web`/`network`/`http` default to the docs
-            // site; any installed content agent (its SOUL + assets) can be served
-            // by name — no per-agent code.
-            let port = port.unwrap_or(8080);
-            let content = if matches!(name, "web" | "network" | "http" | "") { "doc" } else { name };
-            let home = match crate::agent::system::home_for(content) {
-                Some(h) => h,
-                None => {
-                    serial_println!(
-                        "agents> unknown agent '{}' (try: /agents list; UI apps include calc files tetris breakout console maps radio sandbox-lab …)",
-                        name
-                    );
-                    return;
-                }
-            };
-            crate::service::pipeline::start(port, &home);
-            serial_println!(
-                "agents> serving '{}' over the web pipeline network->http->server on TCP :{} (GET / to fetch)",
-                content,
-                port
-            );
-        }
-    }
-}
-
-/// `/agents search <index-url> [query]` — fetch a public registry index over
-/// HTTP(S) and list the installable agents it advertises (discovery over the
-/// network); install with `/agents install <name> --registry <index-url>`.
-fn run_agent_search(arg: &str) {
-    let (url, query) = match arg.split_once(' ') {
-        Some((u, q)) => (u.trim(), q.trim()),
-        None => (arg.trim(), ""),
-    };
-    if url.is_empty() {
-        serial_println!("usage: /agents search <index-url> [query]");
-        return;
-    }
-    match crate::skills::registry_client::search(url, query) {
-        Ok(entries) if entries.is_empty() => serial_println!("search> no matching agents in the registry"),
-        Ok(entries) => {
-            serial_println!("search> {} agent(s) in the registry:", entries.len());
-            for e in entries {
-                serial_println!("search>   {} {} — {} [publisher {}]", e.name, e.version, e.description, e.key_id);
-            }
-        }
-        Err(e) => serial_println!("search> {}", e),
-    }
-}
-
-/// `/agents install <name> [--yes] [--registry <index-url>]` — the consent
-/// install flow: (optionally confirm the name is listed in a registry index),
-/// verify the package signature, ask the human per requested capability
-/// (`modal::confirm`), then install granting only the approved subset. `--yes`
-/// approves every requested capability without prompting (scripting/e2e).
-fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
-    // Parse: first token is the name; flags may follow (--yes, --registry <url>).
-    let mut toks = arg.split_whitespace();
-    let name = toks.next().unwrap_or("").trim();
-    let mut auto_yes = false;
-    let mut registry: Option<&str> = None;
-    let rest: alloc::vec::Vec<&str> = toks.collect();
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i] {
-            "--yes" => auto_yes = true,
-            "--registry" => {
-                registry = rest.get(i + 1).copied();
-                i += 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if name.is_empty() {
-        serial_println!("usage: /agents install <name> [--yes] [--registry <index-url>]   (built-in: report-writer, note-summarizer)");
-        return;
-    }
-    // If a registry index was given, confirm the agent is advertised there
-    // (network discovery) before resolving its payload.
-    if let Some(url) = registry {
-        match crate::skills::registry_client::resolve(url, name) {
-            Ok(Some(entry)) => serial_println!(
-                "install> '{}' {} found in registry (publisher {})",
-                entry.name,
-                entry.version,
-                entry.key_id
-            ),
-            Ok(None) => {
-                serial_println!("install> '{}' is not listed in the registry index", name);
-                return;
-            }
-            Err(e) => {
-                serial_println!("install> registry lookup failed: {}", e);
-                return;
-            }
-        }
-    }
-    let pkg = match built_in_package(name) {
-        Some(p) => p,
-        None => {
-            serial_println!("install> no such package '{}' (built-in: report-writer, note-summarizer)", name);
-            return;
-        }
-    };
-    if !pkg.verify() {
-        serial_println!("install> refused: package signature/hash did not verify");
-        return;
-    }
-    let reqs = pkg.manifest.requested_capabilities.clone();
-    let lines = crate::skills::install::consent_prompt(&pkg);
-    serial_println!("install> '{}' requests {} capabilit(ies):", pkg.manifest.name, reqs.len());
-    serial_println!("install>   (its own folder /agent/{}/ is always granted; anything below is extra)", pkg.manifest.agent.as_ref().map(|a| a.id.0).unwrap_or(0));
-    let mut approved = alloc::vec::Vec::new();
-    for (line, cap) in lines.iter().zip(reqs.iter()) {
-        // Flag a filesystem grant that reaches beyond the agent's own home —
-        // "full filesystem access" is the thing a human most needs to see.
-        let broad_fs = cap.domain == crate::agent::types::CapDomain::Fs
-            && !matches!(&cap.scope, crate::agent::types::Scope::Path(p) if p.starts_with("/agent/") || p.contains("$HOME"));
-        let line = if broad_fs { alloc::format!("{} -- WARNING: FULL filesystem access, beyond its own folder", line) } else { line.clone() };
-        let ok = if auto_yes {
-            serial_println!("install>   [--yes] grant: {}", line);
-            true
-        } else {
-            let msg = alloc::format!("Grant to '{}':\n{}", pkg.manifest.name, line);
-            crate::modal::confirm("Install agent — permission", &msg)
-        };
-        if ok {
-            approved.push(cap.clone());
-        } else {
-            serial_println!("install>   denied: {}", line);
-        }
-    }
-    // MCP servers the agent declares: shown on the consent screen and, if
-    // approved, connected now so the agent's tools are live (their tools become
-    // callable as mcp__<name>__<tool>).
-    let mcp_servers = pkg.manifest.agent.as_ref().map(|a| a.mcp_servers.clone()).unwrap_or_default();
-    let mut approved_mcp = alloc::vec::Vec::new();
-    for s in &mcp_servers {
-        let line = alloc::format!("MCP server '{}' at {}", s.name, s.url);
-        let ok = if auto_yes {
-            serial_println!("install>   [--yes] connect: {}", line);
-            true
-        } else {
-            crate::modal::confirm("Install agent — MCP server", &alloc::format!("'{}' wants to connect an {}", pkg.manifest.name, line))
-        };
-        if ok {
-            approved_mcp.push(s.clone());
-        } else {
-            serial_println!("install>   declined: {}", line);
-        }
-    }
-    let source = if registry.is_some() {
-        crate::agent::types::InstallSource::Registry { name: name.into(), version: pkg.manifest.version.clone() }
-    } else {
-        crate::agent::types::InstallSource::BootModule { name: name.into() }
-    };
-    match crate::skills::install::install(&pkg, &approved, "user", source, crate::arch::now_ms()) {
-        Ok(rec) => {
-            serial_println!(
-                "install> '{}' installed; granted {}/{} requested caps",
-                pkg.manifest.name,
-                rec.granted_capabilities.len(),
-                reqs.len()
-            );
-            // A freshly installed agent may have a new home/persona; drop the
-            // cached chat so the next turn can pick it up if switched to.
-            let _ = chat;
-            // Connect the approved MCP servers now (needs the network up). A
-            // failed connect is a warning, not an install failure — the grant
-            // stands and the server can be reconnected with `/mcp connect`.
-            for s in &approved_mcp {
-                match crate::mcp::connect(&s.name, &s.url, s.bearer.as_deref()) {
-                    Ok(n) => serial_println!("install>   MCP '{}' connected ({} tool(s) registered)", s.name, n),
-                    Err(e) => serial_println!("install>   MCP '{}' not reachable now: {} (retry: /mcp connect {} {})", s.name, e, s.name, s.url),
-                }
-            }
-        }
-        Err(e) => serial_println!("install> failed: {:?}", e),
-    }
-}
-
-fn run_agent_uninstall(arg: &str) {
-    let name = arg.trim();
-    // Map the installed skill by name via its L0 index entry.
-    match crate::skills::index::by_name(name) {
-        Some(meta) => {
-            crate::skills::install::uninstall(meta.id);
-            serial_println!("uninstall> '{}' removed (capabilities revoked)", name);
-        }
-        None => serial_println!("uninstall> '{}' is not installed", name),
-    }
-}
-
-/// Builtin: run the Cortex model on the reference prompt and show the prompt,
-/// the response (streamed live as it decodes -- `run_reference_inference`
-/// prints a `Chitti: response> ...` line to the console), and the throughput
-/// (prompt tokens/prefill time and decode tokens/sec). Slow under QEMU TCG,
-/// hence on demand rather than on the boot path.
-fn run_infer() {
-    use crate::cortex::refcheck;
-    serial_println!("prompt> {}", refcheck::PROMPT);
-    match crate::cortex::run_reference_inference() {
-        Some(r) => {
-            serial_println!("=> \"{}\"", r.continuation_text.trim());
-            let decode_tps = if r.decode_ms > 0 {
-                (r.n_decoded as u64 * 1000) / r.decode_ms
-            } else {
-                0
-            };
-            serial_println!(
-                "   {} prompt tok in {} ms; {} tok decoded in {} ms (~{} tok/s); matches reference={}",
-                r.n_prompt,
-                r.prefill_ms,
-                r.n_decoded,
-                r.decode_ms,
-                decode_tps,
-                match r.matched_reference {
-                    Some(true) => "true",
-                    Some(false) => "false",
-                    None => "SKIP (no fixture)",
-                }
-            );
-        }
-        None => serial_println!("=> no model module present; boot with the model bundled to use `infer`"),
-    }
-}
-
-/// Builtin: microbenchmark the hottest tensor kernel (`matvec_q8_0`) in
-/// isolation and report throughput in MMAC/s. Meaningful under native
-/// execution (aarch64 on HVF); under x86 TCG it just measures the emulator.
-/// Builtin: `/bench [synapse]`. Bare `/bench` is the matvec/SDOT gauge; `/bench
-/// synapse` prices the determinism boundary itself (see `synapse::bench`) — the
-/// authorization decision in ns/call against a per-token cost from `/perf`.
-/// `/bench heap` — grow a Vec the way the KV cache does, and verify every byte.
-///
-/// `Cache::attn_k[l]` is a `Vec<f32>` extended once per prefill chunk, reaching
-/// ~100 MiB on a 1.5k-token context with a 4B. That is the one thing that scales
-/// with context *and* differs between the kernel (first-fit linked-list heap)
-/// and the host harness (system malloc) — and it fits the symptom: a 5-token
-/// `/infer` is exact, a 1546-token chat is garbage, while identical code at the
-/// same context on the host is correct. This reproduces that growth pattern with
-/// a self-describing pattern, so a realloc that loses or aliases data is caught
-/// directly instead of being inferred from bad logits.
-fn run_bench_heap() {
-    use alloc::vec::Vec;
-    const STEP: usize = 16 * 1024; // f32s per extend, ~ one prefill chunk of KV
-    const TOTAL: usize = 40 * 1024 * 1024; // f32 count -> ~160 MiB
-    let (used0, free0) = crate::mm::heap::alloc_stats();
-    let mut v: Vec<f32> = Vec::new();
-    let mut chunk = alloc::vec![0.0f32; STEP];
-    let mut n = 0usize;
-    while n < TOTAL {
-        for (i, c) in chunk.iter_mut().enumerate() {
-            // Encodes its own absolute index; indices stay under 2^24 so this
-            // is lossless in f32 and any mix-up is visible.
-            *c = (n + i) as f32;
-        }
-        v.extend_from_slice(&chunk);
-        n += STEP;
-    }
-    let mut bad = 0usize;
-    let mut first = usize::MAX;
-    for (i, &x) in v.iter().enumerate() {
-        if x != i as f32 {
-            if bad == 0 {
-                first = i;
-            }
-            bad += 1;
-        }
-    }
-    let (used1, free1) = crate::mm::heap::alloc_stats();
-    if bad == 0 {
-        serial_println!("bench> heap grow-and-verify: {} MiB OK ({} elements intact)", (v.len() * 4) >> 20, v.len());
-    } else {
-        serial_println!(
-            "bench> heap grow-and-verify: {} MiB CORRUPT -- {bad} bad element(s), first at {first} (got {}, want {})",
-            (v.len() * 4) >> 20, v[first], first as f32
-        );
-    }
-    serial_println!("bench>   heap allocs {used0} -> {used1}, free-list steps {free0} -> {free1}");
-}
-
-/// `/audit [verify|export <path>]` — read out the Synapse audit log.
-///
-/// The log is the record of every capability invocation, denials included, and
-/// until now it could only be counted, never read or checked from the shell. A
-/// verifier nothing can call is a property claimed rather than held.
-///
-/// `export` writes through the store's batch API on purpose: the durable ext4
-/// backend rewrites every file on sync, so a write per entry would be quadratic
-/// in the log's own length. On-demand export is the shape that costs nothing per
-/// invocation.
-fn run_audit(arg: &str) {
-    let mut it = arg.trim().splitn(2, char::is_whitespace);
-    let sub = it.next().unwrap_or("").trim();
-    let rest = it.next().unwrap_or("").trim();
-    match sub {
-        "" | "status" => {
-            let n = crate::synapse::audit::len();
-            match crate::synapse::audit::verify() {
-                Ok(_) => serial_println!(
-                    "audit> {n} entries (cap {}), chain intact, head {:#018x}",
-                    crate::synapse::audit::MAX_ENTRIES,
-                    crate::synapse::audit::head()
-                ),
-                Err(seq) => serial_println!("audit> {n} entries, CHAIN BROKEN at #{seq}"),
-            }
-            if let Some(ph) = crate::synapse::audit::load_persisted_head() {
-                let match_ = if ph == crate::synapse::audit::head() {
-                    "matches live head"
-                } else {
-                    "differs from live head (export if you need the body)"
-                };
-                serial_println!("audit> persisted head {:#018x} ({match_})", ph);
-            } else {
-                serial_println!("audit> no persisted head yet (written every {} records + export)", 256);
-            }
-            serial_println!("audit> keyed session chain is tamper-evident, not TPM-attested:");
-            serial_println!("audit>   a kernel that can write the log can recompute it. Quote the head off-box.");
-        }
-        "verify" => match crate::synapse::audit::verify() {
-            Ok(n) => serial_println!("audit> ok: {n} entries, chain intact, head {:#018x}", crate::synapse::audit::head()),
-            Err(seq) => serial_println!("audit> BROKEN: entry #{seq} does not follow the one before it"),
-        },
-        "persist" => {
-            crate::synapse::audit::persist_head();
-            serial_println!(
-                "audit> wrote head {:#018x} to {}",
-                crate::synapse::audit::head(),
-                crate::synapse::audit::HEAD_PATH
-            );
-        }
-        "export" => {
-            let path = if rest.is_empty() { "/audit.log" } else { rest };
-            let text = crate::synapse::audit::export();
-            let bytes = text.len();
-            crate::synapse::fs::begin_batch();
-            crate::synapse::fs::write(path, text.as_bytes());
-            crate::synapse::fs::end_batch();
-            crate::synapse::audit::persist_head();
-            serial_println!("audit> wrote {bytes} bytes ({} entries) to {path}", crate::synapse::audit::len());
-            serial_println!("audit> head {:#018x} — record it off-box for the export to prove anything", crate::synapse::audit::head());
-        }
-        other => serial_println!("audit> unknown subcommand '{other}' (try: status, verify, persist, export [path])"),
-    }
-}
-
-fn run_bench(arg: &str) {
-    if arg.trim() == "synapse" {
-        crate::synapse::bench::run();
-        return;
-    }
-    if arg.trim() == "heap" {
-        run_bench_heap();
-        return;
-    }
-    #[cfg(target_arch = "aarch64")]
-    serial_println!("bench> Q4_0 SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_0_sdot());
-    #[cfg(target_arch = "aarch64")]
-    serial_println!("bench> Q4_K SDOT vs exact rel_rms_err = {}", crate::cortex::check_q4_k_sdot());
-    // The batched i8mm GEMM is what every prefill runs and had no in-kernel
-    // check; its unit tests are aarch64-gated and `cargo xtask test` is x86.
-    #[cfg(target_arch = "aarch64")]
-    serial_println!("bench> Q4_0 i8mm GEMM vs matvec rel_rms_err = {}", crate::cortex::check_q4_0_i8mm());
-    let r = crate::cortex::bench_matvec();
-    // MMAC/s = macs / (ms * 1000); guard against a zero interval.
-    let mmacs = if r.ms > 0 { r.macs / (r.ms * 1000) } else { 0 };
-    serial_println!(
-        "bench> matvec_q8_0 (f32 act) {}x{} x{} iters: {} MMAC in {} ms => {} MMAC/s ({}.{} GMAC/s)",
-        r.rows,
-        r.cols,
-        r.iters,
-        r.macs / 1_000_000,
-        r.ms,
-        mmacs,
-        mmacs / 1000,
-        (mmacs % 1000) / 100,
-    );
-    if let Some(sms) = r.sdot_ms {
-        let smmacs = if sms > 0 { r.macs / (sms * 1000) } else { 0 };
-        serial_println!(
-            "bench> matvec_q8_0 (int8 SDOT) same work: {} ms => {} MMAC/s ({}.{} GMAC/s), {}.{}x vs f32; rel_rms_err={}",
-            sms,
-            smmacs,
-            smmacs / 1000,
-            (smmacs % 1000) / 100,
-            if sms > 0 { r.ms / sms } else { 0 },
-            if sms > 0 { (r.ms * 10 / sms) % 10 } else { 0 },
-            r.sdot_rel_rms,
-        );
-    }
-}
-
-/// Builtin: end-to-end inference throughput benchmark (prefill `pp` + decode
-/// `tg`), directly comparable to `llama-bench`. A regression gauge to run after
-/// any change; `infer` remains the correctness (reference-parity) check.
-/// `/perf [n_prompt [n_decode]]` — the pp/tg gauge. The prompt length is an
-/// argument because prefill throughput is a function of it: a 64-token prompt
-/// is one batched chunk, while a real system prompt is ~1.5k tokens, where the
-/// quadratic attention term and the per-position recurrence matter. Defaults
-/// match the historical fixed sizes.
-fn run_perf(arg: &str) {
-    let mut it = arg.split_whitespace();
-    let n_prompt = it.next().and_then(|s| s.parse().ok()).unwrap_or(64usize).clamp(1, 32768);
-    let n_decode = it.next().and_then(|s| s.parse().ok()).unwrap_or(32usize).clamp(1, 4096);
-    // Pump the UI/net between phases and per decoded token, and honor Ctrl+C —
-    // a 27B bench is minutes of blocking wall time otherwise (standing rule).
-    let mut pump = || {
-        ui_tick();
-        crate::net::poll();
-        poll_cancel()
-    };
-    match crate::cortex::bench_inference(n_prompt, n_decode, &mut pump) {
-        Some(r) => {
-            let pp = if r.prefill_ms > 0 { (r.n_prompt as u64 * 1000) / r.prefill_ms } else { 0 };
-            let tg = if r.decode_ms > 0 { (r.n_decode as u64 * 1000) / r.decode_ms } else { 0 };
-            serial_println!(
-                "perf> prefill {} tok in {} ms => {} tok/s (pp); decode {} tok in {} ms => {} tok/s (tg)",
-                r.n_prompt,
-                r.prefill_ms,
-                pp,
-                r.n_decode,
-                r.decode_ms,
-                tg,
-            );
-            // What prefill had to work with. A slow `pp` is usually one of these
-            // three being absent rather than a slow kernel: a hypervisor that
-            // parks the fleet, an ID register that does not advertise i8mm, or a
-            // mixed-quant GGUF that cannot take the batched path at all.
-            serial_println!(
-                "perf>   compute: {} core(s), i8mm {}, window prefill {}",
-                r.cores,
-                if r.i8mm { "yes" } else { "NO (SDOT only — half the MAC/instr)" },
-                if r.batched { "yes" } else { "NO (per-token path: pp can't exceed tg)" },
-            );
-            // Batching is per tensor, so the mix is the number that matters. A
-            // `llama-quantize` file without `--pure` upcasts some tensors, and
-            // those fall back to per-position matvecs; anything well under 100%
-            // means requantizing (or a `--pure` file) would buy real prefill.
-            if r.batched {
-                serial_println!(
-                    "perf>   batched weights: {}% of projection bytes ({})",
-                    r.batch_pct,
-                    match r.batch_pct {
-                        100 => "uniform: every projection is weight-stationary",
-                        1..=99 => "mixed quant: the rest fall back to per-position matvecs",
-                        _ => "no batchable projection — only the attn/delta cores are windowed",
-                    },
-                );
-            }
-            // Where prefill went. The three kinds of work scale differently
-            // (weight-stationary matmul, quadratic attention, per-head
-            // recurrence), so the split is the difference between "the matmul
-            // is slow" and "something serial is holding the fleet".
-            let total: u64 = r.phases.iter().sum();
-            if total > 0 {
-                let pct = |x: u64| (x * 100) / total;
-                serial_println!(
-                    "perf>   prefill split: proj {}% attn {}% delta {}% elementwise {}%",
-                    pct(r.phases[0]),
-                    pct(r.phases[1]),
-                    pct(r.phases[2]),
-                    pct(r.phases[3]),
-                );
-            }
-        }
-        None => serial_println!("perf> no model present (or cancelled)"),
-    }
-}
+// (moved to shell/agents.rs)
 
 /// Read a line from the console (keyboard *or* serial) into `buf`, echoing to
 /// both the framebuffer and serial and handling backspace. Cooperatively
@@ -7441,8 +5693,8 @@ fn suggest_paint(items: &[suggest::Item], sel: usize) {
     let _ = (items, sel);
 }
 
-/// True when the buffer *might* need a slash or @file menu — cheap gate so
-/// normal prose typing does zero catalogue / FS / framebuffer popup work.
+/// True when the buffer *might* need a slash / @file / path menu — cheap gate
+/// so normal prose typing does zero catalogue / FS / framebuffer popup work.
 fn suggest_maybe_active(buf: &str, cur: usize) -> bool {
     let cur = cur.min(buf.len());
     let before = &buf[..cur];
@@ -7450,6 +5702,15 @@ fn suggest_maybe_active(buf: &str, cur: usize) -> bool {
     let t = before.trim_start();
     if t.starts_with('/') && !t.contains(' ') {
         return true;
+    }
+    // A path argument after a path-taking command (`/ls /co`, `/ls /configs/`).
+    if let Some(rest) = t.strip_prefix('/') {
+        if let Some(cmd) = rest.split_whitespace().next() {
+            let after_cmd = rest.as_bytes().get(cmd.len()).map(|&b| b == b' ' || b == b'\t');
+            if suggest::PATH_COMMANDS.contains(&cmd) && after_cmd == Some(true) {
+                return true;
+            }
+        }
     }
     // @mention token.
     if let Some(i) = before.rfind('@') {
@@ -7493,12 +5754,21 @@ fn suggest_refresh(
         }
         return;
     };
-    let paths = if ctx.kind == suggest::Kind::File {
-        crate::synapse::fs::list()
-    } else {
-        alloc::vec::Vec::new()
+    // Path completion lists the *parent* directory of the typed prefix (one
+    // readdir, store or mount — matching what `/ls` shows); @file mentions
+    // list the flat store. Everything else needs neither.
+    let (store_paths, dir_entries) = match ctx.kind {
+        suggest::Kind::File => (crate::synapse::fs::list(), alloc::vec::Vec::new()),
+        suggest::Kind::Path => {
+            let (parent, _) = suggest::path_parts(&ctx.prefix);
+            (
+                alloc::vec::Vec::new(),
+                crate::fs::vfs::readdir(&parent).unwrap_or_default(),
+            )
+        }
+        _ => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
     };
-    let next = suggest::items_for(&ctx, &paths);
+    let next = suggest::items_for(&ctx, &store_paths, &dir_entries);
     if next.is_empty() {
         if !items.is_empty() {
             items.clear();
@@ -7542,6 +5812,22 @@ fn suggest_would_complete(buf: &str, cur: usize, sel: usize, items: &[suggest::I
     let Some(ctx) = suggest::context(buf, cur) else {
         return false;
     };
+    // A *complete* path argument submits on Enter rather than completing or
+    // drilling: `/ls /tmp_e2e` or `/ls /tmp_e2e/sub/` should run the command,
+    // not become `/ls /tmp_e2e/` / `/ls /tmp_e2e/sub/notes.md` (Tab is the
+    // drill key; Enter runs the line). So submit when the token is empty,
+    // ends with `/`, or already names an entry in the menu exactly.
+    if ctx.kind == suggest::Kind::Path {
+        if ctx.prefix.is_empty() || ctx.prefix.ends_with('/') {
+            return false;
+        }
+        let norm = crate::synapse::vpath::normalize(&ctx.prefix);
+        if items.iter().any(|it| {
+            crate::synapse::vpath::normalize(it.label.trim_end_matches('/')) == norm
+        }) {
+            return false;
+        }
+    }
     let start = ctx.token_start.min(cur);
     let mut probe = alloc::string::String::from(buf);
     suggest::apply(&mut probe, cur, start, &item);
@@ -7985,6 +6271,116 @@ fn take_agents_hotkey_pick() -> Option<String> {
     PENDING_AGENTS_PICK.with(|p| p.take())
 }
 
+/// Newest history entry below `start` whose text contains `needle`.
+fn history_find(needle: &str, start: usize) -> Option<usize> {
+    for i in (0..start).rev() {
+        let hit = HISTORY.with(|h| h.get(i).is_some_and(|e| e.contains(needle)));
+        if hit {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Ctrl+R reverse search over command history (bash-style): type a fragment
+/// and the newest matching command is previewed in the composer line, Ctrl+R
+/// steps to the next older match, Enter recalls the previewed command, and
+/// Esc / Ctrl+G / Ctrl+C cancels (the original line is left untouched).
+/// Returns `true` when a command was recalled into `buf` (cursor at the end).
+fn history_reverse_search(buf: &mut String, cur: &mut usize) -> bool {
+    use crate::console;
+    let saved = buf.clone();
+    let saved_cur = *cur;
+    let mut query = String::new();
+    let mut match_idx: Option<usize> = None;
+    // Only redraw the status when the displayed text changes, not per keystroke —
+    // the composer preview already echoes the match, so a status line for every
+    // typed char is just serial chatter.
+    let mut last_status: Option<alloc::string::String> = None;
+    // The right-hand composer hint we may temporarily overwrite; restored on
+    // exit. (The framebuffer module is compiled out of the test build.)
+    let prev_hint = {
+        #[cfg(not(test))]
+        {
+            crate::framebuffer::composer_hint_right()
+        }
+        #[cfg(test)]
+        {
+            alloc::string::String::new()
+        }
+    };
+    loop {
+        // Preview the current match in the composer line.
+        if let Some(i) = match_idx {
+            let line = HISTORY.with(|h| h[i].clone());
+            replace_line(buf, cur, &line);
+        }
+        let shown = match_idx.and_then(|i| HISTORY.with(|h| h.get(i).cloned()));
+        // Search status: composer hint bar on the framebuffer (the fb console
+        // is owned by the composer while read_line is live, so plain output
+        // would be swallowed), plus a serial line for the headless path — but
+        // only when the query or the matched line actually changed.
+        let status = alloc::format!(
+            "(reverse-i-search)`{query}`: {}",
+            shown.as_deref().unwrap_or("")
+        );
+        if last_status.as_deref() != Some(status.as_str()) {
+            last_status = Some(status.clone());
+            #[cfg(not(test))]
+            crate::framebuffer::composer_set_hint_right(&status);
+            crate::serial_println!("{status}");
+        }
+        match console::read_byte() {
+            None => {
+                // No input yet: block like the main line editor does, yielding
+                // to the cooperative scheduler so the net pump / msgchan still
+                // run — a busy-spin here starves them and input stalls.
+                if !crate::sched::block_on(crate::sched::Wait::Console) {
+                    crate::sched::yield_now();
+                }
+            }
+            Some(b'\r') | Some(b'\n') => {
+                // Enter recalls the current match (no match → cancel).
+                if match_idx.is_none() {
+                    replace_line(buf, cur, &saved);
+                    *cur = saved_cur.min(buf.len());
+                }
+                let ok = match_idx.is_some();
+                #[cfg(not(test))]
+                crate::framebuffer::composer_set_hint_right(&prev_hint);
+                return ok;
+            }
+            Some(0x1b) | Some(0x07) | Some(0x03) => {
+                // Esc / Ctrl+G / Ctrl+C: cancel, restore the draft.
+                replace_line(buf, cur, &saved);
+                *cur = saved_cur.min(buf.len());
+                #[cfg(not(test))]
+                crate::framebuffer::composer_set_hint_right(&prev_hint);
+                return false;
+            }
+            Some(0x12) => {
+                // Ctrl+R: next (older) match; from none, start at the newest.
+                match_idx = match match_idx {
+                    Some(i) if i > 0 => history_find(&query, i),
+                    Some(_) => None,
+                    None => history_find(&query, HISTORY.with(|h| h.len())),
+                };
+            }
+            Some(0x08) | Some(0x7f) => {
+                // Backspace: shrink the query.
+                query.pop();
+                match_idx = history_find(&query, HISTORY.with(|h| h.len()));
+            }
+            Some(c @ 0x20..=0x7e) => {
+                // Type: extend the query, jump to the newest match.
+                query.push(c as char);
+                match_idx = history_find(&query, HISTORY.with(|h| h.len()));
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 fn read_line(buf: &mut String) -> ReadOutcome {
     use crate::console;
     // History navigation state: index into HISTORY while browsing, plus the
@@ -8038,7 +6434,12 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 // but only when that would actually complete something. A
                 // fully-typed command name keeps its own entry highlighted, and
                 // "accepting" it there just ate the keystroke.
-                if !sug_items.is_empty() && suggest_would_complete(buf, cur, sug_sel, &sug_items) {
+                //
+                // While browsing history (↑/↓), Enter must **run** the recalled
+                // command, never complete it — a recalled `/ls /configs/core`
+                // would otherwise drill into the suggestion menu instead of
+                // executing.
+                if hist_idx.is_none() && !sug_items.is_empty() && suggest_would_complete(buf, cur, sug_sel, &sug_items) {
                     let accepted = suggest_accept(
                         buf,
                         &mut cur,
@@ -8188,29 +6589,12 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                     }
                 }
                 let action = fb_focus_is_action();
-                // Suggestion menu owns ↑/↓ when open (before history / scroll).
-                if !sug_items.is_empty() && !action {
-                    match fin {
-                        Some(b'A') => {
-                            // Up in menu (wrap).
-                            let n = sug_items.len();
-                            sug_sel = if sug_sel == 0 {
-                                n - 1
-                            } else {
-                                sug_sel.saturating_sub(steps.min(sug_sel))
-                            };
-                            suggest_paint(&sug_items, sug_sel);
-                            continue;
-                        }
-                        Some(b'B') => {
-                            let n = sug_items.len();
-                            sug_sel = (sug_sel + steps) % n;
-                            suggest_paint(&sug_items, sug_sel);
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
+                // ↑/↓ are **history** (readline muscle memory) — the suggestion
+                // menu no longer captures them. To pick a non-first suggestion,
+                // use Ctrl+P / Ctrl+N (readline prev/next in a list); Tab and
+                // Enter still accept the highlighted one. This split is what
+                // makes up-arrow recall work even while a completion popup is
+                // open (which is most of the time after typing `/` or a path).
                 match fin {
                     Some(b'A') if action => fb_scroll_view(true, steps as i64),
                     Some(b'B') if action => fb_scroll_view(true, -(steps as i64)),
@@ -8399,6 +6783,29 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 // Opening `/` or `@` (or filtering further) refreshes the menu.
                 suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
             }
+            // Ctrl+P / Ctrl+N: move the suggestion-menu selection. ↑/↓ are
+            // history now, so this is the readline-style "other way to move in
+            // a list" — how you pick a non-first suggestion (Tab and Enter
+            // accept the highlighted one).
+            Some(c @ (0x10 | 0x0e)) => {
+                if !sug_items.is_empty() && !fb_focus_is_action() {
+                    let n = sug_items.len();
+                    sug_sel = if c == 0x10 {
+                        if sug_sel == 0 { n - 1 } else { sug_sel - 1 } // Ctrl+P: prev (wrap)
+                    } else {
+                        (sug_sel + 1) % n // Ctrl+N: next (wrap)
+                    };
+                    suggest_paint(&sug_items, sug_sel);
+                }
+            }
+            // Ctrl+R: reverse-search command history (bash-style). Recalls the
+            // matched command into the composer; Esc/Ctrl+G/Ctrl+C cancels.
+            Some(0x12) => {
+                if history_reverse_search(buf, &mut cur) {
+                    hist_idx = None;
+                    suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
+                }
+            }
             Some(_) => {} // ignore other control bytes
             None => {
                 // Wake the main loop so it can run the agent on queued DMs
@@ -8528,6 +6935,16 @@ fn ui_tick() {
                         crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Arrow);
                     }
                 }
+            }
+        }
+        // Scroll-wheel over the volume chip adjusts level without opening the menu
+        // (macOS menu-bar style). Other chips ignore the wheel.
+        if t.wheel != 0 {
+            if let Some(crate::framebuffer::StatusChip::Volume) =
+                crate::framebuffer::status_chip_hit(t.x, t.y)
+            {
+                crate::sound::volume_adjust(t.wheel * 5);
+                update_status();
             }
         }
         if t.pressed {
@@ -9182,727 +7599,7 @@ fn update_composer_hint(remote_on: bool, remote_cfg: Option<&remote::RemoteConfi
     let s = alloc::format!("{backend} · {mode}");
     crate::framebuffer::composer_set_hint_right(&s);
 }
-#[cfg(test)]
-fn update_composer_hint(_remote_on: bool, _remote_cfg: Option<&remote::RemoteConfig>) {}
-
-/// `/suspend` — suspend the machine, or report why it cannot.
-///
-/// `/suspend plan` is read-only and enumerates every precondition, which is the useful
-/// form on a machine that will not suspend: a laptop with no `\_S3` package, ACPI mode
-/// still owned by firmware, or no FACS to publish a resume address in each fail for a
-/// different reason and need a different fix.
-///
-/// The transition itself confirms first. A suspend that does not resume loses
-/// everything unsaved and can only be escaped by holding the power button, so this is
-/// exactly the class of action the permission modal exists for.
-/// `/power [status|mode …]` — idle counters + energy policy.
-fn run_power(arg: &str) {
-    let a = arg.trim();
-    if a.is_empty() || a == "status" || a == "info" {
-        run_power_status();
-        return;
-    }
-    let mut parts = a.split_whitespace();
-    let cmd = parts.next().unwrap_or("");
-    match cmd {
-        "mode" => {
-            let Some(name) = parts.next() else {
-                serial_println!(
-                    "power> mode is {} — usage: /power mode performance|powersave|auto",
-                    crate::power::cpu::mode().as_str()
-                );
-                return;
-            };
-            let Some(m) = crate::power::cpu::Mode::parse(name) else {
-                serial_println!("power> unknown mode '{name}' (performance|powersave|auto)");
-                return;
-            };
-            match crate::power::cpu::set_mode(m) {
-                Ok(()) => {
-                    serial_println!(
-                        "power> mode {} (effective {})",
-                        m.as_str(),
-                        crate::power::cpu::last_effective()
-                            .map(|e| e.as_str())
-                            .unwrap_or("?")
-                    );
-                }
-                Err(why) => {
-                    // Policy is still recorded; hardware may not support it.
-                    serial_println!(
-                        "power> mode {} recorded — {why}",
-                        m.as_str()
-                    );
-                }
-            }
-        }
-        _ => serial_println!("power> usage: /power [status|mode <performance|powersave|auto>]"),
-    }
-}
-
-/// `/bluetooth` — HCI transport, scan, PIN pair, HID host.
-fn run_bluetooth(arg: &str) {
-    let a = arg.trim();
-    if a.is_empty() || a == "status" || a == "info" {
-        serial_println!("bluetooth> host + HCI USB:");
-        for line in crate::drivers::bluetooth::status_lines() {
-            serial_println!("  {line}");
-        }
-        serial_println!(
-            "  cmds: status|reset|scan [n]|pair <AA:BB:…>|hid|bonds|disconnect"
-        );
-        return;
-    }
-    let mut parts = a.split_whitespace();
-    let cmd = parts.next().unwrap_or("");
-    match cmd {
-        "reset" | "up" => match crate::drivers::bluetooth::host::reset_and_info() {
-            Ok(s) => serial_println!("bluetooth> {s}"),
-            Err(e) => serial_println!("bluetooth> {e}"),
-        },
-        "scan" => {
-            let slots: u8 = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5);
-            serial_println!("bluetooth> inquiry ({slots}×1.28s)…");
-            match crate::drivers::bluetooth::host::scan(slots) {
-                Ok(list) if list.is_empty() => {
-                    serial_println!("bluetooth> no devices (dongle powered? transport up?)")
-                }
-                Ok(list) => {
-                    for (i, e) in list.iter().enumerate() {
-                        let major = crate::drivers::bluetooth::hci::cod_major(e.class_of_device);
-                        serial_println!(
-                            "  [{i}] {}  CoD={:#x} major={major}",
-                            crate::drivers::bluetooth::hci::format_bd_addr(&e.bd_addr),
-                            e.class_of_device
-                        );
-                    }
-                }
-                Err(e) => serial_println!("bluetooth> scan: {e}"),
-            }
-        }
-        "pair" => {
-            let Some(addr) = parts.next() else {
-                serial_println!("bluetooth> usage: /bluetooth pair <AA:BB:CC:DD:EE:FF>");
-                return;
-            };
-            let pin = if let Some(p) = parts.next() {
-                p.to_string()
-            } else {
-                let p = crate::modal::input(
-                    "Bluetooth PIN",
-                    &alloc::format!("PIN for {addr} (default 0000 if empty)"),
-                    true,
-                );
-                if p.is_empty() {
-                    "0000".into()
-                } else {
-                    p
-                }
-            };
-            match crate::drivers::bluetooth::host::pair(addr, Some(&pin)) {
-                Ok(s) => serial_println!("bluetooth> {s}"),
-                Err(e) => serial_println!("bluetooth> pair: {e}"),
-            }
-        }
-        "hid" => match crate::drivers::bluetooth::host::open_hid() {
-            Ok(s) => serial_println!("bluetooth> {s}"),
-            Err(e) => serial_println!("bluetooth> hid: {e}"),
-        },
-        "bonds" => {
-            let bonds = crate::drivers::bluetooth::bond::load();
-            if bonds.is_empty() {
-                serial_println!("bluetooth> no bonds stored");
-            } else {
-                for b in bonds {
-                    serial_println!("  {}  {}", b.addr, b.name);
-                }
-            }
-        }
-        "disconnect" | "down" => match crate::drivers::bluetooth::host::disconnect() {
-            Ok(()) => serial_println!("bluetooth> disconnected"),
-            Err(e) => serial_println!("bluetooth> {e}"),
-        },
-        _ => serial_println!(
-            "bluetooth> usage: /bluetooth [status|reset|scan|pair <addr>|hid|bonds|disconnect]"
-        ),
-    }
-}
-
-/// `/camera [status|grab]` — UVC still capture to `/downloads/`.
-fn run_camera(arg: &str) {
-    let a = arg.trim();
-    if a.is_empty() || a == "status" || a == "info" {
-        serial_println!("camera> UVC:");
-        for line in crate::drivers::uvc::status_lines() {
-            serial_println!("  {line}");
-        }
-        serial_println!("  cmds: status | grab [path]");
-        return;
-    }
-    let mut parts = a.split_whitespace();
-    match parts.next().unwrap_or("") {
-        "grab" | "capture" | "snap" => {
-            let dest = parts.next().map(|p| {
-                if p.starts_with('/') {
-                    p.to_string()
-                } else {
-                    alloc::format!("/downloads/{p}")
-                }
-            });
-            camera_grab(dest.as_deref());
-        }
-        _ => serial_println!("camera> usage: /camera [status|grab [path]]"),
-    }
-}
-
-fn camera_grab(dest: Option<&str>) {
-    if !crate::arch::uvc_ready() {
-        serial_println!("camera> no stream transport — plug a UVC webcam and reboot/re-enum");
-        return;
-    }
-    serial_println!("camera> grabbing still (up to 8 s)…");
-    let Some((plan, frame)) = crate::arch::uvc_grab(8_000) else {
-        serial_println!("camera> grab failed (timeout or empty frame)");
-        return;
-    };
-    let ext = match plan.format {
-        crate::drivers::uvc::PixelFormat::Mjpeg => "jpg",
-        crate::drivers::uvc::PixelFormat::Yuy2 => "yuy2",
-        crate::drivers::uvc::PixelFormat::UncompressedOther => "bin",
-    };
-    let path = dest
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            let t = crate::arch::now_ms();
-            alloc::format!("/downloads/camera-{t}.{ext}")
-        });
-    // MJPEG should start with JPEG SOI; still save whatever we assembled.
-    if matches!(plan.format, crate::drivers::uvc::PixelFormat::Mjpeg)
-        && (frame.len() < 2 || frame[0] != 0xff || frame[1] != 0xd8)
-    {
-        serial_println!(
-            "camera> warning: frame is not a JPEG SOI ({} bytes) — saving anyway",
-            frame.len()
-        );
-    }
-    crate::synapse::fs::write(&path, &frame);
-    crate::drivers::uvc::mark_grab_ok();
-    serial_println!(
-        "camera> saved {} ({} bytes, {} {}x{}) — /open {}",
-        path,
-        frame.len(),
-        plan.format.name(),
-        plan.width,
-        plan.height,
-        path
-    );
-    // Best-effort: if JPEG, try decoding to prove the frame is real.
-    if matches!(plan.format, crate::drivers::uvc::PixelFormat::Mjpeg) {
-        match crate::image::decode(&frame) {
-            Ok(img) => serial_println!("camera> jpeg decode ok {}x{}", img.w, img.h),
-            Err(e) => serial_println!("camera> jpeg decode: {e}"),
-        }
-    }
-}
-
-/// `/touch [status]` — digitizer path shares HID pointer decode (Tip Switch → click).
-fn run_touch(arg: &str) {
-    let a = arg.trim();
-    if !(a.is_empty() || a == "status" || a == "info") {
-        serial_println!("touch> usage: /touch [status]");
-        return;
-    }
-    serial_println!("touch> HID digitizer:");
-    serial_println!(
-        "  path: same as USB/I2C pointer — Tip Switch (0x0D/0x42) → left click,"
-    );
-    serial_println!("         absolute X/Y scaled to the framebuffer via mouse::set_abs");
-    #[cfg(target_arch = "x86_64")]
-    let has_usb = crate::arch::x86_64::xhci::has_mouse();
-    #[cfg(target_arch = "aarch64")]
-    let has_usb = crate::arch::aarch64::xhci::has_mouse();
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let has_usb = false;
-    serial_println!(
-        "  usb pointer: {}",
-        if has_usb {
-            "enumerated (touch panels use this path when their report layout parses)"
-        } else {
-            "none enumerated yet"
-        }
-    );
-    serial_println!("  note: multi-touch / gestures not implemented; first contact only");
-}
-
-fn run_power_status() {
-    // Keep auto mode tracking idle/battery without requiring a human to re-type.
-    crate::power::cpu::tick();
-    let halts = crate::power::idle::halt_count();
-    let idle_ms = crate::power::idle::idle_ms();
-    let up = crate::arch::now_ms();
-    let pct = if up > 0 {
-        (idle_ms.saturating_mul(100) / up).min(100)
-    } else {
-        0
-    };
-    serial_println!("power> CPU idle (hlt/wfi):");
-    serial_println!("  halts     {halts}");
-    serial_println!(
-        "  skipped   {} (no timer IRQ — cooperative poll, not WFI)",
-        crate::power::idle::skipped_count()
-    );
-    serial_println!(
-        "  halt ok   {}",
-        if crate::arch::idle_halt_ok() {
-            "yes (timer IRQ live)"
-        } else {
-            "no (cooperative — WFI would freeze)"
-        }
-    );
-    serial_println!("  idle time ~{idle_ms} ms ({pct}% of uptime {up} ms)");
-    serial_println!("power> energy policy:");
-    for line in crate::power::cpu::status_lines() {
-        serial_println!("  {line}");
-    }
-    serial_println!("  set       /power mode performance|powersave|auto");
-    serial_println!("  suspend   /suspend plan");
-}
-
-fn run_suspend(arg: &str) {
-    let plan = crate::power::plan();
-    let a = arg.trim();
-    // `--yes` skips the modal, the same escape hatch `/agents install` has, so the e2e
-    // harness can drive a real suspend over serial. Human-typed input still confirms.
-    let assume_yes = a.split_whitespace().any(|w| w == "--yes" || w == "-y");
-    let a = a
-        .split_whitespace()
-        .filter(|w| *w != "--yes" && *w != "-y")
-        .next()
-        .unwrap_or("");
-    let planning = matches!(a, "plan" | "status" | "info" | "");
-    for line in &plan.report {
-        serial_println!("suspend> {line}");
-    }
-    match plan.kind {
-        Some(k) => serial_println!(
-            "suspend> mechanism: {} -- {}",
-            k.label(),
-            if plan.ready { "ready" } else { "NOT ready" }
-        ),
-        None => serial_println!("suspend> this machine cannot suspend"),
-    }
-    if planning {
-        serial_println!("suspend> `/suspend now` to actually suspend (`--yes` skips the prompt)");
-        return;
-    }
-    if !plan.ready {
-        serial_println!("suspend> refusing: preconditions above are not met");
-        return;
-    }
-    #[cfg(not(test))]
-    if !assume_yes
-        && !crate::modal::confirm(
-        "Suspend the machine?",
-        "The machine will sleep. If it does not resume, unsaved state is lost and \
-         the only way back is holding the power button.",
-        )
-    {
-        serial_println!("suspend> cancelled");
-        return;
-    }
-    match crate::power::suspend() {
-        Ok(()) => serial_println!("suspend> resumed"),
-        Err(e) => serial_println!("suspend> not attempted: {e}"),
-    }
-}
-
-/// `/battery` — the ACPI battery, and which step failed if there is no reading.
-///
-/// A diagnostic more than a display (the percentage lives in the status bar via
-/// `${battery}`): none of the battery path can be verified in a VM, so on a real
-/// laptop this is what says whether the namespace, the embedded controller or the
-/// `_BST` evaluation is the thing to fix. Read-only.
-fn run_battery() {
-    for line in crate::drivers::battery::diagnose() {
-        serial_println!("battery> {line}");
-    }
-}
-
-/// `/datetime` — show or set the wall clock and timezone.
-fn run_datetime(arg: &str) {
-    use crate::clock;
-    if arg.is_empty() {
-        serial_println!(
-            "datetime> {}  {}  (source={})",
-            clock::format_datetime(),
-            clock::format_tz(),
-            clock::source().as_str()
-        );
-        serial_println!("  set time: /datetime 2026-07-04 13:45[:00]");
-        serial_println!("  set zone: /datetime tz America/New_York | +5:30 | list");
-        return;
-    }
-    if let Some(tz) = arg.strip_prefix("tz") {
-        let tz = tz.trim();
-        if tz == "list" || tz == "ls" {
-            serial_println!("datetime> zones:");
-            for n in clock::tz::list_names() {
-                if let Some(d) = clock::tz::describe(n, clock::now_unix()) {
-                    serial_println!("  {d}");
-                }
-            }
-            return;
-        }
-        // IANA name first (contains '/'), then fixed offset.
-        if tz.contains('/') || clock::tz::lookup(tz).is_some() {
-            if clock::set_tz_name(tz) {
-                crate::ui_config::persist_tz_name(tz, clock::fixed_tz_offset());
-                update_status();
-                serial_println!(
-                    "datetime> timezone {}  (now {})",
-                    clock::format_tz(),
-                    clock::format_datetime()
-                );
-            } else {
-                serial_println!("datetime> unknown zone '{tz}' — try /datetime tz list");
-            }
-            return;
-        }
-        match parse_tz(tz) {
-            Some(secs) => {
-                // Keep the displayed wall time fixed when relabeling the zone.
-                clock::set_tz_keep_local(secs);
-                crate::ui_config::persist_tz(secs);
-                update_status();
-                serial_println!(
-                    "datetime> timezone {}  (now {})",
-                    clock::format_tz(),
-                    clock::format_datetime()
-                );
-            }
-            None => serial_println!("usage: /datetime tz America/New_York | +5:30 | list"),
-        }
-        return;
-    }
-    match parse_datetime(arg) {
-        Some((y, mo, d, h, mi, s)) => {
-            clock::set_local(y, mo, d, h, mi, s);
-            update_status();
-            serial_println!(
-                "datetime> set to {}  {}",
-                clock::format_datetime(),
-                clock::format_tz()
-            );
-        }
-        None => serial_println!("usage: /datetime YYYY-MM-DD HH:MM[:SS]"),
-    }
-}
-
-/// `/ntp [host|ip]` — SNTP sync (default `pool.ntp.org`). Human-only.
-fn run_ntp(arg: &str) {
-    let host = arg.trim();
-    if !crate::net::is_up() {
-        serial_println!("ntp> no network (try /network dhcp)");
-        return;
-    }
-    serial_println!(
-        "ntp> querying {} …",
-        if host.is_empty() { "pool.ntp.org" } else { host }
-    );
-    match crate::net::ntp_sync_host(host, 8_000) {
-        Ok(unix) => {
-            update_status();
-            serial_println!(
-                "ntp> ok — unix {unix}  {}  {}  (source=ntp)",
-                crate::clock::format_datetime(),
-                crate::clock::format_tz()
-            );
-        }
-        Err(e) => serial_println!("ntp> {e}"),
-    }
-}
-
-/// `/ui` — show or manage the UI config (`/configs/core/ui.json`).
-fn run_ui(arg: &str) {
-    #[cfg(feature = "server")]
-    {
-        let _ = arg;
-        serial_println!("ui> unavailable in the server build (no GUI)");
-        return;
-    }
-    #[cfg(not(feature = "server"))]
-    run_ui_inner(arg);
-}
-
-#[cfg(not(feature = "server"))]
-fn run_ui_inner(arg: &str) {
-    use crate::ui_config;
-    match arg {
-        "" | "config" | "show" => {
-            serial_println!("ui> {} (edit with /open {}, then /ui reload)", ui_config::ui_path(), ui_config::ui_path());
-            for line in ui_config::ui_json_text().lines() {
-                serial_println!("{}", line);
-            }
-        }
-        "reload" => {
-            ui_config::reload_and_apply();
-            update_status();
-            serial_println!("ui> reloaded {} and re-applied the layout", ui_config::ui_path());
-        }
-        "reset" => {
-            ui_config::reset();
-            update_status();
-            serial_println!("ui> reset to defaults and re-applied");
-        }
-        // `status_pos` is the one ui.json field with a dedicated command, since
-        // editing JSON to move a bar is a poor trade; keep them discoverable
-        // from each other.
-        "statusbar" | "bar" => run_statusbar(""),
-        _ => {
-            serial_println!("usage: /ui [config|reload|reset]   (edit {} via /open)", ui_config::ui_path());
-            serial_println!("  /statusbar <top|bottom|left|right>   move the OS status bar");
-        }
-    }
-}
-
-/// `/statusbar` — which desktop edge the OS status bar sits on.
-///
-/// Applies instantly and persists to `ui.json` (`status_pos`), so it survives a
-/// reboot and is also editable by hand via `/open`. Reversible and purely
-/// cosmetic, which is why the settings agent may set it directly.
-fn run_statusbar(arg: &str) {
-    #[cfg(any(feature = "server", test))]
-    {
-        let _ = arg;
-        serial_println!("statusbar> unavailable in the server build (no GUI)");
-    }
-    #[cfg(all(not(feature = "server"), not(test)))]
-    run_statusbar_inner(arg);
-}
-
-#[cfg(all(not(feature = "server"), not(test)))]
-fn run_statusbar_inner(arg: &str) {
-    use crate::panes_layout::StatusPos;
-    let arg = arg.trim();
-    if arg.is_empty() || arg == "status" {
-        let cur = crate::framebuffer::status_pos().unwrap_or_default();
-        serial_println!("statusbar> {} (top | bottom | left | right)", cur.as_str());
-        if cur.vertical() {
-            serial_println!(
-                "statusbar>   side bar: {} cols, fields stack top→bottom (one token per row)",
-                crate::panes_layout::STATUS_V_COLS
-            );
-        }
-        serial_println!("statusbar>   default is top; icons paint ~1.5× body text");
-        serial_println!("statusbar> usage: /statusbar <top|bottom|left|right>");
-        return;
-    }
-    // A typo must not move the bar somewhere unasked-for, so parse strictly and
-    // say what was accepted rather than silently defaulting.
-    let Some(pos) = StatusPos::parse(arg) else {
-        serial_println!("statusbar> unknown position '{}' (expected top | bottom | left | right)", arg);
-        return;
-    };
-    let now = crate::framebuffer::set_status_pos(pos);
-    let mut cfg = crate::ui_config::current();
-    cfg.status_pos = pos.as_str().to_string();
-    crate::ui_config::set_config(cfg);
-    update_status();
-    match now {
-        Some(p) => serial_println!("statusbar> moved to the {} edge", p.as_str()),
-        // No console (serial-only boot): the preference is still saved for next time.
-        None => serial_println!("statusbar> recorded {} (no framebuffer to apply it to)", pos.as_str()),
-    }
-}
-
-/// `/theme` — list / set / save / install UI themes (colours, syntax, cursor,
-/// wallpaper, opacity). A theme is a preset that populates `ui.json`; see
-/// [`crate::theme`].
-fn run_theme(arg: &str) {
-    #[cfg(feature = "server")]
-    {
-        let _ = arg;
-        serial_println!("theme> unavailable in the server build (no GUI)");
-    }
-    #[cfg(not(feature = "server"))]
-    run_theme_inner(arg);
-}
-
-#[cfg(not(feature = "server"))]
-fn run_theme_inner(arg: &str) {
-    let (sub, rest) = match arg.split_once(' ') {
-        Some((a, b)) => (a, b.trim()),
-        None => (arg, ""),
-    };
-    match sub {
-        "" | "list" => {
-            let cur = crate::ui_config::current().theme_name;
-            serial_println!("themes (bundled + installed; * = current):");
-            for n in crate::theme::list() {
-                serial_println!("  {}{}", n, if n == cur { "  *" } else { "" });
-            }
-            serial_println!("/theme set <name> · current · save <name> · install <url>");
-            serial_println!("/theme wallpaper <none|gradient:#a,#b|/path|https://url> · opacity <0-255>");
-        }
-        "current" => serial_println!("theme> current: {}", crate::ui_config::current().theme_name),
-        "wallpaper" | "bg" | "wp" => set_wallpaper_cmd(rest),
-        "opacity" => match rest.parse::<u64>() {
-            Ok(n) => {
-                let op = n.min(255);
-                let mut cfg = crate::ui_config::current();
-                cfg.opacity = op;
-                crate::ui_config::set_config(cfg);
-                serial_println!("theme> opacity {} (255 = opaque; lower = more see-through)", op);
-            }
-            Err(_) => serial_println!("usage: /theme opacity <0-255>"),
-        },
-        "set" => {
-            if rest.is_empty() {
-                serial_println!("usage: /theme set <name>");
-                return;
-            }
-            match crate::theme::apply(rest) {
-                Ok(()) => {
-                    update_status();
-                    serial_println!("theme> set: {}", rest);
-                }
-                Err(e) => serial_println!("theme> error: {}", e),
-            }
-        }
-        "save" => {
-            if rest.is_empty() {
-                serial_println!("usage: /theme save <name>");
-                return;
-            }
-            match crate::theme::save(rest) {
-                Ok(p) => serial_println!("theme> saved current appearance -> {}", p),
-                Err(e) => serial_println!("theme> error: {}", e),
-            }
-        }
-        "install" => {
-            if rest.is_empty() {
-                serial_println!("usage: /theme install <url>");
-                return;
-            }
-            match crate::theme::install(rest) {
-                Ok(n) => serial_println!("theme> installed '{}' — /theme set {}", n, n),
-                Err(e) => serial_println!("theme> error: {}", e),
-            }
-        }
-        _ => serial_println!("usage: /theme [list | set <name> | current | save <name> | install <url> | wallpaper <spec> | opacity <n>]"),
-    }
-}
-
-/// `/theme wallpaper <spec>` — set the desktop backdrop. `spec` is one of:
-/// `none` (solid theme bg), `gradient:#aabbcc,#112233` (two-stop vertical
-/// gradient), a store path to a PNG/JPEG (`/downloads/pic.png`), or an
-/// `http(s)://` URL — which is downloaded into the store, sniffed, then mapped.
-/// The image is decoded once and cover-scaled to the screen by the compositor.
-#[cfg(not(feature = "server"))]
-fn set_wallpaper_cmd(rest: &str) {
-    use alloc::string::{String, ToString};
-    if rest.is_empty() {
-        serial_println!("usage: /theme wallpaper <none | gradient:#aabbcc,#112233 | /path/img | https://url>");
-        serial_println!("  tip: request a screen-sized image (e.g. Unsplash '?w=2560') — large photos decode slowly in-kernel");
-        return;
-    }
-    let spec = if rest.eq_ignore_ascii_case("none") {
-        String::new()
-    } else if rest.starts_with("http://") || rest.starts_with("https://") {
-        serial_println!("theme> downloading wallpaper (large images decode slowly)…");
-        // Fixed store name — the decoder sniffs PNG/JPEG magic, so the
-        // extension is irrelevant; overwrite so repeated sets don't pile up.
-        let args = alloc::format!(
-            r#"{{"url":"{}","path":"wallpaper","overwrite":"true"}}"#,
-            rest
-        );
-        let r = run_download_tool(&args);
-        match r.strip_prefix("ok:path=").and_then(|s| s.split(' ').next()) {
-            Some(p) => {
-                let looks_ok = crate::synapse::fs::read(p)
-                    .map(|b| is_image_bytes(&b))
-                    .unwrap_or(false);
-                if !looks_ok {
-                    serial_println!("theme> downloaded but it isn't a PNG/JPEG image ({}); not applied", p);
-                    return;
-                }
-                serial_println!("theme> saved {}", p);
-                p.to_string()
-            }
-            None => {
-                serial_println!("theme> download failed: {}", r);
-                return;
-            }
-        }
-    } else {
-        // A store path (image) or a `gradient:` / `""` spec — pass through.
-        rest.to_string()
-    };
-    let mut cfg = crate::ui_config::current();
-    cfg.wallpaper = spec;
-    crate::ui_config::set_config(cfg);
-    let now = crate::ui_config::current().wallpaper;
-    if now.is_empty() {
-        serial_println!("theme> wallpaper cleared (solid background)");
-        return;
-    }
-    serial_println!("theme> wallpaper set: {}", now);
-    // A translucent backdrop only reads if the image is bright enough. Probe an
-    // image wallpaper's mean luma and nudge the user when it'll be near-black —
-    // otherwise "I set a wallpaper and nothing changed" looks like a bug.
-    let op = crate::ui_config::current().opacity;
-    if !now.starts_with("gradient:") {
-        if let Some(luma) = crate::synapse::fs::read(&now)
-            .and_then(|b| crate::image::decode(&b).ok())
-            .map(|img| crate::image::mean_luma(&img))
-        {
-            if luma < 40 {
-                serial_println!(
-                    "theme> note: this image is very dark (mean brightness {}/255) — blended at opacity {} \
-                     it will look near-black. Try a brighter image, or a lower opacity to let more of it through.",
-                    luma, op
-                );
-            }
-        }
-    }
-}
-
-/// Cheap magic-byte sniff so a 404/HTML error page isn't mapped as a backdrop.
-#[cfg(not(feature = "server"))]
-fn is_image_bytes(b: &[u8]) -> bool {
-    b.starts_with(&[0x89, b'P', b'N', b'G']) // PNG
-        || b.starts_with(&[0xff, 0xd8, 0xff]) // JPEG
-}
-
-/// `/ktrace` — toggle the ktrace log stream in the action (right) pane.
-fn toggle_ktrace() {
-    #[cfg(not(test))]
-    {
-        use crate::framebuffer::{self, RightMode};
-        if framebuffer::has_tab(RightMode::Ktrace) {
-            framebuffer::close_tab_mode(RightMode::Ktrace);
-            repaint_active_tab();
-            serial_println!("ktrace> tab closed");
-        } else {
-            framebuffer::open_ktrace();
-            serial_println!("ktrace> showing as an action tab (Ctrl+Tab cycles focus, /close closes it)");
-        }
-    }
-}
-
-/// `/close` (also Ctrl+W) — close the **active** action tab; the pane collapses
-/// once the last tab closes. Tears down that tab's process (stops audio,
-/// drops the editor buffer, **kills package-UI agents**).
-fn close_action() {
-    #[cfg(not(test))]
-    {
-        close_active_tab();
-        serial_println!("(closed the active tab)");
-    }
-}
+// (moved to shell/system.rs)
 
 /// Host entry for the **download** tool: HTTP(S) GET + save body to the store.
 /// Used by the download agent (and any agent with `download` in its toolset).
@@ -9991,1895 +7688,7 @@ pub(crate) fn run_download_tool(args_json: &str) -> alloc::string::String {
 }
 
 // --- Browser agent (host HTML engine) --------------------------------------
-
-// Mirror `framebuffer::BROWSER_SURFACE` (module is cfg(not(test))).
-const BROWSER_SURFACE: u32 = u32::MAX - 2;
-const BROWSER_BODY_MAX: usize = 1 << 20; // 1 MiB
-
-/// Browser layout/paint viewport width — the action pane's actual pixel width
-/// so the page is rendered 1:1 into the pane (no upscaling → crisp text).
-/// Falls back to a sane default before the pane exists.
-fn browser_vw() -> i32 {
-    #[cfg(not(test))]
-    {
-        crate::framebuffer::surface_dims_px(BROWSER_SURFACE)
-            .map(|(w, _)| w as i32)
-            .unwrap_or(960)
-            .clamp(320, 4096)
-    }
-    #[cfg(test)]
-    {
-        640
-    }
-}
-
-/// Browser viewport height — the action pane's pixel height minus the reserved
-/// HUD strip, so layout/scroll/paint all agree and present at 1:1.
-fn browser_vh() -> i32 {
-    #[cfg(not(test))]
-    {
-        let hud = crate::framebuffer::browser_hud_height() as i32;
-        crate::framebuffer::surface_dims_px(BROWSER_SURFACE)
-            .map(|(_, h)| (h as i32 - hud).max(200))
-            .unwrap_or(700)
-            .clamp(200, 4096)
-    }
-    #[cfg(test)]
-    {
-        400
-    }
-}
-
-struct BrowserSession {
-    url: alloc::string::String,
-    title: alloc::string::String,
-    html: alloc::string::String,
-    scroll_y: i32,
-    history: alloc::vec::Vec<alloc::string::String>,
-    content_height: i32,
-    /// Focused form control index (layout.controls).
-    focused: Option<usize>,
-    /// Live control values (index → value), survives re-layout for typing.
-    control_values: alloc::collections::BTreeMap<usize, alloc::string::String>,
-    control_checked: alloc::collections::BTreeMap<usize, bool>,
-    /// Fetched external `<script src>` bodies (absolute URL → source).
-    script_bodies: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
-    /// Fetched external stylesheet bodies (absolute URL → CSS, with one level
-    /// of `@import` prepended) — repaints re-merge these without refetching.
-    css_bodies: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
-    /// Decoded CSS background images (absolute URL → (pixels, w, h)).
-    bg_pixels:
-        alloc::collections::BTreeMap<alloc::string::String, (alloc::vec::Vec<u32>, usize, usize)>,
-    /// The script list actually booted into the page JS context (debugging).
-    #[allow(dead_code)]
-    resolved_scripts: alloc::vec::Vec<alloc::string::String>,
-}
-
-static BROWSER: crate::mm::Locked<Option<BrowserSession>> = crate::mm::Locked::new(None);
-
-/// Last painted layout (for hover hit-test without re-parse on every mouse move).
-static BROWSER_LAYOUT: crate::mm::Locked<Option<crate::browser::layout::Layout>> =
-    crate::mm::Locked::new(None);
-
-/// Loading progress 0..=100 for the browser chrome bar; 255 = hidden.
-static BROWSER_PROGRESS: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(255);
-
-/// True while `browser_load_method` is mid-navigation (progressive stages).
-/// Hover / tab-repaint must not re-layout the *previous* session HTML in this
-/// window — that flashed the old page whenever the mouse moved or the action
-/// pane was re-composited.
-static BROWSER_LOADING: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Last pixels we presented for the browser surface (logical RGB, no letterbox).
-/// Used to re-blit without re-layout when the action pane is repainted mid-load
-/// (tab switch, divider drag, status chrome) so the previous page can't return.
-struct BrowserPresentCache {
-    pixels: alloc::vec::Vec<u32>,
-    title: alloc::string::String,
-    url: alloc::string::String,
-    scroll_y: i32,
-    content_h: i32,
-}
-static BROWSER_PRESENT: crate::mm::Locked<Option<BrowserPresentCache>> =
-    crate::mm::Locked::new(None);
-
-/// Active drag-to-select in the browser surface (chat pane has its own `textsel`).
-/// Press anchors; drag extends; release with a real range copies via OSC 52.
-struct BrowserTextSel {
-    anchor: crate::browser::layout::TextPos,
-    head: crate::browser::layout::TextPos,
-    press_sx: i32,
-    press_sy: i32,
-    /// True once the pointer moved past a small threshold (else release = click).
-    moved: bool,
-}
-static BROWSER_SEL: crate::mm::Locked<Option<BrowserTextSel>> = crate::mm::Locked::new(None);
-/// True while LMB is down after a press that began a browser selection.
-static BROWSER_SEL_DRAG: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-fn browser_sel_range() -> Option<(crate::browser::layout::TextPos, crate::browser::layout::TextPos)> {
-    BROWSER_SEL.with(|s| s.as_ref().map(|x| (x.anchor, x.head)))
-}
-
-fn browser_sel_clear() {
-    let had = BROWSER_SEL.with(|s| s.take()).is_some();
-    BROWSER_SEL_DRAG.store(false, core::sync::atomic::Ordering::Relaxed);
-    if had && browser_loaded() && !browser_is_loading() {
-        let _ = browser_repaint();
-    }
-}
-
-/// Anchor a selection at content point under surface `(sx, sy)`.
-fn browser_sel_begin(sx: i32, sy: i32) {
-    let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
-    let content_y = sy + scroll;
-    let pos = BROWSER_LAYOUT.with(|slot| {
-        slot.as_ref()
-            .and_then(|lay| crate::browser::layout::text_pos_at(lay, sx, content_y))
-    });
-    BROWSER_SEL.with(|s| {
-        *s = pos.map(|p| BrowserTextSel {
-            anchor: p,
-            head: p,
-            press_sx: sx,
-            press_sy: sy,
-            moved: false,
-        });
-    });
-    BROWSER_SEL_DRAG.store(true, core::sync::atomic::Ordering::Relaxed);
-    // Clear a prior highlight if any (repaint only when we had a range).
-    let _ = browser_repaint();
-}
-
-/// Extend the selection head to surface `(sx, sy)`.
-fn browser_sel_drag(sx: i32, sy: i32) {
-    let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
-    let content_y = sy + scroll;
-    let pos = BROWSER_LAYOUT.with(|slot| {
-        slot.as_ref()
-            .and_then(|lay| crate::browser::layout::text_pos_at(lay, sx, content_y))
-    });
-    let Some(head) = pos else {
-        return;
-    };
-    let changed = BROWSER_SEL.with(|s| {
-        let Some(sel) = s.as_mut() else {
-            return false;
-        };
-        let dx = (sx - sel.press_sx).abs();
-        let dy = (sy - sel.press_sy).abs();
-        if dx > 3 || dy > 3 {
-            sel.moved = true;
-        }
-        if sel.head != head {
-            sel.head = head;
-            true
-        } else {
-            false
-        }
-    });
-    if changed {
-        let _ = browser_repaint();
-    }
-}
-
-/// Finish browser selection on mouse release.
-/// - Dragged range → `Some(text)` for clipboard (highlight kept).
-/// - Plain click → clear highlight, return `None` so the caller fires `browser_click`.
-fn browser_sel_end() -> Option<alloc::string::String> {
-    let (anchor, head, moved) = BROWSER_SEL.with(|s| {
-        s.as_ref()
-            .map(|x| (x.anchor, x.head, x.moved))
-            .unwrap_or((
-                crate::browser::layout::TextPos { run: 0, col: 0 },
-                crate::browser::layout::TextPos { run: 0, col: 0 },
-                false,
-            ))
-    });
-    if !moved || anchor == head {
-        BROWSER_SEL.with(|s| *s = None);
-        let _ = browser_repaint();
-        return None;
-    }
-    let text = BROWSER_LAYOUT.with(|slot| {
-        slot.as_ref()
-            .map(|lay| crate::browser::layout::selection_text(lay, anchor, head))
-            .unwrap_or_default()
-    });
-    if text.is_empty() {
-        BROWSER_SEL.with(|s| *s = None);
-        let _ = browser_repaint();
-        return None;
-    }
-    // Keep highlight visible until the next press (like chat).
-    Some(text)
-}
-
-/// Host entry for browser tools (`ToolBinding::Browser`).
-pub(crate) fn run_browser_tool(name: &str, args_json: &str) -> alloc::string::String {
-    use crate::session::todo::json_str;
-    match name {
-        "browser_open" | "browser_navigate" => {
-            let url = json_str(args_json, "url").unwrap_or_default();
-            browser_load(&url, name == "browser_navigate" || name == "browser_open")
-        }
-        "browser_back" => browser_back(),
-        "browser_scroll" => {
-            let dy = json_str(args_json, "dy")
-                .and_then(|s| s.parse::<i32>().ok())
-                .or_else(|| {
-                    json_str(args_json, "page")
-                        .and_then(|s| s.parse::<i32>().ok())
-                        .map(|p| p * (browser_vh() - 40))
-                })
-                .unwrap_or(browser_vh() / 2);
-            browser_scroll(dy)
-        }
-        "browser_click" => {
-            let x = json_str(args_json, "x")
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
-            let y = json_str(args_json, "y")
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
-            browser_click(x, y)
-        }
-        "browser_status" => browser_status(),
-        "browser_links" => browser_links(),
-        "browser_text" => {
-            let max = json_str(args_json, "max")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4000);
-            browser_text(max)
-        }
-        _ => alloc::format!("error: unknown browser tool '{name}'"),
-    }
-}
-
-fn browser_set_progress(pct: u8) {
-    BROWSER_PROGRESS.store(pct.min(100), core::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(test))]
-    {
-        crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Wait);
-    }
-}
-
-fn browser_clear_progress() {
-    BROWSER_PROGRESS.store(255, core::sync::atomic::Ordering::Relaxed);
-    BROWSER_LOADING.store(false, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(test))]
-    {
-        crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Arrow);
-    }
-}
-
-fn browser_progress_opt() -> Option<u8> {
-    let p = BROWSER_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-    if p > 100 {
-        None
-    } else {
-        Some(p)
-    }
-}
-
-fn browser_is_loading() -> bool {
-    BROWSER_LOADING.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Start a progressive navigation: mark loading, drop hover, and forget the
-/// previous page's layout so mouse-move hit-tests can't flash it back.
-fn browser_begin_load() {
-    BROWSER_LOADING.store(true, core::sync::atomic::Ordering::Relaxed);
-    let _ = crate::browser::set_hover_link(None);
-    BROWSER_LAYOUT.with(|s| *s = None);
-    // Drop the previous page's present cache so a mid-load `repaint_active_tab`
-    // can't re-blit old pixels. The next `browser_present` will refill it.
-    BROWSER_PRESENT.with(|s| *s = None);
-    // Selection indices are layout-relative — clear on navigation.
-    BROWSER_SEL.with(|s| *s = None);
-    BROWSER_SEL_DRAG.store(false, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn browser_load(url: &str, push_hist: bool) -> alloc::string::String {
-    // Lazily load the CJK fallback font (off the boot path). Safe to scan disks
-    // now — the block probe is idempotent and the FAT directory walk is bounded.
-    ensure_disk_fallback_fonts();
-    browser_load_method(url, "GET", &[], push_hist)
-}
-
-/// Mirror page-JS console lines to the serial console (capped at 50).
-fn browser_mirror_js_lines(lines: &[alloc::string::String]) {
-    for (i, line) in lines.iter().enumerate() {
-        if i >= 50 {
-            crate::serial_println!("browser> js: … {} more lines", lines.len() - 50);
-            break;
-        }
-        crate::serial_println!("browser> js: {}", line);
-    }
-}
-
-/// Drain the live page's console log (console.log + uncaught errors) and
-/// mirror it to serial — the web-devtools view of what page scripts did.
-fn browser_mirror_js_log() {
-    let lines = crate::browser::js_just::page_with_dom(|d| core::mem::take(&mut d.log))
-        .unwrap_or_default();
-    browser_mirror_js_lines(&lines);
-}
-
-/// After delivering events into page JS: follow a handler-requested
-/// navigation (`location.href = …`). Returns `Some(result)` when navigated.
-fn browser_dispatch_nav(base: &str) -> Option<alloc::string::String> {
-    let nav = crate::browser::js_just::page_with_dom(|d| d.navigate.take()).flatten()?;
-    let abs = crate::browser::url::resolve(base, &nav).unwrap_or(nav);
-    if !crate::browser::url::is_http_url(&abs) {
-        return None;
-    }
-    Some(browser_load(&abs, true))
-}
-
-/// Fetch + register `@font-face` web fonts named in `css` (URLs resolved
-/// against `base_url`). WOFF is unwrapped to SFNT ([`crate::font_woff`]) and
-/// WOFF2 is Brotli-decompressed + glyf/loca-reconstructed
-/// ([`crate::font_woff2`]). Failures log, never abort a load.
-fn browser_load_fonts(css: &str, base_url: &str) {
-    let faces = crate::browser::css::scan_font_faces(css);
-    if faces.is_empty() {
-        return;
-    }
-    let mut urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    let mut wanted: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
-        alloc::vec::Vec::new();
-    for f in &faces {
-        if f.family.is_empty() || crate::font_ttf::family_loaded(&f.family) {
-            continue;
-        }
-        if wanted.iter().any(|(fam, _)| fam == &f.family) {
-            continue; // first src per family wins
-        }
-        let abs = crate::browser::url::resolve(base_url, &f.url).unwrap_or_else(|| f.url.clone());
-        if !(abs.starts_with("http://") || abs.starts_with("https://")) {
-            continue;
-        }
-        if !urls.contains(&abs) {
-            urls.push(abs.clone());
-        }
-        wanted.push((f.family.clone(), abs));
-    }
-    if urls.is_empty() {
-        return;
-    }
-    let fetched = crate::browser::worker::fetch_subresources_cooperative(
-        &urls,
-        crate::browser::loader::Destination::Font,
-        1 << 20,
-    );
-    for (family, abs) in wanted {
-        let Some(bytes) = fetched.get(&abs) else {
-            crate::serial_println!("browser> font: '{}' not fetched ({})", family, abs);
-            continue;
-        };
-        let res = if crate::font_woff::is_woff2(bytes) {
-            // WOFF2: Brotli-decompress + reconstruct the transformed glyf/loca.
-            crate::font_woff2::woff2_to_sfnt(bytes)
-                .and_then(|sfnt| crate::font_ttf::load_family(&family, &sfnt))
-        } else if crate::font_woff::is_woff(bytes) {
-            crate::font_woff::woff_to_sfnt(bytes)
-                .and_then(|sfnt| crate::font_ttf::load_family(&family, &sfnt))
-        } else {
-            crate::font_ttf::load_family(&family, bytes)
-        };
-        match res {
-            Ok(()) => {
-                crate::serial_println!("browser> font: loaded '{}' ({} B)", family, bytes.len())
-            }
-            Err(e) => crate::serial_println!("browser> font: '{}' failed: {}", family, e),
-        }
-    }
-}
-
-/// Fetch + decode CSS `background-image: url(…)` targets named in `css`,
-/// keyed by absolute URL (resolved against `base_url`). Decodes through the
-/// same in-kernel decoders as `fill_image_slot`, kept unscaled (the painter
-/// tiles/scales per `background-size`).
-fn browser_fetch_bg_images(
-    css: &str,
-    base_url: &str,
-) -> alloc::collections::BTreeMap<alloc::string::String, (alloc::vec::Vec<u32>, usize, usize)> {
-    let mut out = alloc::collections::BTreeMap::new();
-    let mut urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    for u in crate::browser::css::scan_css_urls(css) {
-        let abs = crate::browser::url::resolve(base_url, &u).unwrap_or(u);
-        if (abs.starts_with("http://") || abs.starts_with("https://")) && !urls.contains(&abs) {
-            urls.push(abs);
-        }
-    }
-    if urls.is_empty() {
-        return out;
-    }
-    let (loaded, assets) = crate::browser::worker::fetch_images_cooperative(&urls);
-    for u in &urls {
-        let body: Option<alloc::vec::Vec<u8>> = loaded
-            .iter()
-            .find(|r| &r.url == u)
-            .map(|r| r.body.clone())
-            .or_else(|| assets.get(u).map(|(_, b)| b.to_vec()));
-        let Some(bytes) = body else { continue };
-        // SVG-aware decode (iana.org's icons are SVG); 0 hints → intrinsic size.
-        let Some(img) = crate::browser::decode_image_or_svg(&bytes, 0, 0) else {
-            crate::serial_println!("browser> bg: decode failed {}", u);
-            continue;
-        };
-        if img.w.saturating_mul(img.h) > 4_000_000 {
-            crate::serial_println!("browser> bg: too large ({}x{}) {}", img.w, img.h, u);
-            continue;
-        }
-        out.insert(u.clone(), (img.pixels, img.w, img.h));
-    }
-    out
-}
-
-/// Build the page-boot script list from parsed `<script>` tags, in document
-/// order: inline bodies verbatim, external `src` bodies from `script_bodies`
-/// (a missing fetch logs `skipped … (not fetched)` and is dropped), module
-/// scripts stripped of import/export syntax with their import graph inlined
-/// (depth ≤ 3, cycle-safe, post-order so imports run before importers), and
-/// `async` tags appended at the very end. Returns `(list, skipped_count)`.
-fn browser_script_list(
-    doc: &crate::browser::html::Document,
-    base_url: &str,
-    script_bodies: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
-) -> (alloc::vec::Vec<alloc::string::String>, usize) {
-    let mut main: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    let mut tail: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    let mut skipped = 0usize;
-    let mut visited: alloc::collections::BTreeSet<alloc::string::String> =
-        alloc::collections::BTreeSet::new();
-    for t in &doc.script_tags {
-        let (body, base) = if let Some(src) = &t.src {
-            let abs =
-                crate::browser::url::resolve(base_url, src).unwrap_or_else(|| src.clone());
-            match script_bodies.get(&abs) {
-                Some(b) => (b.clone(), abs),
-                None => {
-                    crate::serial_println!("browser> js: skipped {} (not fetched)", abs);
-                    skipped += 1;
-                    continue;
-                }
-            }
-        } else {
-            if t.body.trim().is_empty() {
-                continue;
-            }
-            (t.body.clone(), alloc::string::String::from(base_url))
-        };
-        let out = if t.async_ { &mut tail } else { &mut main };
-        if t.module {
-            visited.insert(base.clone()); // self-import cycle guard
-            let (stripped, imports) = crate::browser::css::strip_module_syntax(&body);
-            browser_module_graph(stripped, imports, &base, 3, &mut visited, out);
-        } else {
-            out.push(body);
-        }
-    }
-    main.extend(tail);
-    (main, skipped)
-}
-
-/// Post-order DFS over an ES-module import graph: fetch each import
-/// (depth-limited, cycle-safe), strip its module syntax, recurse into its
-/// own imports, then push — so imports execute before their importer.
-fn browser_module_graph(
-    stripped: alloc::string::String,
-    imports: alloc::vec::Vec<alloc::string::String>,
-    base_url: &str,
-    depth: u32,
-    visited: &mut alloc::collections::BTreeSet<alloc::string::String>,
-    out: &mut alloc::vec::Vec<alloc::string::String>,
-) {
-    for spec in imports {
-        let abs = crate::browser::url::resolve(base_url, &spec).unwrap_or(spec);
-        if !(abs.starts_with("http://") || abs.starts_with("https://"))
-            || visited.contains(&abs)
-        {
-            continue;
-        }
-        visited.insert(abs.clone());
-        if depth == 0 {
-            crate::serial_println!("browser> js: skipped {} (import depth cap)", abs);
-            continue;
-        }
-        let fetched = crate::browser::worker::fetch_subresources_cooperative(
-            core::slice::from_ref(&abs),
-            crate::browser::loader::Destination::Script,
-            512 * 1024,
-        );
-        let Some(bytes) = fetched.get(&abs) else {
-            crate::serial_println!("browser> js: skipped {} (not fetched)", abs);
-            continue;
-        };
-        let src = alloc::string::String::from_utf8_lossy(bytes).into_owned();
-        let (sub_stripped, sub_imports) = crate::browser::css::strip_module_syntax(&src);
-        browser_module_graph(sub_stripped, sub_imports, &abs, depth - 1, visited, out);
-    }
-    out.push(stripped);
-}
-
-/// Host tick hook for the `just` JS engine: pump the UI (clock/mouse/net) and
-/// report a Ctrl+C so a heavy page's scripts can't freeze the cooperatively-
-/// scheduled shell thread. Installed lazily on the first browse; the engine
-/// calls it from its hot loops (see `just_engine::runner::host`).
-fn browser_js_tick() -> bool {
-    upkeep();
-    poll_interrupt()
-}
-
-/// The `host[:port]` of an `http(s)://` URL, or `None`.
-fn http_host_of(url: &str) -> Option<alloc::string::String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
-}
-
-/// **DNS prefetch**: warm the resolver cache for the distinct *cross-origin*
-/// hosts among `hrefs` (resolved against `base`), so their subresource fetches
-/// skip the DNS round trip. The page's own host is already resolved (document
-/// fetch), so only foreign hosts (CDNs) are prefetched — a small, bounded set.
-fn browser_prefetch_dns<'a>(hrefs: impl Iterator<Item = &'a str>, base: &str) {
-    let same = http_host_of(base);
-    let mut seen: alloc::collections::BTreeSet<alloc::string::String> =
-        alloc::collections::BTreeSet::new();
-    for href in hrefs {
-        let abs = crate::browser::url::resolve(base, href).unwrap_or_else(|| href.to_string());
-        if let Some(host) = http_host_of(&abs) {
-            if Some(&host) == same.as_ref() {
-                continue; // same origin — already resolved
-            }
-            if seen.insert(host.clone()) {
-                crate::net::prefetch_dns(&host);
-                upkeep();
-                if poll_interrupt() {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn browser_load_method(
-    url: &str,
-    method: &str,
-    body: &[u8],
-    push_hist: bool,
-) -> alloc::string::String {
-    let url = url.trim();
-    if url.is_empty() {
-        return alloc::string::String::from("error: missing url");
-    }
-    if !crate::browser::url::is_http_url(url) {
-        return alloc::string::String::from("error: url must be http:// or https://");
-    }
-    // Keep the UI alive + Ctrl+C responsive while page scripts run.
-    just_engine::runner::host::set_tick_hook(Some(browser_js_tick));
-    crate::browser::worker::reset_global();
-    // New navigation: clear sessionStorage + session cookies (Web Storage model).
-    crate::browser::storage::STORAGE.with(|s| s.end_session());
-    crate::browser::storage::load_active();
-    crate::browser::events::EVENT_LOOP.with(|el| {
-        el.tasks.clear();
-        el.microtasks.clear();
-        el.queue_load();
-    });
-    browser_begin_load();
-    browser_set_progress(5);
-
-    // Progressive render (stage 1/5): paint a loading screen immediately so the
-    // browser tab opens right away instead of a blank pane while the document +
-    // subresources fetch.
-    {
-        let loading =
-            crate::browser::layout::layout_reader("Loading\u{2026}", url, browser_vw(), browser_vh());
-        browser_paint_stage(&loading, "Loading\u{2026}", url, 8);
-    }
-
-    let doc_res = if method.eq_ignore_ascii_case("POST") {
-        match crate::net::http::request(
-            "POST",
-            url,
-            &[("Content-Type", "application/x-www-form-urlencoded")],
-            body,
-            60_000,
-        ) {
-            Ok(r) => crate::browser::loader::LoadedResource {
-                url: url.to_string(),
-                status: r.status,
-                content_type: r
-                    .get("content-type")
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-                headers: r.headers,
-                body: r.body,
-                from_cache: false,
-                redirects: 0,
-                destination: crate::browser::loader::Destination::Document,
-                cors_opaque: false,
-            },
-            Err(e) => {
-                browser_clear_progress();
-                return alloc::format!("error:{e}");
-            }
-        }
-    } else {
-        match crate::browser::loader::load_document(url, false) {
-            Ok(r) => r,
-            Err(e) => {
-                browser_clear_progress();
-                return alloc::format!("error:{e}");
-            }
-        }
-    };
-    browser_set_progress(25);
-    if doc_res.status >= 400 {
-        browser_clear_progress();
-        return alloc::format!(
-            "error: HTTP {} at {} (after {} redirect(s))",
-            doc_res.status,
-            doc_res.url,
-            doc_res.redirects
-        );
-    }
-    let final_url = doc_res.url.clone();
-    let redirects = doc_res.redirects;
-    let status = doc_res.status;
-    let from_cache = doc_res.from_cache;
-    let mut body_bytes = doc_res.body;
-    if body_bytes.len() > BROWSER_BODY_MAX {
-        body_bytes.truncate(BROWSER_BODY_MAX);
-    }
-    let body_html = alloc::string::String::from_utf8_lossy(&body_bytes).into_owned();
-
-    // Progressive render (stage 2/5): DOM paint — lay out the raw HTML with
-    // inline CSS only (no external CSS, no scripts) so page structure appears
-    // fast, before the heavy script phase.
-    {
-        let empty: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String> =
-            alloc::collections::BTreeMap::new();
-        let (dom_doc, dom_lay) = crate::browser::layout_static(
-            &body_html,
-            browser_vw(),
-            browser_vh(),
-            &final_url,
-            &empty,
-        );
-        let t = if dom_doc.title.is_empty() {
-            final_url.clone()
-        } else {
-            dom_doc.title.clone()
-        };
-        browser_paint_stage(&dom_lay, &t, &final_url, 20);
-    }
-
-    // --- Subresource discovery: parse once to enumerate external scripts /
-    // stylesheets / fonts / background images (the layout parse comes later,
-    // via the session path).
-    let pre = crate::browser::html::parse(&body_html);
-    let is_http = |u: &str| u.starts_with("http://") || u.starts_with("https://");
-
-    // DNS prefetch: resolve the cross-origin hosts of this page's scripts +
-    // stylesheets up front so their fetches (below) skip the DNS round trip.
-    browser_prefetch_dns(
-        pre.script_tags
-            .iter()
-            .filter_map(|t| t.src.as_deref())
-            .chain(pre.styles_ordered.iter().filter_map(|s| match s {
-                crate::browser::html::StyleSrc::External(href) => Some(href.as_str()),
-                _ => None,
-            })),
-        &final_url,
-    );
-
-    // (a) External scripts.
-    let mut script_urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    for t in &pre.script_tags {
-        if let Some(src) = &t.src {
-            let abs =
-                crate::browser::url::resolve(&final_url, src).unwrap_or_else(|| src.clone());
-            if is_http(&abs) && !script_urls.contains(&abs) {
-                script_urls.push(abs);
-            }
-        }
-    }
-    let mut script_bodies: alloc::collections::BTreeMap<
-        alloc::string::String,
-        alloc::string::String,
-    > = alloc::collections::BTreeMap::new();
-    for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
-        &script_urls,
-        crate::browser::loader::Destination::Script,
-        512 * 1024,
-    ) {
-        script_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
-    }
-    browser_set_progress(32);
-
-    // (b) External stylesheets (document order), plus one level of @import —
-    // imports resolve against the *sheet's* URL and prepend to its body.
-    let mut css_urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    for s in &pre.styles_ordered {
-        if let crate::browser::html::StyleSrc::External(href) = s {
-            let abs =
-                crate::browser::url::resolve(&final_url, href).unwrap_or_else(|| href.clone());
-            if is_http(&abs) && !css_urls.contains(&abs) {
-                css_urls.push(abs);
-            }
-        }
-    }
-    let mut css_bodies: alloc::collections::BTreeMap<
-        alloc::string::String,
-        alloc::string::String,
-    > = alloc::collections::BTreeMap::new();
-    for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
-        &css_urls,
-        crate::browser::loader::Destination::Style,
-        256 * 1024,
-    ) {
-        css_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
-    }
-    let mut import_wants: alloc::vec::Vec<(
-        alloc::string::String,
-        alloc::vec::Vec<alloc::string::String>,
-    )> = alloc::vec::Vec::new();
-    let mut import_urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    for (sheet_url, body) in &css_bodies {
-        let imps: alloc::vec::Vec<alloc::string::String> =
-            crate::browser::css::scan_imports(body)
-                .iter()
-                .filter_map(|i| crate::browser::url::resolve(sheet_url, i))
-                .filter(|u| is_http(u))
-                .collect();
-        for u in &imps {
-            if !import_urls.contains(u) && !css_bodies.contains_key(u) {
-                import_urls.push(u.clone());
-            }
-        }
-        if !imps.is_empty() {
-            import_wants.push((sheet_url.clone(), imps));
-        }
-    }
-    if !import_urls.is_empty() {
-        let fetched_imports = crate::browser::worker::fetch_subresources_cooperative(
-            &import_urls,
-            crate::browser::loader::Destination::Style,
-            256 * 1024,
-        );
-        for (sheet_url, imps) in import_wants {
-            let mut prefix = alloc::string::String::new();
-            for u in &imps {
-                if let Some(b) = fetched_imports.get(u) {
-                    prefix.push_str(&alloc::string::String::from_utf8_lossy(b));
-                    prefix.push('\n');
-                }
-            }
-            if !prefix.is_empty() {
-                if let Some(body) = css_bodies.get_mut(&sheet_url) {
-                    prefix.push_str(body);
-                    *body = prefix;
-                }
-            }
-        }
-    }
-    browser_set_progress(40);
-
-    // (c) Web fonts + (d) CSS background images, from inline + external CSS.
-    let mut all_css = pre.stylesheets.clone();
-    for body in css_bodies.values() {
-        all_css.push('\n');
-        all_css.push_str(body);
-    }
-    browser_load_fonts(&all_css, &final_url);
-    let bg_pixels = browser_fetch_bg_images(&all_css, &final_url);
-    browser_set_progress(50);
-
-    // Progressive render (stage 3/5): CSS paint — re-lay out with the fetched
-    // external stylesheets applied (still no scripts), so the page is styled
-    // before the (potentially heavy) script phase runs.
-    {
-        let (css_doc, css_lay) = crate::browser::layout_static(
-            &body_html,
-            browser_vw(),
-            browser_vh(),
-            &final_url,
-            &css_bodies,
-        );
-        let t = if css_doc.title.is_empty() {
-            final_url.clone()
-        } else {
-            css_doc.title.clone()
-        };
-        browser_paint_stage(&css_lay, &t, &final_url, 52);
-    }
-
-    // --- Boot the persistent page JS context (scripts run ONCE per
-    // navigation; repaints re-read the DOM instead of re-running them).
-    let (exec_list, _skipped) = browser_script_list(&pre, &final_url, &script_bodies);
-    let _parsed = crate::browser::js_just::page_boot(
-        &pre,
-        &final_url,
-        browser_vw(),
-        browser_vh(),
-        &exec_list,
-    );
-    browser_mirror_js_log();
-    browser_set_progress(55);
-
-    // Script-requested navigation (location.href = …).
-    if let Some(nav) =
-        crate::browser::js_just::page_with_dom(|d| d.navigate.take()).flatten()
-    {
-        if crate::browser::url::is_http_url(&nav) && nav != final_url {
-            browser_clear_progress();
-            return browser_load(&nav, push_hist);
-        }
-        if let Some(abs) = crate::browser::url::resolve(&final_url, &nav) {
-            if abs != final_url {
-                browser_clear_progress();
-                return browser_load(&abs, push_hist);
-            }
-        }
-    }
-
-    // --- Layout via the session path: live page DOM + merged CSS + bg pixels.
-    let (doc, mut lay, js_lines) = {
-        let assets = crate::browser::SessionAssets {
-            css_external: &css_bodies,
-            bg_pixels: &bg_pixels,
-        };
-        crate::browser::layout_session(&body_html, browser_vw(), browser_vh(), &final_url, &assets)
-    };
-    browser_mirror_js_lines(&js_lines);
-
-    // Progressive render (stage 4/5): scripts paint — the live page DOM after
-    // scripts ran, before images fill in.
-    {
-        let t = if doc.title.is_empty() {
-            final_url.clone()
-        } else {
-            doc.title.clone()
-        };
-        browser_paint_stage(&lay, &t, &final_url, 90);
-    }
-
-    // Subresource images via cooperative worker pool.
-    let mut img_urls = alloc::vec::Vec::new();
-    for im in lay.images.iter() {
-        if im.src.is_empty() {
-            continue;
-        }
-        let abs =
-            crate::browser::url::resolve(&final_url, &im.src).unwrap_or_else(|| im.src.clone());
-        if abs.starts_with("http://") || abs.starts_with("https://") {
-            img_urls.push(abs);
-        }
-    }
-    let n_total = img_urls.len().max(1);
-    let (loaded_imgs, page_assets) =
-        crate::browser::worker::fetch_images_cooperative(&img_urls);
-    browser_set_progress(40 + (50 * loaded_imgs.len() / n_total) as u8);
-    let n_imgs = loaded_imgs.len();
-    let mut by_url: alloc::collections::BTreeMap<
-        alloc::string::String,
-        alloc::vec::Vec<u8>,
-    > = alloc::collections::BTreeMap::new();
-    for res in &loaded_imgs {
-        by_url.insert(res.url.clone(), res.body.clone());
-    }
-    for u in page_assets.urls() {
-        if let Some((_, body)) = page_assets.get(&u) {
-            by_url.entry(u).or_insert_with(|| body.to_vec());
-        }
-    }
-    for im in lay.images.iter_mut() {
-        if im.src.is_empty() {
-            continue;
-        }
-        let abs =
-            crate::browser::url::resolve(&final_url, &im.src).unwrap_or_else(|| im.src.clone());
-        if let Some(body) = by_url.get(&abs).or_else(|| by_url.get(&im.src)) {
-            crate::browser::fill_image_slot(im, body);
-        }
-    }
-
-    // Nested iframes / <video> first frames / canvas already has pixels.
-    let n_frames = lay.frames.len();
-    for fr in lay.frames.iter_mut() {
-        crate::shell::upkeep();
-        if crate::shell::poll_interrupt() {
-            break;
-        }
-        use crate::browser::layout::EmbedKind;
-        match fr.kind {
-            EmbedKind::Canvas => {
-                // pixels already allocated at layout; JS may redraw later
-                continue;
-            }
-            EmbedKind::Iframe | EmbedKind::Other => {
-                if !fr.srcdoc.is_empty() {
-                    crate::browser::fill_frame_slot(fr, &fr.srcdoc.clone(), &final_url);
-                    continue;
-                }
-                if fr.src.is_empty() {
-                    continue;
-                }
-                let abs = crate::browser::url::resolve(&final_url, &fr.src)
-                    .unwrap_or_else(|| fr.src.clone());
-                if !(abs.starts_with("http://") || abs.starts_with("https://")) {
-                    continue;
-                }
-                let req =
-                    crate::browser::loader::LoadRequest::iframe(&abs).with_source(&final_url);
-                match crate::browser::loader::load(&req) {
-                    Ok(res) if res.status < 400 => {
-                        let nested =
-                            alloc::string::String::from_utf8_lossy(&res.body).into_owned();
-                        crate::browser::fill_frame_slot(fr, &nested, &res.url);
-                    }
-                    Ok(res) => {
-                        crate::ktrace::log_fmt(format_args!(
-                            "browser:iframe HTTP {} {}",
-                            res.status, abs
-                        ));
-                    }
-                    Err(e) => {
-                        crate::ktrace::log_fmt(format_args!("browser:iframe error {abs}: {e}"));
-                    }
-                }
-            }
-            EmbedKind::Video => {
-                if fr.src.is_empty() {
-                    continue;
-                }
-                let abs = crate::browser::url::resolve(&final_url, &fr.src)
-                    .unwrap_or_else(|| fr.src.clone());
-                // http(s) via loader, or store/mount path via existing readers
-                let bytes = if abs.starts_with("http://") || abs.starts_with("https://") {
-                    let req = crate::browser::loader::LoadRequest::get(&abs)
-                        .with_source(&final_url)
-                        .with_timeout(60_000);
-                    match crate::browser::loader::load(&req) {
-                        Ok(res) if res.status < 400 => res.body,
-                        _ => continue,
-                    }
-                } else {
-                    match read_mounted(&abs).or_else(|| crate::synapse::fs::read(&abs)) {
-                        Some(b) => b,
-                        None => continue,
-                    }
-                };
-                crate::browser::fill_video_slot(fr, bytes);
-            }
-            EmbedKind::Audio => {
-                // HUD-only for now (no waveform in-page).
-            }
-        }
-    }
-    let _ = n_frames;
-
-    if let Some(last) = lay.images.last() {
-        lay.content_height = lay.content_height.max(last.y + last.h + 16);
-    }
-    for c in &lay.controls {
-        lay.content_height = lay.content_height.max(c.y + c.h + 16);
-    }
-    for f in &lay.frames {
-        lay.content_height = lay.content_height.max(f.y + f.h + 16);
-    }
-
-    let mut scroll0 = 0i32;
-    if let Some(sy) = crate::browser::js_just::page_with_dom(|d| d.scroll_to.take()).flatten() {
-        scroll0 = sy.clamp(0, (lay.content_height - browser_vh()).max(0));
-    }
-
-    let mut control_values = alloc::collections::BTreeMap::new();
-    let mut control_checked = alloc::collections::BTreeMap::new();
-    for c in &lay.controls {
-        control_values.insert(c.index, c.value.clone());
-        control_checked.insert(c.index, c.checked);
-    }
-
-    browser_set_progress(95);
-    let (pixels, content_h) =
-        crate::browser::paint_layout_chrome(&lay, browser_vh(), scroll0, Some(100));
-    let title = doc.title;
-    BROWSER.with(|slot| {
-        let mut hist = slot
-            .as_ref()
-            .map(|s| s.history.clone())
-            .unwrap_or_default();
-        if push_hist {
-            if let Some(prev) = slot.as_ref().map(|s| s.url.clone()) {
-                if !prev.is_empty() && prev != final_url {
-                    hist.push(prev);
-                    if hist.len() > 32 {
-                        hist.remove(0);
-                    }
-                }
-            }
-        }
-        *slot = Some(BrowserSession {
-            url: final_url.clone(),
-            title: title.clone(),
-            html: body_html,
-            scroll_y: scroll0,
-            history: hist,
-            content_height: content_h,
-            focused: None,
-            control_values,
-            control_checked,
-            script_bodies,
-            css_bodies,
-            bg_pixels,
-            resolved_scripts: exec_list,
-        });
-    });
-    browser_clear_progress();
-    crate::browser::events::EVENT_LOOP.with(|el| {
-        el.drain(32);
-    });
-    crate::browser::storage::persist_active();
-    BROWSER_LAYOUT.with(|s| *s = Some(lay.clone()));
-    browser_present(&pixels, &title, &final_url, scroll0, content_h);
-    let chk = crate::browser::paint::checksum(&pixels);
-    let (cache_n, cache_b, hits, misses) = crate::browser::loader::cache_stats();
-    let (dns_n, dns_hits, dns_miss) = crate::net::dns_cache_stats();
-    alloc::format!(
-        "ok:title={} url={} redirects={redirects} status={status} cache={} imgs={n_imgs} forms={} iframes={} mem={cache_n}/{cache_b}b hits={hits} misses={misses} dns={dns_n}/{dns_hits}h/{dns_miss}m checksum={chk:016x} size={}x{}",
-        title,
-        final_url,
-        if from_cache { "hit" } else { "miss" },
-        lay.controls.len(),
-        lay.frames.len(),
-        browser_vw(),
-        browser_vh()
-    )
-}
-
-/// Rebuild layout from session HTML, re-apply control state, paint.
-fn browser_layout_session() -> Option<(
-    crate::browser::layout::Layout,
-    alloc::string::String,
-    alloc::string::String,
-    i32,
-    Option<usize>,
-)> {
-    let (html, scroll, url, title, focused, values, checked, css_bodies, bg_pixels) = BROWSER
-        .with(|s| {
-            s.as_ref().map(|b| {
-                (
-                    b.html.clone(),
-                    b.scroll_y,
-                    b.url.clone(),
-                    b.title.clone(),
-                    b.focused,
-                    b.control_values.clone(),
-                    b.control_checked.clone(),
-                    b.css_bodies.clone(),
-                    b.bg_pixels.clone(),
-                )
-            })
-        })?;
-    // Session path: re-layout from the LIVE page DOM (no script re-run) with
-    // the stored external CSS + background pixels.
-    let (doc, mut lay, js_lines) = {
-        let assets = crate::browser::SessionAssets {
-            css_external: &css_bodies,
-            bg_pixels: &bg_pixels,
-        };
-        crate::browser::layout_session(&html, browser_vw(), browser_vh(), &url, &assets)
-    };
-    // Handlers may log between repaints — mirror fresh lines to serial.
-    browser_mirror_js_lines(&js_lines);
-    // The live DOM may have retitled the page (document.title in a handler).
-    let title = if doc.title.is_empty() { title } else { doc.title.clone() };
-    BROWSER.with(|s| {
-        if let Some(b) = s.as_mut() {
-            b.title = title.clone();
-        }
-    });
-    for c in &mut lay.controls {
-        if let Some(v) = values.get(&c.index) {
-            c.value = v.clone();
-        }
-        if let Some(&k) = checked.get(&c.index) {
-            c.checked = k;
-        }
-        c.focused = focused == Some(c.index);
-    }
-    if let Some(last) = lay.controls.last() {
-        lay.content_height = lay.content_height.max(last.y + last.h + 16);
-    }
-    // Re-layout rebuilds image/iframe boxes WITHOUT pixels (subresources are
-    // only fetched in `browser_load`) — carry the previously decoded pixels
-    // over by `src`, otherwise every click/scroll blanked the page's images.
-    BROWSER_LAYOUT.with(|prev| {
-        if let Some(p) = prev.as_ref() {
-            for im in lay.images.iter_mut() {
-                if im.pixels.is_none() {
-                    if let Some(pim) = p
-                        .images
-                        .iter()
-                        .find(|pi| pi.pixels.is_some() && pi.src == im.src)
-                    {
-                        im.pixels = pim.pixels.clone();
-                        im.w = pim.w;
-                        im.h = pim.h;
-                        im.src_w = pim.src_w;
-                        im.src_h = pim.src_h;
-                    }
-                }
-            }
-            for fr in lay.frames.iter_mut() {
-                if fr.pixels.is_none() {
-                    if let Some(pfr) = p.frames.iter().find(|pf| {
-                        pf.pixels.is_some() && pf.src == fr.src && pf.srcdoc == fr.srcdoc
-                    }) {
-                        fr.pixels = pfr.pixels.clone();
-                        fr.src_w = pfr.src_w;
-                        fr.src_h = pfr.src_h;
-                    }
-                }
-            }
-        }
-    });
-    Some((lay, url, title, scroll, focused))
-}
-
-/// Progressive-render stage paint: render `lay` and blit it to the browser
-/// Surface tab immediately, so the page appears in stages (loading → DOM → CSS
-/// → scripts → images) instead of a blank pane until the whole pipeline
-/// finishes. Pumps `upkeep()` so the clock/mouse stay live between stages.
-#[cfg(not(test))]
-fn browser_paint_stage(
-    lay: &crate::browser::layout::Layout,
-    title: &str,
-    url: &str,
-    progress: u8,
-) {
-    let (pixels, content_h) =
-        crate::browser::paint_layout_chrome(lay, browser_vh(), 0, Some(progress));
-    BROWSER.with(|s| {
-        if let Some(b) = s.as_mut() {
-            b.content_height = content_h;
-        }
-    });
-    // Keep hit-testing in sync with the stage just painted so hover never
-    // falls back to a stale previous-page layout mid-navigation.
-    BROWSER_LAYOUT.with(|s| *s = Some(lay.clone()));
-    browser_present(&pixels, title, url, 0, content_h);
-    crate::shell::upkeep();
-}
-
-#[cfg(test)]
-fn browser_paint_stage(_lay: &crate::browser::layout::Layout, _t: &str, _u: &str, _p: u8) {}
-
-fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: i32, content_h: i32) {
-    // Always cache what we last put on the surface so mid-load / tab-repaint
-    // can re-blit without re-laying out the previous page's HTML.
-    BROWSER_PRESENT.with(|s| {
-        *s = Some(BrowserPresentCache {
-            pixels: pixels.to_vec(),
-            title: title.into(),
-            url: url.into(),
-            scroll_y,
-            content_h,
-        });
-    });
-    #[cfg(not(test))]
-    {
-        // present_surface_reserve already opens/focuses the Surface tab and blits.
-        // Do **not** call set_right afterward: that runs repaint_action() and was
-        // clearing the just-drawn page (blank black pane).
-        // Reserve a video-style HUD strip for title + scroll scrubber + shortcuts.
-        let hud = crate::framebuffer::browser_hud_height().max(1);
-        crate::framebuffer::present_surface_reserve(
-            BROWSER_SURFACE,
-            browser_vw() as usize,
-            browser_vh() as usize,
-            pixels,
-            hud,
-        );
-        let focused = BROWSER.with(|s| s.as_ref().and_then(|b| b.focused).is_some());
-        crate::framebuffer::draw_browser_status(
-            title,
-            url,
-            scroll_y,
-            content_h,
-            browser_vh(),
-            focused,
-        );
-        crate::serial_println!(
-            "browser> {} — {}  scroll {}/{}  runs_px={}",
-            title,
-            url,
-            scroll_y,
-            (content_h - browser_vh()).max(0),
-            pixels.iter().filter(|&&p| p != 0 && p != 0xf5f0e8).count()
-        );
-    }
-    #[cfg(test)]
-    {
-        let _ = (pixels, title, url, scroll_y, content_h);
-    }
-}
-
-/// Re-blit the last presented frame without re-layout. Used while loading and
-/// by hover when a full layout_session would flash the wrong page.
-fn browser_represent_cached() -> bool {
-    BROWSER_PRESENT.with(|s| {
-        if let Some(c) = s.as_ref() {
-            let pixels = c.pixels.clone();
-            let title = c.title.clone();
-            let url = c.url.clone();
-            let scroll_y = c.scroll_y;
-            let content_h = c.content_h;
-            // Don't re-enter the cache writer with the same data via a nested
-            // present path that would clone twice — call the FB blit directly.
-            #[cfg(not(test))]
-            {
-                let hud = crate::framebuffer::browser_hud_height().max(1);
-                crate::framebuffer::present_surface_reserve(
-                    BROWSER_SURFACE,
-                    browser_vw() as usize,
-                    browser_vh() as usize,
-                    &pixels,
-                    hud,
-                );
-                let focused = BROWSER.with(|b| b.as_ref().and_then(|x| x.focused).is_some());
-                crate::framebuffer::draw_browser_status(
-                    &title,
-                    &url,
-                    scroll_y,
-                    content_h,
-                    browser_vh(),
-                    focused,
-                );
-            }
-            let _ = (pixels, title, url, scroll_y, content_h);
-            true
-        } else {
-            false
-        }
-    })
-}
-
-fn browser_repaint() -> alloc::string::String {
-    // Mid-navigation: never re-layout the previous session HTML. Re-blit the
-    // last progressive stage (or no-op if nothing has painted yet).
-    if browser_is_loading() {
-        if browser_represent_cached() {
-            return alloc::string::String::from("ok:loading");
-        }
-        return alloc::string::String::from("ok:loading");
-    }
-    let Some((lay, url, title, scroll, _focused)) = browser_layout_session() else {
-        return alloc::string::String::from("error: no page open (browser_open first)");
-    };
-    let progress = browser_progress_opt();
-    let sel = browser_sel_range();
-    let (pixels, content_h) =
-        crate::browser::paint_layout_chrome_sel(&lay, browser_vh(), scroll, progress, sel);
-    BROWSER.with(|s| {
-        if let Some(b) = s.as_mut() {
-            b.content_height = content_h;
-        }
-    });
-    BROWSER_LAYOUT.with(|s| *s = Some(lay));
-    browser_present(&pixels, &title, &url, scroll, content_h);
-    alloc::format!("ok:scroll={scroll} title={title}")
-}
-
-fn browser_scroll(dy: i32) -> alloc::string::String {
-    if browser_is_loading() {
-        return alloc::string::String::from("ok:loading");
-    }
-    let max = BROWSER.with(|s| {
-        s.as_ref()
-            .map(|b| (b.content_height - browser_vh()).max(0))
-            .unwrap_or(0)
-    });
-    BROWSER.with(|s| {
-        if let Some(b) = s.as_mut() {
-            b.scroll_y = (b.scroll_y + dy).clamp(0, max);
-        }
-    });
-    browser_repaint()
-}
-
-fn browser_back() -> alloc::string::String {
-    let prev = BROWSER.with(|s| s.as_mut().and_then(|b| b.history.pop()));
-    match prev {
-        Some(u) => browser_load(&u, false),
-        None => alloc::string::String::from("error: no history"),
-    }
-}
-
-fn browser_click(x: i32, y: i32) -> alloc::string::String {
-    let Some((lay, base, _title, scroll, _foc)) = browser_layout_session() else {
-        return alloc::string::String::from("error: no page open");
-    };
-    let content_y = y + scroll;
-    match crate::browser::layout::hit_test_ex(&lay, x, content_y) {
-        crate::browser::layout::Hit::Link(href) => {
-            // A covering interactive element gets the click FIRST — its
-            // handler may preventDefault() and suppress the navigation.
-            if crate::browser::js_just::page_active() {
-                let covering = lay
-                    .elem_boxes
-                    .iter()
-                    .rev()
-                    .find(|e| {
-                        x >= e.x && x < e.x + e.w && content_y >= e.y && content_y < e.y + e.h
-                    })
-                    .map(|e| e.elem_idx);
-                if let Some(ei) = covering {
-                    let prevented = crate::browser::js_just::page_dispatch(&[
-                        crate::browser::js_just::PageEvent {
-                            target: ei,
-                            type_: alloc::string::String::from("click"),
-                            x,
-                            y: content_y,
-                        },
-                    ]);
-                    crate::serial_println!("browser> dispatched click → elem {}", ei);
-                    if let Some(out) = browser_dispatch_nav(&base) {
-                        return out;
-                    }
-                    if prevented.first().copied().unwrap_or(false) {
-                        browser_repaint();
-                        return alloc::string::String::from("ok:click handled (default prevented)");
-                    }
-                }
-            }
-            let url = crate::browser::url::resolve(&base, &href).unwrap_or(href);
-            browser_load(&url, true)
-        }
-        crate::browser::layout::Hit::Elem(ei) => {
-            // JS-interactive element: deliver the click into page JS, then
-            // follow any handler navigation, else repaint the mutated DOM.
-            let _prevented = crate::browser::js_just::page_dispatch(&[
-                crate::browser::js_just::PageEvent {
-                    target: ei,
-                    type_: alloc::string::String::from("click"),
-                    x,
-                    y: content_y,
-                },
-            ]);
-            crate::serial_println!("browser> dispatched click → elem {}", ei);
-            if let Some(out) = browser_dispatch_nav(&base) {
-                return out;
-            }
-            browser_repaint();
-            alloc::format!("ok:clicked elem {}", ei)
-        }
-        crate::browser::layout::Hit::Control(idx) => {
-            if let Some(c) = lay.controls.get(idx).cloned() {
-                use crate::browser::layout::ControlKind;
-                // Native focus / check handling first.
-                match c.kind {
-                    ControlKind::Hidden => {
-                        return alloc::string::String::from("ok:hidden");
-                    }
-                    ControlKind::Submit => {}
-                    ControlKind::Checkbox => {
-                        BROWSER.with(|s| {
-                            if let Some(b) = s.as_mut() {
-                                b.focused = Some(idx);
-                                let cur = b.control_checked.get(&idx).copied().unwrap_or(false);
-                                b.control_checked.insert(idx, !cur);
-                            }
-                        });
-                    }
-                    _ => {
-                        BROWSER.with(|s| {
-                            if let Some(b) = s.as_mut() {
-                                b.focused = Some(idx);
-                            }
-                        });
-                    }
-                }
-                // Then deliver the click into page JS (bubbles to the form).
-                let mut prevented = false;
-                if crate::browser::js_just::page_active() {
-                    if let Some(ei) = c.elem_idx {
-                        prevented = crate::browser::js_just::page_dispatch(&[
-                            crate::browser::js_just::PageEvent {
-                                target: ei,
-                                type_: alloc::string::String::from("click"),
-                                x,
-                                y: content_y,
-                            },
-                        ])
-                        .first()
-                        .copied()
-                        .unwrap_or(false);
-                        crate::serial_println!("browser> dispatched click → elem {}", ei);
-                        if let Some(out) = browser_dispatch_nav(&base) {
-                            return out;
-                        }
-                    }
-                }
-                match c.kind {
-                    ControlKind::Submit if !prevented => browser_submit_control(&lay, &c),
-                    ControlKind::Submit => {
-                        browser_repaint();
-                        alloc::string::String::from("ok:submit (default prevented)")
-                    }
-                    ControlKind::Button => {
-                        browser_repaint();
-                        alloc::string::String::from("ok:button")
-                    }
-                    ControlKind::Checkbox => {
-                        browser_repaint();
-                        alloc::string::String::from("ok:checkbox toggled")
-                    }
-                    ControlKind::Text | ControlKind::Password | ControlKind::TextArea => {
-                        browser_repaint();
-                        alloc::format!("ok:focus input {}", c.name)
-                    }
-                    ControlKind::Hidden => alloc::string::String::from("ok:hidden"),
-                }
-            } else {
-                alloc::string::String::from("ok:no control")
-            }
-        }
-        crate::browser::layout::Hit::Embed(idx) => {
-            if let Some(fr) = lay.frames.get(idx).cloned() {
-                use crate::browser::layout::EmbedKind;
-                match fr.kind {
-                    EmbedKind::Video => {
-                        if fr.src.is_empty() {
-                            return alloc::string::String::from("ok:video (no src)");
-                        }
-                        let abs = crate::browser::url::resolve(&base, &fr.src)
-                            .unwrap_or_else(|| fr.src.clone());
-                        browser_play_video_url(&abs, &base)
-                    }
-                    EmbedKind::Iframe if !fr.src.is_empty() => {
-                        let abs = crate::browser::url::resolve(&base, &fr.src)
-                            .unwrap_or_else(|| fr.src.clone());
-                        browser_load(&abs, true)
-                    }
-                    EmbedKind::Canvas => {
-                        alloc::string::String::from("ok:canvas")
-                    }
-                    EmbedKind::Audio => {
-                        alloc::string::String::from("ok:audio (click play not wired)")
-                    }
-                    _ => alloc::string::String::from("ok:embed"),
-                }
-            } else {
-                alloc::string::String::from("ok:no embed")
-            }
-        }
-        crate::browser::layout::Hit::Page => {
-            BROWSER.with(|s| {
-                if let Some(b) = s.as_mut() {
-                    b.focused = None;
-                }
-            });
-            browser_repaint();
-            alloc::string::String::from("ok:no link at point")
-        }
-    }
-}
-
-/// Fetch (or open local path) video and start the full video player tab.
-#[cfg(not(feature = "server"))]
-fn browser_play_video_url(abs: &str, page_url: &str) -> alloc::string::String {
-    let bytes = if abs.starts_with("http://") || abs.starts_with("https://") {
-        let req = crate::browser::loader::LoadRequest::get(abs)
-            .with_source(page_url)
-            .with_timeout(120_000);
-        match crate::browser::loader::load(&req) {
-            Ok(res) if res.status < 400 => res.body,
-            Ok(res) => {
-                return alloc::format!("error: video HTTP {}", res.status);
-            }
-            Err(e) => {
-                return alloc::format!("error: video load: {e}");
-            }
-        }
-    } else {
-        // Guest path / store
-        match read_mounted(abs).or_else(|| crate::synapse::fs::read(abs)) {
-            Some(b) => b,
-            None => {
-                return alloc::format!("error: video not found: {abs}");
-            }
-        }
-    };
-    play_video_bytes(abs, bytes);
-    alloc::format!("ok:playing video {abs}")
-}
-
-#[cfg(feature = "server")]
-fn browser_play_video_url(_abs: &str, _page_url: &str) -> alloc::string::String {
-    alloc::string::String::from("error: video player unavailable in server build")
-}
-
-fn browser_submit_control(
-    lay: &crate::browser::layout::Layout,
-    c: &crate::browser::layout::FormControl,
-) -> alloc::string::String {
-    let form_id = c.form_id;
-    // Merge live values from session into a temporary layout clone.
-    let mut lay = lay.clone();
-    BROWSER.with(|s| {
-        if let Some(b) = s.as_ref() {
-            for ctl in &mut lay.controls {
-                if let Some(v) = b.control_values.get(&ctl.index) {
-                    ctl.value = v.clone();
-                }
-                if let Some(&k) = b.control_checked.get(&ctl.index) {
-                    ctl.checked = k;
-                }
-            }
-        }
-    });
-    let fields = crate::browser::layout::form_fields(&lay, form_id);
-    // Include submitter name/value if named.
-    let mut fields = fields;
-    if !c.name.is_empty() {
-        fields.push(crate::browser::form::FormField {
-            name: c.name.clone(),
-            value: if c.value.is_empty() {
-                alloc::string::String::from("Submit")
-            } else {
-                c.value.clone()
-            },
-        });
-    }
-    let base = BROWSER.with(|s| s.as_ref().map(|b| b.url.clone()).unwrap_or_default());
-    let sub = crate::browser::form::build_submit(&base, &c.form_action, &c.form_method, &fields);
-    if sub.method == "POST" {
-        browser_load_method(&sub.url, "POST", sub.body.as_bytes(), true)
-    } else {
-        browser_load(&sub.url, true)
-    }
-}
-
-/// Update cursor shape when hovering the browser surface.
-fn browser_hover(sx: i32, sy: i32) {
-    // During progressive load, never re-layout/repaint: `browser_repaint` reads
-    // the *previous* page's session HTML and was flashing it back whenever the
-    // mouse moved over a link. Keep the Wait cursor and leave the stage pixels.
-    if browser_is_loading() {
-        #[cfg(not(test))]
-        {
-            crate::framebuffer::set_cursor_shape(crate::framebuffer::CursorShape::Wait);
-        }
-        let _ = (sx, sy);
-        return;
-    }
-    let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
-    let content_y = sy + scroll;
-    let (kind, link_rect) = BROWSER_LAYOUT.with(|slot| match slot.as_ref() {
-        Some(lay) => {
-            let kind = crate::browser::layout::cursor_at(lay, sx, content_y);
-            // Content-space rect of the link under the cursor, for hover
-            // underline (topmost match).
-            let rect = lay
-                .links
-                .iter()
-                .rev()
-                .find(|b| sx >= b.x && sx < b.x + b.w && content_y >= b.y && content_y < b.y + b.h)
-                .map(|b| (b.x, b.y, b.w, b.h));
-            (kind, rect)
-        }
-        None => (crate::browser::layout::CursorKind::Default, None),
-    });
-    // Underline the hovered link (repaint only when the hovered link changes).
-    // Use a paint-from-cached-layout path so we don't re-run the full layout
-    // pipeline on every hover change (still needed for underline chrome).
-    if crate::browser::set_hover_link(link_rect) {
-        browser_repaint_hover();
-    }
-    #[cfg(not(test))]
-    {
-        use crate::framebuffer::CursorShape;
-        let shape = match kind {
-            crate::browser::layout::CursorKind::Pointer => CursorShape::Hand,
-            crate::browser::layout::CursorKind::Text => CursorShape::IBeam,
-            crate::browser::layout::CursorKind::Default => CursorShape::Arrow,
-        };
-        crate::framebuffer::set_cursor_shape(shape);
-    }
-    let _ = (kind, sx, sy);
-}
-
-/// Hover-only repaint: paint the cached layout with the new hover underline.
-/// Avoids a full `layout_session` (which re-parses HTML) on every mouse move.
-fn browser_repaint_hover() {
-    if browser_is_loading() {
-        return;
-    }
-    let Some(lay) = BROWSER_LAYOUT.with(|s| s.clone()) else {
-        return;
-    };
-    let (url, title, scroll) = BROWSER.with(|s| {
-        s.as_ref()
-            .map(|b| (b.url.clone(), b.title.clone(), b.scroll_y))
-            .unwrap_or_else(|| {
-                (
-                    alloc::string::String::new(),
-                    alloc::string::String::new(),
-                    0,
-                )
-            })
-    });
-    if url.is_empty() {
-        return;
-    }
-    let progress = browser_progress_opt();
-    let sel = browser_sel_range();
-    let (pixels, content_h) =
-        crate::browser::paint_layout_chrome_sel(&lay, browser_vh(), scroll, progress, sel);
-    BROWSER.with(|s| {
-        if let Some(b) = s.as_mut() {
-            b.content_height = content_h;
-        }
-    });
-    browser_present(&pixels, &title, &url, scroll, content_h);
-}
-
-fn browser_status() -> alloc::string::String {
-    BROWSER.with(|s| match s.as_ref() {
-        Some(b) => alloc::format!(
-            "ok:url={} title={} scroll={} content_h={} size={}x{}",
-            b.url,
-            b.title,
-            b.scroll_y,
-            b.content_height,
-            browser_vw(),
-            browser_vh()
-        ),
-        None => alloc::string::String::from("ok:empty"),
-    })
-}
-
-fn browser_links() -> alloc::string::String {
-    let html = match BROWSER.with(|s| s.as_ref().map(|b| b.html.clone())) {
-        Some(h) => h,
-        None => return alloc::string::String::from("error: no page open"),
-    };
-    let links = crate::browser::page_links(&html);
-    if links.is_empty() {
-        return alloc::string::String::from("(no links)");
-    }
-    let mut out = alloc::string::String::new();
-    for (i, (h, t)) in links.iter().enumerate().take(64) {
-        out.push_str(&alloc::format!("{}. {} — {}\n", i + 1, t, h));
-    }
-    out
-}
-
-fn browser_text(max: usize) -> alloc::string::String {
-    let html = match BROWSER.with(|s| s.as_ref().map(|b| b.html.clone())) {
-        Some(h) => h,
-        None => return alloc::string::String::from("error: no page open"),
-    };
-    let mut t = crate::browser::page_text(&html);
-    if t.len() > max {
-        t.truncate(max);
-        t.push_str("…");
-    }
-    t
-}
-
-/// Whether the browser tab is showing (for key routing).
-pub fn browser_loaded() -> bool {
-    BROWSER.with(|s| s.is_some())
-}
-
-/// Key-path variant of [`browser_dispatch_nav`]: base = current session URL.
-#[cfg(not(test))]
-fn browser_dispatch_nav_key() -> Option<alloc::string::String> {
-    let base = BROWSER.with(|s| s.as_ref().map(|b| b.url.clone()))?;
-    browser_dispatch_nav(&base)
-}
-
-/// Deliver `types` events to the page-JS element behind form control `idx`
-/// (when the persistent page is live and the control carries a stamped
-/// element index). Syncs the control's live value into the JS DOM first so
-/// `input`/`change` handlers read what the user typed. Returns true when any
-/// handler called `preventDefault()`.
-#[cfg(not(test))]
-fn browser_control_event(idx: usize, types: &[&str]) -> bool {
-    if !crate::browser::js_just::page_active() {
-        return false;
-    }
-    let ei = BROWSER_LAYOUT.with(|s| {
-        s.as_ref().and_then(|l| {
-            l.controls
-                .iter()
-                .find(|c| c.index == idx)
-                .and_then(|c| c.elem_idx)
-        })
-    });
-    let Some(ei) = ei else { return false };
-    let val = BROWSER
-        .with(|s| s.as_ref().and_then(|b| b.control_values.get(&idx).cloned()))
-        .unwrap_or_default();
-    crate::browser::js_just::page_with_dom(|d| {
-        if let Some(e) = d.elements.get_mut(ei) {
-            e.value = val.clone();
-        }
-    });
-    let evs: alloc::vec::Vec<crate::browser::js_just::PageEvent> = types
-        .iter()
-        .map(|t| crate::browser::js_just::PageEvent {
-            target: ei,
-            type_: alloc::string::String::from(*t),
-            x: 0,
-            y: 0,
-        })
-        .collect();
-    crate::browser::js_just::page_dispatch(&evs)
-        .iter()
-        .any(|&p| p)
-}
-
-/// Handle a key while the browser surface is focused. Returns true if consumed.
-#[cfg(not(test))]
-fn browser_key(byte: u8) -> bool {
-    if !browser_loaded() {
-        return false;
-    }
-    // Text entry into focused form control.
-    let focused = BROWSER.with(|s| s.as_ref().and_then(|b| b.focused));
-    if let Some(idx) = focused {
-        match byte {
-            0x1b => {
-                // Esc clears focus.
-                BROWSER.with(|s| {
-                    if let Some(b) = s.as_mut() {
-                        b.focused = None;
-                    }
-                });
-                let _ = browser_repaint();
-                return true;
-            }
-            0x09 => {
-                // Tab → next text control. Guard: `cycle()` + `skip_while` only
-                // terminates if the focused index is IN the text-entry list.
-                if let Some((lay, ..)) = browser_layout_session() {
-                    let in_list = lay
-                        .controls
-                        .iter()
-                        .any(|c| c.index == idx && c.kind.is_text_entry());
-                    let next = if !in_list {
-                        lay.controls
-                            .iter()
-                            .filter(|c| c.kind.is_text_entry())
-                            .map(|c| c.index)
-                            .next()
-                    } else {
-                        lay.controls
-                            .iter()
-                            .filter(|c| c.kind.is_text_entry())
-                            .map(|c| c.index)
-                            .cycle()
-                            .skip_while(|&i| i != idx)
-                            .nth(1)
-                    };
-                    BROWSER.with(|s| {
-                        if let Some(b) = s.as_mut() {
-                            b.focused = next.or(Some(idx));
-                        }
-                    });
-                    let _ = browser_repaint();
-                }
-                return true;
-            }
-            0x0d | 0x0a => {
-                // Enter → change + submit into page JS, then submit the
-                // owning form (unless a handler preventDefault()ed).
-                let prevented = browser_control_event(idx, &["change", "submit"]);
-                if let Some(out) = browser_dispatch_nav_key() {
-                    let _ = out;
-                    return true;
-                }
-                if prevented {
-                    let _ = browser_repaint();
-                    return true;
-                }
-                if let Some((lay, ..)) = browser_layout_session() {
-                    if let Some(c) = lay.controls.get(idx) {
-                        if let Some(sub) = lay
-                            .controls
-                            .iter()
-                            .find(|x| x.form_id == c.form_id && x.kind.is_submit())
-                            .cloned()
-                        {
-                            let _ = browser_submit_control(&lay, &sub);
-                            return true;
-                        }
-                        // Orphan text field: no-op submit.
-                    }
-                }
-                return true;
-            }
-            0x08 | 0x7f => {
-                BROWSER.with(|s| {
-                    if let Some(b) = s.as_mut() {
-                        if let Some(v) = b.control_values.get_mut(&idx) {
-                            v.pop();
-                        }
-                    }
-                });
-                let _ = browser_control_event(idx, &["input"]);
-                let _ = browser_repaint();
-                return true;
-            }
-            b if b >= 0x20 && b < 0x7f => {
-                BROWSER.with(|s| {
-                    if let Some(sess) = s.as_mut() {
-                        let e = sess.control_values.entry(idx).or_default();
-                        if e.len() < 512 {
-                            e.push(b as char);
-                        }
-                    }
-                });
-                let _ = browser_control_event(idx, &["input"]);
-                let _ = browser_repaint();
-                return true;
-            }
-            _ => {}
-        }
-    }
-    match byte {
-        b'j' | b'J' => {
-            let _ = browser_scroll(browser_vh() / 3);
-            true
-        }
-        b'k' | b'K' => {
-            let _ = browser_scroll(-(browser_vh() / 3));
-            true
-        }
-        b' ' if focused.is_none() => {
-            let _ = browser_scroll(browser_vh() - 40);
-            true
-        }
-        b'b' | b'B' if focused.is_none() => {
-            let _ = browser_back();
-            true
-        }
-        b'r' | b'R' if focused.is_none() => {
-            let url = BROWSER.with(|s| s.as_ref().map(|b| b.url.clone()));
-            if let Some(u) = url {
-                let _ = browser_load(&u, false);
-            }
-            true
-        }
-        // PageUp / we only get plain bytes here; Pg keys come as CSI elsewhere.
-        _ => false,
-    }
-}
-
-/// Host entry for media tools (`ToolBinding::Media`): image / audio / video
-/// players in the action pane. Paths may be store keys, `/downloads/…`, or
-/// mount paths. Shared by the **media** agent, shell chat, and `/open`.
-/// `/open x.pdf` (via the pdf agent's command hook): read the file, digest it
-/// through the agent's **wasm** (`pdf_digest` — deterministic parsing below
-/// the boundary), write the extracted text to `/preview/<name>.txt` in the
-/// store, and open that in an editor tab. Returns the summary line.
+// (moved to shell/browser.rs)
 #[cfg(all(not(feature = "server"), not(test)))]
 fn pdf_preview(path: &str) -> alloc::string::String {
     const MAX_PDF: usize = 4 << 20; // b64 + parse arena bounds
@@ -11965,6 +7774,13 @@ pub(crate) fn format_pdf_preview(path: &str, digest: &str) -> (alloc::string::St
     (summary, text)
 }
 
+/// Host entry for media tools (`ToolBinding::Media`): image / audio / video
+/// players in the action pane. Paths may be store keys, `/downloads/…`, or
+/// mount paths. Shared by the **media** agent, shell chat, and `/open`.
+/// `/open x.pdf` (via the pdf agent's command hook): read the file, digest it
+/// through the agent's **wasm** (`pdf_digest` — deterministic parsing below
+/// the boundary), write the extracted text to `/preview/<name>.txt` in the
+/// store, and open that in an editor tab. Returns the summary line.
 pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::String {
     use crate::session::todo::json_str;
     #[cfg(any(feature = "server", test))]
@@ -12779,1040 +8595,8 @@ fn run_pane(arg: &str) {
 #[cfg(any(feature = "server", test))]
 fn run_pane(_arg: &str) {}
 
-/// Surface id the video player presents frames on (== framebuffer::VIDEO_SURFACE).
-#[cfg(not(feature = "server"))]
-const VIDEO_SURFACE: u32 = u32::MAX - 1;
-
-/// A background video player: decoded keyframes plus a playback clock. Frames
-/// are advanced by presentation timestamp from `ui_tick` (`pump_video`), so it
-/// keeps playing/advancing across tab switches like the audio player. Baseline
-/// H.264 decodes every frame (I keyframes + P inter frames), so playback is
-/// full-motion, not keyframe-only.
-#[cfg(not(feature = "server"))]
-struct VideoPlayer {
-    dec: crate::video::StreamDecoder,
-    frame_count: usize,
-    idx: usize,
-    playing: bool,
-    base_ms: u64,     // wall-clock at which pts 0 plays
-    paused_at: u64,   // playback-time when paused
-    total_ms: u64,
-    name: String,
-    finished_announced: bool,
-    muted: bool,
-    has_audio: bool,
-    /// Decoded mono S16 PCM for the video's audio track (option B: owned by
-    /// the video player so closing the tab stops audio without touching the
-    /// standalone audio tab).
-    audio_pcm: Option<alloc::vec::Vec<i16>>,
-    audio_rate: u32,
-    /// Next PCM sample index to queue (advanced by `pump_video` audio path).
-    audio_at: usize,
-    /// FPS meter: frames presented in the current 1 s window + EMA display value.
-    fps_window_start_ms: u64,
-    fps_window_frames: u32,
-    fps_display: u32,
-    /// Wall-clock of last successful present (for instant ms/frame → fps).
-    last_present_ms: u64,
-    /// A decode-ahead job is running on an SMP worker: `dec` is on loan to
-    /// that core and MUST NOT be touched until [`video_job_collect`] returns
-    /// it (reading the immutable sample table — `pts_ms`/`frame_count` — is
-    /// fine). See the SAFETY notes at `vjob`.
-    pending_job: bool,
-    /// A frame decoded ahead of its pts, held until due (`dec.cur` is it).
-    ahead: Option<usize>,
-}
-#[cfg(not(feature = "server"))]
-static VIDEO: crate::mm::Locked<Option<VideoPlayer>> = crate::mm::Locked::new(None);
-
-/// `/open <path>.mp4|.mov` — demux + decode H.264 keyframes and play them in a
-/// "video" action-pane tab. Non-blocking: `pump_video` advances frames from the
-/// idle tick. `/close` or Ctrl+C stops it.
-#[cfg(not(feature = "server"))]
-fn play_video(path: &str) {
-    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
-        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
-        return;
-    };
-    play_video_bytes(path, bytes);
-}
-
-/// Start the video player from already-loaded bytes (browser `<video>` click).
-#[cfg(not(feature = "server"))]
-fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) {
-    let t0 = crate::arch::now_ms();
-    // Probe first so we can report clearly and handle unsupported streams.
-    match crate::video::probe(&bytes) {
-        Ok(info) => {
-            serial_println!("open> {} — {} {}x{} {} frames {}:{:02}", name, info.codec, info.width, info.height, info.frame_count, info.duration_ms / 60000, info.duration_ms % 60000 / 1000);
-            if !info.decodable {
-                serial_println!("open>   cannot decode yet: {}", if info.cabac { "CABAC entropy coding (baseline/CAVLC only)" } else { "unsupported profile" });
-                return;
-            }
-        }
-        Err(e) => {
-            serial_println!("open> cannot open {}: {}", name, e);
-            return;
-        }
-    }
-    // Demux/describe audio; if AAC-LC, decode PCM now so pump_video can sync it.
-    let (has_audio, audio_pcm, audio_rate) = match crate::video::audio_info(&bytes) {
-        Some(a) if a.decodable => {
-            serial_println!(
-                "open>   audio: {} {} Hz {}ch — decoding…",
-                a.codec,
-                a.sample_rate,
-                a.channels
-            );
-            match crate::video::decode_audio(&bytes) {
-                Ok(audio) => {
-                    serial_println!(
-                        "open>   audio ready: {}:{:02} mono @ {} Hz ({} KiB PCM)",
-                        audio.duration_ms() / 60000,
-                        (audio.duration_ms() % 60000) / 1000,
-                        audio.rate,
-                        audio.pcm.len() * 2 / 1024
-                    );
-                    (true, Some(audio.pcm), audio.rate)
-                }
-                Err(e) => {
-                    serial_println!("open>   audio decode failed ({}) — video plays silently", e);
-                    (true, None, 0)
-                }
-            }
-        }
-        Some(a) => {
-            serial_println!(
-                "open>   audio: {} {} Hz {}ch (unsupported profile — video plays silently)",
-                a.codec,
-                a.sample_rate,
-                a.channels
-            );
-            (true, None, 0)
-        }
-        None => (false, None, 0),
-    };
-    match crate::video::StreamDecoder::open(bytes) {
-        Ok(mut dec) => {
-            let frame_count = dec.frame_count();
-            let total_ms = dec.duration_ms;
-            // Stream like VLC: demux + first frame only — no full-clip RGB cache.
-            dec.seek_decode(0);
-            serial_println!(
-                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (streaming) — Ctrl+Tab cycles focus, space=pause",
-                dec.src_w,
-                dec.src_h,
-                frame_count,
-                dec.backend,
-                crate::arch::now_ms().saturating_sub(t0)
-            );
-            let name = name.rsplit('/').next().unwrap_or(name).to_string();
-            let now = crate::arch::now_ms();
-            VIDEO.with(|v| {
-                *v = Some(VideoPlayer {
-                    dec,
-                    frame_count,
-                    idx: 0,
-                    playing: true,
-                    base_ms: now,
-                    paused_at: 0,
-                    total_ms,
-                    name,
-                    finished_announced: false,
-                    muted: false,
-                    has_audio,
-                    audio_pcm,
-                    audio_rate,
-                    audio_at: 0,
-                    fps_window_start_ms: now,
-                    fps_window_frames: 0,
-                    fps_display: 0,
-                    last_present_ms: 0,
-                    pending_job: false,
-                    ahead: None,
-                })
-            });
-            #[cfg(not(test))]
-            {
-                crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIDEO_SURFACE));
-                present_video_frame();
-            }
-        }
-        Err(e) => serial_println!("open> decode failed: {}", e),
-    }
-}
-
-/// Present the current video frame into the video tab (no-op if not active).
-/// Updates the rolling FPS meter (frames presented per wall-clock second).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn present_video_frame() {
-    let now = crate::arch::now_ms();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            if p.pending_job {
-                // `dec` (including `cur`) is on loan to the decode worker;
-                // the pump presents this frame when it collects the job.
-                return;
-            }
-            if let Some(f) = p.dec.cur_frame() {
-                // Reserve the bottom strip for the HUD so the per-frame blit
-                // never repaints under it (no flicker); the HUD lives there.
-                let hud = crate::framebuffer::video_hud_height();
-                crate::framebuffer::present_surface_reserve(VIDEO_SURFACE, f.w, f.h, &f.pixels, hud);
-                // FPS: count presents in 1 s windows; show last completed window.
-                p.fps_window_frames = p.fps_window_frames.saturating_add(1);
-                p.last_present_ms = now;
-                let elapsed = now.saturating_sub(p.fps_window_start_ms);
-                if elapsed >= 1000 {
-                    // frames in this window → fps (scale if window > 1 s)
-                    let fps = if elapsed > 0 {
-                        (p.fps_window_frames as u64 * 1000 / elapsed) as u32
-                    } else {
-                        0
-                    };
-                    p.fps_display = fps;
-                    p.fps_window_start_ms = now;
-                    p.fps_window_frames = 0;
-                }
-            }
-        }
-    });
-    present_video_status();
-}
-#[cfg(not(all(not(feature = "server"), not(test))))]
-fn present_video_frame() {}
-
-/// Whether a video is loaded.
-#[cfg(not(feature = "server"))]
-fn video_loaded() -> bool {
-    VIDEO.with(|v| v.is_some())
-}
-
-/// Stop + unload the video (Ctrl+C / closing the video tab).
-#[cfg(not(feature = "server"))]
-fn stop_video() {
-    let stopped = VIDEO.with(|v| {
-        // Reclaim `dec` from any decode-ahead worker before dropping it.
-        #[cfg(not(test))]
-        if let Some(p) = v.as_mut() {
-            video_job_join(p);
-        }
-        v.take().is_some()
-    });
-    if stopped {
-        serial_println!("\ropen> video stopped");
-    }
-}
-#[cfg(feature = "server")]
-fn stop_video() {}
-
-/// Re-entrancy guard: `upkeep` → `pump_video` must never nest (VIDEO lock).
-#[cfg(all(not(feature = "server"), not(test)))]
-static PUMPING_VIDEO: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Advance the video by presentation time; the idle-tick heartbeat.
-/// Also queues ~200 ms audio chunks from the video's own PCM (when present),
-/// gated on play state and device drain — never steals the standalone audio tab.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn pump_video() {
-    use core::sync::atomic::Ordering;
-    // Bail if already pumping (e.g. a nested upkeep from a mistaken yield
-    // inside decode). Nested VIDEO.with would spin forever.
-    if PUMPING_VIDEO.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let result = pump_video_inner();
-    PUMPING_VIDEO.store(false, Ordering::Release);
-    let _ = result;
-}
-
-#[cfg(all(not(feature = "server"), not(test)))]
-fn pump_video_inner() {
-    use core::sync::atomic::Ordering;
-    let now = crate::arch::now_ms();
-    // Audio chunk (copied out so VIDEO lock isn't held across sound::play).
-    let audio_chunk = VIDEO.with(|v| {
-        let p = v.as_mut()?;
-        if !p.playing {
-            return None;
-        }
-        let pcm = p.audio_pcm.as_ref()?;
-        if p.audio_rate == 0 || p.audio_at >= pcm.len() {
-            return None;
-        }
-        if crate::sound::playing() {
-            return None; // still draining previous chunk
-        }
-        // Snap cursor to the current video pts so seek/pause recover cleanly.
-        let t = now.saturating_sub(p.base_ms);
-        let want = ((t as u128) * p.audio_rate as u128 / 1000) as usize;
-        // Only jump forward/back if we drifted > ~50 ms (avoid tiny jitter).
-        let slop = (p.audio_rate as usize / 20).max(1);
-        if want > p.audio_at + slop || p.audio_at > want + slop {
-            p.audio_at = want.min(pcm.len());
-        }
-        if p.audio_at >= pcm.len() {
-            return None;
-        }
-        let chunk = (p.audio_rate as usize / 5).max(256); // ~200 ms
-        let end = (p.audio_at + chunk).min(pcm.len());
-        let slice = pcm[p.audio_at..end].to_vec();
-        p.audio_at = end;
-        Some((slice, p.audio_rate))
-    });
-    if let Some((slice, rate)) = audio_chunk {
-        let _ = crate::sound::play(&slice, rate);
-    }
-
-    // Phase A: collect a finished decode-ahead job and decide whether the
-    // held frame is due. NO job submission here — the blit below reads
-    // `dec.cur`, so `dec` must not go back on loan until after it runs
-    // (submitting first made `present_video_frame`'s loan-guard skip every
-    // blit: audio + counters advanced, the picture froze on frame one).
-    let present = VIDEO.with(|v| {
-        let Some(p) = v.as_mut() else { return false };
-        // Collect a finished decode-ahead job. The decoded frame is *held*
-        // (`ahead`) until its pts is due — never shown early.
-        if p.pending_job {
-            match video_job_collect(p) {
-                Some((goal, changed)) => {
-                    if changed {
-                        p.ahead = Some(goal);
-                    } else {
-                        p.idx = goal; // decode failed/no-op: skip past, don't loop
-                    }
-                }
-                None => {} // still decoding on the worker
-            }
-        }
-        if !p.playing || p.frame_count == 0 {
-            return false;
-        }
-        let t = now.saturating_sub(p.base_ms);
-        // Present the held frame the moment it is due (already decoded —
-        // this is the cheap path that keeps presentation at clip rate).
-        let mut presented = false;
-        if let Some(a) = p.ahead {
-            if a <= p.idx {
-                p.ahead = None; // stale (a seek moved us past it)
-            } else if p.dec.pts_ms(a) <= t {
-                p.ahead = None;
-                p.idx = a;
-                presented = true;
-                let pts = p.dec.pts_ms(a);
-                if t > pts.saturating_add(100) {
-                    // Behind the wall clock — snap media time forward (drop
-                    // backlog), never snap backward to a previous keyframe.
-                    p.base_ms = now.saturating_sub(pts);
-                }
-                // Content signature for the perf line: proves the *picture*
-                // advances, not just the counters (a present-ordering bug once
-                // froze the image while every metric kept ticking).
-                if let Some(f) = p.dec.cur_frame() {
-                    let mut sig = 0u32;
-                    let step = (f.pixels.len() / 16).max(1);
-                    for px in f.pixels.iter().step_by(step) {
-                        sig = sig.wrapping_mul(31).wrapping_add(*px);
-                    }
-                    VIDEO_SIG.store(((p.idx as u64) << 32) | sig as u64, Ordering::Relaxed);
-                }
-            }
-        }
-        presented
-    });
-    if present {
-        let t0 = crate::arch::now_ms();
-        present_video_frame();
-        VIDEO_PRESENT_MS.fetch_add(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
-        let n = VIDEO_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 32 == 0 {
-            let d = VIDEO_DECODE_MS.swap(0, Ordering::Relaxed);
-            let pr = VIDEO_PRESENT_MS.swap(0, Ordering::Relaxed);
-            let sig = VIDEO_SIG.load(Ordering::Relaxed);
-            crate::ktrace::log_fmt(format_args!(
-                "video: perf: last 32 frames: decode {} ms ({}/frame), present {} ms ({}/frame), at frame {} sig {:08x}",
-                d,
-                d / 32,
-                pr,
-                pr / 32,
-                sig >> 32,
-                sig as u32
-            ));
-        }
-    }
-
-    // Phase B: with the blit done, keep the decode pipeline fed — pick the
-    // next goal and put `dec` back on loan. Decoding runs one frame AHEAD of
-    // its due time, so the ~30 ms 1080p decode overlaps the current frame's
-    // display.
-    let finished = VIDEO.with(|v| {
-        let Some(p) = v.as_mut() else { return false };
-        if p.pending_job || p.ahead.is_some() || !p.playing || p.frame_count == 0 {
-            return false;
-        }
-        let t = now.saturating_sub(p.base_ms);
-        let mut target = p.idx;
-        while target + 1 < p.frame_count && p.dec.pts_ms(target + 1) <= t {
-            target += 1;
-        }
-        // End of clip: stop on the last frame.
-        if t >= p.total_ms && target + 1 >= p.frame_count {
-            p.playing = false;
-            if !p.finished_announced {
-                p.finished_announced = true;
-                p.idx = target;
-                p.dec.seek_decode(target);
-                return true;
-            }
-            return false;
-        }
-        // Forward only; when behind, catch up in SMALL steps (the hurry
-        // flag frame-drops non-reference backlog, and the clock re-anchor
-        // absorbs the rest). Small jobs = frequent presents: one giant
-        // jump would decode every backlog reference in one job and starve
-        // presentation (4K went from ~8 to ~3 fps that way).
-        let goal = if target > p.idx { target.min(p.idx + 2) } else { p.idx + 1 };
-        let goal = goal.min(p.frame_count.saturating_sub(1));
-        if goal > p.idx {
-            let hurry = t > p.dec.pts_ms(goal).saturating_add(100);
-            // Prefer an SMP worker (BSP keeps pumping UI/audio); fall back
-            // to synchronous decode-and-hold when none is available.
-            if video_job_submit(&mut p.dec, goal, hurry) {
-                p.pending_job = true;
-            } else {
-                let t0 = crate::arch::now_ms();
-                let changed = p.dec.seek_decode_hurry(goal, hurry);
-                VIDEO_DECODE_MS.fetch_add(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
-                if changed {
-                    p.ahead = Some(goal);
-                } else {
-                    p.idx = goal;
-                }
-            }
-        }
-        false
-    });
-    if finished {
-        let t0 = crate::arch::now_ms();
-        present_video_frame();
-        VIDEO_PRESENT_MS.fetch_add(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
-        // Stage accounting, one ktrace line per 32 presented frames: where the
-        // per-frame budget goes (decode vs present), per the measure-first rule.
-        let n = VIDEO_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 32 == 0 {
-            let d = VIDEO_DECODE_MS.swap(0, Ordering::Relaxed);
-            let pr = VIDEO_PRESENT_MS.swap(0, Ordering::Relaxed);
-            crate::ktrace::log_fmt(format_args!(
-                "video: perf: last 32 frames: decode {} ms ({}/frame), present {} ms ({}/frame)",
-                d,
-                d / 32,
-                pr,
-                pr / 32
-            ));
-        }
-    }
-}
-
-/// Per-stage wall-time accumulators for the `video: perf:` ktrace (32-frame
-/// windows; see `pump_video_inner`).
-#[cfg(all(not(feature = "server"), not(test)))]
-static VIDEO_DECODE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(not(feature = "server"), not(test)))]
-static VIDEO_PRESENT_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(not(feature = "server"), not(test)))]
-static VIDEO_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// `(presented frame idx << 32) | pixel signature` — the perf line's proof
-/// that the displayed content is advancing.
-#[cfg(all(not(feature = "server"), not(test)))]
-static VIDEO_SIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Decode-ahead job plumbing: the pump loans `dec` to an SMP worker
-/// (`smp::async_submit`) so the ~30 ms 1080p decode overlaps UI/audio work on
-/// the BSP instead of blocking it. Exclusive access is handed over whole: the
-/// BSP sets `pending_job` and must not touch `dec` (beyond the immutable
-/// sample table) until the job completes; every other `dec` toucher goes
-/// through [`video_job_join`] first.
-#[cfg(all(target_arch = "aarch64", not(feature = "server"), not(test)))]
-mod vjob {
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    pub static DEC: AtomicUsize = AtomicUsize::new(0);
-    pub static GOAL: AtomicUsize = AtomicUsize::new(0);
-    pub static HURRY: AtomicBool = AtomicBool::new(false);
-    pub static CHANGED: AtomicBool = AtomicBool::new(false);
-    /// Worker-measured decode wall time (ms) for the stage accounting.
-    pub static MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-    /// Worker-side entry: decode to `GOAL` on the loaned decoder.
-    ///
-    /// # Safety
-    /// Called only via `smp::async_submit`; the BSP published DEC/GOAL/HURRY
-    /// before submitting (release) and reads CHANGED only after observing
-    /// completion (acquire), so this core has exclusive access to the decoder
-    /// for the whole run. `Rc` inside the decoder is safe under whole-object
-    /// single-core handoff.
-    pub unsafe fn run(_ctx: *mut u8) {
-        let dec = DEC.load(Ordering::Acquire) as *mut crate::video::StreamDecoder;
-        if dec.is_null() {
-            return;
-        }
-        let goal = GOAL.load(Ordering::Relaxed);
-        let hurry = HURRY.load(Ordering::Relaxed);
-        let t0 = crate::arch::now_ms();
-        // SAFETY: exclusive loan per above.
-        let changed = unsafe { (*dec).seek_decode_hurry(goal, hurry) };
-        MS.store(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
-        CHANGED.store(changed, Ordering::Release);
-    }
-}
-
-/// Try to start a decode-ahead job for `goal`. `false` → caller decodes
-/// synchronously (x86, no workers, degraded fleet, or a job already active).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn video_job_submit(dec: &mut crate::video::StreamDecoder, goal: usize, hurry: bool) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        vjob::DEC.store(dec as *mut _ as usize, core::sync::atomic::Ordering::Release);
-        vjob::GOAL.store(goal, core::sync::atomic::Ordering::Relaxed);
-        vjob::HURRY.store(hurry, core::sync::atomic::Ordering::Relaxed);
-        vjob::CHANGED.store(false, core::sync::atomic::Ordering::Relaxed);
-        // SAFETY: dec stays in the VIDEO player (stable address) and the BSP
-        // honours the loan via `pending_job` until async_take_done.
-        unsafe { crate::arch::aarch64::smp::async_submit(vjob::run, core::ptr::null_mut()) }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (dec, goal, hurry);
-        false
-    }
-}
-
-/// Poll a pending decode-ahead job; on completion return `Some((goal,
-/// changed))` and return ownership of the decoder to the BSP. The caller
-/// decides whether the frame is held (`ahead`) or skipped.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn video_job_collect(p: &mut VideoPlayer) -> Option<(usize, bool)> {
-    if !p.pending_job {
-        return None;
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::sync::atomic::Ordering;
-        if crate::arch::aarch64::smp::async_take_done() {
-            p.pending_job = false;
-            VIDEO_DECODE_MS.fetch_add(vjob::MS.load(Ordering::Relaxed), Ordering::Relaxed);
-            return Some((vjob::GOAL.load(Ordering::Relaxed), vjob::CHANGED.load(Ordering::Acquire)));
-        }
-        None
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        p.pending_job = false;
-        Some((p.idx, false))
-    }
-}
-
-/// Block (bounded by one frame's decode) until no job is on loan — required
-/// before any mutable `dec` access outside the pump (seek, restart, close).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn video_job_join(p: &mut VideoPlayer) {
-    while p.pending_job {
-        if video_job_collect(p).is_some() {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    // Whatever the join was for (seek/restart/close) invalidates a held frame.
-    p.ahead = None;
-}
-#[cfg(not(all(not(feature = "server"), not(test))))]
-fn pump_video() {}
-
-/// Toggle play/pause on the video (space on the video tab).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn video_toggle_pause() {
-    let now = crate::arch::now_ms();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            if p.playing {
-                p.paused_at = now.saturating_sub(p.base_ms);
-                p.playing = false;
-            } else {
-                p.base_ms = now.saturating_sub(p.paused_at);
-                p.playing = true;
-                p.finished_announced = false;
-            }
-        }
-    });
-    present_video_status();
-}
-
-/// Shared mute for audio + video tabs (`m`). Uses the global software mute so
-/// the next PCM chunk is silence; also mirrors into `VideoPlayer.muted` for the
-/// HUD when a video is loaded.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn media_toggle_mute() {
-    let m = crate::sound::toggle_mute();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            p.muted = m;
-        }
-    });
-    present_video_status();
-    repaint_audio();
-}
-
-/// Shared volume adjust for audio + video tabs (↑/↓). Steps are percent points.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn media_volume_adjust(delta: i32) {
-    let v = crate::sound::volume_adjust(delta);
-    // Keep video HUD mute flag in sync if volume-up unmuted.
-    VIDEO.with(|vp| {
-        if let Some(p) = vp.as_mut() {
-            p.muted = crate::sound::muted();
-        }
-    });
-    let _ = v;
-    present_video_status();
-    repaint_audio();
-}
-
-/// Draw the video player's status bar into the surface tab: playback state,
-/// position/duration, mute, and the key-shortcut hints (mirrors the audio
-/// player's footer). No-op when the video tab isn't the focused surface.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn present_video_status() {
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_ref() {
-            let pos = p.dec.pts_ms(p.idx);
-            // Prefer completed 1 s window; if still filling, show instant
-            // estimate from last inter-present gap.
-            let fps = if p.fps_display > 0 {
-                p.fps_display
-            } else if p.fps_window_frames > 0 {
-                let elapsed = crate::arch::now_ms().saturating_sub(p.fps_window_start_ms).max(1);
-                (p.fps_window_frames as u64 * 1000 / elapsed) as u32
-            } else {
-                0
-            };
-            crate::framebuffer::draw_video_status(
-                &p.name,
-                p.playing,
-                crate::sound::muted() || p.muted,
-                p.has_audio,
-                p.idx + 1,
-                p.frame_count,
-                pos,
-                p.total_ms,
-                crate::sound::volume(),
-                fps,
-            );
-        }
-    });
-}
-#[cfg(not(all(not(feature = "server"), not(test))))]
-fn present_video_status() {}
-
-/// Seek the video by whole frames (arrows on the video tab).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn video_seek(delta: i64) {
-    let now = crate::arch::now_ms();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            video_job_join(p); // reclaim `dec` from any decode-ahead worker
-            let n = p.frame_count as i64;
-            let ni = (p.idx as i64 + delta).clamp(0, n - 1) as usize;
-            p.idx = ni;
-            // Re-anchor the clock to the sought frame's pts.
-            let pts = p.dec.pts_ms(ni);
-            p.base_ms = now.saturating_sub(pts);
-            p.paused_at = pts;
-            p.finished_announced = false;
-            p.dec.seek_decode(ni);
-            // Keep audio cursor in lockstep with video pts.
-            if p.audio_rate > 0 {
-                p.audio_at = ((pts as u128) * p.audio_rate as u128 / 1000) as usize;
-                if let Some(pcm) = p.audio_pcm.as_ref() {
-                    p.audio_at = p.audio_at.min(pcm.len());
-                }
-            }
-        }
-    });
-    present_video_frame();
-}
-
-/// Restart the video from the first frame (0 / Home).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn video_restart() {
-    let now = crate::arch::now_ms();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            video_job_join(p); // reclaim `dec` from any decode-ahead worker
-            p.idx = 0;
-            p.base_ms = now;
-            p.paused_at = 0;
-            p.playing = true;
-            p.finished_announced = false;
-            p.dec.seek_decode(0);
-            p.audio_at = 0;
-        }
-    });
-    present_video_frame();
-}
-
-/// Surface id the `/open` image viewer presents on (labelled "image" in the
-/// tab bar; distinct from any agent-allocated `synapse::ui` surface).
-#[cfg(not(feature = "server"))]
-const VIEWER_SURFACE: u32 = u32::MAX; // == framebuffer::IMAGE_SURFACE (labelled "image")
-
-/// The retained source image plus interactive view state (zoom / rotation /
-/// pan), so the image tab can be zoomed, rotated, and panned and repaints when
-/// you switch back to it (surfaces aren't otherwise backed). The source is
-/// capped to `IMAGE_MAX_PX` at load so a huge photo can't exhaust the heap
-/// while still holding enough detail for a few zoom steps.
-#[cfg(not(feature = "server"))]
-struct ImageTab {
-    src: crate::image::Image,
-    zoom: u32, // percent of fit-to-pane; 100 = fit
-    rot: u32,  // 90° quadrants clockwise
-    pan_x: i64,
-    pan_y: i64,
-}
-#[cfg(not(feature = "server"))]
-static IMAGE: crate::mm::Locked<Option<ImageTab>> = crate::mm::Locked::new(None);
-/// Cap the retained source image (≈16 MiB of u32) — bounds heap use for a huge
-/// photo; box-downscaled once at load, aspect preserved by halving.
-#[cfg(not(feature = "server"))]
-const IMAGE_MAX_PX: usize = 4_000_000;
-
-/// `/open <path>.png|.jpg` — decode and show an image in an action-pane tab.
-/// Reads from a mounted volume (`/mnt/...`) or the Synapse store; the decoded
-/// image is box-downscaled to the pane, then integer-upscaled/letterboxed by
-/// the compositor, and retained so switching back to the tab repaints it.
-#[cfg(not(feature = "server"))]
-fn view_image(path: &str) {
-    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
-        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
-        return;
-    };
-    let t0 = crate::arch::now_ms();
-    // **Decoded in ring 3.** The bytes are attacker-supplied and the decoder needs no authority
-    // to turn them into pixels, so it runs as a tenant that holds nothing and can be discarded —
-    // see `/decoder`, which switches back to the in-kernel path for an A/B.
-    match crate::synapse::tenant::decode_image_for_view(&bytes) {
-        Ok(img) => {
-            let (iw, ih) = (img.w, img.h);
-            #[cfg(not(test))]
-            {
-                // Cap the retained source (halving preserves aspect) so a huge
-                // photo can't exhaust the heap.
-                let mut src = img;
-                let (mut nw, mut nh) = (src.w, src.h);
-                while nw * nh > IMAGE_MAX_PX {
-                    nw = nw.div_ceil(2);
-                    nh = nh.div_ceil(2);
-                }
-                if (nw, nh) != (src.w, src.h) {
-                    src = crate::image::resize(&src, nw, nh);
-                }
-                IMAGE.with(|s| *s = Some(ImageTab { src, zoom: 100, rot: 0, pan_x: 0, pan_y: 0 }));
-                // Open the tab and render the fitted view. Controls activate
-                // once the action pane is focused (Ctrl+Tab / click) — the same
-                // gating as pane scroll, so typing at the prompt is never eaten.
-                crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIEWER_SURFACE));
-                render_image();
-            }
-            #[cfg(test)]
-            drop(img);
-            serial_println!(
-                "open> {} — {}x{} px, {} KiB, decoded in {} ms  (Ctrl+Tab to focus pane, then +/- zoom, r/l rotate, arrows pan, 0 reset; Ctrl+Tab again returns to shell; /close hides)",
-                path,
-                iw,
-                ih,
-                bytes.len() / 1024,
-                crate::arch::now_ms().saturating_sub(t0)
-            );
-        }
-        Err(e) => serial_println!("open> cannot decode {}: {}", path, e),
-    }
-}
-
-/// Render the retained image at its current zoom/rotation/pan into the tab.
-/// Also the repaint-on-switch path (surfaces aren't otherwise backed).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn render_image() {
-    let (pw, ph) = crate::framebuffer::surface_dims_px(VIEWER_SURFACE).unwrap_or((640, 480));
-    let bg = crate::framebuffer::pane_bg().unwrap_or(0);
-    IMAGE.with(|s| {
-        if let Some(t) = s.as_ref() {
-            let v = crate::image::render_view(&t.src, pw as usize, ph as usize, t.zoom, t.rot, t.pan_x, t.pan_y, bg);
-            crate::framebuffer::present_surface(VIEWER_SURFACE, v.w, v.h, &v.pixels);
-        }
-    });
-}
-#[cfg(not(all(not(feature = "server"), not(test))))]
-fn render_image() {}
-#[cfg(not(test))]
-fn repaint_image() {
-    render_image();
-}
-
-/// Apply an interactive image-viewer command (zoom/rotate/pan/reset) and
-/// re-render the tab. No-op unless the image tab is loaded.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn image_cmd(c: u8) {
-    let (pw, ph) = crate::framebuffer::surface_dims_px(VIEWER_SURFACE).unwrap_or((640, 480));
-    let (pw, ph) = (pw as i64, ph as i64);
-    IMAGE.with(|s| {
-        let Some(t) = s.as_mut() else { return };
-        // Pan step scales with the pane so it feels the same at any resolution.
-        let step = (pw / 6).max(16);
-        match c {
-            b'+' | b'=' => t.zoom = (t.zoom + 25).min(800),
-            b'-' | b'_' => t.zoom = t.zoom.saturating_sub(25).max(10),
-            b'r' | b'R' => {
-                t.rot = (t.rot + 1) % 4;
-                t.pan_x = 0;
-                t.pan_y = 0;
-            }
-            b'l' | b'L' => {
-                t.rot = (t.rot + 3) % 4;
-                t.pan_x = 0;
-                t.pan_y = 0;
-            }
-            b'0' => {
-                t.zoom = 100;
-                t.rot = 0;
-                t.pan_x = 0;
-                t.pan_y = 0;
-            }
-            // Arrow bytes forwarded as A/B/C/D: pan the image (only meaningful
-            // once zoomed past the pane).
-            b'A' => t.pan_y += step,
-            b'B' => t.pan_y -= step,
-            b'C' => t.pan_x += step,
-            b'D' => t.pan_x -= step,
-            _ => return,
-        }
-        // Clamp pan so the image can't be dragged entirely off the pane.
-        let (ow, oh) = if t.rot % 2 == 1 { (t.src.h, t.src.w) } else { (t.src.w, t.src.h) };
-        let (fw, fh) = crate::image::fit(ow, oh, pw as usize, ph as usize);
-        let dw = (fw as i64 * t.zoom as i64 / 100).max(1);
-        let dh = (fh as i64 * t.zoom as i64 / 100).max(1);
-        let maxx = (dw - pw).max(0) / 2 + pw / 4;
-        let maxy = (dh - ph).max(0) / 2 + ph / 4;
-        t.pan_x = t.pan_x.clamp(-maxx, maxx);
-        t.pan_y = t.pan_y.clamp(-maxy, maxy);
-    });
-    render_image();
-}
-#[cfg(not(all(not(feature = "server"), not(test))))]
-#[allow(dead_code)]
-fn image_cmd(_c: u8) {}
-
-/// A background audio player: the decoded PCM plus a cursor. Lives in a static
-/// so playback continues while you switch tabs or run other commands — it is
-/// pumped one chunk at a time from `ui_tick` (`pump_audio`), like `/top`
-/// refreshes. `done` latches at end-of-track.
-#[cfg(not(feature = "server"))]
-struct AudioPlayer {
-    pcm: alloc::vec::Vec<i16>,
-    rate: u32,
-    at: usize,
-    name: String,
-    total_ms: u64,
-    done: bool,
-    paused: bool,
-    finished_announced: bool,
-    /// Peak envelope for the wave visualizer (`audio::waveform_peaks`).
-    peaks: alloc::vec::Vec<u8>,
-}
-#[cfg(not(feature = "server"))]
-static AUDIO: crate::mm::Locked<Option<AudioPlayer>> = crate::mm::Locked::new(None);
-
-/// `/open <path>.wav|.mp3|.aac` — decode (RIFF/WAVE, MPEG Layer III, or ADTS
-/// AAC) and play in the background at the file's own sample rate, in an
-/// "audio" action-pane tab.
-/// Non-blocking: it starts playback and returns; `pump_audio` (idle tick) feeds
-/// the device chunk by chunk, so switching tabs, editing, or running other
-/// commands never interrupts the track. `/close` (or Ctrl+C at the prompt)
-/// stops it.
-#[cfg(not(feature = "server"))]
-fn play_audio(path: &str) {
-    let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
-        serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
-        return;
-    };
-    let t0 = crate::arch::now_ms();
-    let audio = match crate::audio::decode(&bytes) {
-        Ok(a) => a,
-        Err(e) => {
-            serial_println!("open> cannot decode {}: {}", path, e);
-            return;
-        }
-    };
-    let total_ms = audio.duration_ms();
-    serial_println!(
-        "open> playing {} — {}:{:02} at {} Hz ({} KiB, decoded in {} ms)",
-        path,
-        total_ms / 60000,
-        total_ms % 60000 / 1000,
-        audio.rate,
-        bytes.len() / 1024,
-        crate::arch::now_ms().saturating_sub(t0)
-    );
-    if !crate::sound::is_up() {
-        serial_println!("open> no sound device — decoded OK but cannot play");
-        return;
-    }
-    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+Tab again returns to shell; Ctrl+C or /close stops");
-    let name = path.rsplit('/').next().unwrap_or(path).to_string();
-    let peaks = crate::audio::waveform_peaks(&audio.pcm, crate::audio::WAVEFORM_BINS);
-    AUDIO.with(|a| {
-        *a = Some(AudioPlayer {
-            pcm: audio.pcm,
-            rate: audio.rate,
-            at: 0,
-            name,
-            total_ms,
-            done: false,
-            paused: false,
-            finished_announced: false,
-            peaks,
-        })
-    });
-    #[cfg(not(test))]
-    {
-        crate::framebuffer::set_right(crate::framebuffer::RightMode::Audio);
-        repaint_audio();
-    }
-}
-
-/// Whether a track is loaded (playing or paused at end).
-#[cfg(not(feature = "server"))]
-fn audio_loaded() -> bool {
-    AUDIO.with(|a| a.is_some())
-}
-
-/// Stop + unload the background track (Ctrl+C / closing the audio tab).
-#[cfg(not(feature = "server"))]
-fn stop_audio() {
-    let was = AUDIO.with(|a| a.take().is_some());
-    if was {
-        serial_println!("\ropen> audio stopped");
-    }
-}
-/// Headless build has no `/open` media player; the tab-close path still calls
-/// this generically, so provide a no-op.
-#[cfg(feature = "server")]
-fn stop_audio() {}
-
-/// Toggle play/pause on the background track (space key on the audio tab).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn audio_toggle_pause() {
-    AUDIO.with(|a| {
-        if let Some(p) = a.as_mut() {
-            p.paused = !p.paused;
-        }
-    });
-    repaint_audio();
-}
-
-/// Seek the background track by `delta_ms` (negative = rewind), clamped to the
-/// track. Takes effect after the device drains its already-queued ~200 ms.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn audio_seek(delta_ms: i64) {
-    AUDIO.with(|a| {
-        if let Some(p) = a.as_mut() {
-            let samples = delta_ms * p.rate as i64 / 1000;
-            let n = (p.at as i64 + samples).clamp(0, p.pcm.len() as i64) as usize;
-            p.at = n;
-            if p.at < p.pcm.len() {
-                p.done = false;
-                p.finished_announced = false;
-            }
-        }
-    });
-    repaint_audio();
-}
-
-/// Restart the background track from the beginning (0 / Home on the audio tab).
-#[cfg(all(not(feature = "server"), not(test)))]
-fn audio_restart() {
-    AUDIO.with(|a| {
-        if let Some(p) = a.as_mut() {
-            p.at = 0;
-            p.done = false;
-            p.finished_announced = false;
-        }
-    });
-    repaint_audio();
-}
-
-/// Feed the next chunk to the sound device when it has drained the previous
-/// one — the background-player heartbeat, called every idle tick. Copies the
-/// chunk out before playing so the `AUDIO` lock isn't held across the device
-/// enqueue. No-op when nothing is loaded or the device is still draining.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn pump_audio() {
-    if crate::sound::playing() {
-        return; // still draining the last chunk
-    }
-    let next = AUDIO.with(|a| {
-        let p = a.as_mut()?;
-        if p.paused {
-            return None; // hold position; the device drains its last chunk to silence
-        }
-        if p.done || p.at >= p.pcm.len() {
-            p.done = true;
-            return None;
-        }
-        let chunk = (p.rate as usize / 5).max(256); // ~200 ms
-        let end = (p.at + chunk).min(p.pcm.len());
-        let slice = p.pcm[p.at..end].to_vec();
-        p.at = end;
-        Some((slice, p.rate))
-    });
-    if let Some((slice, rate)) = next {
-        let _ = crate::sound::play(&slice, rate);
-    }
-    // Announce end-of-track once.
-    let finished = AUDIO.with(|a| a.as_mut().map(|p| p.done && !p.finished_announced && !crate::sound::playing()).unwrap_or(false));
-    if finished {
-        AUDIO.with(|a| {
-            if let Some(p) = a.as_mut() {
-                p.finished_announced = true;
-            }
-        });
-        serial_println!("\ropen> audio finished");
-    }
-}
-#[cfg(not(all(not(feature = "server"), not(test))))]
-fn pump_audio() {}
-
-/// Repaint the audio tab (progress). Called on switch + ~4 Hz while active.
-#[cfg(all(not(feature = "server"), not(test)))]
-fn repaint_audio() {
-    AUDIO.with(|a| {
-        if let Some(p) = a.as_ref() {
-            let pos_ms = p.at as u64 * 1000 / p.rate.max(1) as u64;
-            crate::framebuffer::draw_audio(&crate::framebuffer::AudioView {
-                name: &p.name,
-                pos_ms: pos_ms.min(p.total_ms),
-                total_ms: p.total_ms,
-                rate: p.rate,
-                playing: !p.done && !p.paused,
-                paused: p.paused,
-                peaks: &p.peaks,
-                volume: crate::sound::volume(),
-                muted: crate::sound::muted(),
-            });
-        }
-    });
-}
-#[cfg(not(all(not(feature = "server"), not(test))))]
-fn repaint_audio() {}
-
+// (moved to shell/video.rs)
+// (moved to shell/media.rs)
 /// `/clip [text]` — the shared clipboard. With no argument it prints the
 /// current contents; with text it sets the clipboard, which also pushes to the
 /// host clipboard via OSC 52 (`clipboard::set`). Copy in the editor/chat and it
@@ -13878,1686 +8662,8 @@ fn parse_datetime(s: &str) -> Option<(i64, i64, i64, i64, i64, i64)> {
     Some((y, mo, d, h, mi, s))
 }
 
-// --- block-device / filesystem commands (via `crate::fs::{mount,vfs}`) ----
-
-/// `/mount <disk> [vol] [/path]` — bind volume `vol` (default 0) of disk `disk`
-/// to a mount path (default the first free `/mnt`, `/mnt2`, …).
-fn disk_mount(arg: &str) {
-    use alloc::string::String;
-    let mut disk: Option<usize> = None;
-    let mut vol: usize = 0;
-    let mut path: Option<String> = None;
-    // Default RW for FAT/ext; `ro` forces read-only. NTFS always RO for now.
-    let mut want_rw = true;
-    let mut nums = 0;
-    for tok in arg.split_whitespace() {
-        if tok == "ro" {
-            want_rw = false;
-        } else if tok == "rw" {
-            want_rw = true;
-        } else if let Some(p) = tok.strip_prefix('/') {
-            path = Some(alloc::format!("/{p}"));
-        } else if let Ok(n) = tok.parse::<usize>() {
-            if nums == 0 {
-                disk = Some(n);
-            } else {
-                vol = n;
-            }
-            nums += 1;
-        }
-    }
-    let Some(disk) = disk else {
-        serial_println!(
-            "mount> usage: /mount <disk> [vol] [/path] [rw|ro]\n\
-             mount> FAT/ext default rw; NTFS mounts read-only (writer not implemented)"
-        );
-        return;
-    };
-    match crate::fs::mount::mount(disk, vol, path.as_deref(), want_rw) {
-        Ok(mt) => {
-            serial_println!(
-                "mount> {} -> disk {} ({}, {} MiB, label={}, {})",
-                mt.path,
-                mt.disk,
-                mt.fs.name(),
-                mt.sectors * 512 / 1024 / 1024,
-                mt.label.as_deref().unwrap_or("-"),
-                if mt.writable { "rw" } else { "ro" }
-            );
-            if want_rw && !mt.writable {
-                serial_println!(
-                    "mount> note: {} is mounted read-only (write support not implemented)",
-                    mt.fs.name()
-                );
-            }
-        }
-        Err(crate::fs::mount::MountError::NoDisk) => {
-            serial_println!("mount> no disk {} (see /disks)", disk);
-        }
-        Err(crate::fs::mount::MountError::NoVolume) => {
-            serial_println!("mount> disk {} has no volume {} (see /disks)", disk, vol);
-        }
-        Err(crate::fs::mount::MountError::Busy) => {
-            serial_println!("mount> path already mounted (/umount it first)");
-        }
-        Err(crate::fs::mount::MountError::Unsupported) => {
-            serial_println!(
-                "mount> unsupported filesystem (FAT/ext: rw; NTFS: ro list+read; exFAT: detect only)"
-            );
-        }
-        Err(e) => serial_println!("mount> failed: {e:?}"),
-    }
-}
-
-/// `/umount <path>` — remove a mount.
-fn disk_umount(arg: &str) {
-    let path = arg.trim();
-    match crate::fs::mount::umount(path) {
-        Ok(()) => serial_println!("umount> {} unmounted", path),
-        Err(_) => serial_println!("umount> {} not mounted (see /mounts)", path),
-    }
-}
-
-/// `/mounts` — list the mount table.
-fn disk_mounts() {
-    let m = crate::fs::mount::list();
-    if m.is_empty() {
-        serial_println!("mounts> (nothing mounted; /mount <disk> [vol] [/path])");
-        return;
-    }
-    for mt in m.iter() {
-        serial_println!(
-            "  {:<8} disk {} lba {:<10} {:>6} MiB  {:<8} {} label={}",
-            mt.path,
-            mt.disk,
-            mt.start_lba,
-            mt.sectors * 512 / 1024 / 1024,
-            mt.fs.name(),
-            if mt.writable { "rw" } else { "ro" },
-            mt.label.as_deref().unwrap_or("-")
-        );
-    }
-}
-
-/// `/encrypt <disk> [vol]` — format a **data** partition as C4VE (AES-XTS) and
-/// put an empty ext4 on the payload. **Human-only**, destructive: existing
-/// contents of that volume are wiped. Agent tools must not call this.
-fn disk_encrypt(arg: &str) {
-    use crate::block::ext4::Ext4Writer;
-    use crate::block::volcrypto::{self, DEFAULT_HDR_SECTORS, DEFAULT_ITERATIONS};
-    use crate::block::Partition;
-
-    let mut nums = arg.split_whitespace().filter_map(|t| t.parse::<usize>().ok());
-    let Some(disk) = nums.next() else {
-        serial_println!("encrypt> usage: /encrypt <disk> [vol]   (human-only; wipes the volume)");
-        return;
-    };
-    let vol = nums.next().unwrap_or(0);
-    if !crate::modal::confirm(
-        "Encrypt volume",
-        &alloc::format!("Wipe disk {disk} vol {vol} and encrypt with AES-XTS?"),
-    ) {
-        serial_println!("encrypt> cancelled");
-        return;
-    }
-    let pass = crate::modal::input("Set passphrase", "New passphrase:", true);
-    if pass.is_empty() {
-        serial_println!("encrypt> empty passphrase refused");
-        return;
-    }
-    let pass2 = crate::modal::input("Confirm passphrase", "Repeat:", true);
-    if pass != pass2 {
-        serial_println!("encrypt> passphrases do not match");
-        return;
-    }
-    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-        serial_println!("encrypt> no disk {disk}");
-        return;
-    };
-    let vols = crate::fs::detect::probe(&mut dev);
-    let Some(v) = vols.get(vol).cloned() else {
-        serial_println!("encrypt> no volume {vol} on disk {disk}");
-        return;
-    };
-    let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
-    let key = match volcrypto::format(&mut part, pass.as_bytes(), DEFAULT_ITERATIONS, DEFAULT_HDR_SECTORS)
-    {
-        Ok(k) => k,
-        Err(e) => {
-            serial_println!("encrypt> format header failed: {e:?}");
-            return;
-        }
-    };
-    // Empty ext4 on the encrypted payload.
-    let mut payload =
-        volcrypto::CryptoPart::encrypted(&mut dev, v.start_lba, v.sectors, DEFAULT_HDR_SECTORS, key);
-    if let Err(e) = Ext4Writer::format(&mut payload, &[]) {
-        serial_println!("encrypt> payload mkfs failed: {e:?}");
-        return;
-    }
-    serial_println!(
-        "encrypt> disk {disk} vol {vol} is C4VE + empty ext4 ({} MiB payload). Reboot and unlock, or /unlock.",
-        (v.sectors.saturating_sub(DEFAULT_HDR_SECTORS)) * 512 / 1024 / 1024
-    );
-}
-
-/// `/unlock [disk] [vol]` — unlock a C4VE data volume and adopt it as the
-/// synapse store (if not already mounted). Human-only.
-fn disk_unlock(arg: &str) {
-    use crate::block::ext4_store::Ext4Store;
-    use crate::block::volcrypto;
-    use crate::block::Partition;
-
-    let mut nums = arg.split_whitespace().filter_map(|t| t.parse::<usize>().ok());
-    let disk = nums.next().unwrap_or(0);
-    let vol = nums.next().unwrap_or(0);
-    let pass = crate::modal::input("Unlock volume", "Passphrase:", true);
-    if pass.is_empty() {
-        serial_println!("unlock> cancelled");
-        return;
-    }
-    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
-        serial_println!("unlock> no disk {disk}");
-        return;
-    };
-    let vols = crate::fs::detect::probe(&mut dev);
-    let Some(v) = vols.get(vol).cloned() else {
-        serial_println!("unlock> no volume {vol}");
-        return;
-    };
-    let start = v.start_lba;
-    let count = v.sectors;
-    let (key, hdr) = {
-        let mut part = Partition::new(&mut dev, start, count);
-        match volcrypto::unlock(&mut part, pass.as_bytes()) {
-            Ok(x) => x,
-            Err(_) => {
-                serial_println!("unlock> wrong passphrase or not a C4VE volume");
-                return;
-            }
-        }
-    };
-    drop(dev); // free the handle so mount can re-probe the same disk
-    match Ext4Store::mount_encrypted(disk, start, count, key, hdr.hdr_sectors) {
-        Some(store) => {
-            crate::synapse::fs::mount_ext4(store);
-            serial_println!(
-                "unlock> adopted encrypted store (disk {disk} vol {vol}, hdr {} sectors)",
-                hdr.hdr_sectors
-            );
-        }
-        None => serial_println!("unlock> unlocked but payload is not a readable ext4"),
-    }
-}
-
-/// List the root of a non-store mount via the VFS.
-fn ls_mount(path: &str) {
-    if path == "/" {
-        fs_ls("/");
-        return;
-    }
-    match crate::fs::vfs::readdir(path) {
-        Ok(entries) => {
-            serial_println!("ls> {} ({} entries):", path, entries.len());
-            for e in entries.into_iter().take(64) {
-                if e.is_dir {
-                    serial_println!("  {}/", e.name);
-                } else if e.size > 0 {
-                    serial_println!("  {} ({} bytes)", e.name, e.size);
-                } else {
-                    serial_println!("  {}", e.name);
-                }
-            }
-        }
-        Err(e) => serial_println!("ls> {path}: {e:?}"),
-    }
-}
-
-// --- store filesystem commands (Linux-like over synapse::fs) -------------
-
-/// Parse flags from a shell arg line. Returns `(flags, positionals)`.
-fn fs_split_flags(arg: &str) -> (alloc::vec::Vec<char>, alloc::vec::Vec<alloc::string::String>) {
-    let mut flags = alloc::vec::Vec::new();
-    let mut pos = alloc::vec::Vec::new();
-    for tok in arg.split_whitespace() {
-        if tok == "--" {
-            continue;
-        }
-        if let Some(rest) = tok.strip_prefix('-') {
-            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic()) {
-                for c in rest.chars() {
-                    flags.push(c);
-                }
-                continue;
-            }
-        }
-        pos.push(alloc::string::String::from(tok));
-    }
-    (flags, pos)
-}
-
-/// `/ls [path] [-l]` — hierarchical listing of the store (default `/`).
-/// Also: `/ls <n>` lists volume *n* on disk 0; `/ls /mnt` lists a non-store mount.
-fn fs_ls(arg: &str) {
-    let (flags, pos) = fs_split_flags(arg);
-    let long = flags.contains(&'l') || flags.contains(&'1');
-    let target = pos.first().map(|s| s.as_str()).unwrap_or("/");
-
-    // Numeric → legacy disk volume root listing.
-    if let Ok(n) = target.parse::<usize>() {
-        disk_ls_volume(n);
-        return;
-    }
-
-    let path = crate::synapse::vpath::normalize(target);
-
-    // A non-root disk mount (e.g. /mnt) lists the volume via the VFS.
-    // `/` is the Synapse store tree (never dump percent-encoded on-disk keys).
-    if path != "/" {
-        if crate::fs::mount::by_path(&path).is_some() {
-            ls_mount(&path);
-            return;
-        }
-    }
-
-    // Store hierarchical listing, then VFS fallback for mount files.
-    use crate::synapse::fs as store;
-    use crate::synapse::vpath::{self, EntryClass};
-
-    match store::classify(&path) {
-        None => {
-            // Store miss: try foreign-mount VFS (USB /mnt/…), then file read.
-            match crate::fs::vfs::readdir(&path) {
-                Ok(entries) if path_on_mount(&path) || crate::fs::mount::resolve(&path).is_some() => {
-                    serial_println!("ls> {}  ({} entries)", path, entries.len());
-                    for e in entries.into_iter().take(64) {
-                        if e.is_dir {
-                            serial_println!("  {}/", e.name);
-                        } else if e.size > 0 {
-                            serial_println!("  {} ({} bytes)", e.name, e.size);
-                        } else {
-                            serial_println!("  {}", e.name);
-                        }
-                    }
-                }
-                _ => {
-                    if crate::fs::vfs::read_mount(&path).is_ok() {
-                        serial_println!("ls> {}: is a file (use /cat)", path);
-                    } else {
-                        serial_println!("ls> {}: no such file or directory", path);
-                    }
-                }
-            }
-        }
-        Some(EntryClass::File) => {
-            let sz = store::size_of(&path).unwrap_or(0);
-            serial_println!("ls> {}  ({} bytes)", path, sz);
-        }
-        Some(EntryClass::Dir) => {
-            let entries = store::list_dir(&path);
-            serial_println!("ls> {}  ({} entries)", path, entries.len());
-            if entries.is_empty() {
-                return;
-            }
-            for e in &entries {
-                if long {
-                    let full = if path == "/" {
-                        alloc::format!("/{}", e.name)
-                    } else {
-                        alloc::format!("{}/{}", path, e.name)
-                    };
-                    let (mode, uid, mtime) = store::meta(&full)
-                        .map(|m| (m.mode, m.uid, m.mtime))
-                        .unwrap_or((0, 0, 0));
-                    serial_println!("  {}", vpath::format_long_meta(e, mode, uid, mtime));
-                } else {
-                    serial_println!("  {}", vpath::format_short(e));
-                }
-            }
-        }
-    }
-}
-
-/// `/cat <path>` — print a store file (preferred) or a mounted-volume file.
-fn fs_cat(arg: &str) {
-    let full = crate::synapse::vpath::normalize(arg.trim());
-    if full.is_empty() || arg.trim().is_empty() {
-        serial_println!("cat> usage: /cat <path>");
-        return;
-    }
-    if crate::synapse::fs::is_dir(&full) {
-        serial_println!("cat> {}: is a directory", full);
-        return;
-    }
-    // Store + mounts through the VFS facade.
-    let data = crate::fs::vfs::read(&full);
-    match data {
-        Ok(bytes) => {
-            serial_println!("cat> {} ({} bytes):", full, bytes.len());
-            match core::str::from_utf8(&bytes) {
-                Ok(s) => match crate::highlight::lang_for_path(&full) {
-                    Some(lang) => {
-                        let mut st = crate::highlight::State::default();
-                        for line in s.lines() {
-                            serial_println!("{}", crate::highlight::ansi_line(lang, line, &mut st));
-                        }
-                    }
-                    None => serial_println!("{}", s),
-                },
-                Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
-            }
-        }
-        Err(_) => serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full),
-    }
-}
-
-/// `/grep <query> [path_glob]` — content search over the store.
-fn fs_grep(arg: &str) {
-    let mut parts = arg.split_whitespace();
-    let Some(query) = parts.next() else {
-        serial_println!("grep> usage: /grep <query> [path_glob]");
-        return;
-    };
-    let path_glob = parts.next().unwrap_or("");
-    let mut paths = crate::synapse::fs::list();
-    if !path_glob.is_empty() {
-        paths = crate::tools::pathutil::glob_filter(path_glob, &paths);
-    }
-    let mut files: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = alloc::vec::Vec::new();
-    for p in paths {
-        if let Some(bytes) = crate::synapse::fs::read(&p) {
-            files.push((p, alloc::string::String::from_utf8_lossy(&bytes).into_owned()));
-        }
-    }
-    let hits = crate::tools::pathutil::grep_files(query, &files, 50);
-    if hits.is_empty() {
-        serial_println!("grep> no matches for {:?}", query);
-        return;
-    }
-    serial_println!("grep> {} hit(s) for {:?}:", hits.len(), query);
-    for h in hits {
-        serial_println!("  {}:{}:{}", h.path, h.line, h.text);
-    }
-}
-
-/// `/glob <pattern>` — path glob over the store.
-fn fs_glob(arg: &str) {
-    let pattern = arg.trim();
-    if pattern.is_empty() {
-        serial_println!("glob> usage: /glob <pattern>   e.g. /glob **/*.md");
-        return;
-    }
-    let paths = crate::synapse::fs::list();
-    let hits = crate::tools::pathutil::glob_filter(pattern, &paths);
-    serial_println!("glob> {} match(es) for {:?}:", hits.len(), pattern);
-    for p in hits {
-        serial_println!("  {}", p);
-    }
-}
-
-/// True when `path` is on a **foreign** mount (`/mnt`, USB, second disk), so
-/// shell FS ops should use raw VFS instead of the synapse store.
-///
-/// The auto-mounted data volume at `/` is **not** treated as a foreign mount:
-/// it is the durable synapse store itself. Routing `/mkdir /test` through VFS
-/// wrote an ext4 dir on disk that `/ls` (store view) never saw — the 01_30
-/// VirtualBox screenshot. Those paths stay on `synapse::fs` so they list and
-/// persist via Ext4Store.
-fn path_on_mount(path: &str) -> bool {
-    let Some((mt, _rel)) = crate::fs::mount::resolve(path) else {
-        return false;
-    };
-    mt.path != "/"
-}
-
-fn vfs_err_msg(op: &str, path: &str, e: crate::fs::vfs::VfsError) {
-    use crate::fs::vfs::VfsError;
-    match e {
-        VfsError::ReadOnly => serial_println!("{op}> {path}: read-only mount (remount with rw?)"),
-        VfsError::Unsupported => {
-            serial_println!(
-                "{op}> {path}: unsupported on this volume (FAT/ext RW; NTFS is read-only)"
-            )
-        }
-        VfsError::NotFound => serial_println!("{op}> {path}: not found"),
-        VfsError::NotAFile => serial_println!("{op}> {path}: not a file"),
-        VfsError::NotADir => serial_println!("{op}> {path}: not a directory"),
-        VfsError::NotMounted => serial_println!("{op}> {path}: not mounted (see /mounts)"),
-        VfsError::Io => serial_println!("{op}> {path}: I/O error"),
-    }
-}
-
-/// `/mkdir [-p] <path>` — create a directory (store or writable mount).
-fn fs_mkdir(arg: &str) {
-    let (flags, pos) = fs_split_flags(arg);
-    let parents = flags.contains(&'p');
-    let Some(path) = pos.first() else {
-        serial_println!("mkdir> usage: /mkdir [-p] <path>");
-        return;
-    };
-    if path_on_mount(path) {
-        let norm = crate::fs::path::normalize(path);
-        if parents {
-            let mut cur = alloc::string::String::new();
-            for part in norm.split('/').filter(|s| !s.is_empty()) {
-                cur.push('/');
-                cur.push_str(part);
-                if crate::fs::mount::by_path(&cur).is_some() {
-                    continue; // mount root
-                }
-                // Best-effort: skip if already present as a file or dir.
-                if crate::fs::vfs::readdir(&cur).is_ok() {
-                    continue;
-                }
-                if let Err(e) = crate::fs::vfs::mkdir(&cur) {
-                    // Exists as a file (NotAFile mapping) or already there.
-                    if matches!(
-                        e,
-                        crate::fs::vfs::VfsError::NotAFile | crate::fs::vfs::VfsError::Io
-                    ) {
-                        // FatRw Exists → NotAFile; treat "already exists" as ok for -p.
-                        continue;
-                    }
-                    vfs_err_msg("mkdir", &cur, e);
-                    return;
-                }
-            }
-            serial_println!("mkdir> {norm}");
-            return;
-        }
-        match crate::fs::vfs::mkdir(path) {
-            Ok(()) => serial_println!("mkdir> {norm}"),
-            Err(e) => vfs_err_msg("mkdir", path, e),
-        }
-        return;
-    }
-    match crate::synapse::fs::mkdir(path, parents) {
-        Ok(()) => serial_println!("mkdir> {}", crate::synapse::vpath::normalize(path)),
-        Err(e) => serial_println!("mkdir> {}: {}", path, e),
-    }
-}
-
-/// `/cp [-r] <src> <dst>` — copy file (store and/or mounted volumes).
-fn fs_cp(arg: &str) {
-    let (flags, pos) = fs_split_flags(arg);
-    let recursive = flags.contains(&'r') || flags.contains(&'R');
-    if pos.len() < 2 {
-        serial_println!("cp> usage: /cp [-r] <src> <dst>");
-        return;
-    }
-    let src = &pos[0];
-    let dst = &pos[1];
-    // Volume path: single-file copy via VFS (recursive trees stay store-only).
-    if path_on_mount(src) || path_on_mount(dst) {
-        if recursive {
-            serial_println!("cp> recursive copy across mounts is not supported yet");
-            return;
-        }
-        match crate::fs::vfs::read(src) {
-            Ok(data) => match crate::fs::vfs::write(dst, &data) {
-                Ok(()) => serial_println!("cp> {} → {} ({} byte(s))", src, dst, data.len()),
-                Err(e) => vfs_err_msg("cp", dst, e),
-            },
-            Err(e) => vfs_err_msg("cp", src, e),
-        }
-        return;
-    }
-    match crate::synapse::fs::copy(src, dst, recursive) {
-        Ok(n) => serial_println!("cp> {} → {} ({} file(s))", src, dst, n),
-        Err(e) => serial_println!("cp> {}: {}", src, e),
-    }
-}
-
-/// `/mv <src> <dst>` — rename/move in the store or on a writable ext mount.
-fn fs_mv(arg: &str) {
-    let (_flags, pos) = fs_split_flags(arg);
-    if pos.len() < 2 {
-        serial_println!("mv> usage: /mv <src> <dst>");
-        return;
-    }
-    let src = &pos[0];
-    let dst = &pos[1];
-    if path_on_mount(src) || path_on_mount(dst) {
-        match crate::fs::vfs::rename(src, dst) {
-            Ok(()) => serial_println!("mv> {} → {}", src, dst),
-            Err(e) => vfs_err_msg("mv", src, e),
-        }
-        return;
-    }
-    match crate::synapse::fs::rename(src, dst) {
-        Ok(n) => serial_println!("mv> {} → {} ({} file(s))", src, dst, n),
-        Err(e) => serial_println!("mv> {}: {}", src, e),
-    }
-}
-
-/// `/rm [-r] <path>` — remove a store file/tree or a file on a writable mount.
-fn fs_rm(arg: &str) {
-    let (flags, pos) = fs_split_flags(arg);
-    let recursive = flags.contains(&'r') || flags.contains(&'R');
-    let Some(path) = pos.first() else {
-        serial_println!("rm> usage: /rm [-r] <path>");
-        return;
-    };
-    if path_on_mount(path) {
-        if recursive {
-            serial_println!("rm> recursive remove on mounts is not supported yet");
-            return;
-        }
-        match crate::fs::vfs::unlink(path) {
-            Ok(()) => serial_println!("rm> {}", path),
-            Err(e) => vfs_err_msg("rm", path, e),
-        }
-        return;
-    }
-    match crate::synapse::fs::remove(path, recursive) {
-        Ok(n) => serial_println!("rm> {} ({} file(s))", path, n),
-        Err(e) => serial_println!("rm> {}: {}", path, e),
-    }
-}
-
-/// `/touch <path>` — create empty file or refresh existing (store or mount).
-fn fs_touch(arg: &str) {
-    let path = arg.trim();
-    if path.is_empty() {
-        serial_println!("touch> usage: /touch <path>");
-        return;
-    }
-    if path_on_mount(path) {
-        // Create empty or leave existing contents (read + rewrite).
-        let data = crate::fs::vfs::read(path).unwrap_or_default();
-        match crate::fs::vfs::write(path, &data) {
-            Ok(()) => serial_println!("touch> {}", crate::fs::path::normalize(path)),
-            Err(e) => vfs_err_msg("touch", path, e),
-        }
-        return;
-    }
-    match crate::synapse::fs::touch(path) {
-        Ok(()) => serial_println!("touch> {}", crate::synapse::vpath::normalize(path)),
-        Err(e) => serial_println!("touch> {}: {}", path, e),
-    }
-}
-
-/// `/channel` — manage external messaging channels (Telegram first; generic
-/// backends). OpenClaw-style: add a bot, start polling, pair/allow senders,
-/// send/reply. Inbound text with `auto_agent` is answered by the shell agent.
-fn run_channel(arg: &str) {
-    use crate::msgchan::{self, DmPolicy, Kind};
-    let mut parts = arg.split_whitespace();
-    let sub = parts.next().unwrap_or("");
-    match sub {
-        "" | "list" | "ls" => {
-            let all = msgchan::list();
-            if all.is_empty() {
-                serial_println!("channel> (none) — /channel add telegram <name> <bot_token>");
-                serial_println!("channel> types: {}", msgchan::types().join(", "));
-                return;
-            }
-            serial_println!("channel> {} instance(s):", all.len());
-            for i in all {
-                let st = if i.running { "running" } else { "stopped" };
-                let err = i
-                    .last_error
-                    .as_deref()
-                    .map(|e| alloc::format!(" err={e}"))
-                    .unwrap_or_default();
-                serial_println!(
-                    "  {:<12} {:<10} {:<8} policy={} allow={} auto_agent={}{err}",
-                    i.name,
-                    i.kind.as_str(),
-                    st,
-                    i.policy.as_str(),
-                    i.allow_from.len(),
-                    i.auto_agent
-                );
-            }
-        }
-        "types" => {
-            serial_println!("channel> backends: {}", msgchan::types().join(", "));
-            serial_println!("channel> add more kinds in msgchan::Kind without changing this command");
-        }
-        "add" => {
-            // /channel add telegram <name> <token> [pairing|allowlist|open]
-            let kind_s = parts.next().unwrap_or("");
-            let name = parts.next().unwrap_or("");
-            let token = parts.next().unwrap_or("");
-            let pol_s = parts.next().unwrap_or("pairing");
-            let Some(kind) = Kind::parse(kind_s) else {
-                serial_println!("channel> usage: /channel add <type> <name> <token> [pairing|allowlist|open]");
-                serial_println!("channel> types: {}", msgchan::types().join(", "));
-                return;
-            };
-            let policy = DmPolicy::parse(pol_s).unwrap_or(DmPolicy::Pairing);
-            match msgchan::add(name, kind, token, policy) {
-                Ok(()) => serial_println!(
-                    "channel> added '{}' ({}, policy={}) — /channel start {name}",
-                    name,
-                    kind.as_str(),
-                    policy.as_str()
-                ),
-                Err(e) => serial_println!("channel> add failed: {e}"),
-            }
-        }
-        "remove" | "rm" => {
-            let name = parts.next().unwrap_or("");
-            if name.is_empty() {
-                serial_println!("channel> usage: /channel remove <name>");
-                return;
-            }
-            match msgchan::remove(name) {
-                Ok(()) => serial_println!("channel> removed '{name}'"),
-                Err(e) => serial_println!("channel> {e}"),
-            }
-        }
-        "start" => {
-            let name = parts.next().unwrap_or("");
-            if name.is_empty() {
-                serial_println!("channel> usage: /channel start <name>");
-                return;
-            }
-            serial_println!("channel> starting '{name}' (HTTPS to api.telegram.org; Ctrl+C cancels)…");
-            match msgchan::start(name) {
-                Ok(()) => {
-                    serial_println!(
-                        "channel> '{name}' started — polling every ~2.5s in the background"
-                    );
-                    serial_println!(
-                        "channel> DM the bot, then /channel pair {name} <CODE> (or /channel status)"
-                    );
-                }
-                Err(e) => serial_println!("channel> start failed: {e}"),
-            }
-        }
-        "stop" => {
-            let name = parts.next().unwrap_or("");
-            if name.is_empty() {
-                serial_println!("channel> usage: /channel stop <name>");
-                return;
-            }
-            match msgchan::stop(name) {
-                Ok(()) => serial_println!("channel> '{name}' stopped"),
-                Err(e) => serial_println!("channel> {e}"),
-            }
-        }
-        "status" => {
-            let name = parts.next();
-            let mut any = false;
-            for i in msgchan::list() {
-                if name.is_some_and(|n| n != i.name) {
-                    continue;
-                }
-                any = true;
-                serial_println!(
-                    "channel> {}  kind={}  {}  policy={}  offset={}  allow_from={:?}",
-                    i.name,
-                    i.kind.as_str(),
-                    if i.running { "running" } else { "stopped" },
-                    i.policy.as_str(),
-                    i.offset,
-                    i.allow_from
-                );
-                if let Some(p) = &i.last_peer {
-                    serial_println!("  last_peer={p}");
-                }
-                if let Some((code, uid, disp)) = &i.pending_pair {
-                    serial_println!(
-                        "  pending_pair: code={code}  from={disp} ({uid})  →  /channel pair {} {code}",
-                        i.name
-                    );
-                }
-                if let Some(e) = &i.last_error {
-                    serial_println!("  last_error={e}");
-                }
-            }
-            if !any {
-                serial_println!("channel> (no matching instance)");
-            }
-            let q = msgchan::inbound_len();
-            if q > 0 {
-                serial_println!("channel> {} inbound message(s) queued for the agent", q);
-            }
-            if name.is_none() || any {
-                serial_println!(
-                    "channel> polls every ~2.5s while the prompt is idle; /channel poll [name] forces one now"
-                );
-            }
-        }
-        "allow" => {
-            let name = parts.next().unwrap_or("");
-            let uid = parts.next().unwrap_or("");
-            if name.is_empty() || uid.is_empty() {
-                serial_println!("channel> usage: /channel allow <name> <user_id|*>");
-                return;
-            }
-            match msgchan::allow(name, uid) {
-                Ok(()) => {
-                    serial_println!("channel> '{name}' allows {uid}");
-                    // Catch up on DMs that arrived before allow (offset may
-                    // still be 0 — Telegram buffers recent updates).
-                    serial_println!("channel> fetching pending updates…");
-                    msgchan::poll_now(Some(name));
-                }
-                Err(e) => serial_println!("channel> {e}"),
-            }
-        }
-        "pair" => {
-            // /channel pair <name> <code>  — CODE is the 4 hex digits the bot
-            // sends (e.g. AB12), NOT your Telegram user id.
-            let name = parts.next().unwrap_or("");
-            let code = parts.next().unwrap_or("");
-            if name.is_empty() || code.is_empty() {
-                serial_println!("channel> usage: /channel pair <name> <CODE>");
-                serial_println!(
-                    "channel> CODE = 4 hex digits from the bot DM (e.g. AB12), not your user id"
-                );
-                serial_println!(
-                    "channel> if there is no code yet: DM the bot, wait a few seconds, /channel status"
-                );
-                return;
-            }
-            match msgchan::pair_approve(name, code) {
-                Ok(uid) => serial_println!("channel> paired {uid} on '{name}'"),
-                Err(e) => {
-                    serial_println!("channel> pair failed: {e}");
-                    if e == "no pending pair" {
-                        serial_println!(
-                            "channel> tip: use /channel allow {name} <user_id> if you already know your Telegram id"
-                        );
-                        serial_println!(
-                            "channel> pairing only appears after a DM is *received* (polling must be running)"
-                        );
-                    }
-                }
-            }
-        }
-        "poll" => {
-            // Force an immediate getUpdates round (debug / catch-up).
-            let name = parts.next();
-            serial_println!("channel> polling…");
-            msgchan::poll_now(name);
-            serial_println!("channel> poll done — /channel status");
-        }
-        "send" => {
-            // /channel send <name> <peer> <text…>
-            let name = parts.next().unwrap_or("");
-            let peer = parts.next().unwrap_or("");
-            let text: alloc::string::String = parts.collect::<alloc::vec::Vec<_>>().join(" ");
-            if name.is_empty() || peer.is_empty() || text.is_empty() {
-                serial_println!("channel> usage: /channel send <name> <peer_id> <text>");
-                return;
-            }
-            match msgchan::send(name, peer, &text) {
-                Ok(()) => serial_println!("channel> sent to {peer} via '{name}'"),
-                Err(e) => serial_println!("channel> send failed: {e}"),
-            }
-        }
-        "reply" => {
-            let name = parts.next().unwrap_or("");
-            let text: alloc::string::String = parts.collect::<alloc::vec::Vec<_>>().join(" ");
-            if name.is_empty() || text.is_empty() {
-                serial_println!("channel> usage: /channel reply <name> <text>");
-                return;
-            }
-            match msgchan::reply(name, &text) {
-                Ok(()) => serial_println!("channel> replied on '{name}'"),
-                Err(e) => serial_println!("channel> reply failed: {e}"),
-            }
-        }
-        "help" | _ => {
-            serial_println!("channel> messaging channels (generic; Telegram first):");
-            serial_println!("  /channel [list]                     list instances");
-            serial_println!("  /channel types                      available backends");
-            serial_println!("  /channel add telegram <name> <tok>  [pairing|allowlist|open]");
-            serial_println!("  /channel start|stop|remove <name>");
-            serial_println!("  /channel status [name]");
-            serial_println!("  /channel allow <name> <user_id|*>");
-            serial_println!("  /channel pair <name> <CODE>         approve a DM pairing");
-            serial_println!("  /channel send <name> <peer> <text>");
-            serial_println!("  /channel reply <name> <text>        reply to last inbound");
-            serial_println!("  /channel poll [name]                force getUpdates now");
-            serial_println!("  config: {}", msgchan::CONFIG_PATH);
-        }
-    }
-}
-
-/// Strip light markdown so Telegram gets plain text (the model often emits
-/// `**bold**` despite the system prompt).
-fn strip_md_light(s: &str) -> alloc::string::String {
-    let mut out = alloc::string::String::with_capacity(s.len());
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        // **bold** or *italic* or `code`
-        if b[i] == b'*' || b[i] == b'`' || b[i] == b'_' {
-            // skip run of the same marker
-            let m = b[i];
-            while i < b.len() && b[i] == m {
-                i += 1;
-            }
-            continue;
-        }
-        out.push(b[i] as char);
-        i += 1;
-    }
-    out
-}
-
-/// Drain inbound messaging-channel queue: each message becomes a shell-agent
-/// turn; the reply is sent back on the same channel. Called from the interactive
-/// loop (not from upkeep — inference is too heavy for the poll tick).
-fn drain_channel_inbound(
-    chat: &mut Option<ChatSession>,
-    session: &mut crate::agent::types::Session,
-) {
-    // Process a bounded number per loop so the prompt stays responsive.
-    for _ in 0..3 {
-        let Some(msg) = crate::msgchan::take_inbound() else {
-            break;
-        };
-        serial_println!(
-            "channel[{}] → agent: {} says: {}",
-            msg.channel,
-            msg.from_name,
-            msg.text
-        );
-        // Ensure a chat session exists.
-        if chat.is_none() {
-            let mut spin = Spinner::new("channel");
-            *chat = ChatSession::load(&mut spin);
-            if let Some(c) = chat.as_mut() {
-                c.hydrate_from_session(session);
-            }
-        }
-        let Some(sess) = chat.as_mut() else {
-            let _ = crate::msgchan::send(
-                &msg.channel,
-                &msg.peer_id,
-                "Chitti: no local model loaded — cannot auto-reply. Use /channel reply from the console, or /model load.",
-            );
-            continue;
-        };
-        // Frame the turn so a small model stays on *this* message (not the
-        // previous one) and uses tools for OS facts instead of inventing them.
-        let user = alloc::format!(
-            "Message from Telegram user {} (channel {}).\n\
-             Answer ONLY the latest user message below. Do not continue an earlier topic.\n\
-             If the question needs machine state (disks, files, network, time), call the right tool first; never invent those facts.\n\
-             For simple math or greetings, answer directly in one short plain-text reply (no markdown).\n\
-             \n\
-             User message:\n{}",
-            msg.from_name, msg.channel, msg.text
-        );
-        let reply = sess.turn(&user, session);
-        let reply = strip_md_light(reply.trim());
-        let reply = reply.trim();
-        if reply.is_empty() {
-            let _ = crate::msgchan::send(
-                &msg.channel,
-                &msg.peer_id,
-                "(no reply — try again or check /think /model on the console)",
-            );
-            continue;
-        }
-        serial_println!("channel[{}] ← agent: {}", msg.channel, reply);
-        if let Err(e) = crate::msgchan::send(&msg.channel, &msg.peer_id, reply) {
-            serial_println!("channel> delivery failed: {e}");
-        }
-    }
-}
-
-/// Load large fallback fonts (CJK) from any disk volume and register them into
-/// the system font fallback chain — OS-wide, so the console/UI and the browser
-/// all render CJK. Runs at most once. Kept off the kernel binary because of the
-/// font's size (~16 MB); placed on the fonts/voice disk by `cargo xtask`
-/// (fetch with `cargo xtask font-assets`). A graceful no-op when absent (the
-/// Indic + emoji faces are always bundled in the binary). Safe to call at boot
-/// now that the block probe is idempotent.
-fn ensure_disk_fallback_fonts() {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static TRIED: AtomicBool = AtomicBool::new(false);
-    if TRIED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    const DISK_FALLBACKS: &[(&str, &[&str])] = &[(
-        "Noto Sans CJK",
-        &["NotoSansCJKsc-Regular.otf", "NotoSansCJK.otf", "cjk.otf"],
-    )];
-    for (name, files) in DISK_FALLBACKS {
-        if crate::font_ttf::fallback_loaded(name) {
-            continue;
-        }
-        if let Some(bytes) = find_on_disks(files) {
-            // Parsing a font through fontdue churns the first-fit allocator in
-            // proportion to its glyph count; a full ~16 MB CJK CFF face stalls
-            // the (cooperative) kernel for minutes and freezes the shell. Cap
-            // the size so an oversized font is skipped rather than hanging —
-            // use a **subset** CJK face (a few thousand common glyphs, ≤ a few
-            // MB) if you want CJK coverage.
-            const MAX_FALLBACK_BYTES: usize = 6 * 1024 * 1024;
-            if bytes.len() > MAX_FALLBACK_BYTES {
-                serial_println!(
-                    "font: {} is {} MiB — too large to parse in-kernel, skipped (use a subset ≤ {} MiB)",
-                    name,
-                    bytes.len() / (1024 * 1024),
-                    MAX_FALLBACK_BYTES / (1024 * 1024)
-                );
-                continue;
-            }
-            serial_println!("font: loading {} ({} KiB)\u{2026}", name, bytes.len() / 1024);
-            match crate::font_ttf::register_fallback(name, &bytes) {
-                Ok(()) => crate::ktrace::log_fmt(format_args!(
-                    "font: registered {} fallback ({} bytes, disk)",
-                    name,
-                    bytes.len()
-                )),
-                Err(e) => serial_println!("font: {} load failed: {}", name, e),
-            }
-        }
-    }
-}
-
-/// Scan every disk + volume for the first readable file named one of
-/// `names` (FAT or ext4; root or subpath like `brcm/foo.bin`). Independent of
-/// `/mount` — see [`crate::fs::vfs::find_on_disks`].
-pub(crate) fn find_on_disks(names: &[&str]) -> Option<alloc::vec::Vec<u8>> {
-    crate::fs::vfs::find_on_disks(names)
-}
-
-/// Read a file at an absolute path under some active mount (or the store).
-/// Shared by `/voice models load` and media open helpers.
-fn read_mounted(full: &str) -> Option<alloc::vec::Vec<u8>> {
-    crate::fs::vfs::read(full).ok()
-}
-
-fn disk_list() {
-    use crate::block::BlockDevice;
-    // Enumerate every block device, not just the boot disk: a machine can have
-    // several (e.g. two NVMe namespaces on one controller — VirtualBox presents
-    // each attached disk that way). `probe_disk_nth` walks them until absent.
-    let mut found = 0usize;
-    let mut d = 0usize;
-    while let Some(mut dev) = crate::block::probe_disk_nth(d) {
-        found += 1;
-        let sectors = dev.block_count();
-        serial_println!("disks> disk {}: {} sectors ({} MiB)", d, sectors, sectors * 512 / 1024 / 1024);
-        let vols = crate::fs::detect::probe(&mut dev);
-        if vols.is_empty() {
-            serial_println!("  (no recognizable volumes -- blank or unsupported layout)");
-        }
-        for (i, v) in vols.iter().enumerate() {
-            serial_println!(
-                "  [{}] lba {:<10} {:>6} MiB  {:<8} label={}",
-                i,
-                v.start_lba,
-                v.sectors * 512 / 1024 / 1024,
-                v.fs.name(),
-                v.label.as_deref().unwrap_or("-")
-            );
-        }
-        d += 1;
-        if d >= 16 {
-            break; // safety bound
-        }
-    }
-    if found == 0 {
-        serial_println!(
-            "disks> no block device found\n\
-             disks>   expected: NVMe (VirtualBox default), AHCI/SATA, or virtio-blk\n\
-             disks>   after /install: reboot from the permanent disk alone — data is\n\
-             disks>   on the 'Chitti Data' GPT partition and mounts at boot"
-        );
-        return;
-    }
-    serial_println!(
-        "  ({} disk(s); /mount <disk> [vol] [/path]; data partition auto-mounts as synapse store)",
-        found
-    );
-}
-
-/// List volume `n` on disk 0 (on-disk root; for debugging real FAT/ext4 layouts).
-fn disk_ls_volume(n: usize) {
-    use crate::fs::detect::FsType;
-    let Some(mut dev) = crate::block::probe_disk() else {
-        serial_println!("ls> no block device");
-        return;
-    };
-    let vols = crate::fs::detect::probe(&mut dev);
-    let Some(v) = vols.get(n).cloned() else {
-        serial_println!("ls> no volume {} (see /disks)", n);
-        return;
-    };
-    match v.fs {
-        FsType::Fat16 | FsType::Fat32 => {
-            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
-            match crate::block::fat_read::FatReader::open(&mut part) {
-                Some(mut r) => {
-                    let entries = r.list_root();
-                    serial_println!("ls> {} volume {} root ({} entries):", v.fs.name(), n, entries.len());
-                    for (name, size, is_dir) in entries {
-                        if is_dir {
-                            serial_println!("  {}/", name);
-                        } else {
-                            serial_println!("  {} ({} bytes)", name, size);
-                        }
-                    }
-                }
-                None => serial_println!("ls> FAT volume unreadable"),
-            }
-        }
-        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
-            let mut part = crate::block::Partition::new(&mut dev, v.start_lba, v.sectors);
-            match crate::block::ext4_read::Ext4Reader::open(&mut part) {
-                Some(mut r) => {
-                    let entries = r.list_root();
-                    // Data-partition keys are percent-encoded flat names; show
-                    // a hierarchical store view when this volume is the live store.
-                    serial_println!(
-                        "ls> {} volume {} root ({} on-disk entries; use /ls / for the store tree):",
-                        v.fs.name(),
-                        n,
-                        entries.len()
-                    );
-                    for (name, ino, is_dir) in entries.into_iter().take(32) {
-                        let shown = crate::block::ext4_store::key_decode(&name);
-                        let base = crate::synapse::vpath::basename(&shown);
-                        serial_println!(
-                            "  {}{}  (inode {})",
-                            base,
-                            if is_dir { "/" } else { "" },
-                            ino
-                        );
-                    }
-                }
-                None => serial_println!("ls> ext volume unreadable"),
-            }
-        }
-        other => serial_println!(
-            "ls> volume {} is {} -- directory listing not implemented",
-            n,
-            other.name()
-        ),
-    }
-}
-
-/// Parse `/install` arguments into [`InstallArgs`].
-/// Tokens in any order: an optional numeric disk index, `yes` (skip the
-/// confirmation modal — for scripted use), `format` (force a full repartition
-/// even when an existing Chitti install would be updated in place), and `plan`
-/// (read-only: report a possible install alongside an existing OS, write
-/// nothing), and `alongside` (non-destructively add our loader to the existing
-/// ESP, modifying no partition).
-fn parse_install_args(arg: &str) -> InstallArgs {
-    let mut a = InstallArgs::default();
-    for tok in arg.split_whitespace() {
-        match tok {
-            "yes" => a.pre_confirmed = true,
-            "format" => a.force_format = true,
-            "plan" => a.plan_only = true,
-            "alongside" => a.alongside = true,
-            t => {
-                if let Ok(n) = t.parse::<usize>() {
-                    a.target = Some(n);
-                }
-            }
-        }
-    }
-    a
-}
-
-/// Parsed `/install` arguments.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-struct InstallArgs {
-    pre_confirmed: bool,
-    force_format: bool,
-    /// `plan`: report what an install alongside the existing OS would do and
-    /// change **nothing**. Read-only, no modal, no confirmation — the point is to
-    /// be able to ask "will ChittiOS fit next to Windows on this machine?" without
-    /// risking the machine to find out.
-    plan_only: bool,
-    /// `alongside`: add our loader to the **existing** ESP instead of
-    /// repartitioning. Non-destructive to every existing partition.
-    alongside: bool,
-    target: Option<usize>,
-}
-
-/// Report what installing **alongside** the existing OS on `target_idx` would do,
-/// and change nothing.
-///
-/// This is `/install plan`. It exists because the only way to find out whether
-/// ChittiOS fits next to Windows used to be to run `/install`, which writes a
-/// fresh GPT over the whole disk — you had to risk the machine to learn the
-/// answer. Every operation here is a read.
-///
-/// It reports rather than decides: the planner ([`gpt::plan_alongside`]) refuses
-/// when there is no ESP to share or no single gap big enough, and this prints that
-/// refusal with the free space it did find, so the reason is visible.
-fn install_plan(target_idx: usize) {
-    use crate::block::{gpt, BlockDevice};
-    let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
-        serial_println!("install> no disk {target_idx} (see /disks)");
-        return;
-    };
-    let total = dev.block_count();
-    let Some((is_chitti, parts)) = gpt::read(&mut dev) else {
-        serial_println!("install> disk {target_idx} has no GPT ({total} sectors) -- nothing to install alongside;");
-        serial_println!("install>   a plain `/install {target_idx}` would partition the whole disk.");
-        return;
-    };
-    serial_println!("install> disk {target_idx}: {total} sectors, {} partition(s){}", parts.len(), if is_chitti { " (an existing ChittiOS disk)" } else { "" });
-    for p in &parts {
-        let mib = (p.last_lba.saturating_sub(p.first_lba) + 1) / 2048;
-        serial_println!("install>   {:>10}..{:<10} {:>7} MiB  {}", p.first_lba, p.last_lba, mib, p.name);
-    }
-    // 8 GiB of ext4 for the OS + model, and an ESP with room for our loader.
-    const NEED_SECTORS: u64 = 8 * 1024 * 2048;
-    const MIN_ESP_SECTORS: u64 = 64 * 2048; // 64 MiB
-    let free = gpt::free_extents(&parts, total, 2048);
-    if free.is_empty() {
-        serial_println!("install> no unallocated space -- shrink a Windows partition first (Disk Management)");
-    } else {
-        serial_println!("install> unallocated:");
-        for e in &free {
-            serial_println!("install>   {:>10}..{:<10} {:>7} MiB", e.first_lba, e.last_lba, e.sectors() / 2048);
-        }
-    }
-    match gpt::plan_alongside(&parts, total, NEED_SECTORS, MIN_ESP_SECTORS) {
-        Some(plan) => {
-            serial_println!("install> PLAN: share the existing ESP at {}..{} (adds our loader; Windows' stays)", plan.esp_first_lba, plan.esp_last_lba);
-            serial_println!("install>       new ChittiOS ext4 at {}..{} ({} MiB)", plan.os_first_lba, plan.os_last_lba, (plan.os_last_lba - plan.os_first_lba + 1) / 2048);
-            serial_println!("install>       existing partitions: untouched");
-            serial_println!("install> NOT YET EXECUTABLE: writing the loader into an existing ESP needs FAT32");
-            serial_println!("install>   write-into-existing-volume support, which is not implemented. `/install`");
-            serial_println!("install>   still repartitions the WHOLE disk and would erase the above.");
-        }
-        None => {
-            serial_println!("install> cannot install alongside: need an ESP >= {} MiB to share and {} MiB contiguous free", MIN_ESP_SECTORS / 2048, NEED_SECTORS / 2048);
-        }
-    }
-}
-
-/// Install the ChittiOS loader into the **existing** ESP on `target_idx`, backing
-/// up whatever loader is there. `/install alongside`.
-///
-/// This is the non-destructive counterpart to `/install`: it adds one file to the
-/// EFI System Partition already on the disk and touches no partition table and no
-/// existing partition. What it does *not* do is create the ChittiOS data partition
-/// — so it makes a machine bootable into a ChittiOS kernel that came from the
-/// install medium, not a full on-disk install. The output says so rather than
-/// implying more than happened.
-/// x86-only, and legitimately so rather than as a dropped feature: the payload
-/// comes from a Limine module here, the fallback loader is `BOOTX64.EFI`, and the
-/// scenario is coexisting with an x86 Windows install. An ARM equivalent needs
-/// `BOOTAA64.EFI` and the aarch64 payload plumbing, which is separate work.
-#[cfg(target_arch = "x86_64")]
-fn install_alongside(target_idx: usize, pre_confirmed: bool) {
-    use crate::block::{esp::Esp, gpt, BlockDevice, Partition};
-    let Some(efi) = crate::cortex::find_module("BOOTX64.EFI") else {
-        serial_println!("install> no BOOTX64.EFI payload -- build the ISO with xtask");
-        return;
-    };
-    let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
-        serial_println!("install> no disk {target_idx} (see /disks)");
-        return;
-    };
-    let Some((_, parts)) = gpt::read(&mut dev) else {
-        serial_println!("install> disk {target_idx} has no GPT -- nothing to install alongside");
-        return;
-    };
-    // Locate the ESP by name, the same way the planner does.
-    let Some(esp_part) = parts.iter().find(|p| {
-        let n = p.name.to_ascii_lowercase();
-        n.contains("efi") || n == "esp"
-    }) else {
-        serial_println!("install> no EFI System Partition on disk {target_idx}");
-        return;
-    };
-    // Destructive-enough to confirm: it rewrites a file in another OS's ESP.
-    if !pre_confirmed
-        && !crate::modal::confirm(
-            "Install ChittiOS loader alongside?",
-            &alloc::format!(
-                "Adds ChittiOS to the EXISTING EFI System Partition on disk {target_idx} (lba {}..{}). Any current \\EFI\\BOOT\\BOOTX64.EFI is renamed to BOOTX64.CHB as a backup, not deleted. No partition table or existing partition is modified. Proceed?",
-                esp_part.first_lba, esp_part.last_lba
-            ),
-        )
-    {
-        serial_println!("install> aborted (not confirmed)");
-        return;
-    }
-    let count = esp_part.last_lba.saturating_sub(esp_part.first_lba) + 1;
-    let mut part = Partition::new(&mut dev, esp_part.first_lba, count);
-    let mut esp = match Esp::open(&mut part) {
-        Ok(e) => e,
-        Err(e) => {
-            serial_println!("install> cannot open the ESP filesystem: {e:?}");
-            return;
-        }
-    };
-    serial_println!("install> ESP {} MiB free", esp.free_bytes() / (1024 * 1024));
-    match esp.install_loader(efi) {
-        Ok(done) => {
-            serial_println!("install> loader written to \\EFI\\BOOT\\BOOTX64.EFI ({} cluster(s))", done.clusters_used);
-            if done.backed_up {
-                serial_println!("install>   previous loader renamed to {} (restore it to undo)", crate::block::esp::BACKUP_NAME);
-            } else if done.backup_preserved {
-                serial_println!("install>   existing {} backup left untouched (it is the original)", crate::block::esp::BACKUP_NAME);
-            }
-            serial_println!("install> existing partitions: UNCHANGED");
-            serial_println!("install> NB no ChittiOS data partition was created, and firmware NVRAM was");
-            serial_println!("install>   not touched -- a machine that boots Windows via its own NVRAM entry");
-            serial_println!("install>   still needs its boot order changed by hand.");
-        }
-        Err(e) => serial_println!("install> failed: {e:?} (nothing was changed)"),
-    }
-}
-
-/// The `/install` human gate: a permission modal (destructive actions are
-/// confirmed via the modal, not an inline `yes` token — `yes` remains only as
-/// a scripted pre-confirmation). Returns true to proceed.
-fn confirm_install(pre_confirmed: bool, update: bool, disk: usize) -> bool {
-    if pre_confirmed {
-        return true;
-    }
-    let (title, msg) = if update {
-        (
-            "Update ChittiOS \u{2014} confirm?",
-            alloc::format!(
-                "Disk {} already has Chitti installed. The system partitions (boot loader, kernel, model) will be REWRITTEN; the data partition (agent state) is preserved. Add 'format' to erase everything instead. Proceed?",
-                disk
-            ),
-        )
-    } else {
-        (
-            "Install ChittiOS \u{2014} confirm?",
-            alloc::format!("This ERASES EVERYTHING on disk {} and repartitions it (GPT: ESP + ext4). Proceed?", disk),
-        )
-    };
-    if crate::modal::confirm(title, &msg) {
-        true
-    } else {
-        serial_println!("install> aborted (not confirmed)");
-        false
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn disk_install(arg: &str) {
-    use crate::block::{ext4::{Ext4Writer, FileSpec}, fat::FatWriter, gpt, BlockDevice, Partition};
-    use alloc::string::String;
-    use alloc::vec::Vec;
-    let a = parse_install_args(arg);
-    let (pre_confirmed, force_format, target_override) = (a.pre_confirmed, a.force_format, a.target);
-    if a.plan_only {
-        install_plan(target_override.unwrap_or(0));
-        return;
-    }
-    if a.alongside {
-        install_alongside(target_override.unwrap_or(0), pre_confirmed);
-        return;
-    }
-    let (Some(efi), Some(kernel)) = (crate::cortex::find_module("BOOTX64.EFI"), crate::cortex::find_module("payload/chitti-kernel")) else {
-        serial_println!("install> installer payload missing (BOOTX64.EFI / kernel modules) -- build the ISO with xtask");
-        return;
-    };
-    // Default target: with 2+ disks, prefer disk 1 (the permanent second drive)
-    // over disk 0 (usually the boot/install image). Explicit `/install N` wins.
-    let target_idx = target_override.unwrap_or_else(|| {
-        if crate::block::probe_disk_nth(1).is_some() {
-            serial_println!(
-                "install> multiple disks present — defaulting to disk 1 (use /install 0 to target the boot disk)"
-            );
-            1
-        } else {
-            0
-        }
-    });
-    let Some(mut dev) = crate::block::probe_disk_nth(target_idx) else {
-        serial_println!("install> no disk {} (see /disks; boot with a -drive)", target_idx);
-        return;
-    };
-    // An existing Chitti install (our GPT disk GUID) is UPDATED in place: the
-    // system partitions are rewritten, the data partition (durable agent
-    // state) is untouched. `format` forces the old erase-everything path.
-    let existing = gpt::read(&mut dev).and_then(|(chitti, parts)| {
-        if !chitti || force_format {
-            return None;
-        }
-        let find = |n: &str| parts.iter().find(|p| p.name == n).map(|p| (p.first_lba, p.last_lba));
-        match (find("EFI System"), find("ChittiOS")) {
-            (Some(e), Some(o)) => Some((e, o)),
-            _ => None,
-        }
-    });
-    if !confirm_install(pre_confirmed, existing.is_some(), target_idx) {
-        return;
-    }
-    serial_println!("install> target disk {}", target_idx);
-    let total = dev.block_count();
-
-    // 1. Partitions: reuse the existing GPT on an update; otherwise write a
-    //    fresh GPT (FAT ESP + ext4 OS + ext4 data).
-    let (esp_range, os_range, fresh_layout) = match existing {
-        Some((e, o)) => {
-            serial_println!("install> existing Chitti install detected -- updating in place (data partition preserved)");
-            (e, o, None)
-        }
-        None => {
-            let Some(layout) = gpt::default_layout(total) else {
-                serial_println!("install> disk too small ({} sectors)", total);
-                return;
-            };
-            if let Err(e) = gpt::write(&mut dev, &gpt::standard_parts(&layout)) {
-                serial_println!("install> GPT write failed: {:?}", e);
-                return;
-            }
-            serial_println!("install> GPT: ESP lba {}..{}, ext4 OS lba {}..{}, ext4 data lba {}..{}", layout.esp_first, layout.esp_last, layout.os_first, layout.os_last, layout.data_first, layout.data_last);
-            ((layout.esp_first, layout.esp_last), (layout.os_first, layout.os_last), Some(layout))
-        }
-    };
-
-    // 2. FAT ESP: the Limine loader at /EFI/BOOT/BOOTX64.EFI, plus limine.conf
-    //    + the kernel at the root, so the disk boots from FAT alone (UEFI
-    //    firmware requires FAT; Limine reads its config from the boot volume).
-    let esp_conf = b"timeout: 0\n\n/ChittiOS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n";
-    {
-        let mut esp = Partition::new(&mut dev, esp_range.0, esp_range.1 - esp_range.0 + 1);
-        let r = FatWriter::format(&mut esp).and_then(|mut fw| {
-            fw.write_efi_boot_file("BOOTX64.EFI", efi)?;
-            fw.write_root_file("limine.conf", esp_conf)?;
-            fw.write_root_file("chitti-kernel", kernel)?;
-            Ok(())
-        });
-        if let Err(e) = r {
-            serial_println!("install> ESP FAT write failed: {:?}", e);
-            return;
-        }
-    }
-    serial_println!("install> ESP (FAT16): BOOTX64.EFI + limine.conf + kernel written.");
-
-    // 3. ext4 OS partition: limine.conf + kernel + model parts.
-    let parts = crate::cortex::model_parts();
-    let mut conf = String::from("timeout: 3\n\n/ChittiOS\n    protocol: limine\n    resolution: 1920x1080\n    path: boot():/chitti-kernel\n");
-    for (name, _) in &parts {
-        conf.push_str("    module_path: boot():/");
-        conf.push_str(name);
-        conf.push('\n');
-    }
-    let conf_bytes = conf.into_bytes();
-    let mut files: Vec<FileSpec> = Vec::new();
-    files.push(FileSpec { name: "limine.conf", data: &conf_bytes });
-    files.push(FileSpec { name: "chitti-kernel", data: kernel });
-    for (name, data) in &parts {
-        files.push(FileSpec { name, data });
-    }
-    {
-        let mut os = Partition::new(&mut dev, os_range.0, os_range.1 - os_range.0 + 1);
-        if let Err(e) = Ext4Writer::format(&mut os, &files) {
-            serial_println!("install> ext4 format/write failed: {:?}", e);
-            return;
-        }
-    }
-    serial_println!("install> ext4 OS partition written: limine.conf + kernel + {} model part(s).", parts.len());
-    if let Some(layout) = fresh_layout {
-        // Fresh install only: an empty ext4 data partition for durable agent
-        // state (synapse::fs mounts it at boot, since it holds no *.gguf). An
-        // update never touches it.
-        let mut data = Partition::new(&mut dev, layout.data_first, layout.data_last - layout.data_first + 1);
-        if let Err(e) = Ext4Writer::format(&mut data, &[]) {
-            serial_println!("install> ext4 data partition format failed: {:?}", e);
-            return;
-        }
-        serial_println!("install> ext4 data partition (lba {}..{}) formatted for durable agent state.", layout.data_first, layout.data_last);
-    } else {
-        serial_println!("install> data partition preserved (agent state intact).");
-    }
-    serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Remove the ISO and reboot.");
-}
-
-/// aarch64 `/install`: make the target disk boot Chitti standalone via UEFI.
-/// Layout: GPT with a FAT ESP carrying the Chitti UEFI stub (BOOTAA64.EFI) +
-/// the kernel + the model — the stub reads all three off the ESP at boot — plus
-/// an ext4 data partition for durable agent state. The installer payload is
-/// read from the **boot ESP** this system was started from (the FAT volume
-/// holding `chitti-kernel`), the aarch64 equivalent of the x86 path's Limine
-/// payload modules.
-#[cfg(target_arch = "aarch64")]
-fn disk_install(arg: &str) {
-    use crate::block::{ext4::Ext4Writer, fat::FatWriter, fat_read::FatReader, gpt, BlockDevice, Partition};
-    use crate::fs::detect::FsType;
-    let a = parse_install_args(arg);
-    let (pre_confirmed, force_format, target_override) = (a.pre_confirmed, a.force_format, a.target);
-    if a.plan_only {
-        install_plan(target_override.unwrap_or(0));
-        return;
-    }
-    if a.alongside {
-        // See `install_alongside`: the x86 path installs `BOOTX64.EFI` from a
-        // Limine module. The ARM equivalent needs `BOOTAA64.EFI` and the aarch64
-        // payload plumbing; the `plan` report works on both arches meanwhile.
-        serial_println!("install> `alongside` is x86-only so far (ARM needs BOOTAA64.EFI); try `/install plan`");
-        return;
-    }
-    // Identify the boot ESP (payload source): the FAT volume containing
-    // `chitti-kernel`. Scan every disk's *volumes* (via the FS detector), so it
-    // is found whether the ESP is a bare FAT disk (fresh `--uefi` boot) OR a GPT
-    // partition (an already-installed disk — the common case). Its disk is never
-    // a valid install target (we'd overwrite the payload we're reading).
-    let mut esp: Option<(usize, u64, u64)> = None; // (disk, start_lba, sectors)
-    'scan: for i in 0..16 {
-        let Some(mut dev) = crate::block::probe_disk_nth(i) else { break };
-        for v in crate::fs::detect::probe(&mut dev) {
-            if matches!(v.fs, FsType::Fat16 | FsType::Fat32) {
-                let mut part = Partition::new(&mut dev, v.start_lba, v.sectors);
-                if let Some(mut r) = FatReader::open(&mut part) {
-                    if r.exists("chitti-kernel") {
-                        esp = Some((i, v.start_lba, v.sectors));
-                        break 'scan;
-                    }
-                }
-            }
-        }
-    }
-    let Some((esp_idx, esp_lba, esp_sectors)) = esp else {
-        serial_println!("install> no boot ESP found (a FAT volume with /chitti-kernel) -- boot via `--uefi` to install");
-        return;
-    };
-    // Target: the explicit index if given, else the first non-ESP disk.
-    let target_idx = match target_override {
-        Some(n) => n,
-        None => (0..16).find(|&i| i != esp_idx && crate::block::probe_disk_nth(i).is_some()).unwrap_or(esp_idx),
-    };
-    if target_idx == esp_idx {
-        serial_println!("install> disk {} holds the boot ESP -- cannot install onto it (pick another; see /disks)", target_idx);
-        return;
-    }
-    let Some(mut target) = crate::block::probe_disk_nth(target_idx) else {
-        serial_println!("install> no disk {} (see /disks)", target_idx);
-        return;
-    };
-    // Existing Chitti install on the target? Update in place: rewrite the ESP
-    // (stub + kernel + model), preserve the ext4 data partition. `format`
-    // forces a full repartition.
-    let existing = gpt::read(&mut target).and_then(|(chitti, parts_read)| {
-        if !chitti || force_format {
-            return None;
-        }
-        parts_read.iter().find(|p| p.name == "EFI System").map(|p| (p.first_lba, p.last_lba))
-    });
-    if !confirm_install(pre_confirmed, existing.is_some(), target_idx) {
-        return;
-    }
-    serial_println!("install> target disk {} (boot ESP is on disk {}, lba {})", target_idx, esp_idx, esp_lba);
-
-    // Read the stub + kernel off the boot ESP partition. The model is NOT re-read
-    // from FAT (it would not fit the 256 MiB heap): the stub already loaded it
-    // into RAM at the fixed model address, so `cortex::model_module()` hands us
-    // the exact bytes. (Reading the ESP disk + writing the target disk at the
-    // same time is safe now that the NVMe controller is shared.)
-    let Some(mut src_dev) = crate::block::probe_disk_nth(esp_idx) else { return };
-    let mut esp_part = Partition::new(&mut src_dev, esp_lba, esp_sectors);
-    let (stub, kernel, model_size) = {
-        let Some(mut r) = FatReader::open(&mut esp_part) else {
-            serial_println!("install> boot ESP unreadable");
-            return;
-        };
-        let Some(stub) = r.read_file("EFI/BOOT/BOOTAA64.EFI") else {
-            serial_println!("install> BOOTAA64.EFI missing from the boot ESP");
-            return;
-        };
-        let Some(kernel) = r.read_file("chitti-kernel") else {
-            serial_println!("install> chitti-kernel missing from the boot ESP");
-            return;
-        };
-        (stub, kernel, r.file_size("model.gguf.000"))
-    };
-    // The model's bytes are already in RAM (the stub loaded them at the fixed
-    // model address); `model_module()` exposes the RAM window, and the FAT
-    // directory entry gives the file's true size to slice it by.
-    let model: Option<&'static [u8]> = match (crate::cortex::model_module(), model_size) {
-        (Some(m), Some(sz)) if (sz as usize) <= m.len() => Some(&m[..sz as usize]),
-        _ => None,
-    };
-    let model_len = model.map(|m| m.len()).unwrap_or(0);
-    serial_println!(
-        "install> payload from boot ESP: stub {} B, kernel {} B, model {} B",
-        stub.len(),
-        kernel.len(),
-        model_len
-    );
-
-    // 1. Partitions: reuse the existing ESP range on an update; otherwise
-    //    write a fresh GPT (ESP sized for the payload + ext4 data).
-    let total = target.block_count();
-    let esp_bytes = (stub.len() + kernel.len() + model_len) as u64;
-    let (esp_range, fresh_data) = match existing {
-        Some((first, last)) => {
-            let cap = (last - first + 1) * 512;
-            if cap < esp_bytes {
-                serial_println!("install> existing ESP too small ({} B for a {} B payload) -- re-run with 'format'", cap, esp_bytes);
-                return;
-            }
-            serial_println!("install> existing Chitti install detected -- updating the ESP in place (data preserved)");
-            ((first, last), None)
-        }
-        None => {
-            let Some(parts) = gpt::esp_data_parts(total, esp_bytes) else {
-                serial_println!("install> target disk too small ({} sectors for a {} B payload)", total, esp_bytes);
-                return;
-            };
-            if let Err(e) = gpt::write(&mut target, &parts) {
-                serial_println!("install> GPT write failed: {:?}", e);
-                return;
-            }
-            serial_println!(
-                "install> GPT: ESP lba {}..{}, ext4 data lba {}..{}",
-                parts[0].first_lba,
-                parts[0].last_lba,
-                parts[1].first_lba,
-                parts[1].last_lba
-            );
-            ((parts[0].first_lba, parts[0].last_lba), Some((parts[1].first_lba, parts[1].last_lba)))
-        }
-    };
-
-    // 2. FAT ESP: the stub at /EFI/BOOT/BOOTAA64.EFI + kernel + model at the
-    //    root (exactly where the stub looks).
-    {
-        let mut esp = Partition::new(&mut target, esp_range.0, esp_range.1 - esp_range.0 + 1);
-        let r = FatWriter::format(&mut esp).and_then(|mut fw| {
-            fw.write_efi_boot_file("BOOTAA64.EFI", &stub)?;
-            fw.write_root_file("chitti-kernel", &kernel)?;
-            if let Some(m) = model {
-                fw.write_root_file("model.gguf.000", m)?;
-            }
-            Ok(())
-        });
-        if let Err(e) = r {
-            serial_println!("install> ESP FAT write failed: {:?}", e);
-            return;
-        }
-    }
-    serial_println!("install> ESP (FAT): BOOTAA64.EFI + kernel{} written.", if model.is_some() { " + model" } else { "" });
-
-    // 3. Fresh install only: an empty ext4 data partition for durable agent
-    //    state. An update never touches it.
-    if let Some((first, last)) = fresh_data {
-        let mut data = Partition::new(&mut target, first, last - first + 1);
-        if let Err(e) = Ext4Writer::format(&mut data, &[]) {
-            serial_println!("install> ext4 data partition format failed: {:?}", e);
-            return;
-        }
-        serial_println!("install> ext4 data partition formatted for durable agent state.");
-    } else {
-        serial_println!("install> data partition preserved (agent state intact).");
-    }
-    serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Reboot with --disk-only.");
-}
-
-fn disk_mkext4(arg: &str) {
-    use crate::block::ext4::{Ext4Writer, FileSpec};
-    let a = arg.trim();
-    // Destructive: confirmed via the permission modal ('yes'/'empty' inline
-    // still accepted as a scripted pre-confirmation).
-    if a != "yes" && a != "empty" {
-        let ok = crate::modal::confirm(
-            "Format disk as ext4 \u{2014} confirm?",
-            "This ERASES the whole disk and formats it ext4 (with 2 test files). Proceed?",
-        );
-        if !ok {
-            serial_println!("mkext4> aborted (not confirmed; scripted: /mkext4 yes | empty)");
-            return;
-        }
-    }
-    let Some(mut dev) = crate::block::probe_disk() else {
-        serial_println!("mkext4> no block device");
-        return;
-    };
-    if a == "empty" {
-        match Ext4Writer::format(&mut dev, &[]) {
-            Ok(()) => serial_println!("mkext4> formatted an empty ext4 (0 files) -- the /install data-partition case."),
-            Err(e) => serial_println!("mkext4> empty ext4 format failed: {:?}", e),
-        }
-        return;
-    }
-    // A small file + a ~200 KiB file (forces single-indirect blocks).
-    let hello = b"hello from Chitti's from-scratch ext4 writer\n";
-    let big: alloc::vec::Vec<u8> = (0..200_000u32).map(|i| ((i.wrapping_mul(7)) & 0xff) as u8).collect();
-    let files = [
-        FileSpec { name: "hello.txt", data: &hello[..] },
-        FileSpec { name: "big.bin", data: &big[..] },
-    ];
-    match Ext4Writer::format(&mut dev, &files) {
-        Ok(()) => serial_println!("mkext4> formatted ext4 + wrote hello.txt (45 B) + big.bin (200000 B)."),
-        Err(e) => serial_println!("mkext4> ext4 format failed: {:?}", e),
-    }
-}
-
-fn disk_ext4read() {
-    use crate::block::ext4_read::Ext4Reader;
-    let Some(mut dev) = crate::block::probe_disk() else {
-        serial_println!("ext4read> no block device");
-        return;
-    };
-    let Some(mut r) = Ext4Reader::open(&mut dev) else {
-        serial_println!("ext4read> not an ext filesystem at LBA 0 (try /mkext4 yes first)");
-        return;
-    };
-    serial_println!("ext4read> block_size={}", r.block_size);
-    for (name, ino, is_dir) in r.list_root() {
-        serial_println!("  {}{}  (inode {})", name, if is_dir { "/" } else { "" }, ino);
-    }
-    // Verify hello.txt round-trips.
-    let mut buf = [0u8; 128];
-    if let Some(n) = r.read_root_file("hello.txt", &mut buf) {
-        serial_println!("ext4read> hello.txt ({} B): {}", n, core::str::from_utf8(&buf[..n]).unwrap_or("?"));
-    }
-    // Verify big.bin (200000 B) byte-for-byte against the /mkext4 pattern.
-    if let Some(sz) = r.file_size("big.bin") {
-        let mut big = alloc::vec![0u8; sz as usize];
-        let n = r.read_root_file("big.bin", &mut big).unwrap_or(0);
-        let ok = n == 200_000 && big.iter().enumerate().all(|(i, &b)| b == ((i as u32).wrapping_mul(7) & 0xff) as u8);
-        serial_println!("ext4read> big.bin {} B, pattern match: {}", n, ok);
-    }
-}
+// (moved to shell/fs.rs)
+// (moved to shell/install.rs)
 
 
 #[cfg(test)]
@@ -15663,6 +8769,213 @@ mod agent_flow_tests {
             parse_tool_call("<tool_call>{\"name\":\"memory_get\",\"arguments\":{\"key\":\"colour\"}}</tool_call>").unwrap();
         assert_eq!(name, "memory_get");
         assert!(args.contains("colour"), "got {args}");
+    }
+
+    /// An app agent's tools come from its **manifest ∩ registry**, in manifest
+    /// order. This replaced a hardcoded twelve-name `matches!` that was a copy of
+    /// chess's manifest — so notes/paint/snake were gated on chess tools — and
+    /// which had already drifted from the prompt printed beside it.
+    #[test_case]
+    fn ui_agent_toolset_is_manifest_intersect_registry() {
+        let declared = alloc::vec![
+            String::from("board_set"),
+            String::from("not_a_registered_tool"),
+            String::from("storage_set"),
+            String::from("board_set"), // duplicate in a hand-written manifest
+            String::from("  "),        // whitespace entry
+        ];
+        let known = |t: &str| matches!(t, "board_set" | "storage_set" | "ui_draw");
+        let out = toolset_intersection(&declared, known);
+        // Manifest order, deduplicated, unregistered + blank dropped.
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert_eq!(out[0], "board_set");
+        assert_eq!(out[1], "storage_set");
+        // A tool the registry has but the manifest never asked for is NOT added:
+        // the manifest is the authority on what an agent may call.
+        assert!(!out.iter().any(|t| t == "ui_draw"), "got {out:?}");
+        // An empty manifest yields no tools rather than a default set.
+        assert!(toolset_intersection(&[], known).is_empty());
+
+        // Surface lifecycle belongs to the runtime, not to a model turn, even
+        // though chess's manifest declares all three for its wasm side.
+        for t in ["ui_surface_request", "ui_event_poll", "ui_surface_close"] {
+            assert!(runtime_owned_tool(t), "{t} is runtime-owned");
+        }
+        for t in ["ui_draw", "board_set", "storage_get", "memory_add", "chess_legal"] {
+            assert!(!runtime_owned_tool(t), "{t} is the agent's to call");
+        }
+    }
+
+    /// The protocol prompt is generated from that same set, so an app is never
+    /// told about tools it does not have (the old text advertised chess tools to
+    /// every app, and omitted `memory_*`/`ui_draw` that the gate allowed).
+    #[test_case]
+    fn ui_agent_protocol_lists_only_the_agents_own_tools() {
+        let tools = alloc::vec![String::from("storage_get"), String::from("storage_set")];
+        let p = ui_agent_protocol(42, &tools);
+        assert!(p.contains("surface 42"), "names the surface: {p}");
+        assert!(p.contains("storage_get") && p.contains("storage_set"), "{p}");
+        // No app-specific vocabulary leaks in from this function.
+        for absent in ["chess_legal", "chess_try_move", "board_set", "board_mark", "FEN"] {
+            assert!(!p.contains(absent), "must not mention {absent}: {p}");
+        }
+        // A tool-less agent is told to answer directly rather than shown an
+        // empty list it will try to use anyway.
+        let p = ui_agent_protocol(1, &[]);
+        assert!(p.contains("no tools"), "{p}");
+        assert!(!p.contains("<tool_call>"), "no call syntax without tools: {p}");
+    }
+
+    /// DeepSeek-V4 emits its native **DSML** tool format regardless of the
+    /// `<tool_call>` convention our prompt asks for:
+    /// `<｜DSML｜tool_calls><｜DSML｜invoke name="x"><｜DSML｜parameter …>`.
+    /// Unparsed, that reaches the user as raw markup and the tool never runs —
+    /// which reads as "the model ignores its tools" rather than as a parser gap.
+    #[test_case]
+    fn parse_tool_call_dsml_invoke() {
+        // The real wire form: `｜` is U+FF5C, and the whole block is one turn.
+        let reply = "Let me look at the theme.\n\
+             <｜DSML｜tool_calls>\
+             <｜DSML｜invoke name=\"read\">\
+             <｜DSML｜parameter name=\"path\" string=\"true\">/configs/core/ui.json</｜DSML｜parameter>\
+             </｜DSML｜invoke>\
+             </｜DSML｜tool_calls>";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1, "one DSML call: {calls:?}");
+        assert_eq!(calls[0].0, "read");
+        assert_eq!(calls[0].1, "{\"path\":\"/configs/core/ui.json\"}", "got {}", calls[0].1);
+
+        // Parallel invokes in one block, and `string="false"` values stay JSON —
+        // quoting a `false` would make it a true-ish string.
+        let reply = "<｜DSML｜tool_calls>\
+             <｜DSML｜invoke name=\"glob\">\
+             <｜DSML｜parameter name=\"pattern\" string=\"true\">*.json</｜DSML｜parameter>\
+             </｜DSML｜invoke>\
+             <｜DSML｜invoke name=\"/theme\">\
+             <｜DSML｜parameter name=\"args\" string=\"true\">list</｜DSML｜parameter>\
+             <｜DSML｜parameter name=\"apply\" string=\"false\">false</｜DSML｜parameter>\
+             <｜DSML｜parameter name=\"n\" string=\"false\">3</｜DSML｜parameter>\
+             </｜DSML｜invoke>\
+             </｜DSML｜tool_calls>";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 2, "both invokes: {calls:?}");
+        assert_eq!(calls[0].0, "glob");
+        assert!(calls[0].1.contains("\"pattern\":\"*.json\""), "got {}", calls[0].1);
+        // A leading `/` on the tool name is stripped, as in the JSON path.
+        assert_eq!(calls[1].0, "theme");
+        assert!(calls[1].1.contains("\"apply\":false"), "unquoted bool: {}", calls[1].1);
+        assert!(calls[1].1.contains("\"n\":3"), "unquoted number: {}", calls[1].1);
+        assert!(calls[1].1.contains("\"args\":\"list\""), "got {}", calls[1].1);
+
+        // A value written on its own lines: the layout newlines are not content.
+        let reply = "<｜DSML｜invoke name=\"write\">\
+             <｜DSML｜parameter name=\"content\" string=\"true\">\nline1\nline2\n</｜DSML｜parameter>\
+             </｜DSML｜invoke>";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "{\"content\":\"line1\\nline2\"}", "got {}", calls[0].1);
+
+        // THE SHAPE THAT REACHED A USER: DeepSeek-V4 wraps plain JSON in the
+        // DSML container, opening `tool_calls` (plural) and closing
+        // `tool_call` (singular). Matching the literal `<tool_call>` found
+        // none of it, so a well-formed call was printed as prose instead of run.
+        let reply = "<｜DSML｜tool_calls>{\"name\": \"search_tools\", \"arguments\": {\"keyword\": \"exec\"}}</｜DSML｜tool_call>";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1, "plural container with JSON: {calls:?}");
+        assert_eq!(calls[0].0, "search_tools");
+        assert!(calls[0].1.contains("exec"), "got {}", calls[0].1);
+
+        // …and the same reply after the provider double-encoded `｜` (U+FF5C =
+        // EF BD 9C re-encoded as C3 AF C2 BD C2 9C). This is what the console
+        // rendered as `ï½∏`, and it is why the undecorator keys on the tag NAME:
+        // the decorating bytes are not even stable for one model.
+        let reply = "<\u{ef}\u{bd}\u{9c}\u{ef}\u{bd}\u{9c}DSML\u{ef}\u{bd}\u{9c}\u{ef}\u{bd}\u{9c}tool_calls>\
+             {\"name\": \"search_tools\", \"arguments\": {\"keyword\": \"exec\"}}\
+             </\u{ef}\u{bd}\u{9c}\u{ef}\u{bd}\u{9c}DSML\u{ef}\u{bd}\u{9c}\u{ef}\u{bd}\u{9c}tool_call>";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1, "mojibake DSML: {calls:?}");
+        assert_eq!(calls[0].0, "search_tools");
+
+        // A container may hold several JSON objects (parallel calls), and a
+        // nested `arguments` object must not read as a second call.
+        let reply = "<｜DSML｜tool_calls>\
+             {\"name\":\"read\",\"arguments\":{\"path\":\"/a\"}}\
+             {\"name\":\"read\",\"arguments\":{\"path\":\"/b\"}}\
+             </｜DSML｜tool_calls>";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 2, "parallel JSON calls: {calls:?}");
+        assert!(calls[0].1.contains("/a") && calls[1].1.contains("/b"), "{calls:?}");
+
+        // An empty container parses to nothing (and must not spin).
+        assert!(parse_tool_calls("<｜DSML｜tool_calls>").is_empty());
+        assert!(parse_tool_calls("<｜DSML｜tool_calls></｜DSML｜tool_calls>").is_empty());
+
+        // Mixed formats in one reply keep reply order (side effects must not
+        // be reordered), and the DSML-nested-in-`<tool_call>` shape parses.
+        let reply = "<tool_call>{\"name\":\"ls\",\"arguments\":{\"args\":\"/\"}}</tool_call>\
+             <tool_call><｜DSML｜invoke name=\"skill\">\
+             <｜DSML｜parameter name=\"name\" string=\"true\">doc</｜DSML｜parameter>\
+             </｜DSML｜invoke></tool_call>";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 2, "JSON + DSML: {calls:?}");
+        assert_eq!(calls[0].0, "ls");
+        assert_eq!(calls[1].0, "skill");
+        assert!(calls[1].1.contains("doc"), "got {}", calls[1].1);
+    }
+
+    /// Markup that parsed to no call must not reach the user as prose — that is
+    /// how a bare `<｜DSML｜tool_calls>` ended up in the chat pane as mojibake.
+    #[test_case]
+    fn strip_tool_markup_leaves_prose_and_drops_tags() {
+        // Markup only → empty, so the caller can say "malformed call" instead of
+        // printing tags.
+        assert!(strip_tool_markup("<｜DSML｜tool_calls>").is_empty());
+        assert!(strip_tool_markup("<tool_call></tool_call>").is_empty());
+        // Prose around a malformed call survives, tags do not.
+        let out = strip_tool_markup("Let me look.\n<｜DSML｜tool_calls>\nthinking");
+        assert_eq!(out, "Let me look.\n\nthinking", "got {out:?}");
+        // Ordinary text with angle brackets is untouched.
+        for s in ["a < b and c > d", "use <html> tags", "no tags here"] {
+            assert_eq!(strip_tool_markup(s), s, "must not alter {s}");
+        }
+        // An unterminated tag is content, not a tag to drop.
+        assert_eq!(strip_tool_markup("<tool_call"), "<tool_call");
+    }
+
+    /// The tag rewrite is keyed on the tag *name*, so it must be indifferent to
+    /// which decoration a vendor used — and must leave everything else alone.
+    #[test_case]
+    fn undecorate_tool_tags_is_conservative() {
+        use super::tooljson::undecorate_tool_tags;
+        // Plain tags and prose are returned borrowed (no allocation, no change).
+        for s in [
+            "<tool_call>{\"name\":\"ls\"}</tool_call>",
+            "no tags here at all",
+            "if a < b and c > d then x",
+            "compare 3<4",
+            // A tag name we don't know stays untouched.
+            "<｜DSML｜think>reasoning</｜DSML｜think>",
+        ] {
+            assert!(
+                matches!(undecorate_tool_tags(s), alloc::borrow::Cow::Borrowed(_)),
+                "must not rewrite: {s}"
+            );
+        }
+        // Any decoration works: fullwidth DSML, ASCII pipes, a namespace prefix.
+        for s in [
+            "<｜DSML｜invoke name=\"x\">",
+            "<|DSML|invoke name=\"x\">",
+            "<invoke name=\"x\">",
+        ] {
+            assert_eq!(undecorate_tool_tags(s).as_ref(), "<invoke name=\"x\">", "got {s}");
+        }
+        assert_eq!(
+            undecorate_tool_tags("a</｜DSML｜tool_calls>b").as_ref(),
+            "a</tool_calls>b"
+        );
+        // Decoration longer than the cap is not a tag (bounded scan).
+        let long = alloc::format!("<{}invoke name=\"x\">", "|".repeat(64));
+        assert_eq!(undecorate_tool_tags(&long).as_ref(), long);
     }
 
     /// Multi-tool parse: each block keeps its own name/args (no cross-bleed),
@@ -15776,7 +9089,7 @@ mod agent_flow_tests {
     #[test_case]
     fn enter_submits_a_fully_typed_command_and_still_completes_a_prefix() {
         let items = |buf: &str| match suggest::context(buf, buf.len()) {
-            Some(ctx) => suggest::items_for(&ctx, &[]),
+            Some(ctx) => suggest::items_for(&ctx, &[], &[]),
             None => alloc::vec::Vec::new(),
         };
         // A partial name has something to complete → Enter accepts it.
@@ -15842,6 +9155,53 @@ mod agent_flow_tests {
         assert_eq!(crate::console::read_byte(), Some(b'x'));
     }
 
+    /// Enter submits a *completed* path argument instead of completing or
+    /// drilling into the first child: `/ls /tmp_e2e` and `/ls /tmp_e2e/sub/`
+    /// run the command, and a bare `/ls ` runs `/ls`. Tab is what drills;
+    /// Enter's job is to run the line.
+    #[test_case]
+    fn enter_submits_a_completed_path_argument() {
+        let file = crate::fs::vfs::DirEntry {
+            name: String::from("notes.md"),
+            is_dir: false,
+            size: 0,
+        };
+        let dir = crate::fs::vfs::DirEntry {
+            name: String::from("sub"),
+            is_dir: true,
+            size: 0,
+        };
+        // An exact directory name (no trailing slash) → submit, don't turn it
+        // into `/tmp_e2e/` or drill into a child.
+        let items = suggest::path_items("/tmp_e2e", &[dir.clone()], 8);
+        let buf = String::from("/ls /tmp_e2e");
+        assert!(
+            !suggest_would_complete(&buf, buf.len(), 0, &items),
+            "an exactly-typed dir argument must submit on Enter, not complete"
+        );
+        // Completed directory (trailing slash) → submit, don't drill.
+        let items = suggest::path_items("/tmp_e2e/sub/", &[file.clone()], 8);
+        let buf = String::from("/ls /tmp_e2e/sub/");
+        assert!(
+            !suggest_would_complete(&buf, buf.len(), 0, &items),
+            "a fully-typed dir argument must submit on Enter, not drill"
+        );
+        // Bare `/ls ` (nothing typed yet) → submit the command.
+        let items = suggest::path_items("", &[dir], 8);
+        let buf = String::from("/ls ");
+        assert!(
+            !suggest_would_complete(&buf, buf.len(), 0, &items),
+            "an empty path argument must submit the command on Enter"
+        );
+        // A partial token still completes on Enter.
+        let items = suggest::path_items("/tmp_e2e/sub/n", &[file.clone()], 8);
+        let buf = String::from("/ls /tmp_e2e/sub/n");
+        assert!(
+            suggest_would_complete(&buf, buf.len(), 0, &items),
+            "a partial path must still complete on Enter"
+        );
+    }
+
     /// The system prompt advertises only the small CORE set + search_tools —
     /// this is what stops the 0.8B model calling `help` on a bare "hello".
     #[test_case]
@@ -15853,6 +9213,51 @@ mod agent_flow_tests {
             "Content-Type: application/json".to_string(), "-d".to_string(),
             "{\"n\":1}".to_string(), "http://h/api".to_string(),
         ]);
+    }
+
+    #[test_case]
+    fn js_cli_parses_eval_file_and_print_flags() {
+        // -c / -e with quoted code (the quotes are stripped by tokenize_args).
+        match parse_js_cli("-c \"return 1;\"").unwrap() {
+            JsCli::Eval { source, print, .. } => {
+                assert_eq!(source, "return 1;");
+                assert!(!print);
+            }
+            _ => panic!("expected Eval"),
+        }
+        match parse_js_cli("-e 'console.log(42)'").unwrap() {
+            JsCli::Eval { source, .. } => assert_eq!(source, "console.log(42)"),
+            _ => panic!("expected Eval"),
+        }
+        match parse_js_cli("-p \"1+2\"").unwrap() {
+            JsCli::Eval { source, print, .. } => {
+                assert_eq!(source, "1+2");
+                assert!(print);
+            }
+            _ => panic!("expected Eval"),
+        }
+        match parse_js_cli("demo.js a b").unwrap() {
+            JsCli::File { path, argv } => {
+                assert_eq!(path, "demo.js");
+                assert_eq!(argv, alloc::vec![
+                    "js".to_string(),
+                    "demo.js".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                ]);
+            }
+            _ => panic!("expected File"),
+        }
+        match parse_js_cli("1 + 2").unwrap() {
+            JsCli::Eval { source, print, .. } => {
+                assert_eq!(source, "1 + 2");
+                assert!(print);
+            }
+            _ => panic!("expected bare Eval"),
+        }
+        assert!(matches!(parse_js_cli("").unwrap(), JsCli::Help));
+        assert!(matches!(parse_js_cli("--help").unwrap(), JsCli::Help));
+        assert!(parse_js_cli("-e").is_err());
     }
 
     #[test_case]
@@ -16026,5 +9431,62 @@ mod agent_flow_tests {
         let none = u32::MAX as usize;
         assert_eq!(think_action(42, false, none, none), ThinkAction::Stream);
         assert_eq!(think_action(0, true, none, none), ThinkAction::Stream);
+    }
+
+    /// `history_find` scans from the newest entry backward and returns the first
+    /// (newest) match.
+    #[test_case]
+    fn history_find_newest_match() {
+        let orig = HISTORY.with(|h| h.len());
+        HISTORY.with(|h| {
+            h.clear();
+            h.extend([
+                "/ls /tmp".into(),
+                "/cat notes.md".into(),
+                "/ls /configs".into(),
+                "/open /img0/pic.png".into(),
+            ]);
+        });
+        assert_eq!(history_find("ls", 4), Some(2));
+        assert_eq!(history_find("cat", 4), Some(1));
+        assert_eq!(history_find("nonexistent-zzz", 4), None);
+        // `start` bounds the scan: "open" only appears at index 3, below 3 is none.
+        assert_eq!(history_find("open", 3), None);
+        assert_eq!(history_find("open", 4), Some(3));
+        HISTORY.with(|h| h.truncate(orig));
+    }
+
+    /// Ctrl+R reverse search: typing a fragment recalls the newest match, and
+    /// Esc cancels back to the draft. Both paths run through the real
+    /// `console::read_byte` queue, exactly as a keypress would.
+    #[test_case]
+    fn reverse_search_recalls_and_cancels() {
+        let orig = HISTORY.with(|h| h.len());
+        HISTORY.with(|h| {
+            h.clear();
+            h.extend(["/memory list".into(), "/memory add e2e k".into()]);
+        });
+        // Type "add" then Enter → newest entry containing "add" is /memory add e2e k.
+        crate::console::unread(b'a');
+        crate::console::unread(b'd');
+        crate::console::unread(b'd');
+        crate::console::unread(b'\r');
+        let mut buf = String::from("/model remote x");
+        let mut cur = buf.len();
+        let recalled = history_reverse_search(&mut buf, &mut cur);
+        assert!(recalled, "Enter must recall the match");
+        assert_eq!(buf, "/memory add e2e k", "newest match containing 'add'");
+        assert_eq!(cur, buf.len());
+
+        // Esc cancels and restores the original draft.
+        crate::console::unread(b'a');
+        crate::console::unread(b'x');
+        crate::console::unread(0x1b); // Esc
+        let mut buf = String::from("/keep me");
+        let mut cur = 3;
+        let recalled = history_reverse_search(&mut buf, &mut cur);
+        assert!(!recalled, "Esc must cancel");
+        assert_eq!(buf, "/keep me", "draft restored after cancel");
+        HISTORY.with(|h| h.truncate(orig));
     }
 }

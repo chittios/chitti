@@ -134,11 +134,13 @@ struct P256Key {
 }
 
 static P256_TRUST: &[P256Key] = &[
-    // The registry test publisher (used by the registry-client tests). Replace
-    // with real publisher keys as they are onboarded.
+    // The registry test publisher (used by the registry-client tests and the
+    // e2e harness, which holds the matching private key in
+    // `tests/e2e/certs/registry-key.pem`). Replace with real publisher keys as
+    // they are onboarded.
     P256Key {
         key_id: "chitti-publisher-test",
-        sec1_hex: "04936bb4ad6d7101c2d23ac8d6db1e3ad08f81fd1cf90ecae0501454eae357cd31cd655551ed2f854a75197588cf5b2e97d5ef1fdc826b0039f43f049197b8a4e1",
+        sec1_hex: "04af78d6ecab7b360185e5aeccaa232d0584a9b52fa1b909d189dc5e9d503fce625974b8011abb9414250bdb8827473b2ce45a87f9cede240b050defe255c80289",
     },
 ];
 
@@ -219,7 +221,7 @@ mod tests {
         // the bare-metal target.
         let msg = b"chitti-registry-package-v1";
         let sig = from_hex(
-            "3045022028dbf55d56f51d67777054ace805e8b591d6339fb850aca39478fa21535ae2d7022100ca5f4a0620e5e50ae97b376a361c36e0a61f99d665d104f7fa7fba80d1bceb4b",
+            "304502203f56e4546766bf5a94cd29a2e512a54dbd237b8c98cddaf54a8767ffecdefc3f022100e0a14e549a3fe62193dba5c336415dfa18b4eef270cc356678e9c25fb91a40d1",
         )
         .unwrap();
         assert!(verify_p256("chitti-publisher-test", msg, &sig), "valid P-256 signature must verify");

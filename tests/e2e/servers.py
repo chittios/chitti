@@ -10,13 +10,66 @@ once wrapped in TLS 1.3 (for https:// / wss://). The guest reaches these at
 import base64
 import hashlib
 import json
+import os
 import socket
 import ssl
 import struct
+import subprocess
 import threading
 import time
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _openssl():
+    for c in ("/opt/homebrew/opt/openssl@3/bin/openssl", "/usr/local/opt/openssl@3/bin/openssl", "openssl"):
+        try:
+            out = subprocess.run([c, "version"], capture_output=True, text=True)
+            if out.returncode == 0 and "OpenSSL" in out.stdout:
+                return c
+        except Exception:
+            continue
+    return "openssl"
+
+
+REGISTRY_ENTRIES = [
+    {"name": "report-writer", "version": "1.0.0",
+     "description": "Write reports from facts",
+     "download": "http://10.0.2.2:8100/pkg/report-writer",
+     "key_id": "chitti-publisher-test"},
+    {"name": "note-summarizer", "version": "1.0.0",
+     "description": "Summarize and search note files",
+     "download": "http://10.0.2.2:8100/pkg/note-summarizer",
+     "key_id": "chitti-publisher-test"},
+]
+
+
+def _registry_index():
+    """The agent-registry index, **signed** with the e2e publisher key.
+
+    The kernel refuses unsigned indexes (`registry_client::parse_index`), so
+    this is signed exactly the way the kernel verifies: the message is one
+    `name\\0version\\0download\\0key_id\\n` line per entry (description is
+    display-only), hashed with SHA-256, signed with ECDSA/P-256, and shipped as
+    base64 DER under the root `sig` field. The private key is the test
+    publisher's (`chitti-publisher-test`, whose public point is baked into
+    `kernel/src/skills/crypto.rs`); it lives under `tests/e2e/certs/` and is
+    gitignored — it is a test key, never a real one."""
+    doc = {"schema": 1, "entries": REGISTRY_ENTRIES}
+    msg = b"".join(
+        ("%s\0%s\0%s\0%s\n" % (e["name"], e["version"], e["download"], e["key_id"])).encode()
+        for e in REGISTRY_ENTRIES
+    )
+    key = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "registry-key.pem")
+    if not os.path.exists(key):
+        raise RuntimeError(f"missing registry signing key {key} — regenerate with "
+                           "openssl ecparam -name prime256v1 -genkey and rebake the public key")
+    p = subprocess.run([_openssl(), "dgst", "-sha256", "-sign", key], input=msg, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"openssl sign failed: {p.stderr.decode(errors='replace')}")
+    doc["key_id"] = "chitti-publisher-test"
+    doc["sig"] = base64.b64encode(p.stdout).decode()
+    return json.dumps(doc).encode()
 
 
 def _read_headers(conn):
@@ -183,21 +236,18 @@ def _handle(conn):
                     + _chunk(b"IDAT", _z.compress(raw, 9)) + _chunk(b"IEND", b""))
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
         elif path == "/registry":
-            # A public agent-registry index (discovery over the network).
-            body = json.dumps({
-                "schema": 1,
-                "entries": [
-                    {"name": "report-writer", "version": "1.0.0",
-                     "description": "Write reports from facts",
-                     "download": "http://10.0.2.2:8100/pkg/report-writer",
-                     "key_id": "chitti-publisher-test"},
-                    {"name": "note-summarizer", "version": "1.0.0",
-                     "description": "Summarize and search note files",
-                     "download": "http://10.0.2.2:8100/pkg/note-summarizer",
-                     "key_id": "chitti-publisher-test"},
-                ],
-            }).encode()
+            # A public agent-registry index (discovery over the network),
+            # **signed** so the kernel's index verification accepts it.
+            body = _registry_index()
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        elif path == "/hang":
+            # Accept the request, complete the (TLS) handshake, then send NOTHING.
+            # This is the state a real hosted endpoint leaves us in while it is
+            # thinking, and it is where Ctrl+C used to be misreported: the cancel
+            # was detected inside the TLS read, embedded-tls dropped the reason,
+            # and the HTTP layer called it "no response head (connection closed
+            # early)" — a network fault the user never had.
+            time.sleep(30)
         elif path == "/sse":
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
             for i in range(3):

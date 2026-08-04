@@ -470,6 +470,18 @@ fn main() -> Status {
     // boot-info; the kernel reads the model there (not at a hardcoded address).
     let model_region: Option<(u64, u64)> = load_model(&mut fs);
 
+    // The human's hosted-model preference, if the image carries one on the ESP
+    // (`\chitti-model.json` — the `make vbox REMOTE_RUN_URL=…` channel; the QEMU
+    // `-kernel` path uses fw_cfg instead). Handed to the kernel in the boot-info
+    // page, exactly like the EDID: the ESP filesystem is gone after
+    // ExitBootServices, so it has to be copied here or not at all.
+    let remote_cfg: alloc::vec::Vec<u8> = fs
+        .read(cstr16!("\\chitti-model.json"))
+        .unwrap_or_default();
+    if !remote_cfg.is_empty() {
+        log::info!("chitti-stub: {} B remote-model cfg on ESP -> boot-info", remote_cfg.len());
+    }
+
     // Reserve the kernel heap in free RAM (>= 1 GiB, else AnyPages; HEAP_MAX)
     // and mark it LOADER_DATA so it survives ExitBootServices. Report its
     // base; the kernel places its heap here. A firmware-chosen address (not a
@@ -760,7 +772,13 @@ fn main() -> Status {
             page[536 + i * 16..544 + i * 16].copy_from_slice(&fsz.to_le_bytes());
             free_bytes += fsz;
         }
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), free {} MiB in {fnum} extent(s), EDID {elen}B -> boot-info {addr:#x}", ram >> 20, free_bytes >> 20);
+        // The hosted-model boot seed (`\chitti-model.json`) at 1024..: length at
+        // 1024..1028, then the JSON bytes at 1028 (the free-extent list ends at
+        // 784, so this is far clear of it). Zero length = no seed on the ESP.
+        let mlen = remote_cfg.len().min(2048);
+        page[1024..1028].copy_from_slice(&(mlen as u32).to_le_bytes());
+        page[1028..1028 + mlen].copy_from_slice(&remote_cfg[..mlen]);
+        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), free {} MiB in {fnum} extent(s), EDID {elen}B, remote-cfg {mlen}B -> boot-info {addr:#x}", ram >> 20, free_bytes >> 20);
         Some(addr)
     })();
 

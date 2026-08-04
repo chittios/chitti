@@ -48,6 +48,18 @@ pub const CLOCK: char = '\u{f017}';
 pub const CALCULATOR: char = '\u{f1ec}';
 /// music
 pub const MUSIC: char = '\u{f001}';
+/// volume-high
+pub const VOLUME_HIGH: char = '\u{f028}';
+/// volume-low
+pub const VOLUME_LOW: char = '\u{f027}';
+/// volume-off
+pub const VOLUME_OFF: char = '\u{f026}';
+/// volume-xmark
+pub const VOLUME_XMARK: char = '\u{f6a9}';
+/// plus
+pub const PLUS: char = '\u{f067}';
+/// minus
+pub const MINUS: char = '\u{f068}';
 /// map
 pub const MAP: char = '\u{f279}';
 /// cloud-sun

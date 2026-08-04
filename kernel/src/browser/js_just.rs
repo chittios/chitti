@@ -35,6 +35,46 @@ pub struct JsEval {
 /// `Error` constructors). No DOM bindings yet — that arrives with the
 /// `DomResolver` tier. Returns `Err(msg)` on a parse or runtime error.
 pub fn eval_program(src: &str) -> Result<JsEval, String> {
+    eval_program_with_argv(src, &[])
+}
+
+/// Like [`eval_program`], but installs a Node-shaped `process.argv` (and bare
+/// `argv`) so scripts can read CLI arguments. `argv[0]` is conventionally the
+/// engine name (`"js"`), `argv[1]` the script path / `"-e"`, then user args.
+///
+/// CLI snippets that use a top-level `return` (illegal in a bare script, but
+/// natural for `/js -c "return 1;"`) are retried wrapped in an IIFE so the
+/// return becomes the program result.
+pub fn eval_program_with_argv(src: &str, argv: &[String]) -> Result<JsEval, String> {
+    match eval_program_raw(src, argv) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // Grammar rejects top-level `return` (statement_list / EOI). Wrap
+            // once so `/js -c "return 1;"` and similar snippets work.
+            if src_looks_like_needs_iife(src) {
+                let wrapped = format!("(function(){{\n{src}\n}})()");
+                if let Ok(v) = eval_program_raw(&wrapped, argv) {
+                    return Ok(v);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// True when a CLI snippet is likely to need an IIFE (top-level return, or a
+/// bare expression that failed as a program for another reason is handled by
+/// the caller). Pure heuristic — never wraps full scripts that already parse.
+fn src_looks_like_needs_iife(src: &str) -> bool {
+    let t = src.trim_start();
+    t.starts_with("return")
+        || t.starts_with("throw")
+        || t.contains("\nreturn")
+        || t.contains(";return")
+        || t.contains("; return")
+}
+
+fn eval_program_raw(src: &str, argv: &[String]) -> Result<JsEval, String> {
     // Drain any console residue from a previous run so `log` is scoped to this call.
     let _ = drain_console_log();
 
@@ -43,7 +83,10 @@ pub fn eval_program(src: &str) -> Result<JsEval, String> {
 
     let mut ctx = EvalContext::new();
     ctx.install_core_builtins(BuiltInRegistry::with_core());
+    install_process_argv(&mut ctx, argv);
     just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
+
+    use just_engine::runner::eval::types::CompletionType;
 
     let mut last = JsValue::Undefined;
     for stmt in &ast.body {
@@ -51,6 +94,11 @@ pub fn eval_program(src: &str) -> Result<JsEval, String> {
             Ok(completion) => {
                 if let Some(v) = completion.value {
                     last = v;
+                }
+                // `return` inside the IIFE surfaces as Return completion at the
+                // call site's expression statement — still capture the value.
+                if completion.completion_type == CompletionType::Return {
+                    break;
                 }
             }
             Err(e) => {
@@ -70,6 +118,17 @@ pub fn eval_program(src: &str) -> Result<JsEval, String> {
         value: display_value(&last),
         log: drain_console_log(),
     })
+}
+
+/// Bind `process = { argv: [...] }` and bare `argv` for script CLI use.
+fn install_process_argv(ctx: &mut EvalContext, argv: &[String]) {
+    use just_engine::runner::eval::expression::{make_array, make_object, set_own_prop};
+    let elems: Vec<JsValue> = argv.iter().map(|s| JsValue::String(s.clone())).collect();
+    let arr = make_array(elems);
+    let process = make_object(alloc::vec![]);
+    set_own_prop(&process, "argv", arr.clone(), true);
+    let _ = ctx.set_binding("process", process);
+    let _ = ctx.set_binding("argv", arr);
 }
 
 /// Human-facing rendering of a top-level result value (REPL-style). Distinct
@@ -1667,6 +1726,29 @@ mod tests {
         let out = eval_program("console.log('hello', 42); 0").expect("eval");
         assert_eq!(out.log.len(), 1);
         assert_eq!(out.log[0], "hello 42");
+    }
+
+    #[test_case]
+    fn top_level_return_is_program_result() {
+        // `/js -c "return 1;"` — top-level return is the CLI completion value.
+        assert_eq!(val("return 1;"), "1");
+        assert_eq!(val("return 2 + 3;"), "5");
+    }
+
+    #[test_case]
+    fn process_argv_visible_to_script() {
+        let argv = alloc::vec![
+            "js".to_string(),
+            "t.js".to_string(),
+            "hello".to_string(),
+            "42".to_string(),
+        ];
+        let out = eval_program_with_argv(
+            "process.argv[2] + ':' + process.argv[3] + ':' + argv.length",
+            &argv,
+        )
+        .expect("eval");
+        assert_eq!(out.value, "\"hello:42:4\"");
     }
 
     #[test_case]

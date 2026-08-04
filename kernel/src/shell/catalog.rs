@@ -107,6 +107,12 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Files", title: "Print File", name: "cat", shortcut: "" },
     Entry { category: "Files", title: "Open / Edit / Play", name: "open", shortcut: "" },
     Entry { category: "Files", title: "Image Decoder (ring 3)", name: "decoder", shortcut: "" },
+    Entry {
+        category: "Files",
+        title: "JavaScript (Node-style -e / file)",
+        name: "js",
+        shortcut: "",
+    },
     Entry { category: "Files", title: "Make Directory", name: "mkdir", shortcut: "" },
     Entry { category: "Files", title: "Copy", name: "cp", shortcut: "" },
     Entry { category: "Files", title: "Move / Rename", name: "mv", shortcut: "" },

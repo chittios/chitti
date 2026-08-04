@@ -556,19 +556,20 @@ fn guest_netdev(id: &str) -> String {
 ///
 /// When `CHITTI_REMOTE_URL` is set (optionally `CHITTI_REMOTE_MODEL`,
 /// `CHITTI_REMOTE_KEY`), write a small JSON file and hand it to QEMU as
-/// `-fw_cfg name=opt/chitti/model,file=…`. The kernel reads it at shell
-/// start and activates the hosted backend (same shape as
-/// `/configs/core/model.json`). Used by `make run` for LM Studio / Ollama
-/// without typing `/model remote` by hand.
+/// `-fw_cfg name=opt/chitti/model,file=…` (the `-kernel` path). The same file
+/// is copied onto the ESP as `\chitti-model.json` by the **image** builder, so
+/// a UEFI/stub boot (VirtualBox, real hardware) gets the same seed through the
+/// boot-info page. The kernel reads it at shell start and activates the hosted
+/// backend (same shape as `/configs/core/model.json`).
 ///
 /// Under slirp user-net the host is `10.0.2.2` (not the host's LAN IP).
-fn remote_model_fw_cfg() -> Result<Vec<String>, String> {
+fn remote_model_json() -> Result<Option<PathBuf>, String> {
     let Ok(url) = env::var("CHITTI_REMOTE_URL") else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let url = url.trim().trim_end_matches('/').to_string();
     if url.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!(
@@ -595,6 +596,14 @@ fn remote_model_fw_cfg() -> Result<Vec<String>, String> {
     }
     fs::write(&path, json.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
     eprintln!("  model remote seed: {url} ({model})");
+    Ok(Some(path))
+}
+
+/// The `-fw_cfg` seed for QEMU `-kernel` boots (aarch64 + x86), if any.
+fn remote_model_fw_cfg() -> Result<Vec<String>, String> {
+    let Some(path) = remote_model_json()? else {
+        return Ok(Vec::new());
+    };
     Ok(vec![
         "-fw_cfg".into(),
         format!("name=opt/chitti/model,file={}", path.display()),
@@ -1598,18 +1607,27 @@ mod sample_file_tests {
         let mut seen: Vec<String> = Vec::new();
         for s in SAMPLE_FILES {
             assert!(
-                matches!(s.category, "images" | "videos" | "audios" | "misc"),
+                matches!(s.category, "images" | "videos" | "audios" | "misc" | "js"),
                 "{}: unknown category {:?}",
                 s.name,
                 s.category
             );
             assert!(!s.note.is_empty(), "{}: no provenance note", s.name);
-            assert!(
-                s.url.starts_with("http://") || s.url.starts_with("https://"),
-                "{}: not an http(s) url: {}",
-                s.name,
-                s.url
-            );
+            if s.is_local() {
+                assert!(
+                    s.local_src().is_file(),
+                    "{}: local sample missing at {}",
+                    s.name,
+                    s.local_src().display()
+                );
+            } else {
+                assert!(
+                    s.url.starts_with("http://") || s.url.starts_with("https://"),
+                    "{}: not an http(s) url: {}",
+                    s.name,
+                    s.url
+                );
+            }
             let dst = format!("{}/{}", s.category, s.name);
             assert!(!seen.contains(&dst), "duplicate sample destination {dst}");
             seen.push(dst);
@@ -1623,10 +1641,10 @@ mod sample_file_tests {
     #[test]
     fn every_sample_extension_is_one_the_os_can_open() {
         // Media hooks (agents/media + agents/pdf manifests) plus the text kinds
-        // that fall through to the editor.
+        // that fall through to the editor, plus `.js` for `/js` (and `/open` → editor).
         const OPENABLE: &[&str] = &[
             "png", "jpg", "jpeg", "wav", "mp3", "aac", "mp4", "mov", "mkv", "webm", "pdf", "txt",
-            "json", "csv", "html", "md",
+            "json", "csv", "html", "md", "js",
         ];
         for s in SAMPLE_FILES {
             let ext = s.name.rsplit('.').next().unwrap_or_default();
@@ -1687,7 +1705,15 @@ mod sample_file_tests {
         let md = fs::read_to_string(dir.join("README.md")).expect("readme written");
         for s in SAMPLE_FILES {
             assert!(md.contains(s.name), "readme omits {}", s.name);
-            assert!(md.contains(s.url), "readme omits the source of {}", s.name);
+            if s.is_local() {
+                assert!(
+                    md.contains("samples-src") || md.contains(s.category),
+                    "readme omits local provenance for {}",
+                    s.name
+                );
+            } else {
+                assert!(md.contains(s.url), "readme omits the source of {}", s.name);
+            }
         }
         assert!(md.contains("absent"), "sizes should report absent files as such");
         // Leave the tree as it was found (a real fetch rewrites it with sizes).
@@ -1875,7 +1901,16 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
     f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
     drop(f);
+    // A crashed run can leave this image attached to a raw /dev/diskN (the
+    // model-disk variant of this bug); the next hdiutil attach would return the
+    // stale device and newfs_msdos fails on a node the user does not own.
+    #[cfg(target_os = "macos")]
+    detach_stale_hdiutil(&img);
     let disp_cfg = boot_display_cfg()?;
+    // The hosted-model boot seed (`\chitti-model.json`): the stub hands it to
+    // the kernel via the boot-info page on UEFI/stub boots (VirtualBox, real
+    // hardware) — the image equivalent of the QEMU `-kernel` fw_cfg seed.
+    let remote_cfg = remote_model_json()?;
     if cfg!(target_os = "linux") {
         let mut copies: Vec<(PathBuf, String)> = vec![
             (stub.to_path_buf(), "::/EFI/BOOT/BOOTAA64.EFI".into()),
@@ -1883,6 +1918,9 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
         ];
         if let Some(c) = &disp_cfg {
             copies.push((c.clone(), "::/chitti-display.cfg".into()));
+        }
+        if let Some(rc) = &remote_cfg {
+            copies.push((rc.clone(), "::/chitti-model.json".into()));
         }
         if let Some(m) = model {
             for (src, name) in esp_model_parts(m)? {
@@ -1928,6 +1966,10 @@ fn build_esp_image_aarch64(stub: &Path, kernel: &Path, model: Option<&Path>) -> 
         }
         s
     };
+    let remote_cp = remote_cfg
+        .as_ref()
+        .map(|rc| format!("cp \"{}\" \"$MNT/chitti-model.json\"", rc.display()))
+        .unwrap_or_default();
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -1941,6 +1983,7 @@ cp "{kernel}" "$MNT/chitti-kernel"
 {model_cp}
 {voice_cp}
 {wifi_cp}
+{remote_cp}
 diskutil unmount "$DEV" > /dev/null
 hdiutil detach "$DEV" > /dev/null
 "#,
@@ -1949,6 +1992,7 @@ hdiutil detach "$DEV" > /dev/null
         kernel = kernel.display(),
         disp_cp = disp_cfg.as_ref().map(|c| format!("cp \"{}\" \"$MNT/chitti-display.cfg\"", c.display())).unwrap_or_default(),
         model_cp = model_cp,
+        remote_cp = remote_cp,
         // Voice models at the ESP root, so the kernel's root-file readers find them.
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
         wifi_cp = wifi_cp,
@@ -2021,6 +2065,32 @@ hdiutil detach "$DEV" > /dev/null
 /// lands as `chat.gguf` (the `/model load` runtime-loading path; the e2e
 /// model_load scenario), any other file keeps its own name (the e2e `/open`
 /// image/audio scenario ships media this way). Opt-in via
+/// Detach any hdiutil raw-disk attachment of `img` (macOS only). `hdiutil
+/// info` groups a `/dev/diskN` line above its `image-path:` line, so track the
+/// last device seen and detach it when its image-path matches. A stale
+/// attachment makes the next `newfs_msdos` fail on a device the user does not
+/// own, and it is exactly what a killed parallel e2e run leaves behind.
+#[cfg(target_os = "macos")]
+fn detach_stale_hdiutil(img: &std::path::Path) {
+    use std::process::Command;
+    let Ok(out) = Command::new("hdiutil").arg("info").output() else { return };
+    let txt = String::from_utf8_lossy(&out.stdout);
+    let img_s = img.to_string_lossy();
+    let mut last_dev: Option<String> = None;
+    for line in txt.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("/dev/disk") {
+            let name: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            last_dev = Some(format!("/dev/disk{name}"));
+        } else if t.contains("image-path") && t.contains(img_s.as_ref()) {
+            if let Some(dev) = last_dev.take() {
+                eprintln!("  hdiutil: detaching stale attachment {dev} of {}", img_s);
+                let _ = Command::new("hdiutil").args(["detach", &dev]).status();
+            }
+        }
+    }
+}
+
 /// `CHITTI_MODEL_DISK=<path>[:<path>...]`. Cached; rebuilt when the sources
 /// change. FAT32 caps a file at 4 GiB — larger models must be loaded from an
 /// ext4 data disk instead.
@@ -2041,12 +2111,25 @@ fn build_model_disk(files: &[PathBuf]) -> Result<PathBuf, String> {
         };
         copies.push((f.clone(), dest));
     }
-    let img = repo_root().join("target/chitti-model-disk.img");
     let want = copies.iter().map(|(p, d)| format!("{}>{d}", p.display())).collect::<Vec<_>>().join(":") + &format!(":{total}");
-    let meta = repo_root().join("target/chitti-model-disk.meta");
-    if img.exists() && fs::read_to_string(&meta).map(|s| s.trim() == want).unwrap_or(false) {
+    // Content-addressed name: under `--jobs`, two shards build *different* model
+    // disks concurrently (open_media's media disk vs open_video's clip), and a
+    // shared fixed path made them race the same image — one truncated the
+    // other's file and the attach/format collided. The hash in the name makes
+    // each content's image distinct, so concurrent builds are independent.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::Hasher;
+    h.write(want.as_bytes());
+    let img = repo_root().join(format!("target/chitti-model-disk-{:016x}.img", h.finish()));
+    if img.exists() {
         return Ok(img);
     }
+    // A crashed previous run (or a parallel one that got killed) can leave this
+    // image attached to a raw /dev/diskN; the next hdiutil attach then returns
+    // that *stale* device and newfs_msdos fails with "Permission denied" on a
+    // node it does not own. Detach any stale attachment before rebuilding.
+    #[cfg(target_os = "macos")]
+    detach_stale_hdiutil(&img);
     let size_mb = 64 + total / (1024 * 1024) + 32;
     let f = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&img).map_err(|e| e.to_string())?;
     f.set_len(size_mb * 1024 * 1024).map_err(|e| e.to_string())?;
@@ -2073,7 +2156,6 @@ hdiutil detach "$DEV" > /dev/null
             return Err("model disk build failed (hdiutil/newfs_msdos)".into());
         }
     }
-    let _ = fs::write(&meta, &want);
     let names = copies.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>().join(", ");
     eprintln!("  model disk: {} ({} MiB, {names})", img.display(), size_mb);
     Ok(img)
@@ -2900,6 +2982,10 @@ fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
     f.set_len(total_secs * 512).map_err(|e| e.to_string())?;
     write_gpt_host(&f, total_secs, &[(ESP_GUID_H, esp.0, esp.1, "EFI System"), (LINUX_GUID_H, data.0, data.1, "Chitti Data")])?;
     drop(f);
+    // A crashed run can leave this image attached to a raw /dev/diskN; the next
+    // hdiutil attach would return the stale device and newfs_msdos fails.
+    #[cfg(target_os = "macos")]
+    detach_stale_hdiutil(&img);
 
     if cfg!(target_os = "linux") {
         // Format each partition into a temp file (dosfstools/mtools + e2fsprogs,
@@ -2914,6 +3000,12 @@ fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
         ];
         if let Some(c) = boot_display_cfg()? {
             copies.push((c, "::/chitti-display.cfg".into()));
+        }
+        // The hosted-model boot seed (`\chitti-model.json`): the stub hands it
+        // to the kernel via the boot-info page on UEFI/stub boots — the image
+        // analogue of the QEMU `-kernel` fw_cfg seed.
+        if let Some(rc) = remote_model_json()? {
+            copies.push((rc, "::/chitti-model.json".into()));
         }
         if let Some(m) = &model_path {
             for (src, name) in esp_model_parts(m)? {
@@ -2968,6 +3060,9 @@ fn image_aarch64(model: Model, no_model: bool) -> Result<(), String> {
         }
         s
     };
+    let remote_cp = remote_model_json()?
+        .map(|rc| format!("cp \"{}\" \"$MNT/chitti-model.json\"", rc.display()))
+        .unwrap_or_default();
     let script = format!(
         r#"set -e
 DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" | head -1 | awk '{{print $1}}')
@@ -2981,6 +3076,7 @@ cp "{kernel}" "$MNT/chitti-kernel"
 {model_cp}
 {voice_cp}
 {wifi_cp}
+{remote_cp}
 diskutil unmount "${{DEV}}s1" > /dev/null
 "{mke2fs}" -F -q -t ext4 -b 4096 "${{DEV}}s2"
 hdiutil detach "$DEV" > /dev/null
@@ -2991,6 +3087,7 @@ hdiutil detach "$DEV" > /dev/null
         mke2fs = mke2fs.display(),
         disp_cp = boot_display_cfg()?.map(|c| format!("cp \"{}\" \"$MNT/chitti-display.cfg\"", c.display())).unwrap_or_default(),
         model_cp = model_cp,
+        remote_cp = remote_cp,
         voice_cp = voice.iter().map(|(n, p)| format!("cp \"{}\" \"$MNT/{}\"", p.display(), n)).collect::<Vec<_>>().join("\n"),
         wifi_cp = wifi_cp,
     );
@@ -3356,6 +3453,10 @@ fn ensure_disk_image(want_bytes: u64, fresh: bool) -> Result<PathBuf, String> {
 struct SampleFile {
     category: &'static str,
     name: &'static str,
+    /// Remote `http(s)://…` URL to curl, **or empty** for a **local** sample
+    /// checked in at `assets/samples-src/<category>/<name>` (authored scripts
+    /// such as the `/js` demos — not fetched, never redistributed from a third
+    /// party).
     url: &'static str,
     /// Provenance + what it exercises. Printed by the fetch and written into
     /// the in-OS `/samples/README.md`, because a sample whose origin and
@@ -3367,6 +3468,20 @@ struct SampleFile {
     /// error — `every_sample_extension_is_one_the_os_can_open` holds for the
     /// rest, and the README says which ones will not play.
     openable: bool,
+}
+
+impl SampleFile {
+    fn is_local(&self) -> bool {
+        self.url.is_empty()
+    }
+
+    /// Host path of a local sample (`assets/samples-src/<cat>/<name>`).
+    fn local_src(&self) -> PathBuf {
+        repo_root()
+            .join("assets/samples-src")
+            .join(self.category)
+            .join(self.name)
+    }
 }
 
 /// The sample corpus. Chosen to cover **every decoder `/open` can reach** —
@@ -3499,6 +3614,51 @@ const SAMPLE_FILES: &[SampleFile] = &[
         note: "HTML for the browser agent — the first web page (CERN)",
         openable: true,
     },
+    // JS — scripts for the in-kernel `/js` engine (Node-style CLI). Authored
+    // in-tree under `assets/samples-src/js/` and *copied* (not curl'd) so a
+    // machine with no network still gets them when samples are requested.
+    SampleFile {
+        category: "js",
+        name: "hello.js",
+        url: "",
+        note: "minimal /js script — console.log + top-level return (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "js",
+        name: "argv.js",
+        url: "",
+        note: "prints process.argv / argv — run with `/js /samples/js/argv.js a b` (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "js",
+        name: "fib.js",
+        url: "",
+        note: "iterative Fibonacci; optional N arg (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "js",
+        name: "math.js",
+        url: "",
+        note: "Math + Array map/reduce demo (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "js",
+        name: "class.js",
+        url: "",
+        note: "ES6 class + methods on the just engine (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "js",
+        name: "json.js",
+        url: "",
+        note: "JSON.stringify / JSON.parse round-trip (in-tree, ChittiOS)",
+        openable: true,
+    },
 ];
 
 /// Where the corpus lives on the host. Gitignored: fetched, never committed —
@@ -3591,6 +3751,28 @@ fn cmd_sample_files(rest: &[String]) -> Result<(), String> {
         if dst.exists() && !refresh {
             continue;
         }
+        if s.is_local() {
+            // Authored samples (e.g. /js demos) live in assets/samples-src/ and
+            // are copied, not downloaded — no network, always available.
+            let src = s.local_src();
+            match fs::copy(&src, &dst) {
+                Ok(n) if n > 0 => {
+                    eprintln!("sample-files: copied {}/{} ({})", s.category, s.name, s.note);
+                    fetched += 1;
+                }
+                _ => {
+                    let _ = fs::remove_file(&dst);
+                    eprintln!(
+                        "sample-files: FAILED {}/{} <- missing local {}",
+                        s.category,
+                        s.name,
+                        src.display()
+                    );
+                    failed.push(s.name);
+                }
+            }
+            continue;
+        }
         // `-f` so an HTTP error is a failure rather than an error page saved as a
         // JPEG (which would then be embedded and fail to decode in the OS).
         let ok = Command::new("curl")
@@ -3654,13 +3836,20 @@ fn write_samples_readme(present: &[(&'static str, &'static str, u64)]) -> Result
                 None => "absent".to_string(),
             };
             let flag = if s.openable { "" } else { " **(not playable yet)**" };
-            md.push_str(&format!("- `{}` — {size}{flag} — {}\n  <{}>\n", s.name, s.note, s.url));
+            if s.is_local() {
+                md.push_str(&format!(
+                    "- `{}` — {size}{flag} — {}\n  (local: assets/samples-src/{}/{})\n",
+                    s.name, s.note, s.category, s.name
+                ));
+            } else {
+                md.push_str(&format!("- `{}` — {size}{flag} — {}\n  <{}>\n", s.name, s.note, s.url));
+            }
         }
         md.push('\n');
     }
     md.push_str(
-        "Each file keeps the licence of its upstream source, listed above; they are sample\n\
-         data from the projects' own test corpora, used unmodified.\n",
+        "Fetched media keep the licence of their upstream source, listed above.\n\
+         The `/samples/js/` scripts are authored in-tree (ChittiOS) for the `/js` CLI.\n",
     );
     let dir = samples_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;

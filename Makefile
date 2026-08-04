@@ -4,7 +4,7 @@
 
 # --- knobs (override on the command line: `make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1`) ---
 # ARCH:         aarch64 (native HVF on Apple Silicon) | x86_64
-# MODEL:        bonsai-27b (default) | bonsai-27b-ternary | qwen3.5-0.8b
+# MODEL:       qwen3.5-0.8b (default) | bonsai-27b-ternary | qwen3.5-0.8b
 #               | qwen3.5-2b | qwen3.5-4b | qwen3.5-9b | gemma-4-e4b (e4b)
 #               bonsai-27b         = PrismML Bonsai-27B 1-bit (Q1_0 binary, ~3.8 GB)
 #               bonsai-27b-ternary = PrismML Ternary-Bonsai-27B (Q2_0, ~7.17 GB)
@@ -17,12 +17,22 @@
 #               `make run-remote` to seed a hosted backend. Under user-net the
 #               host is always 10.0.2.2 (not the Mac's LAN IP).
 # REMOTE_MODEL: model name sent to the hosted server (LM Studio / Ollama / …)
+# REMOTE_KEY:   bearer token for the hosted server (`Authorization: Bearer …`).
+#               Empty = none (a LAN LM Studio / Ollama needs no key). Prefer
+#               keeping it out of the shell history / this file:
+#                 export CHITTI_REMOTE_KEY=sk-…   (picked up below)
+#               A hosted provider's URL is the **base** — the kernel appends
+#               `/v1/chat/completions` itself, so stop before that: opencode zen
+#               serves `https://opencode.ai/zen/v1/chat/completions`, hence pass
+#               `https://opencode.ai/zen`. Passing the whole endpoint gets a 404
+#               (the doubled path lands on the provider's marketing site).
 ARCH         ?= aarch64
-MODEL        ?= bonsai-27b
+MODEL        ?= qwen3.5-0.8b
 RELEASE      ?= 1
 BRIDGE       ?=
 REMOTE_URL   ?=
 REMOTE_MODEL ?= ornith-1.0-9b
+REMOTE_KEY   ?= $(CHITTI_REMOTE_KEY)
 # Hosted backend seeded by `run-remote` (override on the command line).
 REMOTE_RUN_URL ?= http://10.0.2.2:1234
 
@@ -88,6 +98,7 @@ FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
 help:
 	@echo "ChittiOS — make targets (ARCH=$(ARCH) MODEL=$(MODEL) RELEASE=$(RELEASE))"
 	@echo "  BRIDGE=$(BRIDGE)  REMOTE_URL=$(REMOTE_URL)  REMOTE_MODEL=$(REMOTE_MODEL)"
+	@echo "  REMOTE_KEY=$(if $(REMOTE_KEY),<set>,)  (never printed; from REMOTE_KEY= or \$$CHITTI_REMOTE_KEY)"
 	@echo "  SAMPLES=$(SAMPLES) (bundle /samples files)"
 	@echo
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
@@ -97,6 +108,8 @@ help:
 	@echo "  make run ARCH=x86_64 MODEL=qwen3.5-9b RELEASE=1"
 	@echo "  make model MODEL=bonsai-27b-ternary && make run MODEL=bonsai-27b-ternary  # Q2_0 build"
 	@echo "  make run-remote REMOTE_RUN_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b"
+	@echo "  make run-remote REMOTE_RUN_URL=https://opencode.ai/zen REMOTE_MODEL=deepseek-v4-flash REMOTE_KEY=sk-…"
+	@echo "  make vbox MODEL=0.8b REMOTE_RUN_URL=https://opencode.ai/zen REMOTE_MODEL=deepseek-v4-flash REMOTE_KEY=sk-…  # same seed, UEFI/VM image"
 	@echo "  make run BRIDGE=en0           # L2 bridge (often needs sudo on macOS)"
 	@echo "  make usb-list                 # grep host USB for BT / camera candidates"
 	@echo "  make run USB_BT=1 USB_CAM=1   # passthrough grepped BT dongle + webcam"
@@ -158,6 +171,7 @@ run:
 	CHITTI_NET_BRIDGE='$(BRIDGE)' \
 	CHITTI_REMOTE_URL='$(REMOTE_URL)' \
 	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
+	CHITTI_REMOTE_KEY='$(REMOTE_KEY)' \
 	CHITTI_USB_BT='$(USB_BT)' \
 	CHITTI_USB_CAM='$(USB_CAM)' \
 	CHITTI_USB_HOST='$(USB_HOST)' \
@@ -167,11 +181,17 @@ run:
 ## run-remote: like `run`, but seed `/model remote` at boot from REMOTE_RUN_URL
 ##             + REMOTE_MODEL (hosted LM Studio / Ollama / vLLM). Override e.g.
 ##             `make run-remote REMOTE_RUN_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b`
+##             A hosted provider needing a bearer token takes REMOTE_KEY (or
+##             `export CHITTI_REMOTE_KEY=…`), and the URL is the base — the
+##             kernel appends `/v1/chat/completions`, so pass `…/zen`, not the
+##             endpoint:
+##             `make run-remote REMOTE_RUN_URL=https://opencode.ai/zen REMOTE_MODEL=deepseek-v4-flash REMOTE_KEY=sk-…`
 .PHONY: run-remote
 run-remote:
 	CHITTI_NET_BRIDGE='$(BRIDGE)' \
 	CHITTI_REMOTE_URL='$(REMOTE_RUN_URL)' \
 	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
+	CHITTI_REMOTE_KEY='$(REMOTE_KEY)' \
 	CHITTI_USB_BT='$(USB_BT)' \
 	CHITTI_USB_CAM='$(USB_CAM)' \
 	CHITTI_USB_HOST='$(USB_HOST)' \
@@ -230,10 +250,17 @@ m1n1:
 
 ## vbox: rebuild the aarch64 image and (re)load it into VirtualBox VM VBOX_VM
 ##       forces USB keyboard + USB tablet + xHCI (aarch64 has no PS/2 input path)
-##       NB: do not put Make `#` comments inside the shell recipe — they break `\`
-##       line continuation and re-run later lines in a fresh shell with VM empty.
+##       REMOTE_RUN_URL/REMOTE_MODEL/REMOTE_KEY seed `/model remote` at boot
+##       (embedded on the ESP as \chitti-model.json — the stub hands it to the
+##       kernel via the boot-info page, the UEFI-boot analogue of run-remote's
+##       fw_cfg seed). NB: do not put Make `#` comments inside the shell recipe —
+##       they break `\` line continuation and re-run later lines in a fresh shell
+##       with VM empty.
 .PHONY: vbox
 vbox:
+	CHITTI_REMOTE_URL='$(REMOTE_RUN_URL)' \
+	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
+	CHITTI_REMOTE_KEY='$(REMOTE_KEY)' \
 	CHITTI_RESOLUTION='$(VBOX_RES)' CHITTI_SAMPLE_FILES='$(SAMPLES)' $(XTASK) image -arch aarch64 -model $(MODEL)
 	@command -v VBoxManage >/dev/null || { echo "VBoxManage not found — install VirtualBox"; exit 1; }
 	@set -e; \
@@ -302,9 +329,12 @@ clean:
 E2E_PY ?= $(shell [ -x /opt/homebrew/bin/python3 ] && echo /opt/homebrew/bin/python3 || echo python3)
 # The `samples` scenario needs the corpus embedded in the booted kernel, so the
 # suite builds with it exactly as `make run` does (SAMPLES= skips that scenario,
-# it does not fail it).
+# it does not fail it). `E2E_JOBS=N` splits the run across N concurrent guest
+# boots (see `tests/e2e/run.py --help`): a Mac with ~8 cores can run
+# `make e2e E2E_JOBS=3` and cut the sweep from ~30 min to ~12 min.
+E2E_JOBS ?= 1
 e2e:
-	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL)
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL) --jobs $(E2E_JOBS)
 # Full e2e incl. local inference + voice (slow; needs assets/model.gguf + assets/voice/).
 e2e-full:
-	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL) --slow
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(E2E_PY) tests/e2e/run.py -arch $(ARCH) -model $(MODEL) --slow --jobs $(E2E_JOBS)

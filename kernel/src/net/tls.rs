@@ -110,6 +110,42 @@ impl ErrorType for TcpStream {
     type Error = StreamError;
 }
 
+/// Latched when a stream read/write aborted because the human pressed Ctrl+C.
+///
+/// A cancel is detected **inside** the transport, at the bottom of a stack whose
+/// middle layer (embedded-tls) wraps our error in its own type and loses the
+/// reason. Without a latch, "the human stopped this" arrives at the HTTP layer as
+/// an anonymous read failure — and gets reported as a network fault, which is how
+/// a plain Ctrl+C came out as *"no response head (connection closed early)"*.
+///
+/// `poll_interrupt` consumes the keystroke, so the fact has to be recorded when it
+/// is observed; nobody upstream can re-derive it.
+static READ_CANCELLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Take (and clear) the cancel latch. Called by the HTTP layer when classifying a
+/// failed read, so a cancel is never reported as a transport error.
+pub fn take_cancelled() -> bool {
+    READ_CANCELLED.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Clear the latch before an exchange, so a stale cancel from an earlier request
+/// cannot make this one look cancelled.
+pub fn clear_cancelled() {
+    READ_CANCELLED.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn latch_cancel() -> StreamError {
+    READ_CANCELLED.store(true, core::sync::atomic::Ordering::Relaxed);
+    StreamError(super::http::CANCELLED)
+}
+
+/// Set the latch without a socket, so the classification rule is testable
+/// off-hardware (the real setter needs a live read to cancel).
+#[cfg(test)]
+pub fn latch_cancel_for_test() {
+    let _ = latch_cancel();
+}
+
 impl TcpStream {
     /// The deadline in effect: the rolling atomic if present, else the fixed one.
     fn effective_deadline(&self) -> u64 {
@@ -130,7 +166,7 @@ impl IoRead for TcpStream {
                 return Err(StreamError("TLS read timeout"));
             }
             if crate::shell::poll_interrupt() {
-                return Err(StreamError("cancelled"));
+                return Err(latch_cancel());
             }
             super::poll();
             let r = NET.with(|n| {
@@ -162,7 +198,7 @@ impl IoWrite for TcpStream {
                 return Err(StreamError("TLS write timeout"));
             }
             if crate::shell::poll_interrupt() {
-                return Err(StreamError("cancelled"));
+                return Err(latch_cancel());
             }
             super::poll();
             let r = NET.with(|n| {
@@ -214,15 +250,24 @@ impl TlsSession {
         self.tls.flush().map_err(|e| alloc::format!("TLS flush: {:?}", e))
     }
 
-    /// Read up to `buf.len()` decrypted bytes. `Ok(0)` = peer closed the TLS
-    /// session (close_notify or transport EOF).
-    pub fn read(&mut self, buf: &mut [u8]) -> usize {
-        match self.tls.read(buf) {
-            Ok(k) => k,
-            // A read error after data flowed is a normal close for a
-            // `Connection: close` response — treat it as EOF.
-            Err(_) => 0,
-        }
+    /// Read up to `buf.len()` decrypted bytes. `Ok(0)` = the peer closed the TLS
+    /// session cleanly (close_notify or transport EOF); `Err` carries the reason
+    /// it failed instead.
+    ///
+    /// This used to map **every** error to `0`, on the reasoning that "a read
+    /// error after data flowed is a normal close for a `Connection: close`
+    /// response" — true, but the code applied it whether or not data had flowed.
+    /// So a TLS read timeout, a cancel, an alert and a decrypt failure all
+    /// reached the HTTP layer as EOF and were reported as
+    /// *"no response head (connection closed early)"*: four distinct facts
+    /// collapsed into the one that happened to be wrong. Deciding "is this the
+    /// normal end of a response?" needs to know whether a response had *started*,
+    /// which is the HTTP layer's knowledge, not this one's — so the reason is
+    /// handed up and [`super::http::drive_stream`] applies that rule.
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+        self.tls
+            .read(buf)
+            .map_err(|e| alloc::format!("TLS read: {:?}", e))
     }
 }
 
