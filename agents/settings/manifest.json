@@ -44,5 +44,20 @@
     "module": "assets/tools.wasm",
     "fuel": 2000000
   },
-  "autostart": false
+  "autostart": false,
+  "command_hooks": [
+    {
+      "command": "/settings",
+      "description": "Open the settings panel (display resolution, theme, status bar).",
+      "match": {
+        "bare": true
+      },
+      "dispatch": {
+        "default": {
+          "tool": "settings_start",
+          "path_arg": "args"
+        }
+      }
+    }
+  ]
 }

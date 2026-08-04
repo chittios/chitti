@@ -262,12 +262,13 @@ pub fn run() -> ! {
         #[cfg(not(test))]
         if crate::framebuffer::composer_available() {
             crate::framebuffer::composer_begin();
+            crate::framebuffer::composer_set_prompt(&prompt_text());
             update_composer_hint(remote_on, remote_cfg.as_ref());
             // UART-only prompt — `serial_print!` would also paint into the chat
             // grid, which is not the input surface when the composer is up.
-            crate::serial::write_str_raw("> ");
+            crate::serial::write_str_raw(&prompt_text());
         } else {
-            serial_print!("> ");
+            serial_print!("{}", prompt_text());
         }
         #[cfg(test)]
         serial_print!("> ");
@@ -548,7 +549,7 @@ pub fn run() -> ! {
                 // Everything else is a stateless system command, shared with the
                 // agent tool layer (see `dispatch_system` / `run_tool_command`).
                 _ => {
-                    if !dispatch_system(name, arg) {
+                    if !dispatch_system(name, arg) && !run_command_hook(name, arg, &mut chat, &mut orch) {
                         serial_println!("unknown command '/{}' -- try /help", name);
                     }
                 }
@@ -675,7 +676,11 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "mv" => fs_mv(arg),
         "rm" => fs_rm(arg),
         "touch" => fs_touch(arg),
-        "pwd" => serial_println!("pwd> /"),
+        "pwd" => serial_println!("pwd> {}", shell_cwd()),
+        "cd" => {
+            set_shell_cwd(arg);
+            serial_println!("cd> {}", shell_cwd());
+        }
         "channel" | "channels" => run_channel(arg),
         "install" => disk_install(arg),
         "mkext4" => disk_mkext4(arg),
@@ -5562,6 +5567,101 @@ fn run_surface(_arg: &str) {
 /// [`read_line`]. Consecutive duplicates are not stored.
 static HISTORY: Locked<alloc::vec::Vec<String>> = Locked::new(alloc::vec::Vec::new());
 
+/// The shell agent's **current working directory** — the `~` the shell starts
+/// in, `/pwd` prints, and agent commands (git clone, downloads, notes) resolve
+/// relative targets against. Starts at the ChittiOS user home; `/cd` moves it,
+/// and the shell passes it to command-hook agents (`run_command_hook`).
+static SHELL_CWD: Locked<alloc::string::String> =
+    Locked::new(alloc::string::String::new());
+
+/// The shell's current working directory (falls back to the user home).
+pub fn shell_cwd() -> alloc::string::String {
+    let c = SHELL_CWD.with(|c| c.clone());
+    if c.is_empty() {
+        crate::agent::home::USER_HOME.to_string()
+    } else {
+        c
+    }
+}
+
+/// Set the shell's working directory (`/cd`). `""`/`.`/`~` → the user home.
+pub fn set_shell_cwd(dir: &str) {
+    let dir = dir.trim();
+    let dir = if dir.is_empty() || dir == "." || dir == "~" || dir == "/" {
+        crate::agent::home::USER_HOME.to_string()
+    } else {
+        crate::synapse::vpath::normalize(dir)
+    };
+    SHELL_CWD.with(|c| *c = dir.clone());
+}
+
+/// Resolve a user-typed path against the shell's working directory, exactly
+/// like a Linux shell: `/abs` stays absolute, `~/x` → the user home, anything
+/// else is relative to the pwd. `.`/`..`/`//` are collapsed. **One** resolver
+/// for every path-taking command (`ls`/`cat`/`open`/`touch`/`mkdir`/`cp`/`mv`/
+/// `rm`/`glob`/`grep`/`edit`…) and for path completion — never re-implement
+/// this logic at a call site.
+pub fn resolve_path(p: &str) -> String {
+    let p = p.trim();
+    if p.is_empty() || p == "." {
+        return shell_cwd();
+    }
+    if p == "~" {
+        return crate::agent::home::USER_HOME.to_string();
+    }
+    if let Some(rest) = p.strip_prefix("~/") {
+        return crate::synapse::vpath::normalize(&alloc::format!(
+            "{}/{}",
+            crate::agent::home::USER_HOME,
+            rest
+        ));
+    }
+    if p.starts_with('/') {
+        return crate::synapse::vpath::normalize(p);
+    }
+    crate::synapse::vpath::normalize(&alloc::format!("{}/{}", shell_cwd(), p))
+}
+
+/// The composer prompt: `~/path (branch) > ` — the cwd abbreviated against the
+/// home (`~`), plus the git branch when the cwd is inside a repo (the same
+/// shell-prompt convention bash/zsh use). Shown at the start of the composer
+/// input box and echoed to serial.
+pub fn prompt_text() -> alloc::string::String {
+    let cwd = shell_cwd();
+    let home = crate::agent::home::USER_HOME;
+    let shown = if cwd == home {
+        "~".to_string()
+    } else if let Some(rest) = cwd.strip_prefix(&alloc::format!("{home}/")) {
+        alloc::format!("~/{rest}")
+    } else {
+        cwd.clone()
+    };
+    match git_branch_at(&cwd) {
+        Some(b) => alloc::format!("{shown} ({b}) > "),
+        None => alloc::format!("{shown} > "),
+    }
+}
+
+/// The git branch of the repo containing `dir`, if any — walk up from `dir`
+/// until a `.git/HEAD` appears (a repo's `.git` sits at an ancestor of its
+/// subdirectories). Pure over the store; `None` outside any repo.
+fn git_branch_at(dir: &str) -> Option<alloc::string::String> {
+    let mut cur = dir.trim_end_matches('/').to_string();
+    loop {
+        if let Some(bytes) = crate::synapse::fs::read(&alloc::format!("{cur}/.git/HEAD")) {
+            let s = String::from_utf8_lossy(&bytes);
+            return s
+                .trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(|b| b.to_string());
+        }
+        match cur.rfind('/') {
+            Some(0) | None => return None,
+            Some(i) => cur.truncate(i),
+        }
+    }
+}
+
 /// Tab completion draws names from [`catalog::ENTRIES`] + [`catalog::COMMAND_ALIASES`].
 /// Add new commands to the catalogue (not a third list here).
 
@@ -5755,12 +5855,31 @@ fn suggest_refresh(
         return;
     };
     // Path completion lists the *parent* directory of the typed prefix (one
-    // readdir, store or mount — matching what `/ls` shows); @file mentions
-    // list the flat store. Everything else needs neither.
+    // readdir, store or mount — matching what `/ls` shows), resolved against
+    // the pwd/`~`; @file mentions list the flat store. Everything else needs
+    // neither.
     let (store_paths, dir_entries) = match ctx.kind {
         suggest::Kind::File => (crate::synapse::fs::list(), alloc::vec::Vec::new()),
         suggest::Kind::Path => {
-            let (parent, _) = suggest::path_parts(&ctx.prefix);
+            let parent = if ctx.prefix.starts_with('~') {
+                crate::agent::home::USER_HOME.to_string()
+            } else if ctx.prefix.starts_with('/') {
+                let (p, _) = suggest::path_parts(&ctx.prefix);
+                if p.is_empty() {
+                    "/".to_string()
+                } else {
+                    p
+                }
+            } else if ctx.prefix.contains('/') {
+                let (p, _) = suggest::path_parts(&ctx.prefix);
+                if p == "/" {
+                    shell_cwd()
+                } else {
+                    resolve_path(&p)
+                }
+            } else {
+                shell_cwd()
+            };
             (
                 alloc::vec::Vec::new(),
                 crate::fs::vfs::readdir(&parent).unwrap_or_default(),
@@ -7970,6 +8089,44 @@ fn run_open(
     run_open_inner(arg, chat, orch);
 }
 
+/// Dispatch a **bare** slash command through a package command hook (an agent
+/// declared in a manifest that it owns `/git`, `/settings`, …). Like
+/// [`open_via_command_hook`] it **rebinds the chat to the owning agent** so the
+/// tool runs under that agent's identity and toolset/caps (the Router refuses
+/// an agent-owning wasm tool called as the shell agent), then prints the
+/// result. The chat stays on the owning agent afterwards (`/agents switch 1`
+/// returns to the shell), the same UX as `/open` handing over to the media/pdf
+/// agent. Returns `false` when no agent claims the command.
+fn run_command_hook(
+    name: &str,
+    arg: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) -> bool {
+    let Some(hook) = crate::agent::system::resolve_command_hook_bare(name) else {
+        return false;
+    };
+    let arg_esc = arg.replace('\\', "\\\\").replace('"', "\\\"");
+    let cwd_esc = shell_cwd().replace('\\', "\\\\").replace('"', "\\\"");
+    // Pass the shell's current directory so the agent resolves relative targets
+    // (e.g. git clone's default folder) against the real pwd, like a CLI.
+    let args = alloc::format!(r#"{{"{}":"{arg_esc}","cwd":"{cwd_esc}"}}"#, hook.path_arg);
+    if active_agent_id() != hook.agent_id {
+        rebind_chat_agent(hook.agent_id, orch);
+        *chat = None;
+        serial_println!(
+            "/{} → agent '{}' ({})  SOUL /agent/{}/SOUL.md  (/agents switch 1 for shell)",
+            name,
+            hook.agent_name,
+            hook.agent_id,
+            hook.agent_id
+        );
+    }
+    let out = execute_chat_tool(&hook.tool, &args, &mut orch.session);
+    serial_println!("/{} → {}: {out}", name, hook.agent_name);
+    true
+}
+
 /// Dispatch `/open` via a package command hook: rebind chat to the owning
 /// agent and run the declared tool under its toolset/caps.
 fn open_via_command_hook(
@@ -8037,16 +8194,18 @@ fn run_open_inner(
         return;
     }
     // Package command_hooks for /open (e.g. media agent owns .mp3/.png/.mp4…).
-    if let Some(hook) = crate::agent::system::resolve_open_hook(arg) {
-        open_via_command_hook(arg, &hook, chat, orch);
+    // Resolve the path against the pwd first so `~/x` and relative names work.
+    let resolved = resolve_path(arg);
+    if let Some(hook) = crate::agent::system::resolve_open_hook(&resolved) {
+        open_via_command_hook(&resolved, &hook, chat, orch);
         return;
     }
     #[cfg(not(test))]
     {
         // No hook: text editor tab.
-        crate::editor::open(arg);
+        crate::editor::open(&resolved);
         crate::framebuffer::focus_set(true);
-        serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab returns to shell", arg);
+        serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab returns to shell", resolved);
     }
     #[cfg(test)]
     let _ = (arg, chat, orch);
@@ -9488,5 +9647,92 @@ mod agent_flow_tests {
         assert!(!recalled, "Esc must cancel");
         assert_eq!(buf, "/keep me", "draft restored after cancel");
         HISTORY.with(|h| h.truncate(orig));
+    }
+}
+
+#[cfg(test)]
+mod resolve_path_tests {
+    use super::*;
+
+    fn with_cwd(cwd: &str, f: impl FnOnce()) {
+        set_shell_cwd(cwd);
+        f();
+        set_shell_cwd(crate::agent::home::USER_HOME);
+    }
+
+    /// Absolute paths pass through; relative and `~` resolve against the pwd
+    /// / home, with `.`/`..` collapsed — the Linux rule every fs command uses.
+    #[test_case]
+    fn resolve_relative_tilde_and_absolute() {
+        with_cwd("/home/chitti/work", || {
+            assert_eq!(resolve_path("hello.txt"), "/home/chitti/work/hello.txt");
+            assert_eq!(resolve_path("sub/notes.md"), "/home/chitti/work/sub/notes.md");
+            assert_eq!(resolve_path("."), "/home/chitti/work");
+            assert_eq!(resolve_path(""), "/home/chitti/work");
+            assert_eq!(resolve_path("~"), "/home/chitti");
+            assert_eq!(resolve_path("~/homedoc.md"), "/home/chitti/homedoc.md");
+            assert_eq!(resolve_path("/samples/x.png"), "/samples/x.png");
+            assert_eq!(resolve_path("/configs/core/ui.json"), "/configs/core/ui.json");
+            assert_eq!(resolve_path("../up.txt"), "/home/chitti/up.txt");
+            assert_eq!(resolve_path("a/../b"), "/home/chitti/work/b");
+            assert_eq!(resolve_path("//double//slash"), "/double/slash");
+        });
+    }
+
+    /// Glob patterns keep their `*`/`**` segments when resolved against the pwd.
+    #[test_case]
+    fn resolve_keeps_glob_segments() {
+        with_cwd("/home/chitti/work", || {
+            assert_eq!(resolve_path("*.md"), "/home/chitti/work/*.md");
+            assert_eq!(resolve_path("**/*.rs"), "/home/chitti/work/**/*.rs");
+            assert_eq!(resolve_path("~/docs/**"), "/home/chitti/docs/**");
+        });
+    }
+
+    /// The bare home (no cd) resolves relative names under `/home/chitti`.
+    #[test_case]
+    fn resolve_from_home_by_default() {
+        set_shell_cwd(crate::agent::home::USER_HOME);
+        assert_eq!(resolve_path("rel.txt"), "/home/chitti/rel.txt");
+        assert_eq!(resolve_path("~/rel.txt"), "/home/chitti/rel.txt");
+        set_shell_cwd("/tmp");
+        assert_eq!(resolve_path("rel.txt"), "/tmp/rel.txt");
+        set_shell_cwd(crate::agent::home::USER_HOME);
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    /// `prompt_text` shows `~` for the home, `~/path` under it, and the git
+    /// branch (walking up to the repo root) when inside a repo.
+    #[test_case]
+    fn prompt_shows_cwd_and_branch() {
+        // Seed a fake repo at /home/chitti/work/repo (as the git agent writes it).
+        crate::synapse::fs::write("/home/chitti/work/repo/.git/HEAD", b"ref: refs/heads/main\n");
+        set_shell_cwd("/home/chitti/work/repo");
+        assert_eq!(prompt_text(), "~/work/repo (main) > ");
+
+        // A subdirectory walks up to the repo's .git.
+        crate::synapse::fs::write("/home/chitti/work/repo/.git/HEAD", b"ref: refs/heads/main\n");
+        set_shell_cwd("/home/chitti/work/repo/src");
+        assert_eq!(prompt_text(), "~/work/repo/src (main) > ");
+
+        // No repo -> no branch.
+        set_shell_cwd("/home/chitti/work");
+        assert_eq!(prompt_text(), "~/work > ");
+
+        // Home -> `~`.
+        set_shell_cwd(crate::agent::home::USER_HOME);
+        assert_eq!(prompt_text(), "~ > ");
+
+        // A bare `.git/HEAD` (non-symbolic) yields no branch name (detached).
+        crate::synapse::fs::write("/home/chitti/work/repo/.git/HEAD", b"71fa4e85c9d510b6a6567d857b9add8cb5b8110b\n");
+        set_shell_cwd("/home/chitti/work/repo");
+        assert_eq!(prompt_text(), "~/work/repo > ");
+
+        crate::synapse::fs::write("/home/chitti/work/repo/.git/HEAD", b"ref: refs/heads/main\n");
+        set_shell_cwd(crate::agent::home::USER_HOME);
     }
 }

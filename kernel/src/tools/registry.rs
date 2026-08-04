@@ -539,6 +539,13 @@ fn builtins() -> Vec<ToolDef> {
             binding: ToolBinding::Media,
         },
         ToolDef {
+            name: "git_command".to_string(),
+            description: "Run a git command (init|status|add|commit|log|branch|checkout|clone|push). Deterministic wasm (git agent). args: the full `/git …` line.".to_string(),
+            input_schema: r#"{"type":"object","properties":{"args":{"type":"string"}},"required":["args"]}"#.to_string(),
+            required: alloc::vec!["args".to_string()],
+            binding: ToolBinding::AgentWasm,
+        },
+        ToolDef {
             name: "audio_player".to_string(),
             description: "Play audio (.wav/.mp3/.aac) in the action pane. args: path.".to_string(),
             input_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.to_string(),

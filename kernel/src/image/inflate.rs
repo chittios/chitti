@@ -115,7 +115,21 @@ const OUT_MAX: usize = 256 << 20;
 
 /// Decompress a raw DEFLATE stream.
 pub fn inflate(src: &[u8]) -> Result<Vec<u8>, &'static str> {
+    Ok(inflate_len(src)?.0)
+}
+
+/// Like [`inflate`] but also reports how many bytes of `src` the deflate
+/// stream consumed — needed to walk a concatenation of deflate streams (git
+/// packfiles pack one object per stream).
+pub fn inflate_len(src: &[u8]) -> Result<(Vec<u8>, usize), &'static str> {
     let mut br = Bits { src, pos: 0, bit: 0 };
+    let out = inflate_blocks(&mut br)?;
+    Ok((out, br.pos + usize::from(br.bit > 0)))
+}
+
+/// The shared block driver of [`inflate`] over an explicit bit reader (so the
+/// caller can recover the consumed length).
+fn inflate_blocks(br: &mut Bits) -> Result<Vec<u8>, &'static str> {
     let mut out: Vec<u8> = Vec::new();
     loop {
         let bfinal = br.bits(1)?;
@@ -124,22 +138,22 @@ pub fn inflate(src: &[u8]) -> Result<Vec<u8>, &'static str> {
             0 => {
                 // Stored: LEN + ~LEN then raw bytes.
                 br.align();
-                if br.pos + 4 > src.len() {
+                if br.pos + 4 > br.src.len() {
                     return Err("deflate: truncated stored header");
                 }
-                let len = src[br.pos] as usize | ((src[br.pos + 1] as usize) << 8);
-                let nlen = src[br.pos + 2] as usize | ((src[br.pos + 3] as usize) << 8);
+                let len = br.src[br.pos] as usize | ((br.src[br.pos + 1] as usize) << 8);
+                let nlen = br.src[br.pos + 2] as usize | ((br.src[br.pos + 3] as usize) << 8);
                 if len != (!nlen & 0xffff) {
                     return Err("deflate: stored length check failed");
                 }
                 br.pos += 4;
-                if br.pos + len > src.len() {
+                if br.pos + len > br.src.len() {
                     return Err("deflate: truncated stored block");
                 }
                 if out.len().saturating_add(len) > OUT_MAX {
                     return Err("deflate: output too large");
                 }
-                out.extend_from_slice(&src[br.pos..br.pos + len]);
+                out.extend_from_slice(&br.src[br.pos..br.pos + len]);
                 br.pos += len;
             }
             1 => {
@@ -155,7 +169,7 @@ pub fn inflate(src: &[u8]) -> Result<Vec<u8>, &'static str> {
                 }
                 let litt = Huff::build(&lit)?;
                 let distt = Huff::build(&[5u8; 30])?;
-                inflate_block(&mut br, &litt, &distt, &mut out)?;
+                inflate_block(br, &litt, &distt, &mut out)?;
             }
             2 => {
                 // Dynamic tables: code-length code, then lit/dist lengths.
@@ -171,7 +185,7 @@ pub fn inflate(src: &[u8]) -> Result<Vec<u8>, &'static str> {
                 let mut lengths = alloc::vec![0u8; hlit + hdist];
                 let mut i = 0;
                 while i < lengths.len() {
-                    let sym = clt.decode(&mut br)?;
+                    let sym = clt.decode(br)?;
                     match sym {
                         0..=15 => {
                             lengths[i] = sym as u8;
@@ -206,7 +220,7 @@ pub fn inflate(src: &[u8]) -> Result<Vec<u8>, &'static str> {
                 }
                 let litt = Huff::build(&lengths[..hlit])?;
                 let distt = Huff::build(&lengths[hlit..])?;
-                inflate_block(&mut br, &litt, &distt, &mut out)?;
+                inflate_block(br, &litt, &distt, &mut out)?;
             }
             _ => return Err("deflate: reserved block type"),
         }
@@ -257,6 +271,13 @@ fn inflate_block(br: &mut Bits<'_>, litt: &Huff, distt: &Huff, out: &mut Vec<u8>
 
 /// Decompress an RFC 1950 zlib stream (2-byte header + deflate + Adler-32).
 pub fn zlib_decompress(src: &[u8]) -> Result<Vec<u8>, &'static str> {
+    Ok(zlib_decompress_len(src)?.0)
+}
+
+/// Like [`zlib_decompress`] but also reports how many bytes of `src` the whole
+/// zlib stream consumed (header + deflate + Adler-32) — needed to walk a
+/// concatenation of zlib streams (git packfiles pack one object per stream).
+pub fn zlib_decompress_len(src: &[u8]) -> Result<(Vec<u8>, usize), &'static str> {
     if src.len() < 6 {
         return Err("zlib: stream too short");
     }
@@ -270,14 +291,18 @@ pub fn zlib_decompress(src: &[u8]) -> Result<Vec<u8>, &'static str> {
     if flg & 0x20 != 0 {
         return Err("zlib: preset dictionary unsupported");
     }
-    let out = inflate(&src[2..src.len() - 4])?;
-    // Verify Adler-32 (the trailing 4 bytes, big-endian).
-    let tail = &src[src.len() - 4..];
+    let (out, consumed) = inflate_len(&src[2..])?;
+    // Verify Adler-32 (the trailing 4 bytes of the stream, big-endian).
+    let tail_off = 2 + consumed;
+    if tail_off + 4 > src.len() {
+        return Err("zlib: truncated adler");
+    }
+    let tail = &src[tail_off..tail_off + 4];
     let want = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
     if adler32(&out) != want {
         return Err("zlib: adler-32 mismatch");
     }
-    Ok(out)
+    Ok((out, tail_off + 4))
 }
 
 /// Adler-32 checksum (RFC 1950 §8).

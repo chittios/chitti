@@ -71,6 +71,20 @@ pub fn composer_set_hint_left(s: &str) {
     composer_set_hint_left_lead(s, &[]);
 }
 
+/// Set the composer prompt prefix (`~/path (branch) > `) from the shell's live
+/// cwd + git branch. Repaints the composer box.
+pub fn composer_set_prompt(s: &str) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.composer_prompt.clear();
+            sc.composer_prompt.push_str(s);
+            if sc.chat.has_composer {
+                sc.draw_composer();
+            }
+        }
+    });
+}
+
 /// Set the left hint, colouring its first `lead.len()` characters from `lead`
 /// (one colour per character) instead of `theme.composer_hint`.
 ///
@@ -341,8 +355,12 @@ impl Screen {
         let (bx, _by, bw, _bh, tx, _ty, _hy) = self.composer_geom();
         let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
         let (_start, _vis, caret_col) = self.composer_visible(max_cols);
-        let prompt_cols = 2u64; // "> "
-        Some(tx + (prompt_cols + caret_col as u64) * self.chat.cw)
+        let prompt_cols = if self.composer_prompt.is_empty() {
+            2 // "> "
+        } else {
+            self.composer_prompt.chars().count()
+        };
+        Some(tx + (prompt_cols as u64 + caret_col as u64) * self.chat.cw)
     }
 
     /// Paint **only** the composer caret bar (blink path). Never blanks the box —
@@ -375,7 +393,12 @@ impl Screen {
         let radius = (4 * self.scale).max(4);
         self.rounded_outline(bx, by, bw, bh, radius, border);
         // Prompt glyph + input text.
-        let prompt = "> ";
+        let prompt: &str = if self.composer_prompt.is_empty() {
+            "> "
+        } else {
+            &self.composer_prompt
+        };
+        let prompt_cols = prompt.chars().count() as u64;
         let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
         let (_vis_start, vis, caret_col) = self.composer_visible(max_cols);
         let mut x = self.draw_str(tx, ty, prompt, self.theme.accent, self.theme.composer_bg);
@@ -387,7 +410,7 @@ impl Screen {
         }
         // Caret inside the box (only while the composer is the live prompt).
         if self.composer_active && !self.action_focused() {
-            let cx = tx + (prompt.len() as u64 + caret_col as u64) * self.chat.cw;
+            let cx = tx + (prompt_cols + caret_col as u64) * self.chat.cw;
             let color = if self.caret_on { self.theme.accent } else { self.theme.composer_bg };
             self.fill_rect(cx, ty, 2 * self.scale.max(1), self.chat.ch, color);
         }
@@ -510,7 +533,12 @@ impl Screen {
         };
         let radius = (4 * self.scale).max(4);
         self.rounded_outline(bx, by, bw, bh, radius, border);
-        let prompt = "> ";
+        let prompt: &str = if self.composer_prompt.is_empty() {
+            "> "
+        } else {
+            &self.composer_prompt
+        };
+        let prompt_cols = prompt.chars().count() as u64;
         let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
         let (_vis_start, vis, caret_col) = self.composer_visible(max_cols);
         let mut x = self.draw_str(tx, ty, prompt, self.theme.accent, self.theme.composer_bg);
@@ -520,7 +548,7 @@ impl Screen {
             self.paint_surface(x, ty, rest, self.chat.ch, self.theme.composer_bg);
         }
         if self.composer_active && !self.action_focused() {
-            let cx = tx + (prompt.len() as u64 + caret_col as u64) * self.chat.cw;
+            let cx = tx + (prompt_cols + caret_col as u64) * self.chat.cw;
             let color = if self.caret_on { self.theme.accent } else { self.theme.composer_bg };
             self.fill_rect(cx, ty, 2 * self.scale.max(1), self.chat.ch, color);
         }

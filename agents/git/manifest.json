@@ -1,0 +1,56 @@
+{
+  "name": "git",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Version control: init/status/add/commit/log/branch/checkout + clone/push over smart HTTP. Deterministic logic ships as assets/tools.wasm (git_command); /git routes here via the command hook.",
+  "toolset": [
+    "git_command"
+  ],
+  "capabilities": [
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "write",
+        "list",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "net",
+      "rights": [
+        "read",
+        "write"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "console",
+      "rights": [
+        "write"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "fuel": 5000000000
+  },
+  "command_hooks": [
+    {
+      "command": "/git",
+      "description": "Run a git command (init|status|add|commit|log|branch|checkout|clone|push).",
+      "match": {
+        "bare": true
+      },
+      "dispatch": {
+        "default": {
+          "tool": "git_command",
+          "path_arg": "args"
+        }
+      }
+    }
+  ],
+  "autostart": false
+}

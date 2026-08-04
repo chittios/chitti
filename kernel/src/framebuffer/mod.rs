@@ -219,6 +219,9 @@ pub struct Screen {
     /// Hint bar under the composer (left / right halves).
     composer_hint_l: String,
     composer_hint_r: String,
+    /// The composer prompt prefix — `~/path (branch) > `, set by the shell so
+    /// it reflects the live cwd + git branch (falls back to `"> "`).
+    composer_prompt: String,
     /// Per-character colours for the **leading** cells of `composer_hint_l`
     /// (empty = the whole hint takes `theme.composer_hint`). This is what lets
     /// the shell paint its gradient progress bar into the hint bar without the

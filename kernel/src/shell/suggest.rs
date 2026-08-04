@@ -224,15 +224,33 @@ pub fn path_items(prefix: &str, entries: &[crate::fs::vfs::DirEntry], max: usize
     let max = max.max(1).min(MAX_ITEMS);
     let (parent, partial) = path_parts(prefix);
     let norm = crate::synapse::vpath::normalize(prefix);
+    // The completed path keeps the **typed form**: absolute for `/…`, `~/` for
+    // the home, bare-relative for anything else (so `docs` completes to
+    // `docs/…`, not an absolute path).
+    let absolute = prefix.starts_with('/');
+    let tilde = prefix.starts_with("~/");
     let mut out: Vec<Item> = Vec::new();
     for e in entries {
         if !e.name.starts_with(&partial) {
             continue;
         }
-        let full = if parent == "/" {
-            alloc::format!("/{}", e.name)
+        let name = &e.name;
+        let full = if absolute {
+            if parent == "/" {
+                alloc::format!("/{name}")
+            } else {
+                alloc::format!("{parent}/{name}")
+            }
+        } else if tilde {
+            if parent == "~" {
+                alloc::format!("~/{name}")
+            } else {
+                alloc::format!("{parent}/{name}")
+            }
+        } else if parent == "/" {
+            name.clone() // bare token → relative to the pwd
         } else {
-            alloc::format!("{parent}/{}", e.name)
+            alloc::format!("{parent}/{name}")
         };
         if !e.is_dir && norm == full {
             continue; // already typed the whole file — nothing to complete
@@ -453,10 +471,11 @@ mod tests {
         assert_eq!(items[0].insert, "/samples/");
         assert_eq!(items[0].detail, "dir");
 
-        // Root listing for a bare space: all dirs, dirs-first + alpha.
+        // A bare space (empty prefix) suggests the **current directory's**
+        // children as relative names (the pwd, not the store root).
         let items = path_items("", &entries, 8);
         let labels: alloc::vec::Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, ["/agent/", "/configs/", "/downloads/", "/samples/"]);
+        assert_eq!(labels, ["agent/", "configs/", "downloads/", "samples/"]);
 
         // Files sort after dirs.
         let mixed = [
@@ -468,6 +487,27 @@ mod tests {
         let labels: alloc::vec::Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, ["/img/", "/a.bin", "/note.txt"]);
         assert!(items[1].detail.is_empty(), "files carry no detail");
+    }
+
+    #[test_case]
+    fn path_items_relative_and_tilde_keep_the_typed_form() {
+        let entries = [de("docs", true), de("dots.txt", false)];
+        // `~/doc` → the home, completed as `~/…`.
+        let items = path_items("~/doc", &entries, 8);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert, "~/docs/");
+        // `doc` → the pwd, completed **relative** (no leading slash).
+        let items = path_items("doc", &entries, 8);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert, "docs/");
+        // `work/doc` → relative with a subdir.
+        let items = path_items("work/doc", &entries, 8);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert, "work/docs/");
+        // Absolute keeps the leading slash.
+        let items = path_items("/doc", &entries, 8);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert, "/docs/");
     }
 
     #[test_case]

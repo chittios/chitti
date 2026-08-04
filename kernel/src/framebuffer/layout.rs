@@ -639,6 +639,7 @@ impl Screen {
             composer_cur: 0,
             composer_hint_l: String::from("↑↓ history · Tab select · Ctrl+P/N pick · Ctrl+R search · Enter send · /cmds · @files"),
             composer_hint_r: String::new(),
+            composer_prompt: String::new(),
             composer_hint_l_lead: alloc::vec::Vec::new(),
             suggest_open: false,
             suggest_items: alloc::vec::Vec::new(),

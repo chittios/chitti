@@ -37,6 +37,7 @@ use crate::agent::storage::{self, Scope as StorageScope};
 use crate::sched::TaskId;
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use wasmi::errors::{MemoryError, TableError};
 use wasmi::{Caller, Config, Engine, Extern, Linker, Memory, Module, ResourceLimiter, Store};
@@ -897,7 +898,275 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_fs_read")?;
 
+        // host_user_home(out_ptr, out_cap) -> i32 — the **ChittiOS user home**
+    // (`~`, `/home/chitti`) the shell agent starts in. Distinct from
+    // `host_home` (the calling agent's `/agent/<id>` install folder): a tool
+    // like git defaults its working tree to the user's home, not its own.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_user_home",
+            |mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap: i32| -> i32 {
+                let home = crate::agent::home::USER_HOME;
+                let b = home.as_bytes();
+                let n = b.len().min(out_cap.max(0) as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &b[..n]).is_err() {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .map_err(|_| "define host_user_home")?;
+
+    // host_home(out_ptr, out_cap) -> i32 — the calling agent's install folder
+    // (`/agent/<id>`), so a wasm tool can build absolute store paths for the
+    // unscoped `host_fs_read`/`host_fs_list` and home-scoped `host_fs_write`.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_home",
+            |mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap: i32| -> i32 {
+                let id = caller.data().bind.agent_id;
+                if id == 0 {
+                    return -3;
+                }
+                let home = crate::agent::home::path(id);
+                let b = home.as_bytes();
+                let n = b.len().min(out_cap.max(0) as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &b[..n]).is_err() {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .map_err(|_| "define host_home")?;
+
+    // host_fs_write(path, data_ptr, data_len) -> i32  (0 ok; -1 bad args, -2
+    // outside the agent's home, -3 no agent). Unlike the read side, **write is
+    // scoped to the calling agent's own `/agent/<id>/` home** — a wasm tool is
+    // untrusted input and must not scribble over arbitrary store keys. The git
+    // agent's repos live in its home.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_fs_write",
+            |caller: Caller<'_, HostState>,
+             path_ptr: i32,
+             path_len: i32,
+             data_ptr: i32,
+             data_len: i32|
+             -> i32 {
+                let id = caller.data().bind.agent_id;
+                if id == 0 {
+                    return -3;
+                }
+                let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
+                    return -1;
+                };
+                let Some(data) = read_guest_bytes(&caller, data_ptr, data_len) else {
+                    return -1;
+                };
+                let home = crate::agent::home::path(id);
+                let p = crate::synapse::vpath::normalize(&path);
+                let in_home = p == home || p.starts_with(&alloc::format!("{home}/"));
+                if !in_home {
+                    // Only agents whose manifest grants `Scope::Any` fs may
+                    // write outside their home — and never into another
+                    // agent's private `/agent/<n>/` folder (SOULs, storage).
+                    if !crate::agent::system::fs_any_scope(id) {
+                        return -2;
+                    }
+                    if p.starts_with("/agent/") {
+                        return -2;
+                    }
+                }
+                crate::synapse::fs::write(&p, &data);
+                0
+            },
+        )
+        .map_err(|_| "define host_fs_write")?;
+
+    // host_fs_exists(path) -> i32 (1 exists, 0 missing, -1 bad args).
+    linker
+        .func_wrap(
+            "chitti",
+            "host_fs_exists",
+            |caller: Caller<'_, HostState>, path_ptr: i32, path_len: i32| -> i32 {
+                let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
+                    return -1;
+                };
+                i32::from(crate::synapse::fs::exists(&path))
+            },
+        )
+        .map_err(|_| "define host_fs_exists")?;
+
+    // host_now_unix() -> i64  — wall-clock Unix seconds (commit timestamps).
+    linker
+        .func_wrap("chitti", "host_now_unix", |_caller: Caller<'_, HostState>| -> i64 {
+            crate::clock::now_unix()
+        })
+        .map_err(|_| "define host_now_unix")?;
+
+    // host_sha1(src_ptr, src_len, out_ptr) -> i32 (writes 20 bytes; 0 ok).
+    linker
+        .func_wrap(
+            "chitti",
+            "host_sha1",
+            |mut caller: Caller<'_, HostState>,
+             src_ptr: i32,
+             src_len: i32,
+             out_ptr: i32|
+             -> i32 {
+                let Some(src) = read_guest_bytes(&caller, src_ptr, src_len) else {
+                    return -1;
+                };
+                let digest = crate::net::sha1::sha1(&src);
+                if write_guest_bytes(&mut caller, out_ptr, &digest).is_err() {
+                    return -1;
+                }
+                0
+            },
+        )
+        .map_err(|_| "define host_sha1")?;
+
+    // host_inflate(src, srclen, out, outcap) -> i64  (zlib decompress; low 32
+    // bits = out length, high 32 bits = **input bytes consumed** — a packfile
+    // packs one zlib stream per object, so the caller must know where each
+    // stream ends; -1 on error).
+    linker
+        .func_wrap(
+            "chitti",
+            "host_inflate",
+            |mut caller: Caller<'_, HostState>,
+             src_ptr: i32,
+             src_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i64 {
+                let Some(src) = read_guest_bytes(&caller, src_ptr, src_len) else {
+                    return -1;
+                };
+                let Ok((dec, consumed)) = crate::image::inflate::zlib_decompress_len(&src) else {
+                    return -2;
+                };
+                let n = dec.len().min(out_cap.max(0) as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &dec[..n]).is_err() {
+                    return -1;
+                }
+                ((consumed as i64) << 32) | n as i64
+            },
+        )
+        .map_err(|_| "define host_inflate")?;
+
+    // host_deflate(src, srclen, out, outcap) -> i32  (zlib **stored-block**
+    // compress — valid zlib real git accepts; len or -1).
+    linker
+        .func_wrap(
+            "chitti",
+            "host_deflate",
+            |mut caller: Caller<'_, HostState>,
+             src_ptr: i32,
+             src_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i32 {
+                let Some(src) = read_guest_bytes(&caller, src_ptr, src_len) else {
+                    return -1;
+                };
+                let enc = zlib_deflate_stored(&src);
+                let n = enc.len().min(out_cap.max(0) as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &enc[..n]).is_err() {
+                    return -1;
+                }
+                n as i32
+            },
+        )
+        .map_err(|_| "define host_deflate")?;
+
+    // host_http(req_ptr, req_len, out_ptr, out_cap) -> i64 = (status << 32) | len.
+    // `req` JSON: {"m":"GET|POST","u":"url","h":"K: V; K: V","b":"<base64 body>"}.
+    // Response body (raw bytes) is written to `out` (capped); the low 32 bits of
+    // the return are its length, the high bits the HTTP status. Gated: the
+    // calling agent must declare a `net` capability in its manifest.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_http",
+            |mut caller: Caller<'_, HostState>,
+             req_ptr: i32,
+             req_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i64 {
+                if !crate::agent::system::has_net_cap(caller.data().bind.agent_id) {
+                    return -1;
+                }
+                let Some(req) = read_guest_str(&caller, req_ptr, req_len) else {
+                    return -2;
+                };
+                let Some(j) = crate::json::Json::parse(&req) else {
+                    return -3;
+                };
+                let method = j.get("m").and_then(|v| v.as_str()).unwrap_or("GET").to_string();
+                let url = j.get("u").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if url.is_empty() {
+                    return -4;
+                }
+                let mut header_owns: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+                if let Some(h) = j.get("h").and_then(|v| v.as_str()) {
+                    for pair in h.split(';') {
+                        if let Some((k, v)) = pair.split_once(':') {
+                            header_owns.push((k.trim().to_string(), v.trim().to_string()));
+                        }
+                    }
+                }
+                let headers: alloc::vec::Vec<(&str, &str)> = header_owns
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let body = match j.get("b").and_then(|v| v.as_str()) {
+                    Some(b64) => crate::net::ws::base64_decode(b64).unwrap_or_default(),
+                    None => alloc::vec::Vec::new(),
+                };
+                let resp = match crate::net::http::request(&method, &url, &headers, &body, 30_000) {
+                    Ok(r) => r,
+                    Err(_) => return -5,
+                };
+                let n = resp.body.len().min(out_cap.max(0) as usize);
+                if write_guest_bytes(&mut caller, out_ptr, &resp.body[..n]).is_err() {
+                    return -1;
+                }
+                ((resp.status as i64) << 32) | n as i64
+            },
+        )
+        .map_err(|_| "define host_http")?;
+
     Ok(())
+}
+
+/// zlib-compress `data` using **stored (uncompressed) deflate blocks** — a
+/// valid zlib stream real git inflates and accepts (equivalent to
+/// `core.compression=0`). No Huffman machinery needed on our side.
+fn zlib_deflate_stored(data: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(data.len() + data.len() / 65535 * 5 + 11);
+    out.push(0x78);
+    out.push(0x01); // deflate, 32K window, FLEVEL 0 (FCHECK valid)
+    let mut rest = data;
+    loop {
+        let n = rest.len().min(65535);
+        let last = rest.len() <= 65535;
+        out.push(if last { 0x01 } else { 0x00 }); // BFINAL + BTYPE=00 stored
+        let len = n as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(&rest[..n]);
+        rest = &rest[n..];
+        if rest.is_empty() {
+            break;
+        }
+    }
+    out.extend_from_slice(&crate::image::inflate::adler32(data).to_be_bytes());
+    out
 }
 
 /// Apply a settings-app preference to live shell/UI state.

@@ -230,7 +230,7 @@ pub fn call_agent_export(agent_id: u64, export: &str, args_json: &str) -> Result
         &wasm,
         export,
         args_json,
-        Limits::default().with_fuel(CALL_FUEL),
+        Limits::default().with_fuel(crate::agent::system::manifest_fuel(agent_id).unwrap_or(CALL_FUEL)),
         bindings_for(agent_id),
     )
 }

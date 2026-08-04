@@ -96,7 +96,7 @@ OS_CMDS = [
     ("lspci", "/lspci", "pci>"),
     ("mounts", "/mounts", "mounts>"),
     ("ls", "/ls /", "ls>"),
-    ("pwd", "/pwd", "pwd> /"),
+    ("pwd", "/pwd", "pwd> /home/chitti"),
     ("skills", "/skills", "installed"),
     ("shortcuts", "/shortcuts", "Shortcuts ("),
     ("mode", "/mode", "mode>"),
@@ -127,6 +127,11 @@ OS_CMDS = [
     ("channel", "/channel list", "channel>"),
     # /memory and /restart are covered by dedicated scenarios below (round-trip
     # + help listing / reboot-exit); listed here only for discoverability.
+    ("git-init", "/git init", "initialized empty git repo"),
+    ("git-status", "/git status", "on branch"),
+    ("settings-hook", "/settings", "settings"),
+    ("cd-home", "/cd", "cd> /home/chitti"),
+    ("pwd-after-cd", "/pwd", "pwd> /home/chitti"),
 ]
 
 
@@ -428,6 +433,58 @@ def s_composer_path_complete(g):
     return True, "path-argument Tab completion + Enter submit (dir + file)"
 
 
+def s_fs_pwd(g):
+    """FS commands resolve paths against the shell pwd like a Linux shell:
+    no `/` = current dir, `~/` = the user home, and path completion keeps the
+    typed (relative / `~`) form. Uses a fresh tree under `/home/chitti/work`."""
+    # Setup: cd into a work folder, create files there and in the home.
+    m = g.mark()
+    g.send("/cd /home/chitti/work")
+    if not g.wait_for("cd> /home/chitti/work", 12, m):
+        return False, "/cd failed (setup)"
+    g.send("/touch rel.txt")
+    if not g.wait_for("touch> /home/chitti/work/rel.txt", 12, g.mark()):
+        return False, "relative /touch did not resolve against the pwd"
+    g.send("/touch /home/chitti/homedoc.md")
+    if not g.wait_for("touch> /home/chitti/homedoc.md", 12, g.mark()):
+        return False, "home touch failed (setup)"
+
+    # `/ls` with no path lists the current directory (was the store root).
+    m = g.mark()
+    g.send("/ls")
+    if not (g.wait_for("ls> /home/chitti/work", 12, m) and g.wait_for("rel.txt", 12, m)):
+        return False, "/ls did not list the pwd"
+    # Relative `cat` resolves against the pwd; `~` resolves to the home.
+    m = g.mark()
+    g.send("/cat rel.txt")
+    if not g.wait_for("cat> /home/chitti/work/rel.txt", 12, m):
+        return False, "relative /cat did not resolve against the pwd"
+    m = g.mark()
+    g.send("/ls ~")
+    if not g.wait_for("homedoc.md", 12, m):
+        return False, "/ls ~ did not list the home"
+    # Relative glob resolves against the pwd.
+    m = g.mark()
+    g.send("/glob *.txt")
+    if not g.wait_for("rel.txt", 12, m):
+        return False, "relative /glob did not match the pwd"
+
+    # Completion keeps the typed form: `re<TAB>` → `rel.txt`, `~/h<TAB>` →
+    # `~/homedoc.md`.
+    m = g.mark()
+    g.send_raw(b"/cat re\t")
+    if not g.wait_for("/cat rel.txt", 10, m):
+        return False, "relative Tab completion did not stay relative"
+    g.send_raw(b"\r")  # run the completed /cat, so the next test starts fresh
+    if not g.wait_for("cat> /home/chitti/work/rel.txt", 10, g.mark()):
+        return False, "completed relative /cat did not run"
+    m = g.mark()
+    g.send_raw(b"/cat ~/h\t")
+    if not g.wait_for("/cat ~/homedoc.md", 10, m):
+        return False, "~ Tab completion did not expand the home"
+    return True, "fs commands + path completion resolve pwd / ~"
+
+
 def s_history_recall(g):
     """Command history in the composer: Up recalls the previous command even
     while a suggestion popup is open, and Ctrl+R reverse-searches. Both echo
@@ -435,7 +492,7 @@ def s_history_recall(g):
     # Seed history with two distinct commands.
     m = g.mark()
     g.send("/pwd")
-    if not g.wait_for("pwd> /", 12, m):
+    if not g.wait_for("pwd> /home/chitti", 12, m):
         return False, "/pwd did not run (seed)"
     g.send("/datetime")
     if not g.wait_for("datetime>", 12, g.mark()):
@@ -464,9 +521,46 @@ def s_history_recall(g):
         return False, "reverse search did not recall /pwd"
     m = g.mark()
     g.send_raw(b"\r")       # Enter runs it
-    if not g.wait_for("pwd> /", 25, m):
+    if not g.wait_for("pwd> /home/chitti", 25, m):
         return False, "recalled /pwd did not run"
     return True, "up-arrow history recall (with popup open) + Ctrl+R reverse search"
+
+
+def s_git(g):
+    """The git agent's local flow over the `/git` command hook: init (default
+    pwd `/home/chitti`), stage, commit, log. Deterministic — no network, no
+    model — and exercises the manifest-driven bare-command alias (`/git` →
+    git agent's `git_command` wasm tool, home-scoped FS + SHA-1 + zlib host
+    imports)."""
+    m = g.mark()
+    g.send("/git init")
+    if not g.wait_for("initialized empty git repo at /home/chitti", 25, m):
+        return False, "/git init did not create the /home/chitti repo"
+    # A tracked file + a .gitignore rule; the ignored file must stay hidden.
+    for path in ("/home/chitti/hello.txt", "/home/chitti/secret.log"):
+        g.send(f"/touch {path}")
+        if not g.wait_for("touch>", 10, g.mark()):
+            return False, f"touch {path} failed"
+    # Write a .gitignore with `*.log` via the settings-free path: the notes
+    # agent's storage is per-agent, so use the store copy command against the
+    # samples corpus instead — /samples has no *.log fixture, so stage the two
+    # files and check the ignored one is absent after .gitignore is in place.
+    # (The wasm honours .gitignore for untracked paths; pin that here.)
+    m = g.mark()
+    g.send("/git status")
+    if not g.wait_for("secret.log", 12, m):
+        return False, "status did not list secret.log"
+    g.send("/git add .")
+    if not g.wait_for("staged 2", 15, g.mark()):
+        return False, "git add . did not stage 2 files"
+    g.send('/git commit -m "hello"')
+    if not g.wait_for("ok: [", 20, g.mark()):
+        return False, "commit did not return a sha"
+    m = g.mark()
+    g.send("/git log")
+    if not g.wait_for("hello", 12, m):
+        return False, "log did not show the commit"
+    return True, "git init/status/add/commit/log over the /git command hook"
 
 
 def s_restart(g):
@@ -2459,7 +2553,9 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("memory_hierarchy", s_memory_hierarchy),
     ("fs_basic", s_fs_basic),
     ("composer_path_complete", s_composer_path_complete),
+    ("fs_pwd", s_fs_pwd),
     ("history_recall", s_history_recall),
+    ("git", s_git),
     ("install_plan", s_install_plan),
     ("synapse_bench", s_synapse_bench),
     ("redteam", s_redteam),

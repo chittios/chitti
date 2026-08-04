@@ -863,7 +863,18 @@ FDT claims a GICv3 but carries no readable `reg`.
   extraction), the full **chess game** (`tools/chess-wasm` — rules, board UI,
   and the agent-opponent flow; zero chess code in the kernel), and the app
   suite `notes/paint/slides/minesweeper/snake/synth` (one shared module from
-  `tools/apps-wasm`). **Chat tool calls run on a fresh instance** — design
+  `tools/apps-wasm`). **git** is a wasm-tool agent too (`git_command` from
+  `tools/git-wasm`, `agents/git/`): a real git over the store — loose objects
+  (SHA-1 + zlib), `init`/`status`/`add`/`commit`/`log`/`branch`/`checkout`,
+  smart-HTTP `clone`/`push` (`.git/config` records `origin`, so `/git push`
+  needs no URL), a `.gitignore` matcher for untracked paths, and a working
+  directory that starts at the shell's pwd (`git clone` makes a folder named
+  after the repo basename in the current dir, like the CLI). It needs **host
+  imports** beyond the pure-string ABI, gated by its manifest capabilities:
+  `host_fs_*` (write home-scoped unless the manifest grants `fs` scope `any`),
+  `host_sha1`, `host_inflate`/`host_deflate` (stored-block zlib + consumed
+  length), `host_now_unix`, `host_user_home`/`host_home`, and `host_http`
+  (only for agents whose manifest declares a `net` cap). **Chat tool calls run on a fresh instance** — design
   those digest-once (one call returns everything as JSON; the kernel caches)
   and pass binary inputs as base64 — **but a running package-UI app keeps ONE
   persistent instance** (`service/package_ui.rs`): guest statics ARE the game
@@ -1117,7 +1128,23 @@ FDT claims a GICv3 but carries no readable `reg`.
   and Tab drills one level at a time. The same Enter gate is extended so a
   *complete* path argument submits the command rather than completing or
   drilling (the case that swallowed `/ls /tmp_e2e` into `/ls /tmp_e2e/`); Tab
-  remains the drill key. mouse cursor + click, **mouse text selection in the
+  remains the drill key.
+
+  **The shell has a working directory, and every path-taking command resolves
+  through ONE function — `shell::resolve_path`.** The shell agent starts in the
+  ChittiOS user home (`agent::home::USER_HOME`, `/home/chitti` — the `~`); `/cd
+  <dir>` moves it (bare `/cd`/`.`/`~`/`/` → home) and `/pwd` prints the live
+  value (`shell::shell_cwd`/`set_shell_cwd`). `resolve_path(p)` implements the
+  Linux rule once: `/abs` stays absolute, `~/x` → home, anything else →
+  `<pwd>/<x>`, with `.`/`..`/`//` collapsed (`vpath::normalize`). It is applied
+  at **every** fs-command call site (`ls`/`cat`/`glob`/`grep`/`touch`/`mkdir`/
+  `cp`/`mv`/`rm`/`open`/`edit`) and to the path-completion popup's readdir — a
+  bare `/ls` lists the **pwd** (not the store root), `cat hello.txt` and
+  `~/file` work, and completion keeps the typed form (`re<TAB>` → `rel.txt`,
+  `~/h<TAB>` → `~/homedoc.md`, `/co<TAB>` stays absolute). **Never re-implement
+  relative resolution at a call site** — route through `resolve_path`, and pass
+  the shell's cwd to command-hook agents (e.g. the git agent gets `{"cwd":…}`
+  so `git clone`'s default folder is the pwd, like the git CLI). mouse cursor + click, **mouse text selection in the
   chat pane** (drag-to-copy → clipboard, paste with Ctrl+V; absolute-indexed
   over scrollback via `textsel`, like the editor's drag-select), a **host
   clipboard bridge** (`clipboard`: an in-OS copy emits an **OSC 52** escape so a

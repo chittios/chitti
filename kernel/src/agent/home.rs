@@ -17,6 +17,28 @@ pub fn path(id: u64) -> String {
     format!("/agent/{}", id)
 }
 
+/// The **ChittiOS user home** (`~`) — the folder the shell agent starts in,
+/// `/pwd` names, and user commands (git, downloads, notes) default to. A
+/// single-user OS, so the home is a fixed `/home/chitti` rather than a
+/// per-login path. Distinct from the per-agent `/agent/<id>/` install homes.
+pub const USER_HOME: &str = "/home/chitti";
+
+/// Ensure the user home exists as a directory in the store (a `.keep` marker
+/// on `/home` and `/home/chitti`, the same convention `mkdir` uses). Called at
+/// boot alongside the agent-roster install, so the `~` exists both in the
+/// in-memory store (diskless boots) and on a freshly installed disk's empty
+/// ext4 data partition — **never** removing or overwriting user files (a
+/// home that already has children needs no marker, and an in-place `/install`
+/// update preserves the whole data partition).
+pub fn ensure_user_home() {
+    if !fs::exists("/home/.keep") {
+        fs::write("/home/.keep", b"");
+    }
+    if !fs::exists("/home/chitti/.keep") {
+        fs::write("/home/chitti/.keep", b"");
+    }
+}
+
 /// Ensure agent `id`'s home exists: `SOUL.md` (seeded with a default persona on
 /// first boot), optional `MEMORY.md` seed, `skills/` and `memory/` markers.
 /// Idempotent; cheap when present. A SOUL.md placed by an installed package
@@ -435,6 +457,26 @@ pub fn run_memory_tool(name: &str, agent_id: u64, args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ensure_user_home` creates the `~` directory markers in the store,
+    /// is idempotent, and never clobbers existing user files.
+    #[test_case]
+    fn ensure_user_home_creates_and_preserves() {
+        crate::synapse::fs::write("/home/chitti/.keep", b"");
+        crate::synapse::fs::write("/home/chitti/notes.txt", b"hello");
+        ensure_user_home();
+        assert!(crate::synapse::fs::is_dir("/home"), "home dir missing");
+        assert!(crate::synapse::fs::is_dir("/home/chitti"), "~ dir missing");
+        assert!(crate::synapse::fs::exists("/home/chitti/.keep"));
+        // Idempotent, and user files are untouched.
+        ensure_user_home();
+        assert_eq!(
+            crate::synapse::fs::read("/home/chitti/notes.txt"),
+            Some(b"hello".to_vec())
+        );
+        crate::synapse::fs::write("/home/chitti/.keep", b"");
+        crate::synapse::fs::write("/home/chitti/notes.txt", b"hello");
+    }
 
     #[test_case]
     fn memory_key_sanitise_rejects_traversal() {

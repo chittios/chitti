@@ -272,15 +272,13 @@ pub(super) fn fs_split_flags(arg: &str) -> (alloc::vec::Vec<char>, alloc::vec::V
 pub(super) fn fs_ls(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let long = flags.contains(&'l') || flags.contains(&'1');
-    let target = pos.first().map(|s| s.as_str()).unwrap_or("/");
-
-    // Numeric → legacy disk volume root listing.
-    if let Ok(n) = target.parse::<usize>() {
-        disk_ls_volume(n);
+    // Numeric → legacy disk volume root listing (before pwd resolution).
+    if let Some(t) = pos.first().and_then(|s| s.parse::<usize>().ok()) {
+        disk_ls_volume(t);
         return;
     }
-
-    let path = crate::synapse::vpath::normalize(target);
+    // No path → the current directory, like `ls` (was the store root).
+    let path = super::resolve_path(pos.first().map(|s| s.as_str()).unwrap_or("."));
 
     // A non-root disk mount (e.g. /mnt) lists the volume via the VFS.
     // `/` is the Synapse store tree (never dump percent-encoded on-disk keys).
@@ -351,7 +349,7 @@ pub(super) fn fs_ls(arg: &str) {
 
 /// `/cat <path>` — print a store file (preferred) or a mounted-volume file.
 pub(super) fn fs_cat(arg: &str) {
-    let full = crate::synapse::vpath::normalize(arg.trim());
+    let full = super::resolve_path(arg.trim());
     if full.is_empty() || arg.trim().is_empty() {
         serial_println!("cat> usage: /cat <path>");
         return;
@@ -392,7 +390,8 @@ pub(super) fn fs_grep(arg: &str) {
     let path_glob = parts.next().unwrap_or("");
     let mut paths = crate::synapse::fs::list();
     if !path_glob.is_empty() {
-        paths = crate::tools::pathutil::glob_filter(path_glob, &paths);
+        let resolved = super::resolve_path(path_glob);
+        paths = crate::tools::pathutil::glob_filter(&resolved, &paths);
     }
     let mut files: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = alloc::vec::Vec::new();
     for p in paths {
@@ -413,13 +412,14 @@ pub(super) fn fs_grep(arg: &str) {
 
 /// `/glob <pattern>` — path glob over the store.
 pub(super) fn fs_glob(arg: &str) {
-    let pattern = arg.trim();
-    if pattern.is_empty() {
+    let raw = arg.trim();
+    if raw.is_empty() {
         serial_println!("glob> usage: /glob <pattern>   e.g. /glob **/*.md");
         return;
     }
+    let pattern = super::resolve_path(raw);
     let paths = crate::synapse::fs::list();
-    let hits = crate::tools::pathutil::glob_filter(pattern, &paths);
+    let hits = crate::tools::pathutil::glob_filter(&pattern, &paths);
     serial_println!("glob> {} match(es) for {:?}:", hits.len(), pattern);
     for p in hits {
         serial_println!("  {}", p);
@@ -462,12 +462,13 @@ pub(super) fn vfs_err_msg(op: &str, path: &str, e: crate::fs::vfs::VfsError) {
 pub(super) fn fs_mkdir(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let parents = flags.contains(&'p');
-    let Some(path) = pos.first() else {
+    let Some(raw) = pos.first() else {
         serial_println!("mkdir> usage: /mkdir [-p] <path>");
         return;
     };
-    if path_on_mount(path) {
-        let norm = crate::fs::path::normalize(path);
+    let path = super::resolve_path(raw);
+    if path_on_mount(&path) {
+        let norm = crate::fs::path::normalize(&path);
         if parents {
             let mut cur = alloc::string::String::new();
             for part in norm.split('/').filter(|s| !s.is_empty()) {
@@ -496,14 +497,14 @@ pub(super) fn fs_mkdir(arg: &str) {
             serial_println!("mkdir> {norm}");
             return;
         }
-        match crate::fs::vfs::mkdir(path) {
+        match crate::fs::vfs::mkdir(&path) {
             Ok(()) => serial_println!("mkdir> {norm}"),
-            Err(e) => vfs_err_msg("mkdir", path, e),
+            Err(e) => vfs_err_msg("mkdir", &path, e),
         }
         return;
     }
-    match crate::synapse::fs::mkdir(path, parents) {
-        Ok(()) => serial_println!("mkdir> {}", crate::synapse::vpath::normalize(path)),
+    match crate::synapse::fs::mkdir(&path, parents) {
+        Ok(()) => serial_println!("mkdir> {}", crate::synapse::vpath::normalize(&path)),
         Err(e) => serial_println!("mkdir> {}: {}", path, e),
     }
 }
@@ -516,24 +517,24 @@ pub(super) fn fs_cp(arg: &str) {
         serial_println!("cp> usage: /cp [-r] <src> <dst>");
         return;
     }
-    let src = &pos[0];
-    let dst = &pos[1];
+    let src = super::resolve_path(&pos[0]);
+    let dst = super::resolve_path(&pos[1]);
     // Volume path: single-file copy via VFS (recursive trees stay store-only).
-    if path_on_mount(src) || path_on_mount(dst) {
+    if path_on_mount(&src) || path_on_mount(&dst) {
         if recursive {
             serial_println!("cp> recursive copy across mounts is not supported yet");
             return;
         }
-        match crate::fs::vfs::read(src) {
-            Ok(data) => match crate::fs::vfs::write(dst, &data) {
+        match crate::fs::vfs::read(&src) {
+            Ok(data) => match crate::fs::vfs::write(&dst, &data) {
                 Ok(()) => serial_println!("cp> {} → {} ({} byte(s))", src, dst, data.len()),
-                Err(e) => vfs_err_msg("cp", dst, e),
+                Err(e) => vfs_err_msg("cp", &dst, e),
             },
-            Err(e) => vfs_err_msg("cp", src, e),
+            Err(e) => vfs_err_msg("cp", &src, e),
         }
         return;
     }
-    match crate::synapse::fs::copy(src, dst, recursive) {
+    match crate::synapse::fs::copy(&src, &dst, recursive) {
         Ok(n) => serial_println!("cp> {} → {} ({} file(s))", src, dst, n),
         Err(e) => serial_println!("cp> {}: {}", src, e),
     }
@@ -546,16 +547,16 @@ pub(super) fn fs_mv(arg: &str) {
         serial_println!("mv> usage: /mv <src> <dst>");
         return;
     }
-    let src = &pos[0];
-    let dst = &pos[1];
-    if path_on_mount(src) || path_on_mount(dst) {
-        match crate::fs::vfs::rename(src, dst) {
+    let src = super::resolve_path(&pos[0]);
+    let dst = super::resolve_path(&pos[1]);
+    if path_on_mount(&src) || path_on_mount(&dst) {
+        match crate::fs::vfs::rename(&src, &dst) {
             Ok(()) => serial_println!("mv> {} → {}", src, dst),
-            Err(e) => vfs_err_msg("mv", src, e),
+            Err(e) => vfs_err_msg("mv", &src, e),
         }
         return;
     }
-    match crate::synapse::fs::rename(src, dst) {
+    match crate::synapse::fs::rename(&src, &dst) {
         Ok(n) => serial_println!("mv> {} → {} ({} file(s))", src, dst, n),
         Err(e) => serial_println!("mv> {}: {}", src, e),
     }
@@ -565,22 +566,23 @@ pub(super) fn fs_mv(arg: &str) {
 pub(super) fn fs_rm(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let recursive = flags.contains(&'r') || flags.contains(&'R');
-    let Some(path) = pos.first() else {
+    let Some(raw) = pos.first() else {
         serial_println!("rm> usage: /rm [-r] <path>");
         return;
     };
-    if path_on_mount(path) {
+    let path = super::resolve_path(raw);
+    if path_on_mount(&path) {
         if recursive {
             serial_println!("rm> recursive remove on mounts is not supported yet");
             return;
         }
-        match crate::fs::vfs::unlink(path) {
+        match crate::fs::vfs::unlink(&path) {
             Ok(()) => serial_println!("rm> {}", path),
-            Err(e) => vfs_err_msg("rm", path, e),
+            Err(e) => vfs_err_msg("rm", &path, e),
         }
         return;
     }
-    match crate::synapse::fs::remove(path, recursive) {
+    match crate::synapse::fs::remove(&path, recursive) {
         Ok(n) => serial_println!("rm> {} ({} file(s))", path, n),
         Err(e) => serial_println!("rm> {}: {}", path, e),
     }
@@ -588,22 +590,22 @@ pub(super) fn fs_rm(arg: &str) {
 
 /// `/touch <path>` — create empty file or refresh existing (store or mount).
 pub(super) fn fs_touch(arg: &str) {
-    let path = arg.trim();
-    if path.is_empty() {
+    let path = super::resolve_path(arg.trim());
+    if path.is_empty() || arg.trim().is_empty() {
         serial_println!("touch> usage: /touch <path>");
         return;
     }
-    if path_on_mount(path) {
+    if path_on_mount(&path) {
         // Create empty or leave existing contents (read + rewrite).
-        let data = crate::fs::vfs::read(path).unwrap_or_default();
-        match crate::fs::vfs::write(path, &data) {
-            Ok(()) => serial_println!("touch> {}", crate::fs::path::normalize(path)),
-            Err(e) => vfs_err_msg("touch", path, e),
+        let data = crate::fs::vfs::read(&path).unwrap_or_default();
+        match crate::fs::vfs::write(&path, &data) {
+            Ok(()) => serial_println!("touch> {}", crate::fs::path::normalize(&path)),
+            Err(e) => vfs_err_msg("touch", &path, e),
         }
         return;
     }
-    match crate::synapse::fs::touch(path) {
-        Ok(()) => serial_println!("touch> {}", crate::synapse::vpath::normalize(path)),
+    match crate::synapse::fs::touch(&path) {
+        Ok(()) => serial_println!("touch> {}", crate::synapse::vpath::normalize(&path)),
         Err(e) => serial_println!("touch> {}: {}", path, e),
     }
 }

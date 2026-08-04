@@ -570,7 +570,64 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
             include_bytes!("../../../agents/sandbox-lab/assets/tools.wasm"),
         )],
     },
+    // git: version control. All logic ships as tools.wasm (git_command); the
+    // `/git` command hook routes the shell to it. Host imports give the wasm
+    // FS (home-scoped), SHA-1, zlib, clock and HTTP (net cap) — see
+    // `wasm_rt::register_host_imports`.
+    SystemAgentDef {
+        name: "git",
+        soul: include_str!("../../../agents/git/SOUL.md"),
+        manifest_json: include_str!("../../../agents/git/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 47),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 47),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/git/assets/tools.wasm"),
+        )],
+    },
 ];
+
+/// Whether system agent `id` declares a `net` capability in its manifest
+/// (gates the wasm `host_http` host import — a wasm tool must not reach the
+/// network unless the agent's granted capabilities include it).
+pub fn has_net_cap(id: u64) -> bool {
+    SYSTEM_AGENTS.iter().any(|d| {
+        d.agent_id.0 == id
+            && parse_manifest(d.manifest_json).is_some_and(|m| {
+                m.capabilities
+                    .iter()
+                    .any(|c| c.domain == crate::agent::types::CapDomain::Net)
+            })
+    })
+}
+
+/// The manifest's `wasm.fuel` for system agent `id` (the wasm runtime's per-call
+/// instruction budget). `None` when the manifest declares none.
+pub fn manifest_fuel(id: u64) -> Option<u64> {
+    let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
+    let j = Json::parse(def.manifest_json)?;
+    j.get("wasm")
+        .and_then(|w| w.get("fuel"))
+        .and_then(|f| f.as_i64())
+        .map(|v| v.max(1) as u64)
+}
+
+/// Whether system agent `id`'s manifest grants an **unrestricted** (`Scope::Any`)
+/// filesystem scope — gates the wasm `host_fs_write` import. The git agent
+/// declares one so it can clone/checkout into `/home/…` and any user folder;
+/// every other agent keeps the `home` scope (only its own `/agent/<id>/`).
+pub fn fs_any_scope(id: u64) -> bool {
+    SYSTEM_AGENTS.iter().any(|d| {
+        d.agent_id.0 == id
+            && parse_manifest(d.manifest_json).is_some_and(|m| {
+                m.capabilities.iter().any(|c| {
+                    c.domain == crate::agent::types::CapDomain::Fs
+                        && matches!(c.scope, crate::agent::types::Scope::Any)
+                })
+            })
+    })
+}
 
 /// The install-folder path (`/agent/<id>`) of a system agent by name.
 pub fn home_for(name: &str) -> Option<String> {
@@ -587,7 +644,8 @@ pub struct HookDispatch {
 }
 
 /// A shell command interception declared by a package (e.g. media owns `/open`
-/// for media extensions). Parsed from manifest `command_hooks`.
+/// for media extensions, or the git agent owns the bare command `/git`).
+/// Parsed from manifest `command_hooks`.
 #[derive(Clone, Debug)]
 pub struct CommandHook {
     /// Slash command, e.g. `"/open"`.
@@ -595,7 +653,12 @@ pub struct CommandHook {
     pub description: String,
     /// File extensions this hook matches (lowercase, with leading `.`).
     pub extensions: Vec<String>,
-    /// Per-extension tool dispatch (key = extension).
+    /// Bare-command hook: the shell routes `command` to the agent's tool with
+    /// the *rest of the line* as the argument, no path/extension matching
+    /// (e.g. `/settings`, `/git …`). Declared with `"match": {"bare": true}`.
+    pub bare: bool,
+    /// Per-extension tool dispatch (key = extension, or `"default"` for a bare
+    /// hook's single tool).
     pub dispatch: alloc::collections::BTreeMap<String, HookDispatch>,
 }
 
@@ -771,6 +834,14 @@ fn parse_command_hooks(j: &Json) -> Vec<CommandHook> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // `"match": {"bare": true}` = the shell routes the bare command (no
+        // path/extension) to the agent's tool with the rest of the line as the
+        // argument. Otherwise this is an extension hook (media owns /open).
+        let bare = h
+            .get("match")
+            .and_then(|m| m.get("bare"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
         let mut extensions = Vec::new();
         if let Some(exts) = h
             .get("match")
@@ -815,6 +886,7 @@ fn parse_command_hooks(j: &Json) -> Vec<CommandHook> {
             command,
             description,
             extensions,
+            bare,
             dispatch,
         });
     }
@@ -871,6 +943,43 @@ pub fn resolve_command_hook(command: &str, path: &str) -> Option<OpenHookMatch> 
                 path_arg: disp.path_arg.clone(),
                 extension: ext,
             });
+        }
+    }
+    None
+}
+
+/// Resolve a **bare** command (`/git …`, `/settings`) against system agents'
+/// `command_hooks` — the manifest-declared aliases that turn an agent into a
+/// shell command. `args` is the rest of the line after the command name; the
+/// matching agent's tool receives it under its `path_arg` key. `None` when no
+/// agent claims the command.
+pub fn resolve_command_hook_bare(command: &str) -> Option<OpenHookMatch> {
+    let cmd = if command.starts_with('/') {
+        command.to_string()
+    } else {
+        alloc::format!("/{command}")
+    };
+    for def in SYSTEM_AGENTS {
+        let Some(m) = parse_manifest(def.manifest_json) else {
+            continue;
+        };
+        for hook in &m.command_hooks {
+            if hook.bare && hook.command == cmd {
+                // The single dispatch entry (`"default"` key) names the tool.
+                let disp = hook
+                    .dispatch
+                    .get("default")
+                    .or_else(|| hook.dispatch.values().next());
+                if let Some(disp) = disp {
+                    return Some(OpenHookMatch {
+                        agent_name: def.name,
+                        agent_id: def.agent_id.0,
+                        tool: disp.tool.clone(),
+                        path_arg: disp.path_arg.clone(),
+                        extension: String::new(),
+                    });
+                }
+            }
         }
     }
     None
@@ -1012,6 +1121,10 @@ pub fn install_all(now: Ticks) {
     // is quadratic — it took *minutes* on a real disk, while a diskless guest kept
     // everything in memory and showed nothing.
     crate::synapse::fs::begin_batch();
+    // The user home (`~`, `/home/chitti`) must exist as a directory before the
+    // shell starts in it — on a diskless memfs boot and on a fresh install's
+    // empty data partition alike. Idempotent; never touches user files.
+    crate::agent::home::ensure_user_home();
     for def in SYSTEM_AGENTS {
         let Some(m) = parse_manifest(def.manifest_json) else {
             crate::ktrace::log_fmt(format_args!("system-agent: '{}' manifest.json failed to parse", def.name));
@@ -1345,8 +1458,8 @@ mod tests {
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
         // SOUL + package agents (no network/http plumbing as agents).
-        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab).
-        assert_eq!(SYSTEM_AGENTS.len(), 46);
+        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git.
+        assert_eq!(SYSTEM_AGENTS.len(), 47);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "browser"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));

@@ -1,0 +1,26 @@
+[package]
+name = "chitti-git-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "git tool module for the Chitti git agent (assets/tools.wasm)"
+
+# Stand-alone crate (not part of the root workspace / host xtask).
+[workspace]
+
+[lib]
+# cdylib = the wasm module; rlib lets `cargo test` run the pure logic on the host.
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
+# none — pure no_std + alloc. All primitives (FS, hash, compress, net, clock)
+# are host imports provided by the kernel's wasm runtime (wasm_rt.rs), which
+# gates them by the agent's capabilities and home scope.

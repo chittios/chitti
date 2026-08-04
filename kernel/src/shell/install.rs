@@ -331,7 +331,10 @@ pub(super) fn disk_install(arg: &str) {
     if let Some(layout) = fresh_layout {
         // Fresh install only: an empty ext4 data partition for durable agent
         // state (synapse::fs mounts it at boot, since it holds no *.gguf). An
-        // update never touches it.
+        // update never touches it — the user home, agent state and user files
+        // all survive `/install`. (The home's `.keep` markers are seeded by
+        // `agent::home::ensure_user_home` on first boot, after the store
+        // mounts this partition.)
         let mut data = Partition::new(&mut dev, layout.data_first, layout.data_last - layout.data_first + 1);
         if let Err(e) = Ext4Writer::format(&mut data, &[]) {
             serial_println!("install> ext4 data partition format failed: {:?}", e);
@@ -339,7 +342,7 @@ pub(super) fn disk_install(arg: &str) {
         }
         serial_println!("install> ext4 data partition (lba {}..{}) formatted for durable agent state.", layout.data_first, layout.data_last);
     } else {
-        serial_println!("install> data partition preserved (agent state intact).");
+        serial_println!("install> data partition preserved (home + agent state intact).");
     }
     serial_println!("install> DONE -- the disk now boots Chitti standalone via UEFI. Remove the ISO and reboot.");
 }
