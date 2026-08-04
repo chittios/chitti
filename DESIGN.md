@@ -2,7 +2,7 @@
 
 The visual identity of ChittiOS: the mark, the palette, the type, and how the
 console renders them. Everything here is driven by the framebuffer compositor
-([`kernel/src/framebuffer.rs`](kernel/src/framebuffer.rs)) and is
+([`kernel/src/framebuffer/`](kernel/src/framebuffer/)) and is
 **configurable at runtime** from `/configs/core/ui.json` (edit via `/ui` or the
 `/open` editor) — no rebuild needed to retheme.
 

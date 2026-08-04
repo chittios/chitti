@@ -1,5 +1,5 @@
 //! Pure text-selection math for the chat pane's mouse copy (the framebuffer
-//! calls this; keeping it out of `framebuffer.rs` makes it unit-testable —
+//! calls this; keeping it out of `framebuffer/` makes it unit-testable —
 //! the compositor is `cfg(not(test))`). Coordinates are `(line, col)` where
 //! `line` is an **absolute** index over a pane's scrollback + live grid
 //! (0 = oldest scrollback line) and `col` is a cell column; both endpoints

@@ -476,7 +476,8 @@ chitti/
         ├── agent/ session/ tools/ skills/  # the agent layer, sessions, tools, skills (+ registry_client)
         ├── service/                # long-running native service agents (network, http/doc) + supervisor
         ├── block/ fs/              # block devices (virtio/nvme/ahci) + FAT/ext4
-        ├── framebuffer.rs font_geist.rs editor.rs mouse.rs clock.rs ui_config.rs json.rs
+        ├── framebuffer/            # the compositor, one module per surface (see its mod.rs map)
+        ├── font_geist.rs editor.rs mouse.rs clock/ ui_config.rs json.rs
         ├── console.rs serial.rs ktrace.rs   # I/O + deterministic logging
         └── shell/                  # the `/`-command + chat shell
 ```

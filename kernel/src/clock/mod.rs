@@ -12,6 +12,7 @@
 //! Hinnant's `days_from_civil` / `civil_from_days`), pure integer arithmetic so
 //! it is `no_std` and deterministic.
 
+pub mod face;
 pub mod tz;
 
 use crate::mm::Locked;

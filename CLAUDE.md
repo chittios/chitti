@@ -232,6 +232,19 @@ Two layers, and new work adds to **both** where they apply:
    the executor scope gate, `registry_client::parse_index`). If logic broke
    before, it gets a test.
 
+   **`framebuffer/` is `#[cfg(not(test))]`, so a test written inside the
+   compositor never runs — it is not even compiled.** (The gate is in `lib.rs`:
+   a `-Z build-std` + `cargo test` interaction gives two non-unified copies of
+   `core`/`alloc` otherwise.) A `#[cfg(test)] mod` in there is therefore silent
+   dead code, not coverage — which is how an analog-clock trig reduction wrong
+   in **two of four quadrants** shipped, with tests sitting next to it that
+   asserted the right things and were never built. So geometry, wrapping and
+   colour math must live **outside** the compositor to be testable, the way
+   `clock::face` (dial geometry), `editor_wrap` (soft wrap), `textsel`
+   (selection), `panes_layout` (pane geometry) and `display` already do. When
+   you touch drawing code, check whether the logic you are changing is in a
+   module that can be tested at all before adding a test to it.
+
 2. **End-to-end tests** (`tests/e2e/`, `make e2e` / `make e2e-full`) for
    anything that only exists **on the running OS** — a shell command, a
    network/TLS/WebSocket exchange, a model or voice flow. The harness boots the
@@ -1010,7 +1023,17 @@ FDT claims a GICv3 but carries no readable `reg`.
   because a defence is only interesting if it is good on both axes.
 - **Microkernel** — tasks + context switch, cooperative + timer-preemptive
   scheduler, unforgeable capabilities, IPC, SMP, frame allocator + heap, MMU.
-- **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono. The
+- **UI** — a tmux-style split-pane framebuffer compositor in Geist Mono, living
+  in [`kernel/src/framebuffer/`](kernel/src/framebuffer/): **`mod.rs` owns the
+  data model** (every type, constant and static — a child module sees its
+  parent's private items, so a `Screen` field is reachable from every painter
+  with no visibility annotations) and one submodule owns each surface
+  (`paint`/`text`/`pane`/`layout`/`tabs`/`focus`/`status`/`menu`/`clock`/`modal`/
+  `composer`/`views`/`surface`/`select`/`cursor`/`console`/`colors` — the map is
+  a table at the top of `mod.rs`). Each is re-exported, so every
+  `crate::framebuffer::…` path is flat regardless of which file an item is in;
+  put a new painter in the module it belongs to rather than growing one file back
+  to the 8.7k lines this was. The
   shell (chat) pane is fixed in the primary band; the other band is a
   **resizable grid of 1–8 action panes** (`/pane grid <cols> <rows>`, or
   `/pane max <2-9>` for a balanced shape — `panes_layout::grid_for_count`).
