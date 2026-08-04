@@ -4996,7 +4996,7 @@ fn draw_clock_menu_body(
     let face_r = (ch * 3).max(28).min(content_w / 2 - 4);
     let fcx = ix + content_w / 2;
     let fcy = y + face_r + 4;
-    draw_analog_clock(sc, fcx as i64, fcy as i64, face_r as i64, h, mi, s);
+    draw_analog_clock(sc, fcx as i64, fcy as i64, face_r as i64, cw, ch, h, mi, s);
     y = fcy + face_r + ch;
 
     let time = alloc::format!("{:02}:{:02}:{:02}", h, mi, s);
@@ -5011,41 +5011,158 @@ fn draw_clock_menu_body(
     y + ch
 }
 
-/// Analog clock: 0° at 12 o'clock, clockwise. Integer Q10 sin/cos.
-fn draw_analog_clock(sc: &Screen, cx: i64, cy: i64, r: i64, h: i64, mi: i64, s: i64) {
+/// One hand's geometry, derived from the face radius: how far past the pivot the
+/// tip reaches, the counterweight tail behind it, and the stroke width in
+/// **tenths of a pixel** (so a 1.2 px second hand is expressible without floats).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct HandGeom {
+    len: i64,
+    tail: i64,
+    w10: i64,
+}
+
+/// `(hour, minute, second)` hand geometry for a face of radius `r`. Pure, so the
+/// proportions are unit-testable without a framebuffer. The minimums matter: at
+/// the smallest face (`r == 28`) the ratios alone would round the second hand
+/// down to a sub-pixel width and it would vanish.
+fn hand_geoms(r: i64) -> [HandGeom; 3] {
+    [
+        // Hour: short and thick, tucked inside the numerals.
+        HandGeom { len: r * 52 / 100, tail: (r * 14 / 100).max(2), w10: (r * 10 / 11).max(30) },
+        // Minute: reaches the tick ring, a touch narrower.
+        HandGeom { len: r * 76 / 100, tail: (r * 15 / 100).max(2), w10: (r * 10 / 16).max(24) },
+        // Second: thin, long, with the longest counterweight.
+        HandGeom { len: r * 88 / 100, tail: (r * 20 / 100).max(3), w10: (r * 10 / 40).max(10) },
+    ]
+}
+
+/// Analog clock face: 0° at 12 o'clock, clockwise, integer Q10 trig.
+///
+/// Everything curved or angled here is **sub-pixel sampled** (`aa_coverage`)
+/// rather than plotted: the ring is one anti-aliased annulus (it used to be
+/// single pixels stepped every 2°, which left a dotted gap at every other
+/// degree), and the hands are anti-aliased round-cap capsules (they used to be
+/// 1 px Bresenham lines, thickened by drawing a second line one pixel to the
+/// right — which is a staircase at every angle that isn't a multiple of 45°, and
+/// made the hour hand lopsided since the offset was always `+x`).
+fn draw_analog_clock(sc: &Screen, cx: i64, cy: i64, r: i64, cw: u64, ch: u64, h: i64, mi: i64, s: i64) {
     let ring = sc.theme.border_dim;
     let fg = sc.theme.chat_fg;
+    let dim = sc.theme.title_dim;
     let accent = sc.theme.accent;
-    // Outer ring + centre hub.
-    sc.fill_disc(cx, cy, r, sc.theme.chat_bg);
-    // Ring outline ≈ 2px via two discs.
-    let t = (r / 16).max(1);
-    for deg in (0..360).step_by(2) {
-        let (dx, dy) = clock_offset(r, deg);
-        sc.put_pixel((cx + dx) as u64, (cy + dy) as u64, ring);
-        let (dx2, dy2) = clock_offset(r - t, deg);
-        sc.put_pixel((cx + dx2) as u64, (cy + dy2) as u64, ring);
+    let dial = sc.theme.chat_bg;
+
+    // Dial, then a crisp ring of thickness `t` around its rim.
+    sc.fill_disc(cx, cy, r, dial);
+    let t = (r / 14).max(1);
+    stroke_ring(sc, cx, cy, r, t, ring);
+
+    // A mark every minute; the five-minute ones longer and brighter.
+    let rim = r - t - 1;
+    let hour_tick = (r / 7).max(3);
+    for m in 0..60i32 {
+        let on_hour = m % 5 == 0;
+        let len = if on_hour { hour_tick } else { (r / 14).max(2) };
+        let w10 = if on_hour { (r * 10 / 26).max(14) } else { (r * 10 / 44).max(10) };
+        let (ox, oy) = clock_offset(rim, m * 6);
+        let (px, py) = clock_offset(rim - len, m * 6);
+        fill_capsule(sc, cx + px, cy + py, cx + ox, cy + oy, w10, if on_hour { fg } else { dim });
     }
-    // Hour ticks.
-    for hour in 0..12 {
-        let deg = hour * 30;
-        let (ox, oy) = clock_offset(r - 2, deg);
-        let (ix, iy) = clock_offset(r - r / 5, deg);
-        draw_line_i(sc, cx + ix, cy + iy, cx + ox, cy + oy, fg);
+
+    // Hour numerals inside the tick ring — only where a text cell actually fits
+    // there, so a small face degrades to ticks alone instead of to a smear.
+    let (cw, ch) = (cw as i64, ch as i64);
+    let num_r = rim - hour_tick - ch / 2 - 2;
+    if num_r >= ch && r >= ch * 5 / 2 {
+        for hour in 1..=12i64 {
+            let (nx, ny) = clock_offset(num_r, (hour * 30) as i32);
+            let label = alloc::format!("{hour}");
+            let x = cx + nx - label.len() as i64 * cw / 2;
+            let y = cy + ny - ch / 2;
+            if x >= 0 && y >= 0 {
+                sc.draw_str(x as u64, y as u64, &label, fg, dial);
+            }
+        }
     }
-    // Hands: hour (short), minute, second (accent).
-    let h_deg = ((h % 12) * 30 + mi / 2) as i32;
+
+    // Hands. Hour and minute in the text colour, second in accent, each drawn
+    // tail-through-tip so the counterweight lands on the far side of the pivot.
+    let [hg, mg, sg] = hand_geoms(r);
+    let h_deg = (h.rem_euclid(12) * 30 + mi / 2) as i32;
     let m_deg = (mi * 6 + s / 10) as i32;
     let s_deg = (s * 6) as i32;
-    let (hx, hy) = clock_offset(r * 55 / 100, h_deg);
-    draw_line_i(sc, cx, cy, cx + hx, cy + hy, fg);
-    // Thicken hour hand with a parallel stroke.
-    draw_line_i(sc, cx + 1, cy, cx + hx + 1, cy + hy, fg);
-    let (mx, my) = clock_offset(r * 78 / 100, m_deg);
-    draw_line_i(sc, cx, cy, cx + mx, cy + my, fg);
-    let (sx, sy) = clock_offset(r * 88 / 100, s_deg);
-    draw_line_i(sc, cx, cy, cx + sx, cy + sy, accent);
+    for (g, deg, c) in [(hg, h_deg, fg), (mg, m_deg, fg), (sg, s_deg, accent)] {
+        let (tx, ty) = clock_offset(g.len, deg);
+        let (bx, by) = clock_offset(-g.tail, deg);
+        fill_capsule(sc, cx + bx, cy + by, cx + tx, cy + ty, g.w10, c);
+    }
+    // Pivot: an accent hub with a dial-coloured pin hole once there's room.
     sc.fill_disc(cx, cy, (r / 12).max(2), accent);
+    if r >= 36 {
+        sc.fill_disc(cx, cy, (r / 40).max(1), dial);
+    }
+}
+
+/// Anti-aliased ring: the annulus between radius `r` and `r - t`, in one pass.
+fn stroke_ring(sc: &Screen, cx: i64, cy: i64, r: i64, t: i64, c: Rgb) {
+    if r <= 0 || t <= 0 {
+        return;
+    }
+    let outer = (2 * AA_SS * r).pow(2);
+    let inner = (2 * AA_SS * (r - t).max(0)).pow(2);
+    let span = r + 1;
+    for dy in -span..=span {
+        for dx in -span..=span {
+            let a = aa_coverage(dx, dy, |fx, fy| {
+                let d2 = fx * fx + fy * fy;
+                d2 <= outer && d2 >= inner
+            });
+            // Negative coords wrap to a huge u64 and are dropped by blend_pixel.
+            sc.blend_pixel((cx + dx) as u64, (cy + dy) as u64, c, a);
+        }
+    }
+}
+
+/// Fill the **capsule** (a thick segment with round end caps) from `(x0,y0)` to
+/// `(x1,y1)`, `w10` wide in tenths of a pixel, anti-aliased.
+///
+/// This is what makes a hand read as a hand: coverage comes from the squared
+/// point-to-segment distance evaluated on `aa_coverage`'s sub-pixel grid, so a
+/// hand at 7° is as smooth as one at 90° and a sub-pixel width still shows up as
+/// a faint even line rather than dropping out.
+fn fill_capsule(sc: &Screen, x0: i64, y0: i64, x1: i64, y1: i64, w10: i64, c: Rgb) {
+    /// The grid `aa_coverage` hands to its predicate is scaled by `2·AA_SS`.
+    const K: i64 = 2 * AA_SS;
+    // Half-width on that grid: (w10/10 px) / 2 → K·w10/20. Never below half a
+    // sub-pixel step, or a thin hand would sample to nothing at all.
+    let hw = (K * w10 / 20).max(K / 2);
+    let hw2 = hw * hw;
+    // Work relative to (x0, y0) — which is also the origin `aa_coverage`'s
+    // `(fx, fy)` are measured from — so the products stay small.
+    let (bx, by) = (K * (x1 - x0), K * (y1 - y0));
+    let dd = bx * bx + by * by;
+    let pad = w10 / 20 + 2;
+    let (lo_x, hi_x) = ((x1 - x0).min(0) - pad, (x1 - x0).max(0) + pad);
+    let (lo_y, hi_y) = ((y1 - y0).min(0) - pad, (y1 - y0).max(0) + pad);
+    for dy in lo_y..=hi_y {
+        for dx in lo_x..=hi_x {
+            let a = aa_coverage(dx, dy, |fx, fy| {
+                // Projection of the sample onto the segment, clamped to the caps.
+                let dot = fx * bx + fy * by;
+                if dd == 0 || dot <= 0 {
+                    return fx * fx + fy * fy <= hw2;
+                }
+                if dot >= dd {
+                    let (qx, qy) = (fx - bx, fy - by);
+                    return qx * qx + qy * qy <= hw2;
+                }
+                // Perpendicular distance, compared without dividing.
+                let cross = fx * by - fy * bx;
+                cross * cross <= hw2 * dd
+            });
+            sc.blend_pixel((x0 + dx) as u64, (y0 + dy) as u64, c, a);
+        }
+    }
 }
 
 /// (dx, dy) from centre: deg 0 = 12 o'clock, clockwise. Length `r`.
@@ -5057,64 +5174,36 @@ fn clock_offset(r: i64, deg: i32) -> (i64, i64) {
     ((r * c as i64) / 1024, -((r * s as i64) / 1024))
 }
 
-/// cos/sin of `deg` (0..359) in Q10 (1024 = 1.0).
+/// `cos(deg)` in Q10 (1024 = 1.0) for the first quadrant, `deg` clamped to 0..=90.
+/// `round(1024 * cos(d°))`, so `COS_Q10[0] == 1024` and `COS_Q10[90] == 0` exactly.
+const COS_Q10: [i32; 91] = [
+    1024, 1024, 1023, 1023, 1022, 1020, 1018, 1016, 1014, 1011, 1008, 1005, 1002, 998, 994, 989,
+    984, 979, 974, 968, 962, 956, 949, 943, 935, 928, 920, 912, 904, 896, 887, 878, 868, 859, 849,
+    839, 828, 818, 807, 796, 784, 773, 761, 749, 737, 724, 711, 698, 685, 672, 658, 644, 630, 616,
+    602, 587, 573, 558, 543, 527, 512, 496, 481, 465, 449, 433, 416, 400, 384, 367, 350, 333, 316,
+    299, 282, 265, 248, 230, 213, 195, 178, 160, 143, 125, 107, 89, 71, 54, 36, 18, 0,
+];
+
+/// cos/sin of `deg` (any integer, reduced mod 360) in Q10 (1024 = 1.0).
+///
+/// The quadrant reduction is the whole substance of this function and it was
+/// wrong for two of the four: quadrants II and III had the cos and sin
+/// expressions **swapped**, which is why every hand and hour tick in the bottom
+/// half of the analog face pointed somewhere else — the second hand appeared to
+/// run backwards from the 30 s mark on. The identities, spelled out so a future
+/// edit can be checked against them rather than guessed:
+///
+/// - `cos(d) = -cos(180-d)` and `sin(d) = cos(d-90)`  for `d` in 90..=180
+/// - `cos(d) = -cos(d-180)` and `sin(d) = -cos(270-d)` for `d` in 180..=270
+/// - `cos(d) =  cos(360-d)` and `sin(d) = -cos(d-270)` for `d` in 270..360
 fn cos_sin_q10(deg: i32) -> (i32, i32) {
     let d = deg.rem_euclid(360) as usize;
-    // 0..90 table for cos; sin(d)=cos(90-d)
-    const COS: [i32; 91] = [
-        1024, 1023, 1023, 1022, 1021, 1020, 1018, 1016, 1014, 1011, 1008, 1005, 1001, 997, 993, 988,
-        983, 978, 972, 966, 960, 953, 946, 939, 931, 923, 915, 906, 897, 888, 878, 868, 858, 847,
-        836, 825, 814, 802, 790, 777, 765, 752, 739, 725, 711, 697, 683, 668, 653, 638, 623, 607,
-        591, 575, 559, 542, 526, 509, 492, 475, 457, 440, 422, 404, 386, 368, 350, 331, 313, 294,
-        275, 256, 237, 218, 199, 180, 160, 141, 121, 102, 82, 62, 42, 22, 2, 0, 0, 0, 0, 0, 0,
-    ];
-    // Fix last entries properly for 85..90
-    // Actually COS[90] should be 0; above is approximate. Use safe index.
-    let cos_q = |a: usize| -> i32 {
-        let a = a.min(90);
-        // regenerate clean values for key angles
-        match a {
-            0 => 1024,
-            30 => 887,
-            45 => 724,
-            60 => 512,
-            90 => 0,
-            _ => COS[a],
-        }
-    };
-    let (c, s) = match d {
+    let cos_q = |a: usize| COS_Q10[a.min(90)];
+    match d {
         0..=90 => (cos_q(d), cos_q(90 - d)),
-        91..=180 => (-cos_q(d - 90), cos_q(180 - d)),
-        181..=270 => (-cos_q(270 - d), -cos_q(d - 180)),
+        91..=180 => (-cos_q(180 - d), cos_q(d - 90)),
+        181..=270 => (-cos_q(d - 180), -cos_q(270 - d)),
         _ => (cos_q(360 - d), -cos_q(d - 270)),
-    };
-    (c, s)
-}
-
-fn draw_line_i(sc: &Screen, x0: i64, y0: i64, x1: i64, y1: i64, c: Rgb) {
-    let mut x0 = x0;
-    let mut y0 = y0;
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    loop {
-        if x0 >= 0 && y0 >= 0 {
-            sc.put_pixel(x0 as u64, y0 as u64, c);
-        }
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
     }
 }
 
@@ -8398,6 +8487,117 @@ pub fn clear_chat() {
             sc.cursor_overlay();
         }
     });
+}
+
+#[cfg(test)]
+mod clock_face_tests {
+    use super::{clock_offset, cos_sin_q10, COS_Q10};
+
+    /// The table is the reference the quadrant reduction is checked against, so
+    /// pin its ends and the exact angles (30/45/60) that used to be patched by a
+    /// `match` arm because the hand-written values disagreed with them.
+    #[test_case]
+    fn cosine_table_is_exact_at_the_named_angles() {
+        assert_eq!(COS_Q10[0], 1024);
+        assert_eq!(COS_Q10[30], 887);
+        assert_eq!(COS_Q10[45], 724);
+        assert_eq!(COS_Q10[60], 512);
+        assert_eq!(COS_Q10[90], 0);
+        // Monotonically decreasing over the quadrant — a transcription slip shows
+        // up here even where no named angle pins the value.
+        for d in 1..=90usize {
+            assert!(COS_Q10[d] <= COS_Q10[d - 1], "COS_Q10 rises at {d}");
+        }
+    }
+
+    /// cos/sin must satisfy the reflection identities in **every** quadrant.
+    /// Quadrants II and III had the two expressions swapped, which is the whole
+    /// bug: `cos_sin_q10(180)` answered `(0, 1024)` instead of `(-1024, 0)`.
+    #[test_case]
+    fn quadrants_agree_with_the_reflection_identities() {
+        assert_eq!(cos_sin_q10(0), (1024, 0));
+        assert_eq!(cos_sin_q10(90), (0, 1024));
+        assert_eq!(cos_sin_q10(180), (-1024, 0));
+        assert_eq!(cos_sin_q10(270), (0, -1024));
+        for d in 0..360i32 {
+            let (c, s) = cos_sin_q10(d);
+            // cos(180-d) = -cos(d), sin(180-d) = sin(d)
+            let (c2, s2) = cos_sin_q10(180 - d);
+            assert_eq!((c2, s2), (-c, s), "reflection about 90° fails at {d}");
+            // cos(-d) = cos(d), sin(-d) = -sin(d)
+            let (c3, s3) = cos_sin_q10(-d);
+            assert_eq!((c3, s3), (c, -s), "reflection about 0° fails at {d}");
+            // Unit circle, within Q10 rounding.
+            let mag = (c * c + s * s) / 1024;
+            assert!((mag - 1024).abs() <= 2, "|(cos,sin)| off at {d}: {mag}");
+        }
+    }
+
+    /// Screen convention: 0° is 12 o'clock and +y is **down**.
+    #[test_case]
+    fn clock_offset_points_at_the_right_hour_mark() {
+        assert_eq!(clock_offset(100, 0), (0, -100)); // 12
+        assert_eq!(clock_offset(100, 90), (100, 0)); // 3
+        assert_eq!(clock_offset(100, 180), (0, 100)); // 6
+        assert_eq!(clock_offset(100, 270), (-100, 0)); // 9
+    }
+
+    /// The regression the user saw: past the 30 s mark the second hand ran
+    /// backwards. Clockwise motion in screen coordinates (y down) means the cross
+    /// product of consecutive tip vectors is **positive** for every step of the
+    /// sweep — including the wrap from 59 s back to 0 s.
+    #[test_case]
+    fn second_hand_sweeps_clockwise_through_every_second() {
+        let r = 100;
+        for s in 0..60i32 {
+            let (x0, y0) = clock_offset(r, s * 6);
+            let (x1, y1) = clock_offset(r, (s + 1) % 60 * 6);
+            let cross = x0 * y1 - y0 * x1;
+            assert!(cross > 0, "hand goes backwards from {s}s: ({x0},{y0}) -> ({x1},{y1})");
+        }
+        // And the bottom half really is the bottom half (it used to point left).
+        assert!(clock_offset(r, 30 * 6).1 > 0, "30s must point down");
+        assert!(clock_offset(r, 45 * 6).0 < 0, "45s must point left");
+    }
+
+    /// The hands must stay ordered short-thick to long-thin, and none of them may
+    /// round away at the smallest face the dropdown ever draws (`r == 28`) — the
+    /// second hand's width is a ratio that would otherwise reach zero.
+    #[test_case]
+    fn hand_proportions_hold_at_every_face_size() {
+        for r in [28i64, 36, 48, 64, 96, 160] {
+            let [h, m, s] = super::hand_geoms(r);
+            assert!(h.len < m.len && m.len < s.len, "r={r} lengths {h:?} {m:?} {s:?}");
+            assert!(h.w10 > m.w10 && m.w10 > s.w10, "r={r} widths {h:?} {m:?} {s:?}");
+            // Every hand fits inside the dial, tail included, and is drawable.
+            for g in [h, m, s] {
+                assert!(g.len + g.tail < r, "r={r} hand overruns the rim: {g:?}");
+                assert!(g.tail > 0 && g.w10 >= 10, "r={r} hand vanishes: {g:?}");
+            }
+        }
+    }
+
+    /// Hour ticks and the hour/minute hands share the same helper, so a quadrant
+    /// slip put whole hours on top of each other. All 12 marks must be distinct
+    /// and each must sit in the quadrant its hour belongs to.
+    #[test_case]
+    fn twelve_hour_ticks_are_distinct_and_in_quadrant() {
+        let r = 100;
+        let mut marks = [(0i64, 0i64); 12];
+        for hour in 0..12i32 {
+            marks[hour as usize] = clock_offset(r, hour * 30);
+        }
+        for a in 0..12 {
+            for b in (a + 1)..12 {
+                assert!(marks[a] != marks[b], "hour {a} and {b} land on {:?}", marks[a]);
+            }
+        }
+        // 1,2 o'clock: right and up. 4,5: right and down. 7,8: left and down.
+        assert!(marks[1].0 > 0 && marks[1].1 < 0);
+        assert!(marks[4].0 > 0 && marks[4].1 > 0);
+        assert!(marks[7].0 < 0 && marks[7].1 > 0);
+        assert!(marks[10].0 < 0 && marks[10].1 < 0);
+    }
 }
 
 #[cfg(test)]
