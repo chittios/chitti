@@ -9060,6 +9060,13 @@ mod agent_flow_tests {
         // The Qwen form still parses (LFM parser must not steal it).
         let (name, _) = parse_tool_call("<tool_call>{\"name\": \"ls\", \"arguments\": {\"args\": \"/mnt\"}}</tool_call>").unwrap();
         assert_eq!(name, "ls");
+        // A sloppy LFM reply wraps the call in prose + a nested start marker.
+        let calls = parse_tool_calls(
+            "<|tool_call_start|>Combine: I'll use the `datetime` tool.<|tool_call_start|>[datetime()]<|tool_call_end|>",
+        );
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].0, "datetime");
+        assert_eq!(calls[0].1, "{}");
     }
 
     /// An app agent's tools come from its **manifest ∩ registry**, in manifest

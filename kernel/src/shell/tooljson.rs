@@ -494,6 +494,11 @@ pub(crate) fn parse_tool_calls(
 /// LFM2.x tool-call syntax: `<|tool_call_start|>[name(args)]<|tool_call_end|>`,
 /// or `{"name":…,"arguments":…}` wrapped in the same markers. The bracket
 /// arguments are wrapped as `{"args": "…"}` (the free-form shell shape).
+///
+/// A small quantized LFM is sloppy: it wraps the call in prose and can emit a
+/// **nested** start marker (`…<|tool_call_start|>[datetime()]<|tool_call_end|>`),
+/// so the real call body is taken after the *last* start marker before the end,
+/// and the bracket call is found anywhere in that region.
 fn parse_lfm2_tool_calls(text: &str) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
     use alloc::string::ToString;
     let mut out = alloc::vec::Vec::new();
@@ -502,11 +507,17 @@ fn parse_lfm2_tool_calls(text: &str) -> alloc::vec::Vec<(alloc::string::String, 
         let start = i + rel;
         let body_at = start + "<|tool_call_start|>".len();
         let after = &text[body_at..];
-        let end = after.find("<|tool_call_end|>").unwrap_or(after.len());
-        let block = after[..end].trim();
+        let end_rel = after.find("<|tool_call_end|>").unwrap_or(after.len());
+        let region = &after[..end_rel];
+        // A nested start marker means the real body starts after the last one.
+        let region = match region.rfind("<|tool_call_start|>") {
+            Some(k) => &region[k + "<|tool_call_start|>".len()..],
+            None => region,
+        };
+        let trimmed = region.trim_start();
         // JSON object form inside the markers.
-        if block.starts_with('{') {
-            if let Some(obj) = extract_balanced_json_object(block) {
+        if trimmed.starts_with('{') {
+            if let Some(obj) = extract_balanced_json_object(trimmed) {
                 if let Some(name) = json_str(&obj, "name") {
                     let name = name.trim().trim_start_matches('/').to_string();
                     if !name.is_empty() {
@@ -514,17 +525,38 @@ fn parse_lfm2_tool_calls(text: &str) -> alloc::vec::Vec<(alloc::string::String, 
                     }
                 }
             }
-        } else if let Some((name, args)) = parse_lfm_bracket_call(block) {
+        } else if let Some((name, args)) = find_lfm_bracket_call(region) {
             out.push((name, args));
         } else {
             crate::ktrace::log_fmt(format_args!(
-                "chat.toolcall: unparsable LFM tool-call body: {:.120}",
-                block
+                "chat.toolcall: unparsable LFM tool-call body: {:.160}",
+                region.trim()
             ));
         }
-        i = body_at + end.max(1);
+        i = body_at + end_rel.max(1);
     }
     out
+}
+
+/// Find the last `[name(args)]` anywhere in `region` — the model wraps calls
+/// in prose, so the whole region is not the call. Cap the search window so a
+/// stray `[` in prose (e.g. a bracket in a sentence) does not scan forever.
+fn find_lfm_bracket_call(region: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+    let mut best = None;
+    let mut search = 0usize;
+    while search < region.len() {
+        let Some(rel) = region[search..].find('[') else { break };
+        let b = search + rel;
+        // The bracket call is short; stop scanning past a window.
+        let window = core::cmp::min(b + 256, region.len());
+        let Some(close_rel) = region[b..window].find(']') else { break };
+        let cand = &region[b..b + close_rel + 1];
+        if let Some(call) = parse_lfm_bracket_call(cand) {
+            best = Some(call);
+        }
+        search = b + 1;
+    }
+    best
 }
 
 /// `[name(args)]` → `(name, {"args": "…"})`. The argument string is kept raw
