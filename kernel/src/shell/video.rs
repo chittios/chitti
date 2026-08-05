@@ -389,6 +389,11 @@ pub(super) fn pump_video_inner() {
         // End of clip: stop on the last frame.
         if t >= p.total_ms && target + 1 >= p.frame_count {
             p.playing = false;
+            // **Record where we stopped.** Without this `paused_at` keeps whatever the
+            // last manual pause left in it (0 if there never was one), so pressing play
+            // afterwards anchored the clock to a stale time while `idx` sat on the final
+            // frame — and since the goal is forward-only, nothing was ever decoded again.
+            p.paused_at = p.total_ms;
             if !p.finished_announced {
                 p.finished_announced = true;
                 p.idx = target;
@@ -568,7 +573,23 @@ pub(super) fn video_toggle_pause() {
                 p.paused_at = now.saturating_sub(p.base_ms);
                 p.playing = false;
             } else {
-                p.base_ms = now.saturating_sub(p.paused_at);
+                // Never resume the clock behind the picture, and treat play-at-the-end as
+                // a replay — see `video::resume_action` for what each case froze.
+                let frame_pts = p.dec.pts_ms(p.idx);
+                match crate::video::resume_action(p.paused_at, frame_pts, p.total_ms) {
+                    crate::video::Resume::Restart => {
+                        video_job_join(p); // reclaim `dec` before seeking it
+                        p.idx = 0;
+                        p.base_ms = now;
+                        p.paused_at = 0;
+                        p.dec.seek_decode(0);
+                        p.audio_at = 0;
+                    }
+                    crate::video::Resume::At(ms) => {
+                        p.paused_at = ms;
+                        p.base_ms = now.saturating_sub(ms);
+                    }
+                }
                 p.playing = true;
                 p.finished_announced = false;
             }

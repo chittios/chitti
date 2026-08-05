@@ -757,6 +757,42 @@ impl StreamDecoder {
 }
 
 /// What [`audio_info`] reports about a file's audio track.
+/// What pressing play should do, given where the picture is in the clip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resume {
+    /// Play again from the first frame — the clip had finished.
+    Restart,
+    /// Resume with the media clock anchored at this time (ms).
+    At(u64),
+}
+
+/// Decide how to resume playback.
+///
+/// **The media clock and the displayed frame must never disagree**, which is the bug this
+/// exists to prevent. The player advances by picking a goal frame *forward* of the current
+/// one (`idx + 1`, clamped to the last frame), so if the clock is resumed behind the
+/// picture nothing is ever due and nothing is ever decoded: playback reports "playing" and
+/// sits on one frame until the clock catches up. Two ways that happened:
+///
+/// * **Play at the end of a clip.** Reaching the end stops playback but recorded no
+///   position, so `paused_at` still held whatever the last manual pause left there — 0 if
+///   the user never paused. Resuming anchored the clock to that stale time while `idx`
+///   stayed on the final frame, where `idx + 1` clamps to `idx` and no goal is ever
+///   greater. The picture froze on the last frame for a whole clip duration, then stopped
+///   again. `Restart` is what every player does here.
+/// * **Play after pausing earlier in the clip.** Same shape, shorter freeze: the clock
+///   resumed at the old pause point, behind the frame on screen, and playback waited out
+///   the difference. Anchoring to `max(paused_at, frame_pts)` makes the clock at least as
+///   far along as the picture, so the next frame is due immediately.
+///
+/// `total_ms == 0` (a clip whose duration is unknown) must not read as "already finished".
+pub fn resume_action(paused_at: u64, frame_pts: u64, total_ms: u64) -> Resume {
+    if total_ms > 0 && paused_at >= total_ms {
+        return Resume::Restart;
+    }
+    Resume::At(paused_at.max(frame_pts))
+}
+
 pub struct AudioInfo {
     pub codec: &'static str,
     pub sample_rate: u32,
@@ -828,6 +864,45 @@ pub fn decode_audio(bytes: &[u8]) -> Result<crate::audio::Audio, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resuming must never leave the clock behind the picture, because the player only
+    /// ever decodes *forward*: a clock behind the displayed frame means no frame is due,
+    /// nothing is decoded, and the picture sits still while the HUD says "playing".
+    #[test_case]
+    fn resuming_never_anchors_the_clock_behind_the_picture() {
+        const TOTAL: u64 = 6_000;
+
+        // Play at the end of the clip replays it. This is the freeze that was reported:
+        // the end-of-clip stop left `paused_at` at 0, so play anchored the clock to 0
+        // while the last frame stayed on screen — and `idx + 1` clamps to `idx` there, so
+        // no goal was ever greater and nothing decoded for a whole clip duration.
+        assert_eq!(resume_action(TOTAL, 5_966, TOTAL), Resume::Restart);
+        assert_eq!(resume_action(TOTAL + 40, 5_966, TOTAL), Resume::Restart);
+        // The pre-fix state, now harmless: a stale 0 with the picture on the last frame
+        // resumes *at the picture*, not at 0.
+        assert_eq!(resume_action(0, 5_966, TOTAL), Resume::At(5_966));
+
+        // Ordinary mid-clip pause/resume is unchanged: the clock returns to the pause point.
+        assert_eq!(resume_action(3_000, 3_000, TOTAL), Resume::At(3_000));
+        assert_eq!(resume_action(3_000, 2_966, TOTAL), Resume::At(3_000));
+
+        // A stale pause point behind the picture (paused early, played on, stopped) is
+        // pulled forward to the frame on screen rather than waiting the difference out.
+        assert_eq!(resume_action(1_000, 4_500, TOTAL), Resume::At(4_500));
+
+        // A clip with unknown duration must not read as "already finished" — that would
+        // make every resume restart from the beginning.
+        assert_eq!(resume_action(0, 0, 0), Resume::At(0));
+        assert_eq!(resume_action(5_000, 5_000, 0), Resume::At(5_000));
+
+        // Whatever it returns, the clock is never behind the picture.
+        for (paused, pts) in [(0u64, 0u64), (0, 5_966), (1_000, 4_500), (3_000, 3_000), (9_999, 12)] {
+            match resume_action(paused, pts, TOTAL) {
+                Resume::Restart => {}
+                Resume::At(ms) => assert!(ms >= pts, "clock {ms} is behind the picture {pts}"),
+            }
+        }
+    }
 
     #[test_case]
     fn sniff_recognises_containers() {
