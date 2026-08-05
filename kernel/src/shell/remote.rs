@@ -240,6 +240,15 @@ impl RemoteChat {
         }
     }
 
+    /// Sent when the model repeats a batch it already has the output for.
+    ///
+    /// Naming the loop is the part that works: told only "answer now", a model tends to
+    /// repeat the call a third time. Told *what it just did*, it answers.
+    const REPEAT_NUDGE_TEXT: &'static str =
+        "You just requested the same tool calls again, and their output is already above. \
+         Do not repeat them. Answer the user now with what you have, or take a different \
+         step if something is genuinely missing.";
+
     /// Keep the leading system message current (SOUL, tool list, **memory
     /// digest**). Remote history is re-sent whole each turn, so refreshing
     /// here makes `memory_add` facts visible without requiring `/compact`.
@@ -257,22 +266,32 @@ impl RemoteChat {
     /// `ChatSession::turn`, with generation done by the hosted model. Records
     /// into `session` so `/session save|resume` works for remote chat too.
     /// Returns the final assistant answer (the voice loop speaks it).
+    ///
+    /// Bounded by [`super::MAX_TOOLS_PER_TURN`] **tool calls** — not round trips, which
+    /// is what this counted before and why a many-step task stopped after four requests.
+    /// Reaching the ceiling asks the model to answer from what it has; it never ends the
+    /// turn empty-handed.
     pub fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> String {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
-        const MAX_TOOL_ITERS: usize = 4;
         // Mid-turn interjection queue while HTTP wait / tools run.
         super::set_chat_busy(true);
         self.refresh_system();
         self.messages.push(("user".to_string(), msg.to_string()));
         session.push_message(Role::User, msg.to_string(), Provenance::UserTyped, now());
         session.budget.turns_used = session.budget.turns_used.saturating_add(1);
+        // Per-message, like the local loop: the cumulative session counters are meant
+        // for bounded sub-agents, and letting them accrue across messages (and reboots,
+        // since the session persists) makes every later task die early.
+        session.budget.tool_calls_used = 0;
         let turn_t0 = crate::arch::now_ms();
         // Remote has no separate think clock — wall time → Worked for only.
         // (Thought for is local, when a think block is parsed + timed.)
         let mut last_batch: Option<alloc::vec::Vec<(String, String)>> = None;
         let mut call_id = 1u64;
-        for _ in 0..MAX_TOOL_ITERS {
+        let mut tools_used = 0u32;
+        let mut nudged = false;
+        loop {
             // Composer-bar "Thinking  Ns  |" only — never into chat scrollback.
             crate::shell::begin_thinking("thinking");
             let result = chat_completion(&self.cfg, &self.messages);
@@ -324,13 +343,21 @@ impl RemoteChat {
                 super::set_chat_busy(false);
                 return reply;
             }
+            // A model repeating a batch it already has the output for is stuck, not
+            // working. Nudge once — it usually answers — and only then stop asking for
+            // tools. Either way the turn goes on to produce an *answer*: ending here
+            // returned an empty string, so the user saw the turn footer and nothing
+            // else, which reads as the shell having silently given up.
             if last_batch.as_ref() == Some(&batch) {
+                if !nudged {
+                    nudged = true;
+                    crate::serial_println!("\x1b[33m[repeated call — asking for an answer]\x1b[0m");
+                    self.messages
+                        .push(("user".to_string(), Self::REPEAT_NUDGE_TEXT.to_string()));
+                    continue;
+                }
                 crate::serial_println!("\x1b[33m[tool loop stopped: repeated call]\x1b[0m");
-                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
-                super::print_turn_footer(0.0, worked);
-                let _ = crate::session::save(session);
-                super::set_chat_busy(false);
-                return String::new();
+                break;
             }
             last_batch = Some(batch.clone());
             let mut tcs = alloc::vec::Vec::new();
@@ -368,18 +395,68 @@ impl RemoteChat {
                 };
                 session.push_tool_result_from(ids[i], obs.clone(), prov, origin.as_deref(), now());
                 results.push((cmd.clone(), obs));
+                tools_used = tools_used.saturating_add(1);
             }
             self.messages.push((
                 "user".to_string(),
                 crate::agent::prompt::format_multi_tool_response(&results),
             ));
+            // Same policy function as the local loop, so the two cannot drift again.
+            let limits_max = session.budget.limits.max_tool_calls;
+            if super::budget_step(
+                tools_used,
+                session.budget.tool_calls_used,
+                limits_max,
+                false,
+            ) == super::TurnStep::Close
+            {
+                crate::serial_println!(
+                    "\x1b[33m[tool-call budget reached ({tools_used}) — answering from what is known]\x1b[0m"
+                );
+                break;
+            }
         }
-        crate::serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+        // **The budget changes what the model is asked for; it does not delete its
+        // work.** Falling out of the loop used to `return String::new()` — so the whole
+        // last round of tool output, already fetched and paid for, was thrown away and
+        // the user got an empty reply under a "Worked for 13.9s." footer. One more
+        // completion, with tools declined, turns that into an answer plus an honest note
+        // about what is unfinished.
+        self.messages
+            .push(("user".to_string(), super::BUDGET_NUDGE.to_string()));
+        crate::shell::begin_thinking("thinking");
+        let closing = chat_completion(&self.cfg, &self.messages);
+        crate::shell::end_thinking();
+        let answer = match closing {
+            Ok(r) => {
+                let shown = super::strip_tool_markup(&r);
+                if shown.trim().is_empty() {
+                    // It spent its last turn calling tools anyway. Say so rather than
+                    // printing nothing: the turn ends either way, but the reason is the
+                    // one thing the user cannot infer from an empty screen.
+                    String::from(
+                        "stopped: reached this turn's tool-call limit and the model kept \
+                         calling tools instead of answering. Ask again to continue.",
+                    )
+                } else {
+                    super::print_assistant_markdown("", &shown);
+                    self.messages.push(("assistant".to_string(), r.clone()));
+                    session.push_message(Role::Assistant, r, Provenance::SystemTrusted, now());
+                    shown
+                }
+            }
+            Err(e) => alloc::format!(
+                "stopped: reached this turn's tool-call limit, and the closing request failed ({e})"
+            ),
+        };
+        if answer.starts_with("stopped:") {
+            crate::serial_println!("\x1b[33m{answer}\x1b[0m");
+        }
         let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
         super::print_turn_footer(0.0, worked);
         let _ = crate::session::save(session);
         super::set_chat_busy(false);
-        String::new()
+        answer
     }
 
     /// `/compact` for the remote backend: the hosted model summarizes, then

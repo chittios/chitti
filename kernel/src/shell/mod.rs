@@ -655,6 +655,8 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "close" => close_action(),
         "pdf" => run_pdf(arg),
         "skills" => run_skills_cmd(arg),
+        // Authoring subcommands only; `install` and the chat-bound ones stay human-typed.
+        "agents" => return run_agents_as_tool(arg),
         // Human/e2e surface over the same store as the agent `memory_*` tools.
         "memory" => run_memory_cmd(arg),
         "disks" => disk_list(),
@@ -2132,6 +2134,61 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
     s.push_str("After tools run you get <tool_response>...; then answer, or call more tools.");
     s
 }
+
+/// Per-message tool-call ceiling, **shared by both backends**.
+///
+/// Counted in *tool calls* — the unit a user cares about, and the unit the local loop
+/// always used. The remote loop bounded *model round trips* at 4 instead: a different
+/// quantity under the same name, and a far smaller one, since one round trip can carry
+/// a whole batch of calls. So a task needing a dozen steps died after four, and the two
+/// backends could not be reasoned about together.
+///
+/// The human owns everything above this via Ctrl+C. The ceiling exists so a confused
+/// model cannot loop forever — not to ration ordinary work.
+pub(crate) const MAX_TOOLS_PER_TURN: u32 = 24;
+
+/// What a chat loop should do next, given how much of the turn's tool budget is spent.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum TurnStep {
+    /// Room left — let the model call tools.
+    Continue,
+    /// Budget spent: ask for an answer from what is already known.
+    Close,
+    /// Already asked, and it called tools anyway. Stop.
+    Stop,
+}
+
+/// The tool-budget policy for a chat turn, shared by the local and remote loops.
+///
+/// Pure so it can be tested: the bug this replaces was a *unit* mismatch (the remote loop
+/// counted model round trips, the local one counted tool calls) and it was invisible
+/// because each loop expressed the policy in its own inline condition. One function means
+/// one policy, and `budget_counts_calls_not_round_trips` pins the distinction.
+///
+/// `limits_max == 0` means **unlimited** — the shell agent's own setting. Read as
+/// "0 remaining" it would stop every turn before it began.
+pub(crate) fn budget_step(used: u32, session_used: u32, limits_max: u32, closing: bool) -> TurnStep {
+    if closing {
+        return TurnStep::Stop;
+    }
+    let spent = used >= MAX_TOOLS_PER_TURN || (limits_max != 0 && session_used >= limits_max);
+    if spent {
+        TurnStep::Close
+    } else {
+        TurnStep::Continue
+    }
+}
+
+/// Sent when the tool-call ceiling is reached, in place of a silent stop.
+///
+/// Both backends use this, so the behaviour at the ceiling cannot drift between them.
+/// It names the limit and asks for the unfinished parts explicitly: a model told only
+/// "answer now" tends to claim it is done, which is worse than stopping — the user then
+/// has no idea a limit was involved.
+pub(crate) const BUDGET_NUDGE: &str =
+    "You have reached this turn's tool-call limit. Do not call any more tools. Answer the \
+     user now using what you already gathered, and state plainly which parts you could \
+     not finish so they can ask you to continue.";
 
 /// The tools advertised inline in the system prompt; the rest of the registry
 /// is reachable through `search_tools`. Keep this list short — prefill on a
@@ -3807,7 +3864,7 @@ impl ChatSession {
         // every basic task dies with "budget reached". Reset the per-message
         // counters here so this ceiling is the real bound; the human (Ctrl+C)
         // owns everything above it.
-        const MAX_TOOLS_PER_TURN: u32 = 16;
+        // Shared with the remote backend, so the two cannot drift (see the constant).
         CHAT_BUSY.store(true, core::sync::atomic::Ordering::Relaxed);
         self.cancelled = false;
         self.last_thought_secs = 0.0;
@@ -3860,16 +3917,25 @@ impl ChatSession {
             return alloc::string::String::from("stopped: tool-call budget exhausted");
         }
         let max_this_turn = MAX_TOOLS_PER_TURN.min(remaining);
+        // Set once the ceiling is hit: the model gets **one** more generation, asked to
+        // answer from what it gathered. Returning here instead threw away a turn's worth
+        // of tool output that had already been fetched and paid for — the same defect the
+        // remote loop had, where it was worse still because the reply came back empty.
+        let mut closing = false;
         loop {
-            if tools_this_turn >= max_this_turn
-                || (limits.max_tool_calls != 0 && session.budget.tool_calls_used >= limits.max_tool_calls)
+            if !closing
+                && budget_step(
+                    tools_this_turn,
+                    session.budget.tool_calls_used,
+                    limits.max_tool_calls,
+                    false,
+                ) == TurnStep::Close
             {
-                serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
-                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
-                print_turn_footer(self.last_thought_secs, worked);
-                let _ = crate::session::save(session);
-                finish_chat_turn(self, session);
-                return alloc::string::String::from("stopped: tool-call budget exhausted");
+                closing = true;
+                serial_println!(
+                    "\x1b[33m[tool-call budget reached ({tools_this_turn}) — answering from what is known]\x1b[0m"
+                );
+                self.prefill_committed("user\n", &crate::agent::prompt::system_reminder(BUDGET_NUDGE), true);
             }
             // No speaker stamp (agent message); MD streams without prefix.
             let text = self.generate_assistant("");
@@ -3908,6 +3974,19 @@ impl ChatSession {
                 let _ = crate::session::save(session);
                 finish_chat_turn(self, session);
                 return text;
+            }
+            // Asked to answer and it called a tool anyway: stop, and say which of the two
+            // things happened. An empty reply cannot distinguish "gave up" from "crashed".
+            if closing {
+                serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
+                let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
+                print_turn_footer(self.last_thought_secs, worked);
+                let _ = crate::session::save(session);
+                finish_chat_turn(self, session);
+                return alloc::string::String::from(
+                    "stopped: reached this turn's tool-call limit and the model kept calling \
+                     tools instead of answering. Ask again to continue.",
+                );
             }
             if last_batch.as_ref() == Some(&batch) {
                 if nudged {
@@ -9435,6 +9514,73 @@ mod agent_flow_tests {
         // Decoration longer than the cap is not a tag (bounded scan).
         let long = alloc::format!("<{}invoke name=\"x\">", "|".repeat(64));
         assert_eq!(undecorate_tool_tags(&long).as_ref(), long);
+    }
+
+    /// The budget counts **tool calls, not model round trips** — the bug this replaces.
+    ///
+    /// The remote loop bounded round trips at 4. A model that batches its calls (the
+    /// common case: three reads at once) therefore got ~4 requests and stopped, while the
+    /// local loop allowed 16 *calls* under the same name. Simulated here as batches,
+    /// which is the shape that made the two diverge.
+    #[test_case]
+    fn budget_counts_calls_not_round_trips() {
+        // Four round trips of three calls each: the old remote bound stopped here.
+        let mut used = 0u32;
+        let mut trips = 0u32;
+        while budget_step(used, used, 0, false) == TurnStep::Continue {
+            used += 3;
+            trips += 1;
+            assert!(trips < 100, "the loop must terminate");
+        }
+        assert_eq!(used, MAX_TOOLS_PER_TURN, "24 calls, reached exactly by 3s");
+        assert_eq!(trips, 8, "eight round trips of three, not four");
+
+        // One call per round trip gets the full ceiling.
+        let mut solo = 0u32;
+        while budget_step(solo, solo, 0, false) == TurnStep::Continue {
+            solo += 1;
+        }
+        assert_eq!(solo, MAX_TOOLS_PER_TURN);
+    }
+
+    /// The ceiling asks for an answer; only a model that ignores that request stops the
+    /// turn. Reaching the limit must never be the end of the turn by itself — that is
+    /// what discarded a whole round of tool output and returned an empty reply.
+    #[test_case]
+    fn budget_asks_for_an_answer_before_it_stops() {
+        assert_eq!(budget_step(0, 0, 0, false), TurnStep::Continue);
+        assert_eq!(
+            budget_step(MAX_TOOLS_PER_TURN - 1, 0, 0, false),
+            TurnStep::Continue,
+            "one below the ceiling still works"
+        );
+        assert_eq!(
+            budget_step(MAX_TOOLS_PER_TURN, 0, 0, false),
+            TurnStep::Close,
+            "at the ceiling: ask for an answer, do not stop"
+        );
+        assert_eq!(
+            budget_step(MAX_TOOLS_PER_TURN + 9, 0, 0, false),
+            TurnStep::Close,
+            "past it too -- a batch can overshoot"
+        );
+        // `closing` is only ever passed true after another batch was parsed.
+        assert_eq!(budget_step(0, 0, 0, true), TurnStep::Stop);
+        assert_eq!(budget_step(MAX_TOOLS_PER_TURN, 0, 0, true), TurnStep::Stop);
+    }
+
+    /// `max_tool_calls == 0` means unlimited, not "no calls allowed".
+    ///
+    /// It is the shell agent's own setting, so reading it as a zero ceiling would stop
+    /// every turn before it started — the trap the local loop documents inline.
+    #[test_case]
+    fn a_zero_cumulative_limit_means_unlimited() {
+        assert_eq!(budget_step(0, 9_999, 0, false), TurnStep::Continue);
+        // A real cumulative limit is honoured, and it is about the *session* counter.
+        assert_eq!(budget_step(0, 4, 5, false), TurnStep::Continue);
+        assert_eq!(budget_step(0, 5, 5, false), TurnStep::Close);
+        // Whichever bound is hit first wins.
+        assert_eq!(budget_step(MAX_TOOLS_PER_TURN, 0, 1_000, false), TurnStep::Close);
     }
 
     /// Multi-tool parse: each block keeps its own name/args (no cross-bleed),

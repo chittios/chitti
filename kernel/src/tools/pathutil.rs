@@ -7,6 +7,29 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+/// The longest prefix of `s` that is at most `max` **bytes** and ends on a character
+/// boundary.
+///
+/// `&s[..max]` panics when `max` lands inside a multi-byte character, and the byte that
+/// gets cut is not under our control: it is a byte of somebody's file. `grep` truncated
+/// its preview with a raw slice at 200 and **panicked the kernel** on a line whose `…`
+/// occupied bytes 198..201 — a crash reachable by grepping any file containing
+/// non-ASCII text near a 200-byte offset, which includes this repo's own docs.
+///
+/// The walk-back loop existed correctly in four other places, hand-written each time
+/// ([`crate::agent::prompt::bound_tool_result`], `agent::home`, `synapse::abi`). Five
+/// copies is how one comes to be missing, so this is the shared one.
+pub fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Glob match against a full path. Supports `*`, `?`, and `**` (any path
 /// segment sequence including `/`). Patterns without `/` match the basename
 /// or the full path (so `*.md` matches `/agent/1/MEMORY.md`).
@@ -197,7 +220,7 @@ pub fn grep_files_ex(
             };
             if hay.contains(&q) {
                 let text = if line.len() > 200 {
-                    let mut t = line[..200].to_string();
+                    let mut t = truncate_on_char_boundary(line, 200).to_string();
                     t.push('…');
                     t
                 } else {
@@ -352,6 +375,73 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use alloc::vec;
+
+    /// The kernel panicked here: `grep` cut its 200-byte preview with a raw slice, and a
+    /// line whose `…` sat at bytes 198..201 split the character.
+    ///
+    /// `KERNEL PANIC: end byte index 200 is not a char boundary; it is inside '…'` — from
+    /// `/search agent` over this repo's own files, so any document with non-ASCII text
+    /// near a 200-byte offset was a crash waiting for a query to find it.
+    #[test_case]
+    fn grep_preview_cuts_a_long_line_on_a_char_boundary() {
+        // Reproduce the panic's exact geometry: '…' at bytes 198..201, so the 200-byte
+        // cut falls *inside* the character (not on either end of it).
+        let mut line = String::from("agent");
+        while line.len() < 198 {
+            line.push('x');
+        }
+        line.push('…');
+        while line.len() < 260 {
+            line.push('y');
+        }
+        assert!(
+            !line.is_char_boundary(200),
+            "the fixture must put byte 200 inside a character, as the crash did"
+        );
+        let files = vec![(String::from("/doc.md"), line)];
+        let hits = grep_files_ex("agent", &files, 8, false);
+        assert_eq!(hits.len(), 1);
+        // Truncated below the limit rather than panicking, and still valid UTF-8.
+        assert!(hits[0].text.len() <= 201, "preview stays near the cap");
+        assert!(hits[0].text.ends_with('…'), "an elided preview is marked");
+
+        // A multi-byte character at every offset around the cut: each must be survivable.
+        for pad in 195..=205 {
+            let mut l = String::from("agent");
+            while l.len() < pad {
+                l.push('x');
+            }
+            l.push('é');
+            while l.len() < 240 {
+                l.push('z');
+            }
+            let f = vec![(String::from("/p"), l)];
+            assert_eq!(grep_files_ex("agent", &f, 4, false).len(), 1, "pad {pad}");
+        }
+    }
+
+    /// The shared helper: never past `max`, never inside a character, never lossy below.
+    #[test_case]
+    fn truncate_on_char_boundary_is_exact_and_safe() {
+        assert_eq!(truncate_on_char_boundary("hello", 99), "hello", "short is untouched");
+        assert_eq!(truncate_on_char_boundary("hello", 5), "hello", "exact fit");
+        assert_eq!(truncate_on_char_boundary("hello", 2), "he");
+        // '…' is 3 bytes: cutting at 1 or 2 must yield nothing, not a partial character.
+        assert_eq!(truncate_on_char_boundary("…", 1), "");
+        assert_eq!(truncate_on_char_boundary("…", 2), "");
+        assert_eq!(truncate_on_char_boundary("…", 3), "…");
+        assert_eq!(truncate_on_char_boundary("a…b", 2), "a");
+        assert_eq!(truncate_on_char_boundary("a…b", 3), "a");
+        assert_eq!(truncate_on_char_boundary("a…b", 4), "a…");
+        // 4-byte characters too (the widest UTF-8 encodes).
+        let emoji = "🙂🙂";
+        for max in 0..=8 {
+            let out = truncate_on_char_boundary(emoji, max);
+            assert!(out.len() <= max, "max {max}: {} bytes", out.len());
+            assert_eq!(out.len() % 4, 0, "max {max}: whole characters only");
+        }
+        assert_eq!(truncate_on_char_boundary("", 0), "");
+    }
 
     #[test_case]
     fn glob_basics() {

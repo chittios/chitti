@@ -395,7 +395,7 @@ fn run_app_tool(
     let text = format_tool_result(out.is_error, out.result);
     crate::ktrace::log_fmt(format_args!(
         "package_ui: ask tool {tool} -> {}",
-        if text.len() > 80 { &text[..80] } else { text.as_str() }
+        crate::tools::pathutil::truncate_on_char_boundary(&text, 80)
     ));
     text
 }

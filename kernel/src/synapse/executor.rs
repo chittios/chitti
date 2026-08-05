@@ -653,7 +653,10 @@ fn run_primitive(
             match crate::net::http::get(url, 15_000) {
                 Ok(resp) => {
                     let body = resp.text();
-                    let capped = if body.len() > 4096 { &body[..4096] } else { &body };
+                    // Char-boundary safe: this is a **remote server's** bytes, so a raw
+                    // `&body[..4096]` is a kernel panic any host can trigger by putting a
+                    // multi-byte character across byte 4096.
+                    let capped = crate::tools::pathutil::truncate_on_char_boundary(&body, 4096);
                     format!("ok:status={} body={}", resp.status, capped)
                 }
                 Err(e) => format!("error:{e}"),

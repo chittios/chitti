@@ -152,11 +152,7 @@ pub fn bound_tool_result(result: &str, spill_path: Option<&str>) -> String {
         return result.to_string();
     }
     // Prefer a char-safe cut near the limit.
-    let mut end = TOOL_RESULT_MAX_BYTES.min(result.len());
-    while end > 0 && !result.is_char_boundary(end) {
-        end -= 1;
-    }
-    let head = &result[..end];
+    let head = crate::tools::pathutil::truncate_on_char_boundary(result, TOOL_RESULT_MAX_BYTES);
     match spill_path {
         Some(p) => format!(
             "{head}\n… [truncated {} bytes → full output at {p}]",

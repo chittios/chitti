@@ -2616,6 +2616,14 @@ def s_skills_bundled(g):
     # that teaches a loop which does not work is worse than no skill.
     if not g.wait_for("build-agent", 5, m):
         return False, "the build-agent skill is not in the L0 index"
+    # The skill's authoring steps must exist as real commands. That they are reachable
+    # from `run_shell_command` (the bug: they were not, so the agent stalled) is pinned by
+    # `the_build_agent_skills_authoring_steps_are_callable_as_tools`, which can call the
+    # tool path directly -- there is no `/tool` command to drive it from here.
+    m = g.mark()
+    g.send("/agents new e2edev")
+    if not g.wait_for("scaffolded", 20, m):
+        return False, "/agents new did not scaffold"
     m = g.mark()
     g.send("/skills load build-agent")
     # The console only previews the first part of a body (the rest goes to the agent's
@@ -2624,8 +2632,8 @@ def s_skills_bundled(g):
     # `the_build_agent_skill_describes_the_real_commands`.
     if not g.wait_for("loaded skill 'build-agent'", 20, m):
         return False, "the build-agent skill did not load"
-    if not g.wait_for("agents new", 10, m):
-        return False, "the build-agent body does not start with the scaffold step"
+    if not g.wait_for("compiles JavaScript", 10, m):
+        return False, "the build-agent body preview is not the expected text"
     m = g.mark()
     g.send("/skills load remember")
     if not g.wait_for("memory_add", 15, m):

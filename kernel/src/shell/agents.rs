@@ -9,6 +9,58 @@
 
 use super::*;
 
+/// The `/agents` subcommands an **agent** may run through `run_shell_command`.
+///
+/// Only the authoring steps, and the line is drawn by authority, not convenience:
+/// `new`, `build` and `validate` write and check files in the user's own home and grant
+/// nothing, so they need no more privilege than the `write` the agent already has. They
+/// are also the only ones that take just their argument — `install` needs the consent
+/// modal, `reload`/`test`/`switch`/`kill` need the live chat and orchestrator.
+///
+/// **`install` stays human-only on purpose.** It is the step that grants capabilities,
+/// and invariant 5 says the human approves that; an agent that could install its own
+/// package could grant itself authority by writing a manifest. So the answer to
+/// "the agent cannot finish the loop" is that the last step is the human's, and the
+/// message below says so instead of reporting the command as unavailable.
+///
+/// This gap is why the `build-agent` skill shipped teaching a loop the agent could not
+/// run: `/agents` was absent from `dispatch_system` entirely, so `agents new test` came
+/// back as "not available as a tool" and the agent stalled asking the user to type it.
+pub(super) fn run_agents_as_tool(arg: &str) -> bool {
+    let (sub, sarg) = match arg.split_once(' ') {
+        Some((s, a)) => (s, a.trim()),
+        None => (arg.trim(), ""),
+    };
+    match sub {
+        "new" => run_agent_new(sarg),
+        "build" => run_agent_build(sarg),
+        "validate" | "lint" => run_agent_validate(sarg),
+        // Named, not silently refused: each of these has a reason, and an agent that is
+        // told the reason can carry on with the part it *can* do.
+        "install" => {
+            // Only the package name — `sarg` still carries any `--path …` the caller
+            // wrote, and echoing that back produced a line with three `--path` flags.
+            let pkg = sarg.split_whitespace().next().unwrap_or("");
+            let pkg = if pkg.is_empty() || pkg.starts_with('-') { "<name>" } else { pkg };
+            serial_println!(
+                "agents> `install` grants capabilities, so only the human runs it: ask them to \
+                 type `/agents install {pkg} --path ~/agents/{pkg}` and approve the consent \
+                 screen."
+            );
+        }
+        "reload" | "test" | "switch" | "kill" => serial_println!(
+            "agents> `{sub}` acts on the live chat session, so it is only available when the \
+             human types `/agents {sub} …` at the prompt."
+        ),
+        "" | "list" => print_agents_text(),
+        _ => serial_println!(
+            "agents> `{sub}` is not available as a tool. Authoring steps are: new, build, \
+             validate, list."
+        ),
+    }
+    true
+}
+
 pub(super) fn run_agents(
     arg: &str,
     chat: &mut Option<ChatSession>,

@@ -224,6 +224,39 @@ mod tests {
         }
     }
 
+    /// Every authoring step the skill tells the agent to run must actually be runnable.
+    ///
+    /// The skill shipped saying "run these with `run_shell_command`" while `/agents` was
+    /// not in `dispatch_system` at all, so `agents new test` answered "not available as a
+    /// tool" and the agent stalled asking the human to type it. Asserting that the body
+    /// *mentions* the commands did not catch that — mentioning and being callable are
+    /// different claims, and only the second one is what the skill promises.
+    #[test_case]
+    fn the_build_agent_skills_authoring_steps_are_callable_as_tools() {
+        // Called with no package name, so each one prints its usage and touches nothing.
+        // What matters is that the dispatcher *reached* them: the bug was the generic
+        // "not available as a tool" refusal, which is what this asserts is absent.
+        for sub in ["new", "build", "validate"] {
+            let out = crate::shell::run_tool_command("agents", sub);
+            assert!(
+                !out.contains("not available as a tool"),
+                "the skill tells the agent to run `agents {sub}`, but run_shell_command \
+                 refuses it: {out}"
+            );
+            assert!(
+                out.contains("usage") || out.contains("agents>"),
+                "`agents {sub}` should have reached its handler, got: {out}"
+            );
+        }
+        // And the step that grants authority must NOT be silently runnable by an agent.
+        // (`agents` as a whole is toolable; the subcommand gate is what refuses install.)
+        let out = crate::shell::run_tool_command("agents", "install evil --path /x");
+        assert!(
+            out.contains("only the human"),
+            "install must be refused with a reason, got: {out}"
+        );
+    }
+
     /// The `build-agent` skill has to name the commands that exist, in the order they
     /// are used, or it teaches a loop that does not work.
     #[test_case]
@@ -297,7 +330,14 @@ fn build_agent_skill(id: SkillId) -> SkillPackage {
 # build-agent — create a new agent (or a new tool) on this machine\n\
 \n\
 ChittiOS compiles JavaScript to a real wasm module locally, so a new agent needs no\n\
-host toolchain and no kernel rebuild. Run these with `run_shell_command`.\n\
+host toolchain and no kernel rebuild.\n\
+\n\
+**Steps 1-4 you run yourself** with `run_shell_command` (they only write and check\n\
+files). **Steps 5-7 the human types** at the prompt: `install` grants capabilities and\n\
+needs their approval, and `test`/`reload` act on the live chat session. So do the\n\
+authoring, then tell them exactly which line to type — do not stall waiting for\n\
+permission to scaffold, and do not report the loop as blocked when four of its steps\n\
+are yours.\n\
 \n\
 ## The loop\n\
 \n\
@@ -310,12 +350,13 @@ host toolchain and no kernel rebuild. Run these with `run_shell_command`.\n\
    build.**\n\
 4. `agents validate <name>` — lints the manifest and the module. Fix every `error`\n\
    before installing; `warn` lines are advisory.\n\
-5. `agents install <name> --path` — asks the human to approve each capability, then\n\
-   registers the agent and its tools. Without `--path` it looks for a built-in or\n\
-   registry package instead.\n\
-6. `agents test <name> --tool <tool> --args {\"k\":1}` — runs one tool under that\n\
-   agent's identity and prints the structured outcome.\n\
-7. After a later edit: `agents build <name>` then `agents reload <name>`. Both.\n\
+5. **(human types)** `/agents install <name> --path ~/agents/<name>` — the consent\n\
+   screen; they approve each capability, then it registers the agent and its tools.\n\
+   You cannot run this: installing is what grants authority, so it is theirs.\n\
+6. **(human types)** `/agents test <name> --tool <tool> --args {\"k\":1}` — runs one\n\
+   tool under that agent's identity and prints the structured outcome.\n\
+7. After a later edit: `agents build <name>` (yours), then the human types\n\
+   `/agents reload <name>`. Both are needed — a build alone does not reload.\n\
 \n\
 ## How a tool is written\n\
 \n\

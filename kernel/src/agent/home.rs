@@ -144,12 +144,10 @@ pub fn memory_search(id: u64, query: &str) -> Vec<String> {
             continue;
         }
         let snip = if val.len() > 120 {
-            // char-safe cut
-            let mut end = 120.min(val.len());
-            while end > 0 && !val.is_char_boundary(end) {
-                end -= 1;
-            }
-            alloc::format!("{}…", &val[..end])
+            alloc::format!(
+                "{}…",
+                crate::tools::pathutil::truncate_on_char_boundary(&val, 120)
+            )
         } else {
             val
         };

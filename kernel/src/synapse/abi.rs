@@ -382,11 +382,8 @@ fn write_reply(space: &AddressSpace, out_ptr: u64, out_cap: u64, text: &str) -> 
     let n = (text.len() as u64).min(out_cap) as usize;
     // Truncate on a char boundary so a tenant never receives half a UTF-8
     // sequence — it would be reading bytes that are not the text we sent.
-    let mut end = n;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    copy_out(space, out_ptr, text[..end].as_bytes()).unwrap_or(0)
+    let head = crate::tools::pathutil::truncate_on_char_boundary(text, n);
+    copy_out(space, out_ptr, head.as_bytes()).unwrap_or(0)
 }
 
 /// Render an [`super::executor::Invocation`] as the text a tenant sees.
