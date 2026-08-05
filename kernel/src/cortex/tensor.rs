@@ -2433,9 +2433,17 @@ pub unsafe fn matmul_q4_0_i8mm_rows(
     let blocks = n_cols / QK;
     let row_bytes = blocks * Q4_0_BLOCK_BYTES;
     let nb = blocks; // activation scales per column
+    // **Weight-stationary** M-tile: each weight block is loaded once and
+    // applied to all `MT` tokens of the tile (accumulators live in a stack
+    // array), so the weight matrix is streamed from RAM `m_count/MT` times
+    // instead of `m_count/8`. For a 64-token prefill chunk that is 8x less
+    // weight traffic — the prefill bottleneck (the kernel's prior 8-token
+    // tiles re-read the full 1.5 GiB weight matrix 8 times per chunk).
+    const MT: usize = 64;
+    let mut res = [0.0f32; MT * 2];
+    const COLP: usize = 4;
     let cols_even = (m_count / 2) * 2;
     let rows_even = row_start + ((row_end - row_start) / 2) * 2;
-    const COLP: usize = 4;
     let full_cols = (cols_even / (2 * COLP)) * (2 * COLP);
     // SAFETY: caller's contract; all loads in-bounds, `y` rows disjoint.
     unsafe {
@@ -2452,9 +2460,12 @@ pub unsafe fn matmul_q4_0_i8mm_rows(
         let mut r = row_start;
         while r < rows_even {
             let (row0, row1) = (w.add(r * row_bytes), w.add((r + 1) * row_bytes));
-            let mut mt = 0;
-            while mt < full_cols {
-                let mut res = [vdupq_n_f32(0.0); COLP];
+            let mut m0 = 0;
+            while m0 < m_count {
+                let mt = core::cmp::min(MT, m_count - m0);
+                res[..mt * 2].fill(0.0);
+                // One pass over the full row width per M-tile: weights loaded
+                // once, activations streamed in 8-token register tiles.
                 for b in 0..blocks {
                     let base = b * Q4_0_BLOCK_BYTES;
                     let dw0 = f16_to_f32(u16::from_le_bytes([*row0.add(base), *row0.add(base + 1)]));
@@ -2462,31 +2473,40 @@ pub unsafe fn matmul_q4_0_i8mm_rows(
                     let dw_vec = vcombine_f32(vdup_n_f32(dw0), vdup_n_f32(dw1));
                     let wk0 = unpack(row0, base);
                     let wk1 = unpack(row1, base);
-                    for t in 0..COLP {
-                        let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
-                        let (a0lo, a0hi) = ldp_s8(xq.add(m0 * n_cols + b * QK));
-                        let (a1lo, a1hi) = ldp_s8(xq.add(m1 * n_cols + b * QK));
-                        let ak0 = [vget_low_s8(a0lo), vget_high_s8(a0lo), vget_low_s8(a0hi), vget_high_s8(a0hi)];
-                        let ak1 = [vget_low_s8(a1lo), vget_high_s8(a1lo), vget_low_s8(a1hi), vget_high_s8(a1hi)];
-                        let mut acc2 = vdupq_n_s32(0);
-                        for kg in 0..4 {
-                            acc2 = vmmlaq_s32(acc2, vcombine_s8(wk0[kg], wk1[kg]), vcombine_s8(ak0[kg], ak1[kg]));
+                    let mut tg = 0;
+                    while tg < mt {
+                        let mut acc = [vdupq_n_f32(0.0); COLP];
+                        for t in 0..COLP {
+                            let (mm0, mm1) = (m0 + tg + 2 * t, m0 + tg + 2 * t + 1);
+                            let (a0lo, a0hi) = ldp_s8(xq.add(mm0 * n_cols + b * QK));
+                            let (a1lo, a1hi) = ldp_s8(xq.add(mm1 * n_cols + b * QK));
+                            let ak0 = [vget_low_s8(a0lo), vget_high_s8(a0lo), vget_low_s8(a0hi), vget_high_s8(a0hi)];
+                            let ak1 = [vget_low_s8(a1lo), vget_high_s8(a1lo), vget_low_s8(a1hi), vget_high_s8(a1hi)];
+                            let mut acc2 = vdupq_n_s32(0);
+                            for kg in 0..4 {
+                                acc2 = vmmlaq_s32(acc2, vcombine_s8(wk0[kg], wk1[kg]), vcombine_s8(ak0[kg], ak1[kg]));
+                            }
+                            let dx0 = *xs.add(mm0 * nb + b);
+                            let dx1 = *xs.add(mm1 * nb + b);
+                            let pair = vset_lane_f32(dx1, vdup_n_f32(dx0), 1);
+                            let dx_vec = vcombine_f32(pair, pair);
+                            acc[t] = vfmaq_f32(acc[t], vcvtq_f32_s32(acc2), vmulq_f32(dw_vec, dx_vec));
                         }
-                        let dx0 = *xs.add(m0 * nb + b);
-                        let dx1 = *xs.add(m1 * nb + b);
-                        let pair = vset_lane_f32(dx1, vdup_n_f32(dx0), 1);
-                        let dx_vec = vcombine_f32(pair, pair);
-                        res[t] = vfmaq_f32(res[t], vcvtq_f32_s32(acc2), vmulq_f32(dw_vec, dx_vec));
+                        for t in 0..COLP {
+                            let mm = tg + 2 * t;
+                            res[mm * 2] += vgetq_lane_f32(acc[t], 0);
+                            res[mm * 2 + 1] += vgetq_lane_f32(acc[t], 1);
+                            res[(mm + 1) * 2] += vgetq_lane_f32(acc[t], 2);
+                            res[(mm + 1) * 2 + 1] += vgetq_lane_f32(acc[t], 3);
+                        }
+                        tg += 2 * COLP;
                     }
                 }
-                for t in 0..COLP {
-                    let (m0, m1) = (mt + 2 * t, mt + 2 * t + 1);
-                    *y.add(m0 * n_rows + r) = vgetq_lane_f32(res[t], 0);
-                    *y.add(m1 * n_rows + r) = vgetq_lane_f32(res[t], 1);
-                    *y.add(m0 * n_rows + r + 1) = vgetq_lane_f32(res[t], 2);
-                    *y.add(m1 * n_rows + r + 1) = vgetq_lane_f32(res[t], 3);
+                for mm in 0..mt {
+                    *y.add((m0 + mm) * n_rows + r) = res[mm * 2];
+                    *y.add((m0 + mm) * n_rows + r + 1) = res[mm * 2 + 1];
                 }
-                mt += 2 * COLP;
+                m0 += mt;
             }
             r += 2;
         }

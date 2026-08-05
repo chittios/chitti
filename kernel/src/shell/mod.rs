@@ -1952,6 +1952,9 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
     // listed tool on a bare "hello".
     s.push_str("\n\nTools you can call. Emit one or more blocks (multiple OK for independent reads):\n");
     s.push_str("<tool_call>{\"name\": \"<name>\", \"arguments\": {…}}</tool_call>\n");
+    // LFM-style models ignore that and use their native markers — the shell
+    // parses both, so advertise the alternative to maximize compliance.
+    s.push_str("(If you are an LFM model, use <|tool_call_start|>{\"name\": \"<name>\", \"arguments\": {…}}<|tool_call_end|>)\n");
     s.push_str("FS tools use path/content/old/new; memory uses key/value; shell tools may use {\"args\":\"…\"}.\n");
     for d in defs.iter().filter(|d| CORE_TOOLS.contains(&d.name.as_str())) {
         s.push_str("- ");
