@@ -129,6 +129,20 @@ pub fn chat_current_gi() -> usize {
     })
 }
 
+/// A **monotonic** count of chat lines produced: `evicted + hist.len() + row`.
+///
+/// Unlike [`chat_current_gi`], which is a live index into `hist`+grid and stops advancing
+/// once the scrollback ring saturates, this only ever increases — so the difference
+/// between two readings is the number of lines printed between them, whether or not the
+/// ring wrapped in the meantime. Used to measure a block's height across printing.
+pub fn chat_line_cursor() -> usize {
+    SCREEN.with(|slot| {
+        slot.as_ref()
+            .map(|sc| sc.chat.evicted + sc.chat.hist.len() + sc.chat.row as usize)
+            .unwrap_or(0)
+    })
+}
+
 /// Register a fold: the line at `gi` reveals `hidden` (pre-styled text, may
 /// contain ANSI + newlines) when clicked. Bounded so it can't grow unbounded.
 pub fn chat_note_fold(gi: usize, hidden: &str) {

@@ -104,6 +104,21 @@ type Rgb = (u8, u8, u8);
 /// and modal dismissals, and can be scrolled back through.
 type Cell = (char, Rgb);
 
+/// An elevated background band over a run of chat lines.
+///
+/// The chat pane has no per-cell background (`Cell` is `(char, fg)`), so a block tint is
+/// carried as line metadata the compositor owns rather than as colour in the text stream.
+/// That also keeps the serial console byte-identical: the tint and the icon chrome are
+/// rendering, and a host terminal reading the same stream is unaffected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Band {
+    None,
+    /// A line the human typed (`theme.composer_bg`).
+    User,
+    /// An agent tool call and its output (`theme.tool_bg`).
+    Tool,
+}
+
 /// Scrollback depth per pane, in lines. At 200 cols a full ring is ~3 MB —
 /// noise next to the model heap. Cleared only by `/clear`.
 const HIST_MAX: usize = 2000;
@@ -169,6 +184,22 @@ struct Pane {
     /// Absolute line indices (`hist`+grid, same as `sel`) painted with the
     /// elevated user-prompt band background (`theme.composer_bg`).
     user_band: Vec<usize>,
+    /// Lines evicted from `hist` over this pane's life.
+    ///
+    /// Absolute `gi` coordinates are *not* monotonic: once `hist` saturates at `HIST_MAX`
+    /// every new line evicts one, so `hist.len() + row` stops advancing and a
+    /// "mark before, measure after" span comes out as **zero** — the tool tint would
+    /// simply stop appearing once a session got long enough, which is the kind of bug
+    /// that shows up only after an hour of use. `evicted + hist.len() + row` always
+    /// advances, so a span measured across printing is right whether or not the ring wrapped.
+    evicted: usize,
+    /// The same, for agent **tool-call blocks** (`theme.tool_bg`).
+    ///
+    /// A second sorted vec rather than one list of `(gi, kind)`: both are searched per
+    /// cell on every repaint, and `binary_search` over a plain `usize` is what makes that
+    /// free. They are disjoint by construction — a line is either the human's prompt or a
+    /// tool block — and [`Pane::band`] resolves user-first if that ever stops holding.
+    tool_band: Vec<usize>,
     /// Incremental UTF-8 decode buffer: the incoming byte stream is decoded one
     /// `char` at a time (a multi-byte glyph spans several `pane_putc` calls).
     utf8: [u8; 4],

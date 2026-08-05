@@ -52,15 +52,38 @@ impl Pane {
             sel: None,
             has_composer,
             folds: Vec::new(),
+            evicted: 0,
             user_band: Vec::new(),
+            tool_band: Vec::new(),
             utf8: [0; 4],
             utf8_len: 0,
         }
     }
 
-    /// Elevated bg for a user-prompt band line, else `None` (use pane bg).
-    fn band_bg(&self, gi: usize) -> bool {
-        self.user_band.binary_search(&gi).is_ok()
+    /// The glyph to draw for cell `c` of a line in `band`, and whether it is an icon that
+    /// must be drawn inline (one cell) rather than at full icon size.
+    ///
+    /// Shared by the full-row painter and the single-cell selection repaint: with the
+    /// substitution in only one of them, dragging a selection across a tool block turned
+    /// its icons back into `*` and `|` as the cells were repainted.
+    fn band_glyph(band: Band, c: usize, ch: char) -> (char, bool) {
+        if band == Band::Tool && c == 0 {
+            if let Some(icon) = crate::shell::chrome::tool_chrome_icon(ch) {
+                return (icon, true);
+            }
+        }
+        (ch, false)
+    }
+
+    /// Which elevated band, if any, line `gi` belongs to.
+    fn band(&self, gi: usize) -> Band {
+        if self.user_band.binary_search(&gi).is_ok() {
+            Band::User
+        } else if self.tool_band.binary_search(&gi).is_ok() {
+            Band::Tool
+        } else {
+            Band::None
+        }
     }
 
     /// Write `byte` into the grid cell under the cursor (0 erases).
@@ -287,6 +310,7 @@ impl Pane {
         self.sel = None;
         self.folds.clear();
         self.user_band.clear();
+        self.tool_band.clear();
         self.col = 0;
         self.row = 0;
         self.fg = self.default_fg;
@@ -365,11 +389,24 @@ pub(super) fn dummy_pane() -> Pane {
         esc: EscState::Ground, csi: [0; 32], csi_len: 0, bold: false,
         title: String::new(), show_caret: false,
         grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None, has_composer: false,
-        folds: Vec::new(), user_band: Vec::new(), utf8: [0; 4], utf8_len: 0,
+        folds: Vec::new(), evicted: 0, user_band: Vec::new(), tool_band: Vec::new(),
+        utf8: [0; 4], utf8_len: 0,
     }
 }
 
 impl Screen {
+    /// The background for a line in `band`, or `plain` when it is in none.
+    ///
+    /// One place, because four painters resolve it and a fifth elevation added to only
+    /// some of them would show up as a band that changes colour when you select it.
+    fn band_bg(&self, band: Band, plain: Rgb) -> Rgb {
+        match band {
+            Band::User => self.theme.composer_bg,
+            Band::Tool => self.theme.tool_bg,
+            Band::None => plain,
+        }
+    }
+
     /// Scroll a pane's interior up by one text row: the top grid row is evicted
     /// into the scrollback ring, the grid shifts up, and (when the view is live)
     /// the pixels shift with it.
@@ -380,6 +417,7 @@ impl Screen {
             p.hist.push_back(p.grid[..cols].to_vec());
             while p.hist.len() > HIST_MAX {
                 p.hist.pop_front();
+                p.evicted += 1;
                 // Absolute selection coordinates shift with the evicted line;
                 // a selection that loses its first line is dropped.
                 p.sel = p.sel.and_then(|((r1, c1), (r2, c2))| {
@@ -395,15 +433,19 @@ impl Screen {
                         true
                     }
                 });
-                // User-band line indices track absolute gi the same way.
-                p.user_band.retain_mut(|gi| {
-                    if *gi == 0 {
-                        false
-                    } else {
-                        *gi -= 1;
-                        true
-                    }
-                });
+                // Band line indices track absolute gi the same way — **both** of them,
+                // or the surviving list drifts one line per eviction and the tint ends
+                // up behind whatever text later occupies those indices.
+                for band in [&mut p.user_band, &mut p.tool_band] {
+                    band.retain_mut(|gi| {
+                        if *gi == 0 {
+                            false
+                        } else {
+                            *gi -= 1;
+                            true
+                        }
+                    });
+                }
             }
             p.grid.copy_within(cols.., 0);
             let start = p.grid.len() - cols;
@@ -470,6 +512,7 @@ impl Screen {
                 }
                 Some(&p.grid[gr * cols..(gr + 1) * cols])
             };
+            let band = p.band(gi);
             for c in 0..cols {
                 let (b, fg) = line.and_then(|l| l.get(c).copied()).unwrap_or(('\0', p.default_fg));
                 let x = p.ix + c as u64 * p.cw;
@@ -477,16 +520,17 @@ impl Screen {
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
                 let bg = if selected {
                     self.theme.editor_sel
-                } else if p.band_bg(gi) {
-                    self.theme.composer_bg
                 } else {
-                    p.bg
+                    self.band_bg(band, p.bg)
                 };
                 // Always fill the cell first so deselected / empty cells leave
                 // no residue (selection highlight, partial glyphs).
                 self.fill_cell_bg(x, y, p.cw, p.ch, bg);
                 if b != '\0' && b != ' ' {
-                    self.blit_glyph(x, y, b, fg, bg);
+                    match Pane::band_glyph(band, c, b) {
+                        (g, true) => self.blit_glyph_inline(x, y, g, fg, bg),
+                        (g, false) => self.blit_glyph(x, y, g, fg, bg),
+                    }
                 }
             }
         }
@@ -523,16 +567,18 @@ impl Screen {
         };
         let x = p.ix + c as u64 * p.cw;
         let y = p.iy + r as u64 * p.ch;
+        let band = p.band(gi);
         let bg = if selected {
             self.theme.editor_sel
-        } else if p.band_bg(gi) {
-            self.theme.composer_bg
         } else {
-            p.bg
+            self.band_bg(band, p.bg)
         };
         self.fill_cell_bg(x, y, p.cw, p.ch, bg);
         if b != '\0' && b != ' ' {
-            self.blit_glyph(x, y, b, fg, bg);
+            match Pane::band_glyph(band, c, b) {
+                    (g, true) => self.blit_glyph_inline(x, y, g, fg, bg),
+                    (g, false) => self.blit_glyph(x, y, g, fg, bg),
+                }
         }
     }
 
@@ -815,16 +861,18 @@ impl Screen {
                 let x = p.ix + c as u64 * p.cw;
                 let y = p.iy + r as u64 * p.ch;
                 let selected = sel.is_some_and(|s| crate::textsel::contains(s, gi, c));
+                let band = p.band(gi);
                 let bg = if selected {
                     self.theme.editor_sel
-                } else if p.band_bg(gi) {
-                    self.theme.composer_bg
                 } else {
-                    p.bg
+                    self.band_bg(band, p.bg)
                 };
                 self.fill_cell_bg(x, y, p.cw, p.ch, bg);
                 if b != '\0' && b != ' ' {
-                    self.blit_glyph(x, y, b, fg, bg);
+                    match Pane::band_glyph(band, c, b) {
+                    (g, true) => self.blit_glyph_inline(x, y, g, fg, bg),
+                    (g, false) => self.blit_glyph(x, y, g, fg, bg),
+                }
                 }
             }
         }

@@ -125,6 +125,27 @@ pub fn hint_gradient() -> ((u8, u8, u8), (u8, u8, u8)) {
 /// `composer_bg`), pad them full-width, and repaint so the band is visible
 /// immediately (including empty cells to the right of the text).
 pub fn chat_mark_user_band_rows(n: usize) {
+    chat_mark_band_rows(n, Band::User);
+}
+
+/// The same for an agent **tool-call block** (`theme.tool_bg`): the header line and the
+/// output rows under it, so the whole call reads as one panel.
+pub fn chat_mark_tool_band_rows(n: usize) {
+    chat_mark_band_rows(n, Band::Tool);
+}
+
+/// Tint every chat line printed since `start`, a reading of [`chat_line_cursor`].
+///
+/// The caller takes `start` *before* printing, so wrapped rows are covered: a tool result
+/// clipped to 120 characters still soft-wraps in a narrow pane, and counting the printed
+/// rows instead left the wrapped remainder untinted. The cursor is monotonic precisely so
+/// this subtraction stays right after the scrollback ring saturates.
+pub fn chat_mark_tool_band_since(start: usize) {
+    let end = chat_line_cursor();
+    chat_mark_band_rows(end.saturating_sub(start), Band::Tool);
+}
+
+fn chat_mark_band_rows(n: usize, kind: Band) {
     if n == 0 {
         return;
     }
@@ -140,12 +161,17 @@ pub fn chat_mark_user_band_rows(n: usize) {
         let end = p.hist.len() + p.row as usize; // exclusive end (current empty row)
         let start = end.saturating_sub(n);
         for gi in start..end {
-            if let Err(i) = p.user_band.binary_search(&gi) {
-                p.user_band.insert(i, gi);
+            let band = match kind {
+                Band::Tool => &mut p.tool_band,
+                _ => &mut p.user_band,
+            };
+            if let Err(i) = band.binary_search(&gi) {
+                band.insert(i, gi);
             }
             // Cap bookkeeping so a long session cannot grow unbounded.
-            if p.user_band.len() > 256 {
-                p.user_band.drain(0..p.user_band.len() - 256);
+            if band.len() > 256 {
+                let excess = band.len() - 256;
+                band.drain(0..excess);
             }
             // Pad short rows so the elevated fill spans the full pane width.
             if gi < p.hist.len() {

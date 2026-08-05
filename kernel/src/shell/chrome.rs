@@ -8,8 +8,34 @@ use core::fmt::Write;
 /// Prompt prefix for a submitted user line in scrollback.
 pub const PROMPT_ARROW: &str = ">";
 
-/// Tool / thought chrome bullet.
+/// Tool / thought chrome bullet, **as it goes on the wire**.
+///
+/// Deliberately ASCII. This string reaches the real serial port as well as the
+/// framebuffer, and the two want different things: a host terminal (and the e2e harness,
+/// which asserts on `* Write`-style banners) wants a character it can render and match,
+/// while the compositor wants a Font Awesome mark. So the icon substitution happens at
+/// **draw time** in the pane — see [`tool_chrome_icon`] — and the byte stream is
+/// unchanged. Putting a Private-Use-Area codepoint in here instead would show as tofu
+/// over a serial console and silently break those assertions.
 pub const DIAMOND: &str = "*";
+
+/// Vertical connector down the left edge of a tool call's output, on the wire.
+pub const TOOL_PIPE: &str = "|";
+
+/// The Font Awesome glyph the **compositor** draws in place of a wire-level chrome
+/// marker, or `None` for anything else.
+///
+/// Called only for column 0 of a line the pane has already classified as a tool block,
+/// so it never sees ordinary text: a `*` or `|` a user typed is not in that band. Pure,
+/// so the mapping is checked without a framebuffer — `framebuffer/` is
+/// `#[cfg(not(test))]` and a test written in there would never even compile.
+pub fn tool_chrome_icon(ch: char) -> Option<char> {
+    match ch {
+        '*' => Some(crate::icons::fa::CIRCLE),
+        '|' => Some(crate::icons::fa::GRIP_LINES_VERTICAL),
+        _ => None,
+    }
+}
 
 /// Format a short wall-clock duration for status lines.
 pub fn format_duration_secs(secs: f32) -> String {
@@ -182,6 +208,34 @@ pub fn format_user_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire markers stay ASCII and the icons are a draw-time substitution.
+    ///
+    /// Both halves matter. A Private-Use-Area codepoint in the byte stream would reach a
+    /// real serial console as tofu and break the e2e assertions on `* Write`-style
+    /// banners; an icon that is *not* mapped leaves the chat showing raw `*` and `|`.
+    #[test_case]
+    fn tool_chrome_is_ascii_on_the_wire_and_an_icon_on_screen() {
+        assert_eq!(DIAMOND, "*", "the wire marker must stay ASCII");
+        assert_eq!(TOOL_PIPE, "|", "the wire connector must stay ASCII");
+        assert!(DIAMOND.is_ascii() && TOOL_PIPE.is_ascii());
+
+        // Each wire marker maps to a real Font Awesome glyph...
+        let mark = tool_chrome_icon('*').expect("the bullet maps to an icon");
+        let pipe = tool_chrome_icon('|').expect("the connector maps to an icon");
+        assert_eq!(mark, crate::icons::fa::CIRCLE);
+        assert_eq!(pipe, crate::icons::fa::GRIP_LINES_VERTICAL);
+        // ...and both are in the range the FA fallback face is consulted for, or they
+        // would resolve to a monospace glyph (or tofu) instead of an icon.
+        assert!(crate::icons::is_icon(mark));
+        assert!(crate::icons::is_icon(pipe));
+
+        // Everything else is left exactly as printed — the substitution runs on column 0
+        // of a tool line, and ordinary text must survive it untouched.
+        for ch in ['o', ' ', '>', '-', '+', '\0', 'k', '│', '•'] {
+            assert!(tool_chrome_icon(ch).is_none(), "{ch:?} must not be rewritten");
+        }
+    }
 
     #[test_case]
     fn duration_under_and_over_minute() {

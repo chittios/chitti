@@ -31,6 +31,8 @@ pub mod fa {
     pub const CIRCLE: char = '\u{f111}';
     /// circle-dot
     pub const CIRCLE_DOT: char = '\u{f192}';
+    /// grip-lines-vertical — the connector down a tool call's left edge
+    pub const GRIP_LINES_VERTICAL: char = '\u{f7a5}';
     /// microchip — CPU / activity
     pub const MICROCHIP: char = '\u{f2db}';
     /// memory

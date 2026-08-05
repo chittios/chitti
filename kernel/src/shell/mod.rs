@@ -2657,7 +2657,11 @@ pub(crate) fn print_tool_header(cmd: &str, args: &str) {
     let a = theme_sgr("accent", (204, 120, 92));
     let f = theme_sgr("chat_fg", (247, 244, 237));
     let m = theme_sgr("muted", (108, 106, 100));
+    // Blank separator line first, *outside* the tint, so consecutive tool calls read as
+    // separate panels rather than one long block.
     serial_println!("");
+    #[cfg(not(test))]
+    let mark = crate::framebuffer::chat_line_cursor();
     if arg.is_empty() {
         serial_println!("{a}{}\x1b[0m \x1b[1m{f}{verb}\x1b[0m", chrome::DIAMOND);
     } else {
@@ -2666,6 +2670,9 @@ pub(crate) fn print_tool_header(cmd: &str, args: &str) {
             chrome::DIAMOND
         );
     }
+    // The header opens the block's tint; each output row extends it.
+    #[cfg(not(test))]
+    crate::framebuffer::chat_mark_tool_band_since(mark);
 }
 
 /// Thought summary — only when a think block was enabled and timed.
@@ -2724,8 +2731,10 @@ pub(crate) fn print_tool_output(obs: &str) {
     let shown = total.min(MAX_LINES);
     let row = |l: &str| -> alloc::string::String {
         let clipped: alloc::string::String = l.chars().take(120).collect();
-        alloc::format!("{a}|\x1b[0m  \x1b[2m{clipped}\x1b[0m")
+        alloc::format!("{a}{}\x1b[0m  \x1b[2m{clipped}\x1b[0m", chrome::TOOL_PIPE)
     };
+    #[cfg(not(test))]
+    let mark = crate::framebuffer::chat_line_cursor();
     for l in &lines[..shown] {
         serial_println!("{}", row(l));
     }
@@ -2736,7 +2745,8 @@ pub(crate) fn print_tool_output(obs: &str) {
         {
             let gi = crate::framebuffer::chat_current_gi();
             serial_println!(
-                "{a}|\x1b[0m  \x1b[2m> {} more line(s) - click to expand\x1b[0m",
+                "{a}{}\x1b[0m  \x1b[2m> {} more line(s) - click to expand\x1b[0m",
+                chrome::TOOL_PIPE,
                 total - shown
             );
             crate::framebuffer::chat_note_fold(gi, &hidden);
@@ -2744,6 +2754,11 @@ pub(crate) fn print_tool_output(obs: &str) {
         #[cfg(test)]
         let _ = hidden;
     }
+    // Tint every line the output actually occupies. Measured from absolute line indices
+    // rather than by counting `serial_println!` calls, because a 120-char row soft-wraps
+    // in a narrow pane — counting calls left the tail of a wrapped block untinted.
+    #[cfg(not(test))]
+    crate::framebuffer::chat_mark_tool_band_since(mark);
 }
 
 /// Shell approval mode: how much an **agent's** tool calls need human

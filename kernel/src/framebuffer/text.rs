@@ -52,6 +52,38 @@ impl Screen {
         }
     }
 
+    /// Draw an icon **inside one mono cell**, vertically centred.
+    ///
+    /// [`Self::glyph_cell`] gives a Font Awesome glyph a square of the *line height*, which
+    /// is right for a tab label or a status field but wrong for chrome sitting inline in a
+    /// text grid: at `cw × 2 ≈ ch` it is two columns wide, so it reads as oversized **and**
+    /// gets its right half erased the moment the streaming painter fills the next cell
+    /// (`paint_chat_cell` writes one cell at a time as bytes arrive, and cannot know a
+    /// neighbour overhangs into it). Sizing to the column width keeps the glyph round,
+    /// unclipped, and the size of the text it sits beside.
+    pub(super) fn blit_glyph_inline(&self, px: u64, py: u64, ch: char, fg: Rgb, bg: Rgb) {
+        let (cw, chh) = (self.cw(), self.ch());
+        let tinted = self.wallpaper.is_some() && self.opacity < 255;
+        for gy in 0..chh {
+            for gx in 0..cw {
+                let cbg = self.bg_at(px + gx, py + gy, bg);
+                self.put_pixel(px + gx, py + gy, cbg);
+            }
+        }
+        let side = cw.min(chh);
+        let oy = (chh.saturating_sub(side)) / 2;
+        let mix = |b: u8, f: u8, a: u32| (((b as u32) * (255 - a) + (f as u32) * a) / 255) as u8;
+        let _ = crate::font_ttf::blit_ui_cell(ch, side as usize, side as usize, |gx, gy, a| {
+            let (x, y) = (px + gx as u64, py + oy + gy as u64);
+            let b = if tinted { self.bg_at(x, y, bg) } else { bg };
+            self.put_pixel(
+                x,
+                y,
+                (mix(b.0, fg.0, a as u32), mix(b.1, fg.1, a as u32), mix(b.2, fg.2, a as u32)),
+            );
+        });
+    }
+
     pub(super) fn blit_glyph(&self, px: u64, py: u64, ch: char, fg: Rgb, bg: Rgb) {
         let (cell_w, cell_h) = self.glyph_cell(ch);
         // Background fill first (both paths blend ink over it). With a

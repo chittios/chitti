@@ -209,9 +209,87 @@ pub fn install(url: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+/// How far a derived surface tint moves from the background toward the foreground, in
+/// percent.
+///
+/// 8% is the smallest step that is actually visible as a panel. The first attempt derived
+/// the tool-call tint as the midpoint of `chat_bg` and `composer_bg`, which on the brand
+/// dark palette differ by **6 units** — a 3-unit lift, invisible on a real display, so the
+/// feature looked like it had not shipped.
+const TINT_PCT: u16 = 8;
+
+/// `bg` lifted [`TINT_PCT`] of the way toward `fg`.
+///
+/// Used to **derive** a theme colour a palette omits, so an older theme file gains a new
+/// surface in its own colours rather than inheriting the brand default. Blending toward
+/// the *text* colour is what makes it direction-agnostic: on a dark theme the result is
+/// lighter, on a light theme darker, which is "slightly raised" in both cases.
+///
+/// Lives here rather than beside its caller in `framebuffer/colors.rs` because that whole
+/// tree is `#[cfg(not(test))]`: colour maths written there cannot be tested at all.
+pub fn tint_toward(bg: (u8, u8, u8), fg: (u8, u8, u8)) -> (u8, u8, u8) {
+    // u16 throughout: `x * 8` overflows a u8 well before the percentage is applied, and
+    // wrapping would send a light theme's tint to near-black.
+    let f = |x: u8, y: u8| -> u8 {
+        let (x, y) = (x as u16, y as u16);
+        let v = if y >= x {
+            x + (y - x) * TINT_PCT / 100
+        } else {
+            x - (x - y) * TINT_PCT / 100
+        };
+        v.min(255) as u8
+    };
+    (f(bg.0, fg.0), f(bg.1, fg.1), f(bg.2, fg.2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A derived tint must be **visible** and must move the right way on any palette.
+    ///
+    /// Both halves were wrong once. Deriving it from `chat_bg`/`composer_bg` gave a 3-unit
+    /// lift on the brand palette — invisible, so the panel looked like it never shipped —
+    /// and a *fixed* fallback would paint the brand's dark tint behind tool calls on the
+    /// `light` theme, since none of the six bundled themes declares the key.
+    #[test_case]
+    fn a_derived_tint_is_visible_and_moves_toward_the_text_on_any_palette() {
+        // Brand dark: chat_bg #1f1e1b lifted toward cream #faf9f5 — lighter, and by
+        // enough to see. The old midpoint-of-two-surfaces gave (34, 32, 29).
+        let dark = tint_toward((31, 30, 27), (250, 249, 245));
+        assert_eq!(dark, (48, 47, 44));
+        assert!(dark.0 > 31 && dark.1 > 30 && dark.2 > 27, "dark theme lifts lighter");
+
+        // The light theme moves the other way — toward its dark text — and stays light.
+        let light = tint_toward((250, 247, 240), (35, 33, 30));
+        assert!(light.0 < 250 && light.1 < 247 && light.2 < 240, "light theme darkens");
+        assert!(light.0 > 200 && light.1 > 200 && light.2 > 200, "but stays light");
+
+        // Visible on both: a lift under ~8 units reads as no band at all.
+        for (bg, fg) in [((31, 30, 27), (250, 249, 245)), ((250, 247, 240), (35, 33, 30))] {
+            let t = tint_toward(bg, fg);
+            let delta = (t.0 as i32 - bg.0 as i32).abs();
+            assert!(delta >= 8, "tint delta {delta} is too small to see");
+        }
+
+        // Never leaves the interval, in either direction.
+        for (bg, fg) in [((0, 0, 0), (255, 255, 255)), ((255, 255, 255), (0, 0, 0)),
+                         ((10, 200, 90), (240, 12, 130))] {
+            let t = tint_toward(bg, fg);
+            for (lo, hi, got) in [
+                (bg.0.min(fg.0), bg.0.max(fg.0), t.0),
+                (bg.1.min(fg.1), bg.1.max(fg.1), t.1),
+                (bg.2.min(fg.2), bg.2.max(fg.2), t.2),
+            ] {
+                assert!(got >= lo && got <= hi, "{got} outside {lo}..={hi}");
+            }
+        }
+        // The overflow case the u16 maths exists for: maxed channels stay maxed.
+        assert_eq!(tint_toward((255, 255, 255), (255, 255, 255)), (255, 255, 255));
+        // A palette whose text and background match gets no band rather than a
+        // wrapped-around colour.
+        assert_eq!(tint_toward((37, 35, 32), (37, 35, 32)), (37, 35, 32));
+    }
 
     #[test_case]
     fn bundled_themes_parse_and_have_palettes() {

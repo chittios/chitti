@@ -37,6 +37,13 @@ pub struct Theme {
     pub composer_border: Rgb,
     /// Hint-bar text under the composer.
     pub composer_hint: Rgb,
+    /// Background of an agent **tool-call block** in the chat pane.
+    ///
+    /// A third elevation, deliberately between `chat_bg` and the user-prompt band's
+    /// `composer_bg`: the two bands sit next to each other in the transcript, so
+    /// reusing one colour would make a tool call look like something the human typed.
+    /// Lower elevation reads as secondary, which is what a tool call is.
+    pub tool_bg: Rgb,
 }
 
 impl Theme {
@@ -64,6 +71,7 @@ impl Theme {
         composer_bg: (37, 35, 32),     // elevated like status_bg
         composer_border: (58, 55, 51), // matches border_dim when unfocused
         composer_hint: (108, 106, 100), // muted
+        tool_bg: (48, 47, 44),         // chat_bg lifted 8% toward the cream text
     };
 }
 
@@ -93,6 +101,7 @@ pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]
     let mut t = Theme::BRAND_DARK;
     let mut has_logo = false;
     let mut has_logo_node = false;
+    let mut has_tool_bg = false;
     for (name, hex) in pairs {
         let slot = match name.as_str() {
             "screen_bg" => &mut t.screen_bg,
@@ -122,6 +131,10 @@ pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]
             "composer_bg" => &mut t.composer_bg,
             "composer_border" => &mut t.composer_border,
             "composer_hint" => &mut t.composer_hint,
+            "tool_bg" => {
+                has_tool_bg = true;
+                &mut t.tool_bg
+            }
             _ => continue,
         };
         *slot = parse_hex(hex, *slot);
@@ -133,6 +146,17 @@ pub fn theme_from_pairs(pairs: &[(alloc::string::String, alloc::string::String)]
     }
     if !has_logo_node {
         t.logo_node = t.chat_fg;
+    }
+    // Same rule as the logo keys: an omitted `tool_bg` is **derived**, never left at the
+    // brand default. Every bundled theme (and every theme a user writes) predates this
+    // key, so a fixed fallback would put a dark tint behind tool calls on `light`. The
+    // midpoint between the pane and the user band gives each theme its own third
+    // elevation, in its own palette, for free.
+    if !has_tool_bg {
+        // The blend itself lives in `crate::theme` — `framebuffer/` is
+        // `#[cfg(not(test))]`, so colour maths written here cannot be unit-tested at all
+        // (a `#[cfg(test)] mod` in this tree is silently never compiled).
+        t.tool_bg = crate::theme::tint_toward(t.chat_bg, t.chat_fg);
     }
     t
 }
