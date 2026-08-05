@@ -1923,6 +1923,83 @@ def s_js_agent_build(g):
     return True, "JS authored, compiled and run on the machine; the host-surface gate refuses an unbound tool with a legible reason"
 
 
+def s_agent_dev_loop(g):
+    """The whole on-machine agent loop: scaffold, compile, validate, install under
+    consent, test under the agent's own identity, rebuild, reload.
+
+    Two things here are only checkable end to end. **Tool registration**: a manifest's
+    `toolset` does not create tools (the registry is a compiled-in list that
+    `for_agent` merely filters), so without registering a local package's own tools
+    its agent can see none of them — `/agents test` would refuse and the agent would
+    look broken. And **reload hygiene**: a tool deleted from the module has to stop
+    existing, or the registry keeps a def pointing at bytes that no longer export it.
+    """
+    m = g.mark()
+    g.send("/agents new devloop")
+    if not g.wait_for("scaffolded", 40, m):
+        return False, "/agents new failed"
+
+    # Before building there is no module, and validate must say so rather than let
+    # the install fail later with "tools.wasm missing".
+    m = g.mark()
+    g.send("/agents validate devloop")
+    if not g.wait_for("error", 40, m):
+        return False, "validate should report the missing module before it is built"
+
+    m = g.mark()
+    g.send("/agents build devloop")
+    if not g.wait_for("3 tool(s)", 180, m):
+        return False, "/agents build did not compile the three scaffolded tools"
+
+    m = g.mark()
+    g.send("/agents validate devloop")
+    if not g.wait_for("0 error(s)", 60, m):
+        return False, "validate should be clean once the module is built"
+
+    # Install goes through the same consent path a registry package takes; --yes is
+    # the scripted stand-in for the modal.
+    m = g.mark()
+    g.send("/agents install devloop --path --yes")
+    if not g.wait_for("registered 3 tool(s)", 120, m):
+        return False, "install did not register the package's own tools"
+
+    # Test runs the real Router under the agent's identity, so the outcome is the
+    # actual gate chain's answer. `_sum` computes; `_note` reaches host storage,
+    # which only works *because* there is an identity here.
+    m = g.mark()
+    g.send('/agents test devloop --tool devloop_sum --args {"xs":[4,5,6]}')
+    if not g.wait_for("ok in", 120, m):
+        return False, "a tool of the installed local agent did not run"
+    if not g.wait_for('"sum":15', 20, m):
+        return False, "the tool ran but did not compute the right answer"
+    m = g.mark()
+    g.send('/agents test devloop --tool devloop_note --args {"text":"remember"}')
+    if not g.wait_for("ok in", 120, m):
+        return False, "a tool using the gated host surface failed under an agent identity"
+
+    # Rebuild with only one tool, then reload: the registry must shed the other two.
+    m = g.mark()
+    g.send("/js build /home/chitti/agents/devloop/tools.js "
+           "-o /home/chitti/agents/devloop/assets/tools.wasm --tools devloop_sum")
+    if not g.wait_for("built", 180, m):
+        return False, "rebuilding with a narrower tool list failed"
+    m = g.mark()
+    g.send("/agents reload devloop")
+    if not g.wait_for("1 tools", 120, m):
+        return False, "reload did not pick up the rebuilt module's tool list"
+    # The tool that no longer exists must be gone, not merely broken.
+    m = g.mark()
+    g.send('/agents test devloop --tool devloop_note --args {}')
+    if not g.wait_for("REFUSED", 120, m):
+        return False, "a tool removed from the module should no longer be callable"
+    # ...and the surviving one still works.
+    m = g.mark()
+    g.send('/agents test devloop --tool devloop_sum --args {"xs":[1,1]}')
+    if not g.wait_for('"sum":2', 120, m):
+        return False, "the surviving tool broke after reload"
+    return True, "on-machine agent loop: new -> build -> validate -> install (consent) -> test -> rebuild -> reload"
+
+
 def s_open_pdf(g):
     """The PDF viewer on a **multi-page** document, which is where the parts that
     a one-page fixture cannot reach live: per-page geometry (pages in one file may
@@ -2846,6 +2923,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("todos_pane", s_todos_pane),
     ("session", s_session),
     ("js_agent_build", s_js_agent_build),
+    ("agent_dev_loop", s_agent_dev_loop),
     ("open_media", s_open_media),
     ("open_pdf", s_open_pdf),
     ("open_video", s_open_video),

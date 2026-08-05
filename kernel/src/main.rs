@@ -19,6 +19,17 @@ fn run_os() -> ! {
     chitti_kernel::agent::system::install_all(chitti_kernel::arch::now_ms());
     // Bundled skills (L0 index only until `skill` is invoked).
     chitti_kernel::skills::bundled::install_all();
+    // Agents authored on this machine (`/agents new` + `/agents install --path`).
+    //
+    // They need re-installing every boot for the same reason the system roster does:
+    // an install registers a role and its tools in memory, and install records are
+    // written to the store but never read back. Without this a local agent's files
+    // would survive a reboot while the agent itself quietly would not.
+    //
+    // Grants come from the **recorded** grant intersected with what the manifest now
+    // asks for, never from the manifest alone — the package lives in a writable store,
+    // so re-reading its requests as authority would make editing a file an escalation.
+    chitti_kernel::agent::local_pkg::reinstall_all(chitti_kernel::arch::now_ms());
     // The `/samples/` corpus, when this image was built with one
     // (CHITTI_SAMPLE_FILES): openable images/video/audio/PDFs on a first boot
     // with no network. Skips files that already exist, so an edited sample on an

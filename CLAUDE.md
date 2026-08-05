@@ -1049,11 +1049,42 @@ FDT claims a GICv3 but carries no readable `reg`.
   Rebuilding the plugin changes its stamp, so **every `tools.wasm` built against the
   old one becomes stale** — detected and reported as "rebuild it", not failed inside
   QuickJS.
-  **Not yet done** (see `~/.claude/plans/start-the-plan-lazy-harp.md`):
-  `/agents validate|install --path|reload|test`, and the id allocation + boot
-  reinstall they need — so a local JS package can be built and called by path today,
-  but not yet *installed* as an agent. Note also that install records are written to
-  the store and never read back, so that persistence is a prerequisite.
+  **The whole loop runs on the machine** (`agent/local_pkg.rs`): `/agents new` →
+  edit → `/agents build` → `/agents validate` → `/agents install <name> --path`
+  (the same consent modal a registry package gets) → `/agents test <name> --tool t
+  --args '{…}'` → `/agents reload`. Five things that path pins down:
+  - **A manifest's `toolset` does not create tools.** `registry::for_agent` only
+    *filters* a compiled-in list, so a name with no `ToolDef` is silently invisible
+    and a freshly installed local agent could call none of its own tools.
+    `local_pkg::register_tools` registers them at install via `register_replace`,
+    deciding which names are the package's own from **the module's exports** — a
+    toolset also lists borrowed tools like `memory_add`, and registering those would
+    shadow the real ones. Reload deregisters the previous set first (remembered in
+    the store, since the registry has no per-agent index), so a tool deleted from
+    the script stops existing rather than lingering as a def over absent bytes.
+  - **A re-install grants `manifest ∩ recorded grant`, never the manifest alone.**
+    The package lives in the store, which any agent with a broad `Fs` scope can
+    write, so re-reading its requests as authority would make editing a file an
+    escalation. `InstallRecord.granted_capabilities` is the ceiling (invariant 5),
+    and `a_reinstall_cannot_widen_the_recorded_grant` pins it.
+  - **Install records are written to the store and never read back**, so
+    `install::load_record` is new and `local_pkg::reinstall_all` runs at boot from
+    `main.rs` — without it a local agent's *files* survive a reboot while its role
+    and tools quietly do not. NB the live-ISO store is memfs, so this only bites on
+    an installed system.
+  - **Ids must survive a reboot** because `/agent/<id>/` holds the SOUL, assets and
+    memory. `next_agent_id()` is an in-memory counter from 1 and the system roster
+    bypasses it with fixed `9000+` ids, so local packages draw from a **persisted**
+    counter at `LOCAL_ID_BASE` (20000) and a name always gets its id back.
+  - **`parse_manifest` is forgiving because it must be** (it also reads the
+    compiled-in manifests at boot, where a hard failure would cost the machine an
+    agent) — and that forgiveness hides real mistakes from a human editing a file:
+    an unrecognised `kind` silently becomes a *service*, an unknown capability
+    `domain` is dropped whole, unknown `rights` vanish, and an unrecognised `scope`
+    widens to **ANY**, the worst reading of a typo. `local_pkg::lint` reports each,
+    is shared by `/agents validate` and the install path, and blocks an install on
+    errors. `/agents test` prints the **structured** `ToolOutcome` — kind,
+    provenance, origin — never a parse of the reply text.
 - **Messaging channels** (`msgchan/`) — external inbox adapters (Telegram
   live; Discord/Slack/webhooks follow the same shape): a named instance +
   backend + access policy delivering inbound DMs into the shell agent and

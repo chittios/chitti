@@ -22,6 +22,7 @@ pub mod compiled;
 pub mod context;
 pub mod home;
 pub mod js_rt;
+pub mod local_pkg;
 pub mod jsmod;
 pub mod manifest;
 pub mod orchestrator;

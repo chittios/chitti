@@ -46,6 +46,29 @@ pub fn is_installed(id: SkillId) -> bool {
     RECORDS.with(|r| r.iter().any(|rec| rec.skill == id))
 }
 
+/// Read an install record back **from the store**.
+///
+/// [`RECORDS`] is only ever populated by [`install`], so after a reboot it is empty
+/// even though `skills/<id>/install` is still on disk. Everything installed from
+/// compiled-in data is re-installed at boot and so refills it; a package that lives
+/// only in the store has no such path, and without this its grant would be lost —
+/// which matters because **the recorded grant is the ceiling on a re-install**
+/// (invariant 5: a skill is bounded by its install-time grant, forever). A manifest
+/// that has been edited to ask for more must not get it.
+pub fn load_record(id: SkillId) -> Option<InstallRecord> {
+    let bytes = crate::synapse::fs::read(&record_key(id))?;
+    postcard::from_bytes::<InstallRecord>(&bytes).ok()
+}
+
+/// Remember a record read from the store, so `granted_caps`/`is_installed` answer
+/// for it without a second install.
+pub fn adopt_record(record: InstallRecord) {
+    RECORDS.with(|r| {
+        r.retain(|rec| rec.skill != record.skill);
+        r.push(record);
+    });
+}
+
 /// Install a package: verify → consent (the caller passes the human-`approved`
 /// subset) → register granting only `approved ∩ requested`. Refuses an
 /// unsigned/tampered/untrusted package. `now`/`approved_by`/`source` describe

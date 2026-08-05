@@ -87,6 +87,9 @@ pub(super) fn run_agents(
         "install" => run_agent_install(sarg, chat),
         "new" => run_agent_new(sarg),
         "build" => run_agent_build(sarg),
+        "validate" | "lint" => run_agent_validate(sarg),
+        "reload" => run_agent_reload(sarg, chat, orch),
+        "test" => run_agent_test(sarg, chat, orch),
         "uninstall" => run_agent_uninstall(sarg),
         "start" => run_agent_start(sarg, chat, orch),
         // Package-UI stops live in run_agent_start (`/agents start stop-…`), but
@@ -413,6 +416,7 @@ pub(super) fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
     let mut toks = arg.split_whitespace();
     let name = toks.next().unwrap_or("").trim();
     let mut auto_yes = false;
+    let mut local = false;
     let mut registry: Option<&str> = None;
     let rest: alloc::vec::Vec<&str> = toks.collect();
     let mut i = 0;
@@ -423,12 +427,17 @@ pub(super) fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
                 registry = rest.get(i + 1).copied();
                 i += 1;
             }
+            // A package authored on this machine (`/agents new` + `/agents build`),
+            // read out of the store instead of the kernel image.
+            "--path" | "--local" => local = true,
             _ => {}
         }
         i += 1;
     }
     if name.is_empty() {
-        serial_println!("usage: /agents install <name> [--yes] [--registry <index-url>]   (built-in: report-writer, note-summarizer)");
+        serial_println!("usage: /agents install <name> [--yes] [--path] [--registry <index-url>]");
+        serial_println!("  --path     install ~/agents/<name>/ (made by /agents new + /agents build)");
+        serial_println!("  built-in:  report-writer, note-summarizer, mcp-agent");
         return;
     }
     // If a registry index was given, confirm the agent is advertised there
@@ -451,11 +460,30 @@ pub(super) fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
             }
         }
     }
-    let pkg = match built_in_package(name) {
-        Some(p) => p,
-        None => {
-            serial_println!("install> no such package '{}' (built-in: report-writer, note-summarizer)", name);
-            return;
+    let pkg = if local {
+        // Read the package the human authored, and refuse a manifest with errors
+        // *before* asking them to approve capabilities from it.
+        match crate::agent::local_pkg::package_from_store(name) {
+            Ok((p, diags)) => {
+                print_diagnostics(name, &diags);
+                p
+            }
+            Err(diags) => {
+                print_diagnostics(name, &diags);
+                serial_println!("install> refused: fix the errors above, then /agents install {name} --path");
+                return;
+            }
+        }
+    } else {
+        match built_in_package(name) {
+            Some(p) => p,
+            None => {
+                serial_println!(
+                    "install> no such package '{}' (built-in: report-writer, note-summarizer; local: add --path)",
+                    name
+                );
+                return;
+            }
         }
     };
     if !pkg.verify() {
@@ -507,11 +535,33 @@ pub(super) fn run_agent_install(arg: &str, chat: &mut Option<ChatSession>) {
     }
     let source = if registry.is_some() {
         crate::agent::types::InstallSource::Registry { name: name.into(), version: pkg.manifest.version.clone() }
+    } else if local {
+        // Finally constructing the variant the types have carried unused: this
+        // package came from the store, and the record says which folder.
+        crate::agent::types::InstallSource::Store {
+            key: crate::agent::types::StoreKey(crate::agent::local_pkg::dir_for(name)),
+        }
     } else {
         crate::agent::types::InstallSource::BootModule { name: name.into() }
     };
+    let local_module: alloc::vec::Vec<u8> =
+        pkg.assets.first().map(|(_, b)| b.clone()).unwrap_or_default();
+    let local_toolset = pkg.manifest.agent.as_ref().map(|a| a.toolset.clone()).unwrap_or_default();
+    let local_desc = pkg.manifest.description.clone();
     match crate::skills::install::install(&pkg, &approved, "user", source, crate::arch::now_ms()) {
         Ok(rec) => {
+            // A manifest's toolset does not create tools — the registry is a
+            // compiled-in list that `for_agent` merely filters — so a local package's
+            // own tools have to be registered here or the agent cannot call them.
+            if local {
+                let tools = crate::agent::local_pkg::register_tools(
+                    name,
+                    &local_module,
+                    &local_toolset,
+                    &local_desc,
+                );
+                serial_println!("install> registered {} tool(s): {}", tools.len(), tools.join(", "));
+            }
             serial_println!(
                 "install> '{}' installed; granted {}/{} requested caps",
                 pkg.manifest.name,
@@ -1046,3 +1096,218 @@ export function @NAME@_note() {
   }
 }
 "#;
+
+/// Print a manifest's diagnostics, errors first.
+fn print_diagnostics(name: &str, diags: &[crate::agent::local_pkg::Diagnostic]) {
+    use crate::agent::local_pkg::Level;
+    let errors = diags.iter().filter(|d| d.level == Level::Error).count();
+    let warns = diags.len() - errors;
+    for d in diags.iter().filter(|d| d.level == Level::Error) {
+        serial_println!("  error  {}: {}", d.field, d.message);
+    }
+    for d in diags.iter().filter(|d| d.level == Level::Warning) {
+        serial_println!("  warn   {}: {}", d.field, d.message);
+    }
+    if errors == 0 && warns == 0 {
+        serial_println!("validate> {name}: ok");
+    } else {
+        serial_println!("validate> {name}: {errors} error(s), {warns} warning(s)");
+    }
+}
+
+/// `/agents validate <name>` — check a local package's manifest and module.
+///
+/// Worth its own command because `parse_manifest` is deliberately forgiving (it also
+/// reads the compiled-in manifests at boot, where a hard failure would cost the
+/// machine an agent) and that forgiveness hides real mistakes from a human editing a
+/// file: an unrecognised `kind` silently becomes a service, an unknown capability
+/// domain is dropped, and an unrecognised scope widens to ANY.
+fn run_agent_validate(arg: &str) {
+    let name = arg.split_whitespace().next().unwrap_or("");
+    if name.is_empty() {
+        serial_println!("usage: /agents validate <name>");
+        return;
+    }
+    let dir = crate::agent::local_pkg::dir_for(name);
+    let Some(bytes) = crate::synapse::fs::read(&alloc::format!("{dir}/manifest.json")) else {
+        serial_println!("validate> no {dir}/manifest.json — /agents new {name} first");
+        return;
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        serial_println!("validate> manifest.json is not valid UTF-8");
+        return;
+    };
+    let mut diags = crate::agent::local_pkg::lint(text);
+    // Also check the built artifact, which is where "it validated but will not run"
+    // hides: a missing, stale or non-wasm module.
+    match crate::agent::local_pkg::package_from_store(name) {
+        Ok((_, more)) => {
+            for d in more {
+                if !diags.iter().any(|x| x.field == d.field && x.message == d.message) {
+                    diags.push(d);
+                }
+            }
+        }
+        Err(more) => {
+            for d in more {
+                if !diags.iter().any(|x| x.field == d.field && x.message == d.message) {
+                    diags.push(d);
+                }
+            }
+        }
+    }
+    print_diagnostics(name, &diags);
+}
+
+/// `/agents reload <name>` — re-install a local package after an edit.
+///
+/// **Capped by the recorded grant**: the manifest is a request, and the ceiling is
+/// what a human already approved. Otherwise editing `manifest.json` in the store and
+/// reloading would be a way to acquire authority nobody consented to — the store is
+/// writable by any agent with a broad `Fs` scope.
+fn run_agent_reload(arg: &str, chat: &mut Option<ChatSession>, orch: &mut crate::agent::orchestrator::Orchestrator) {
+    let name = arg.split_whitespace().next().unwrap_or("");
+    if name.is_empty() {
+        serial_println!("usage: /agents reload <name>");
+        return;
+    }
+    let Some(entry) = crate::agent::local_pkg::lookup(name) else {
+        serial_println!("reload> '{name}' is not installed — /agents install {name} --path");
+        return;
+    };
+    let (pkg, diags) = match crate::agent::local_pkg::package_from_store(name) {
+        Ok(v) => v,
+        Err(d) => {
+            print_diagnostics(name, &d);
+            serial_println!("reload> refused: the package on disk has errors");
+            return;
+        }
+    };
+    if !diags.is_empty() {
+        print_diagnostics(name, &diags);
+    }
+    let requested = pkg.manifest.requested_capabilities.clone();
+    let Some(granted) = crate::agent::local_pkg::regrant(entry.skill, &requested) else {
+        serial_println!("reload> no install record for '{name}' — install it first");
+        return;
+    };
+    if granted.len() < requested.len() {
+        serial_println!(
+            "reload> note: the manifest now requests {} capabilities but {} were approved; keeping the approved set (re-run /agents install {name} --path to widen)",
+            requested.len(),
+            granted.len()
+        );
+    }
+    // A live package UI holds an instance of the old module; drop it so the next call
+    // picks up the rebuilt one.
+    let _ = crate::service::package_ui::stop_named(name);
+    let source = crate::agent::types::InstallSource::Store {
+        key: crate::agent::types::StoreKey(crate::agent::local_pkg::dir_for(name)),
+    };
+    let module: alloc::vec::Vec<u8> = pkg.assets.first().map(|(_, b)| b.clone()).unwrap_or_default();
+    let toolset = pkg.manifest.agent.as_ref().map(|a| a.toolset.clone()).unwrap_or_default();
+    let desc = pkg.manifest.description.clone();
+    match crate::skills::install::install(&pkg, &granted, "user", source, crate::arch::now_ms()) {
+        Ok(_) => {
+            // Re-register: a tool deleted from the script must stop existing, and a
+            // rebuilt module's tools must point at the new bytes.
+            let tools = crate::agent::local_pkg::register_tools(name, &module, &toolset, &desc);
+            serial_println!(
+                "reload> '{name}' reinstalled as agent {} ({} capabilities, {} tools: {})",
+                entry.agent.0,
+                granted.len(),
+                tools.len(),
+                tools.join(", ")
+            );
+            // If the chat is pointed at this agent, rebind so the next turn uses the
+            // new SOUL and toolset rather than the cached ones.
+            if active_agent_id() == entry.agent.0 {
+                rebind_chat_agent(entry.agent.0, orch);
+                *chat = None;
+                serial_println!("reload> chat rebound to the reloaded agent");
+            }
+        }
+        Err(e) => serial_println!("reload> failed: {e:?}"),
+    }
+}
+
+/// `/agents test <name> --tool <tool> [--args <json>]` — invoke one tool under that
+/// agent's identity and print the **structured** outcome.
+///
+/// Structured on purpose. The kind, the provenance and the origin come from the
+/// `ToolOutcome` itself, never from reading the reply text: classifying by text is
+/// what once made `security::redteam` report five permitted attacks as none, and a
+/// test command that lied the same way would be worse than not having one.
+///
+/// The call goes through the **real `Router`** under the agent's own identity, so
+/// what it exercises is the actual gate chain — toolset membership, capabilities,
+/// taint — and not a bypass that happens to work.
+fn run_agent_test(arg: &str, chat: &mut Option<ChatSession>, orch: &mut crate::agent::orchestrator::Orchestrator) {
+    let toks: alloc::vec::Vec<&str> = arg.split_whitespace().collect();
+    let name = toks.first().copied().unwrap_or("");
+    let mut tool = alloc::string::String::new();
+    let mut args = alloc::string::String::from("{}");
+    let mut i = 1;
+    while i < toks.len() {
+        match toks[i] {
+            "--tool" => {
+                tool = toks.get(i + 1).copied().unwrap_or("").to_string();
+                i += 2;
+            }
+            "--args" => {
+                // The JSON contains spaces, so it is everything that follows.
+                let rest = toks[i + 1..].join(" ");
+                if !rest.is_empty() {
+                    args = rest;
+                }
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    if name.is_empty() || tool.is_empty() {
+        serial_println!("usage: /agents test <name> --tool <tool> [--args '<json>']");
+        return;
+    }
+    let Some(entry) = crate::agent::local_pkg::lookup(name) else {
+        serial_println!("test> '{name}' is not installed — /agents install {name} --path");
+        return;
+    };
+    if crate::skills::install::granted_caps(entry.skill).is_none() {
+        serial_println!("test> '{name}' has no install record on this boot");
+        return;
+    }
+
+    // Run as the agent, then put the chat back where it was: a test must not leave
+    // the console talking to something else.
+    let was = active_agent_id();
+    if was != entry.agent.0 {
+        rebind_chat_agent(entry.agent.0, orch);
+        *chat = None;
+    }
+    let t0 = crate::arch::now_ms();
+    let outcome = {
+        use crate::agent::agent_loop::ToolDispatch;
+        use crate::agent::types::ToolCall;
+        let mut router = crate::tools::Router::taint_aware();
+        let call = ToolCall { call_id: 1, tool: tool.clone(), args: args.clone() };
+        let caller = crate::sched::current_task_id();
+        router.call(&mut orch.session, caller, &call)
+    };
+    let ms = crate::arch::now_ms().saturating_sub(t0);
+    if was != entry.agent.0 {
+        rebind_chat_agent(was, orch);
+        *chat = None;
+    }
+
+    serial_println!(
+        "test> {tool} as agent {} — {} in {ms} ms",
+        entry.agent.0,
+        if outcome.is_error { "REFUSED/ERROR" } else { "ok" }
+    );
+    serial_println!("  provenance: {:?}", outcome.provenance);
+    if let Some(origin) = &outcome.origin {
+        serial_println!("  origin:     {origin}");
+    }
+    serial_println!("  result:     {}", outcome.result);
+}

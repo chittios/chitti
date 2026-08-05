@@ -540,6 +540,21 @@ agent). The engine itself is `assets/wasm/javy-plugin.wasm`, rebuilt with
 stripped, because `javy init-plugin` validates through binaryen, which reads the
 `target_features` custom section to decide which wasm features to allow.
 
+Then install and test it without leaving the machine:
+
+```text
+/agents validate demo                    # manifest + module lint, with field names
+/agents install demo --path              # the same consent modal a registry package gets
+/agents test demo --tool demo_sum --args '{"xs":[4,5,6]}'
+/agents reload demo                      # after an edit + /agents build
+```
+
+`/agents test` runs the real `Router` under the agent's own identity and prints the
+structured outcome, so a tool using the gated host surface (`Chitti.storage`) works
+there where the identity-less `/js call` is correctly refused. A **re-install can only
+narrow** the capability grant: the manifest is a request and the recorded grant is the
+ceiling, because the package lives in a writable store.
+
 The lower-level form is `/js build <in.js> [-o out.wasm] [--tools a,b]`; exports are
 scanned from `export function <name>` when `--tools` is omitted. The shape is fixed
 by Javy: exported functions take **no arguments** and their **return value is
