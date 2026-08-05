@@ -44,6 +44,9 @@ enum Model {
     /// piece is the `Q2_0` (GGML type 42) ternary dequant. Higher quality than
     /// the 1-bit at ~2× the footprint; selected with `-model bonsai-27b-ternary`.
     Bonsai27BTernary,
+    /// Liquid LFM2.5-2.6B instruct (`LFM2.5-2.6B-Q4_0.gguf`, ~1.6 GiB). Cortex
+    /// `Lfm2` family: 30 layers, 22 recurrent shortconv + 8 attention.
+    Lfm2_6B,
     /// Any GGUF by path (`-model path/to/file.gguf`): the kernel derives the
     /// architecture/config from the file itself, so xtask only needs the path
     /// and a derived guest-RAM size (leaked `'static` strs — xtask is a
@@ -62,6 +65,8 @@ impl Model {
             Model::Qwen9B | Model::Gemma4E4B => &["model-9b"],
             // ~3.8 GiB Q1_0 / ~7.17 GiB Q2_0 weights → 1 GiB heap (9B tier).
             Model::Bonsai27B | Model::Bonsai27BTernary => &["model-9b"],
+            // ~1.6 GiB Q4_0 weights → default (1 GiB) heap tier.
+            Model::Lfm2_6B => &[],
             // The default tier (1 GiB heap) fits every model: guest RAM is
             // derived from the file size, and the heap sits at the top of it.
             Model::Custom { .. } => &[],
@@ -77,6 +82,7 @@ impl Model {
             Model::Gemma4E4B => "assets/model-gemma4-e4b.gguf",
             Model::Bonsai27B => "assets/model-bonsai-27b-q1.gguf",
             Model::Bonsai27BTernary => "assets/model-bonsai-27b.gguf",
+            Model::Lfm2_6B => "assets/model-lfm2-2.6b.gguf",
             Model::Custom { path, .. } => path,
         }
     }
@@ -104,6 +110,8 @@ impl Model {
             Model::Bonsai27B => "8G",
             // ~7.17 GiB Q2_0 model at 2 GiB + a 1 GiB heap at the top of RAM.
             Model::Bonsai27BTernary => "12G",
+            // ~1.6 GiB Q4_0 at 2 GiB + heap.
+            Model::Lfm2_6B => "5G",
             Model::Custom { mem, .. } => mem,
         }
     }
@@ -116,6 +124,7 @@ impl Model {
             Model::Gemma4E4B => "gemma-4-e4b",
             Model::Bonsai27B => "bonsai-27b",
             Model::Bonsai27BTernary => "bonsai-27b-ternary",
+            Model::Lfm2_6B => "lfm2.5-2.6b",
             Model::Custom { path, .. } => path,
         }
     }
@@ -668,6 +677,12 @@ fn parse_model(rest: &[String]) -> Result<Model, String> {
                 | "bonsai-ternary"
                 | "ternary-bonsai-27b"
                 | "Ternary-Bonsai-27B" => Ok(Model::Bonsai27BTernary),
+                // Liquid LFM2.5-2.6B (Q4_0, cortex Lfm2 family).
+                "lfm2.5-2.6b"
+                | "lfm2-2.6b"
+                | "lfm2.5"
+                | "lfm2"
+                | "LFM2.5-2.6B" => Ok(Model::Lfm2_6B),
                 // Any other value is a GGUF path: the kernel discovers the
                 // architecture from the file, so any family/quant works here.
                 other if other.ends_with(".gguf") => {
@@ -3593,6 +3608,52 @@ const SAMPLE_FILES: &[SampleFile] = &[
         name: "document.pdf",
         url: "https://raw.githubusercontent.com/py-pdf/sample-files/main/002-trivial-libre-office-writer/002-trivial-libre-office-writer.pdf",
         note: "PDF with extractable text, LibreOffice-produced (py-pdf/sample-files)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "pdflatex-4-pages.pdf",
+        url: "https://raw.githubusercontent.com/py-pdf/sample-files/main/004-pdflatex-4-pages/pdflatex-4-pages.pdf",
+        note: "4-page PDF, 24 KiB — the smallest multi-page document here, so page navigation is testable without a 2 MB download (py-pdf/sample-files, CC-BY-SA-4.0)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "pdflatex-image.pdf",
+        url: "https://raw.githubusercontent.com/py-pdf/sample-files/main/003-pdflatex-image/pdflatex-image.pdf",
+        note: "PDF with an embedded raster image (DCTDecode) — the renderer's JPEG-inside-PDF path, which no vector-only document reaches (py-pdf/sample-files, CC-BY-SA-4.0)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "geotopo.pdf",
+        url: "https://raw.githubusercontent.com/py-pdf/sample-files/main/009-pdflatex-geotopo/GeoTopo-komprimiert.pdf",
+        // The "long document with pictures" case, and the only sample where page
+        // *navigation* is more than a formality: 117 pages, 19 embedded JPEGs
+        // (photographic knot renderings with soft shadows), running headers,
+        // boxed theorems and heavy maths. Pages cost ~0.5 s each in the
+        // interpreter, so it is also the demonstration that a long document stays
+        // usable where a figure-dense paper does not.
+        note: "117-page LaTeX book with 19 embedded JPEG figures (Martin Thoma, GeoTopo) — long-document navigation + the raster-image path at scale (py-pdf/sample-files, CC-BY-SA-4.0)",
+        openable: true,
+    },
+    SampleFile {
+        category: "misc",
+        name: "attention.pdf",
+        url: "https://arxiv.org/pdf/1706.03762v7",
+        // The real-world case for the page renderer, and the one that set its
+        // limits: 15 pages, Computer Modern Type 1 fonts, the Transformer
+        // architecture diagram (translucent fills), and two full-page
+        // attention-matrix figures that are the heaviest pages measured
+        // anywhere — 56 MiB of guest memory and ~6.9 s each at pane fit.
+        //
+        // NB its licence is **not** permissive like the rest of this corpus:
+        // arXiv's non-exclusive distribution licence lets arXiv distribute it,
+        // not third parties. That is fine here only because the corpus is
+        // fetched and never committed, so this tree redistributes nothing — the
+        // same rule the voice and WiFi assets follow. Anyone publishing a built
+        // image should drop this entry.
+        note: "\"Attention Is All You Need\" (Vaswani et al., arXiv:1706.03762v7) — 15 pages, Type 1 fonts, vector figures; the renderer's real-world stress case. Licence: arXiv non-exclusive distribution (NOT freely redistributable — fetched here, never committed)",
         openable: true,
     },
     SampleFile {

@@ -55,6 +55,11 @@ pub enum Family {
     /// Gemma 4: attention-only, sliding-window/global interleave with
     /// per-kind geometry, sandwich norms, GELU, logit softcap.
     Gemma4,
+    /// Liquid LFM2.x hybrid: attention layers (QK-norm + RoPE) interleaved
+    /// with **shortconv** recurrent layers (gated causal depthwise conv over a
+    /// cached per-layer state — llama.cpp `models/lfm2.cpp`). A layer is
+    /// recurrent when its `attention.head_count_kv` entry is 0.
+    Lfm2,
 }
 
 /// Gated-DeltaNet (SSM) hyperparameters — present for [`Family::QwenHybrid`].
@@ -109,7 +114,7 @@ pub struct SwaConfig {
 
 /// The numeric hyperparameters Cortex's forward pass needs, pulled from the
 /// `{general.architecture}.*` / `tokenizer.*` metadata keys.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub family: Family,
     pub block_count: usize,
@@ -130,6 +135,12 @@ pub struct Config {
     pub ssm: Option<SsmConfig>,
     /// Sliding-window scheme (Gemma4).
     pub swa: Option<SwaConfig>,
+    /// LFM2: width of the shortconv causal conv kernel (`shortconv.l_cache`);
+    /// 0 for families without recurrent shortconv layers.
+    pub shortconv_l_cache: usize,
+    /// LFM2: per-layer KV heads (0 = recurrent shortconv layer). Empty for
+    /// families where every layer uses the scalar `head_count_kv`.
+    pub kv_heads_per_layer: alloc::vec::Vec<u32>,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: u32,
     /// Whether the template should prepend BOS once at context start.
@@ -142,7 +153,19 @@ impl Config {
         match self.family {
             Family::QwenHybrid => (l + 1) % self.full_attn_interval == 0,
             Family::Gemma4 => true,
+            // LFM2: a layer is attention when its per-layer KV-head count is
+            // non-zero (0 = recurrent shortconv layer).
+            Family::Lfm2 => self
+                .kv_heads_per_layer
+                .get(l)
+                .copied()
+                .unwrap_or(self.head_count_kv as u32)
+                != 0,
         }
+    }
+    /// Is layer `l` a recurrent **shortconv** layer (LFM2; false otherwise)?
+    pub fn is_shortconv(&self, l: usize) -> bool {
+        self.family == Family::Lfm2 && !self.is_attention_layer(l)
     }
     /// Is layer `l` a sliding-window layer (SWA families; false otherwise)?
     pub fn is_sliding(&self, l: usize) -> bool {
@@ -418,8 +441,10 @@ impl<'a> Gguf<'a> {
         let family = match arch {
             "qwen35" | "qwen36" => Family::QwenHybrid,
             "gemma4" => Family::Gemma4,
+            "lfm2" => Family::Lfm2,
             _ if get_u32.contains_key(ak("ssm.inner_size").as_str()) => Family::QwenHybrid,
             _ if get_u32.contains_key(ak("attention.sliding_window").as_str()) => Family::Gemma4,
+            _ if get_u32.contains_key(ak("shortconv.l_cache").as_str()) => Family::Lfm2,
             _ => return Err(GgufError::UnsupportedArch),
         };
 
@@ -439,7 +464,7 @@ impl<'a> Gguf<'a> {
                 state: u32_of("ssm.state_size")? as usize,
                 conv_kernel: u32_of("ssm.conv_kernel")? as usize,
             }),
-            Family::Gemma4 => None,
+            Family::Gemma4 | Family::Lfm2 => None,
         };
 
         // Attention geometry. SWA families carry two variants: the base
@@ -453,6 +478,26 @@ impl<'a> Gguf<'a> {
                 f32_of("rope.freq_base").unwrap_or(10_000_000.0),
                 None,
             ),
+            // LFM2: no key_length / rope.dimension_count keys — full per-head
+            // RoPE, head_dim = n_embd / n_head. head_count_kv is per-layer (the
+            // scalar form is absent); the first nonzero layer value stands in.
+            Family::Lfm2 => {
+                let n_embd = u32_of("embedding_length")? as usize;
+                let n_head = u32_of("attention.head_count")? as usize;
+                let head_dim = n_embd / n_head;
+                let kv = kv_heads_per_layer
+                    .as_ref()
+                    .and_then(|v| v.iter().find(|&&n| n > 0))
+                    .map(|&n| n as usize)
+                    .unwrap_or(n_head);
+                (
+                    kv,
+                    head_dim,
+                    head_dim,
+                    f32_of("rope.freq_base").unwrap_or(10_000_000.0),
+                    None,
+                )
+            }
             Family::Gemma4 => {
                 if block_count > 64 {
                     return Err(GgufError::BadValue("sliding pattern exceeds 64 layers"));
@@ -469,11 +514,11 @@ impl<'a> Gguf<'a> {
                 // (sliding vs global) — the two-geometry scheme.
                 // Accept either a per-layer I32 array *or* a scalar U32 (Gemma 4
                 // E4B ships the scalar form: one n_kv for every layer).
-                let kv: Vec<i32> = if let Some(v) = kv_heads_per_layer {
+                let kv: Vec<i32> = if let Some(v) = kv_heads_per_layer.as_ref() {
                     if v.len() != block_count {
                         return Err(GgufError::BadValue("head_count_kv length != block_count"));
                     }
-                    v
+                    v.clone()
                 } else if let Some(n) = get_u32.get(ak("attention.head_count_kv").as_str()) {
                     alloc::vec![*n as i32; block_count]
                 } else {
@@ -527,7 +572,7 @@ impl<'a> Gguf<'a> {
             rope_freq_base,
             full_attn_interval: match family {
                 Family::QwenHybrid => u32_of("full_attention_interval").unwrap_or(4) as usize,
-                Family::Gemma4 => 1,
+                Family::Gemma4 | Family::Lfm2 => 1,
             },
             head_count: u32_of("attention.head_count")? as usize,
             head_count_kv,
@@ -535,6 +580,10 @@ impl<'a> Gguf<'a> {
             rope_dim,
             ssm,
             swa,
+            shortconv_l_cache: u32_of("shortconv.l_cache").unwrap_or(0) as usize,
+            kv_heads_per_layer: kv_heads_per_layer
+                .map(|v| v.into_iter().map(|n| n.max(0) as u32).collect())
+                .unwrap_or_default(),
             bos_token_id: get_u32.get("tokenizer.ggml.bos_token_id").copied(),
             eos_token_id: get_u32
                 .get("tokenizer.ggml.eos_token_id")

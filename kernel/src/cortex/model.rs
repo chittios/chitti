@@ -282,6 +282,27 @@ enum LayerKind<'a> {
         /// history, which is what made 18 of Gemma-4-E4B's 42 layers wrong.
         kv_src: usize,
     },
+    /// LFM2 attention (llama.cpp `lfm2.cpp`): plain GQA, RMS QK-norm + full
+    /// per-head RoPE, attention scale `1/sqrt(head_dim)`, no gate.
+    Lfm2Attn {
+        q: QWeight<'a>,        // [dim -> n_head*head_dim]
+        k: QWeight<'a>,        // [dim -> n_kv*head_dim]
+        v: QWeight<'a>,        // [dim -> n_kv*head_dim]
+        o: QWeight<'a>,        // [n_head*head_dim -> dim]
+        q_norm: &'a [f32],     // [head_dim]
+        k_norm: &'a [f32],     // [head_dim]
+        n_kv: usize,
+    },
+    /// LFM2 recurrent **shortconv** block (llama.cpp `lfm2.cpp`): a 3-way
+    /// projection split into `b`/`c`/`x`, the gated product `b·x` through a
+    /// **causal depthwise conv1d** over a cached per-layer state (d_conv =
+    /// `shortconv.l_cache - 1` columns), then `c · conv(b·x)` via an out
+    /// projection. The state is the recurrent half of the hybrid.
+    ShortConv {
+        conv: &'a [f32],         // [l_cache * n_embd], tap j of channel c at c*K+j
+        in_proj: QWeight<'a>,    // [dim -> 3*dim]
+        out_proj: QWeight<'a>,   // [dim -> dim]
+    },
 }
 
 struct Layer<'a> {
@@ -411,6 +432,10 @@ impl State {
         let ple_len = ple_e * c.block_count;
         let q_width = (c.head_count * c.head_dim * 2).max(c.head_count * hd_g);
         let kv_width = (c.head_count_kv * c.head_dim).max(kv_g);
+        // LFM2 shortconv scratch: the 3-way in_proj needs 3*dim, and the conv
+        // uses `dim`-wide bx / conv_out staging (reusing the DeltaNet scratch,
+        // which is zero-sized when the family has no ssm).
+        let sc_qkv = if c.family == Family::Lfm2 { 3 * c.embedding_length } else { 0 };
         // Widest matvec input across all projections (columns): the norm-fed
         // projections use `dim`, ffn_down uses the FFN width, o_proj uses
         // head_count*head_dim (per geometry), and the DeltaNet output uses
@@ -429,12 +454,12 @@ impl State {
             v: v(kv_width),
             attn_out: v(q_width),
             scores: v(c.context_length),
-            qkv: v(ssm_conv),
+            qkv: v(ssm_conv.max(sc_qkv)),
             z: v(ssm_inner),
             gates: v(ssm_heads),
-            betas: v(ssm_heads),
+            betas: v(ssm_heads.max(c.embedding_length)),
             conv: v(ssm_conv),
-            delta_o: v(ssm_inner),
+            delta_o: v(ssm_inner.max(c.embedding_length)),
             ffn_gate: v(c.feed_forward_length),
             ffn_up: v(c.feed_forward_length),
             ffn_act: v(c.feed_forward_length),
@@ -466,6 +491,10 @@ pub struct Cache {
     ring: Vec<bool>,
     delta_s: Vec<Vec<f32>>, // [layer] -> [n_v_heads * state * head_v_dim]
     conv: Vec<Vec<f32>>,    // [layer] -> conv ring [conv_kernel * conv_dim]
+    /// LFM2 shortconv recurrent state: `[layer] -> [d_conv * n_embd]` (the
+    /// last `d_conv` columns of `b·x`, prepended causally on the next token).
+    /// Empty on every other family / attention layer.
+    shortconv_state: Vec<Vec<f32>>,
     positions: usize,
 }
 
@@ -483,6 +512,8 @@ impl Cache {
         let mut ring = Vec::with_capacity(n);
         let mut delta_s = Vec::with_capacity(n);
         let mut conv = Vec::with_capacity(n);
+        let mut shortconv_state = Vec::with_capacity(n);
+        let sc_d_conv = c.shortconv_l_cache.saturating_sub(1);
         for l in 0..n {
             if c.is_attention_layer(l) {
                 // Sliding-window layers bound their KV to a W-slot ring (the
@@ -519,8 +550,14 @@ impl Cache {
                 delta_s.push(alloc::vec![0.0f32; s_size]);
                 conv.push(alloc::vec![0.0f32; conv_size]);
             }
+            // LFM2 shortconv recurrent layers keep a per-layer conv state.
+            shortconv_state.push(if c.is_shortconv(l) {
+                alloc::vec![0.0f32; sc_d_conv * c.embedding_length]
+            } else {
+                Vec::new()
+            });
         }
-        Self { attn_k, attn_v, ring, delta_s, conv, positions: 0 }
+        Self { attn_k, attn_v, ring, delta_s, conv, shortconv_state, positions: 0 }
     }
 
     pub fn len(&self) -> usize {
@@ -581,7 +618,7 @@ impl Cache {
 
 impl<'a> Model<'a> {
     pub fn load(gguf: Gguf<'a>) -> Result<Self, GgufError> {
-        let c = gguf.config;
+        let c = &gguf.config;
         let dim = c.embedding_length;
         let ffn = c.feed_forward_length;
         let vocab = gguf.tokens.len().max(1);
@@ -674,6 +711,36 @@ impl<'a> Model<'a> {
                         out: qtensor(&gguf, &n("ssm_out.weight"), value_dim, dim)?,
                     };
                     (kind, f32_tensor(&gguf, &n("post_attention_norm.weight"), dim)?)
+                }
+                Family::Lfm2 if c.is_attention_layer(l) => {
+                    // Per-layer KV heads: 0 marks a recurrent layer, else the
+                    // layer's own GQA count.
+                    let n_kv = c
+                        .kv_heads_per_layer
+                        .get(l)
+                        .copied()
+                        .unwrap_or(c.head_count_kv as u32) as usize;
+                    let kv_dim = n_kv * head_dim;
+                    let kind = LayerKind::Lfm2Attn {
+                        q: qtensor(&gguf, &n("attn_q.weight"), dim, c.head_count * head_dim)?,
+                        k: qtensor(&gguf, &n("attn_k.weight"), dim, kv_dim)?,
+                        v: qtensor(&gguf, &n("attn_v.weight"), dim, kv_dim)?,
+                        o: qtensor(&gguf, &n("attn_output.weight"), c.head_count * head_dim, dim)?,
+                        q_norm: f32_tensor(&gguf, &n("attn_q_norm.weight"), head_dim)?,
+                        k_norm: f32_tensor(&gguf, &n("attn_k_norm.weight"), head_dim)?,
+                        n_kv,
+                    };
+                    (kind, f32_tensor(&gguf, &n("ffn_norm.weight"), dim)?)
+                }
+                Family::Lfm2 => {
+                    // Recurrent shortconv layer: the cached-state conv block.
+                    let k = c.shortconv_l_cache;
+                    let kind = LayerKind::ShortConv {
+                        conv: f32_tensor(&gguf, &n("shortconv.conv.weight"), k * dim)?,
+                        in_proj: qtensor(&gguf, &n("shortconv.in_proj.weight"), dim, 3 * dim)?,
+                        out_proj: qtensor(&gguf, &n("shortconv.out_proj.weight"), dim, dim)?,
+                    };
+                    (kind, f32_tensor(&gguf, &n("ffn_norm.weight"), dim)?)
                 }
             };
             // Gemma E-series per-layer-embedding block. All-or-nothing: a file
@@ -772,6 +839,16 @@ impl<'a> Model<'a> {
                         }
                         acct(o);
                     }
+                    LayerKind::Lfm2Attn { q, k, v, o, .. } => {
+                        acct(q);
+                        acct(k);
+                        acct(v);
+                        acct(o);
+                    }
+                    LayerKind::ShortConv { in_proj, out_proj, .. } => {
+                        acct(in_proj);
+                        acct(out_proj);
+                    }
                 }
             }
         }
@@ -784,7 +861,7 @@ impl<'a> Model<'a> {
         let batched = cfg!(target_arch = "aarch64");
 
         Ok(Self {
-            config: c,
+            config: c.clone(),
             gguf,
             token_embd,
             output,
@@ -1243,6 +1320,8 @@ impl<'a> Model<'a> {
                 LayerKind::Attn { .. } => self.attn_layer(l, pos, cache, s),
                 LayerKind::Delta { .. } => self.delta_layer(l, cache, s),
                 LayerKind::GemmaAttn { .. } => self.gemma_attn_layer(l, pos, cache, s),
+                LayerKind::Lfm2Attn { .. } => self.lfm2_attn_layer(l, pos, cache, s),
+                LayerKind::ShortConv { .. } => self.shortconv_layer(l, cache, s),
             }
             // Gemma sandwich: normalize the block output before its residual.
             if let Some(w) = ly.post_attn_norm {
@@ -1457,6 +1536,114 @@ impl<'a> Model<'a> {
     /// cannot drift.
     fn attn_core(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
         self.attn_core_batched(l, pos, 1, &mut s.q, &mut s.k, &s.v, cache, &mut s.scores, &mut s.attn_out);
+    }
+
+    /// LFM2 attention (llama.cpp `lfm2.cpp` `build_attn_block`): RMS QK-norm,
+    /// full per-head RoPE, plain GQA causal attention at `1/sqrt(head_dim)`,
+    /// out projection — no gate (unlike QwenHybrid). Decode-position core.
+    fn lfm2_attn_layer(&self, l: usize, pos: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let dim = c.embedding_length;
+        let hd = c.head_dim;
+        let nq = c.head_count;
+        let (q_w, k_w, v_w, o_w, q_norm, k_norm, n_kv) = match &self.layers[l].kind {
+            LayerKind::Lfm2Attn { q, k, v, o, q_norm, k_norm, n_kv } => (*q, *k, *v, *o, *q_norm, *k_norm, *n_kv),
+            _ => unreachable!(),
+        };
+        let kv_dim = n_kv * hd;
+        let scale = 1.0 / tensor_sqrtf(hd as f32);
+
+        matvec_qw(q_w, &s.norm, &mut s.q[..nq * hd], &mut s.xq, &mut s.xs, nq * hd, dim);
+        matvec_qw(k_w, &s.norm, &mut s.k[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim);
+        matvec_qw(v_w, &s.norm, &mut s.v[..kv_dim], &mut s.xq, &mut s.xs, kv_dim, dim);
+
+        // Per-head QK norms + full RoPE (V is left bare, as llama.cpp does).
+        for h in 0..nq {
+            let qh = &mut s.q[h * hd..(h + 1) * hd];
+            tensor::rmsnorm_inplace(qh, q_norm, c.rms_eps);
+            tensor::rope_ext(qh, pos, hd, c.rope_freq_base, None);
+        }
+        for h in 0..n_kv {
+            let kh = &mut s.k[h * hd..(h + 1) * hd];
+            tensor::rmsnorm_inplace(kh, k_norm, c.rms_eps);
+            tensor::rope_ext(kh, pos, hd, c.rope_freq_base, None);
+        }
+
+        cache.attn_k[l].extend_from_slice(&s.k[..kv_dim]);
+        cache.attn_v[l].extend_from_slice(&s.v[..kv_dim]);
+        let group = nq / n_kv;
+        let o = &mut s.attn_out[..nq * hd];
+        o.iter_mut().for_each(|x| *x = 0.0);
+        for h in 0..nq {
+            let kvh = h / group;
+            let qh = &s.q[h * hd..(h + 1) * hd];
+            let sc = &mut s.scores[..pos + 1];
+            for t in 0..=pos {
+                let base = t * kv_dim + kvh * hd;
+                let kt = &cache.attn_k[l][base..base + hd];
+                sc[t] = tensor::dot_f32(qh, kt) * scale;
+            }
+            tensor::softmax(sc);
+            for t in 0..=pos {
+                let base = t * kv_dim + kvh * hd;
+                let vt = &cache.attn_v[l][base..base + hd];
+                let w = sc[t];
+                for i in 0..hd {
+                    o[h * hd + i] += w * vt[i];
+                }
+            }
+        }
+        matvec_qw(o_w, &s.attn_out[..nq * hd], &mut s.proj, &mut s.xq, &mut s.xs, dim, nq * hd);
+    }
+
+    /// LFM2 recurrent **shortconv** block (llama.cpp `lfm2.cpp`
+    /// `build_shortconv_block`): in_proj → split `b`/`c`/`x` → `bx = b·x` →
+    /// causal depthwise conv1d over the cached per-layer state (d_conv
+    /// columns, prepended causally) → `y = c·conv(bx)` → out_proj. Decode is
+    /// one token per call, so the conv consumes exactly state ++ [current].
+    fn shortconv_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let dim = c.embedding_length;
+        let (conv, in_proj, out_proj) = match &self.layers[l].kind {
+            LayerKind::ShortConv { conv, in_proj, out_proj } => (*conv, *in_proj, *out_proj),
+            _ => unreachable!(),
+        };
+        let k = c.shortconv_l_cache; // kernel width
+        let d = k.saturating_sub(1); // state columns
+        let proj_len = 3 * dim;
+
+        // 3-way projection: [b | c | x], each `dim` wide.
+        matvec_qw(in_proj, &s.norm, &mut s.qkv[..proj_len], &mut s.xq, &mut s.xs, proj_len, dim);
+        let (b, cg, x) = (&s.qkv[..dim], &s.qkv[dim..2 * dim], &s.qkv[2 * dim..]);
+        let state = &mut cache.shortconv_state[l];
+        // bx = b · x, staged in `betas`.
+        for i in 0..dim {
+            s.betas[i] = b[i] * x[i];
+        }
+        let bx = &s.betas[..dim];
+        // Causal depthwise conv: window[j] = state[i*d+j] for j<d, then bx[i].
+        for i in 0..dim {
+            let mut acc = 0.0f32;
+            for j in 0..d {
+                acc += conv[i * k + j] * state[i * d + j];
+            }
+            acc += conv[i * k + d] * bx[i];
+            s.delta_o[i] = acc;
+        }
+        // y = c · conv_out, then out_proj.
+        for i in 0..dim {
+            s.delta_o[i] *= cg[i];
+        }
+        matvec_qw(out_proj, &s.delta_o[..dim], &mut s.proj, &mut s.xq, &mut s.xs, dim, dim);
+        // Update the state: shift each channel column left, append bx.
+        for i in 0..dim {
+            for j in 0..d.saturating_sub(1) {
+                state[i * d + j] = state[i * d + j + 1];
+            }
+            if d > 0 {
+                state[i * d + d - 1] = bx[i];
+            }
+        }
     }
 
     /// The "position-sequential" part of an attention layer over a whole

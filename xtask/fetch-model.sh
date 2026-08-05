@@ -101,8 +101,15 @@ case "$MODEL" in
     URL="https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf/resolve/main/Ternary-Bonsai-27B-Q2_0.gguf"
     SIZE="~7.17 GB (Q2_0 ternary)"
     ;;
+  lfm2.5-2.6b|lfm2-2.6b|lfm2.5|lfm2|LFM2.5-2.6B)
+    DEST="$DIR/assets/model-lfm2-2.6b.gguf"
+    # Liquid LFM2.5-2.6B instruct, Q4_0 (cortex Lfm2 family: 30 layers,
+    # 22 recurrent shortconv + 8 attention; gpt2 BPE; ChatML-ish delimiters).
+    URL="https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/main/LFM2.5-2.6B-Q4_0.gguf"
+    SIZE="~1.6 GB (Q4_0)"
+    ;;
   *)
-    echo "unknown model '$MODEL' (expected qwen3.5-0.8b|2b|4b|9b, gemma-4-e4b, bonsai-27b, or bonsai-27b-ternary)" >&2
+    echo "unknown model '$MODEL' (expected qwen3.5-0.8b|2b|4b|9b, gemma-4-e4b, bonsai-27b, bonsai-27b-ternary, or lfm2.5-2.6b)" >&2
     exit 1
     ;;
 esac
