@@ -1835,6 +1835,81 @@ def s_samples(g):
     return True, "/samples seeded: png+jpeg decoded, wav opened, mp4 decoded, 117-page pdf rendered + navigated, README present"
 
 
+def s_js_agent_build(g):
+    """Author, compile and run an agent tool **in JavaScript, on the machine** —
+    no host toolchain anywhere in the loop.
+
+    This is the whole point of the QuickJS path: `/agents new` scaffolds a working
+    package (there is no other way to get file content into the store from the
+    shell), `/agents build` compiles `tools.js` to the `assets/tools.wasm` the
+    manifest already names, and `/js call` runs one tool with JSON in and JSON out.
+
+    What would break silently without this scenario: the emitted module's LEB128
+    lengths, the fd-0 config handshake with the engine, the 3-word compile result,
+    and the plugin stamp. Every one of those produces a module that *validates* and
+    then misbehaves, so only executing it proves anything.
+    """
+    m = g.mark()
+    g.send("/agents new jsdemo")
+    if not g.wait_for("scaffolded", 30, m):
+        return False, "/agents new did not scaffold a package"
+    # The scaffold has to be a *working* agent, not a skeleton.
+    m = g.mark()
+    g.send("/cat /home/chitti/agents/jsdemo/tools.js")
+    # `/cat` syntax-highlights, so ANSI codes land between tokens — match a single
+    # identifier rather than a phrase like "export function jsdemo_echo".
+    if not g.wait_for("jsdemo_echo", 20, m):
+        return False, "the scaffolded tools.js has no exported tool"
+
+    m = g.mark()
+    g.send("/agents build jsdemo")
+    if not g.wait_for("built", 180, m):
+        return False, "/agents build did not compile tools.js"
+    out = g.text()[m:]
+    if "jsdemo_echo" not in out or "jsdemo_sum" not in out:
+        return False, f"both tools should have been exported, got: {out[-200:]}"
+
+    # The artifact is a real wasm module at the path the manifest names.
+    m = g.mark()
+    g.send("/ls /home/chitti/agents/jsdemo/assets")
+    if not g.wait_for("tools.wasm", 20, m):
+        return False, "assets/tools.wasm was not produced"
+
+    wasm = "/home/chitti/agents/jsdemo/assets/tools.wasm"
+    # Arguments reach the script and a computed answer comes back.
+    m = g.mark()
+    g.send(f"/js call {wasm} jsdemo_sum '{{\"xs\":[1,2,3,4]}}'")
+    if not g.wait_for('"sum":10', 120, m):
+        return False, "the compiled JS tool did not compute the right answer"
+    m = g.mark()
+    g.send(f"/js call {wasm} jsdemo_echo '{{\"name\":\"chitti\"}}'")
+    if not g.wait_for('"name":"chitti"', 120, m):
+        return False, "arguments did not reach the compiled JS tool"
+
+    # A tool the module does not export fails as a tool error, not a crash, and the
+    # shell stays usable afterwards.
+    m = g.mark()
+    g.send(f"/js call {wasm} not_a_tool '{{}}'")
+    if not g.wait_for("failed", 60, m):
+        return False, "calling a missing tool should report a failure"
+    m = g.mark()
+    g.send("/pwd")
+    if not g.wait_for("/home/chitti", 20, m):
+        return False, "the shell did not survive a failed tool call"
+
+    # Editing the script and rebuilding changes the result — the loop is a loop.
+    # `/js build` is the lower-level form and writes beside its input.
+    m = g.mark()
+    g.send("/js build /home/chitti/agents/jsdemo/tools.js -o /tmp_js/rebuilt.wasm --tools jsdemo_sum")
+    if not g.wait_for("built", 180, m):
+        return False, "/js build (explicit tools + output) failed"
+    m = g.mark()
+    g.send("/js call /tmp_js/rebuilt.wasm jsdemo_sum '{\"xs\":[5,5]}'")
+    if not g.wait_for('"sum":10', 120, m):
+        return False, "the rebuilt module did not run"
+    return True, "JS authored, compiled (QuickJS in wasm) and run on the machine: scaffold -> build -> call"
+
+
 def s_open_pdf(g):
     """The PDF viewer on a **multi-page** document, which is where the parts that
     a one-page fixture cannot reach live: per-page geometry (pages in one file may
@@ -2757,6 +2832,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("plan_mode_and_permissions", s_plan_mode_and_permissions),
     ("todos_pane", s_todos_pane),
     ("session", s_session),
+    ("js_agent_build", s_js_agent_build),
     ("open_media", s_open_media),
     ("open_pdf", s_open_pdf),
     ("open_video", s_open_video),

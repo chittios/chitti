@@ -58,6 +58,16 @@ const PAGE_SIZE: usize = 64 * 1024;
 pub struct Limits {
     pub fuel: u64,
     pub max_memory_pages: u32,
+    /// How many instances may live in one store.
+    ///
+    /// One, for every guest that is a single module. The JavaScript path is the
+    /// exception and the reason this is configurable: a JS-derived `tools.wasm`
+    /// imports the QuickJS engine, so the engine and the module are two instances
+    /// sharing a store. wasmi enforces this through `ResourceLimiter`, and the
+    /// symptom of getting it wrong is the flat refusal `"tried to instantiate too
+    /// many instances"` at the *second* instantiation — which reads like a problem
+    /// with the module rather than with our own bookkeeping.
+    pub max_instances: usize,
     /// Ceiling on function-table elements. An indirect-call table is how a
     /// module does dynamic dispatch, so its size tracks how much abstraction the
     /// guest was compiled with: a hand-written app tool needs tens of entries,
@@ -74,6 +84,7 @@ impl Default for Limits {
             fuel: DEFAULT_FUEL,
             max_memory_pages: DEFAULT_MAX_MEMORY_PAGES,
             max_table_elems: DEFAULT_MAX_TABLE_ELEMS,
+            max_instances: 1,
         }
     }
 }
@@ -91,6 +102,11 @@ impl Limits {
 
     pub fn with_table_elems(mut self, elems: u32) -> Self {
         self.max_table_elems = elems.max(1);
+        self
+    }
+
+    pub fn with_instances(mut self, n: usize) -> Self {
+        self.max_instances = n.max(1);
         self
     }
 }
@@ -124,18 +140,67 @@ pub struct HostState {
     pub last_error: Option<&'static str>,
     /// Rate-limit host_log spam (count of logs this store).
     log_count: u32,
+    /// The three standard file descriptors, for guests that speak WASI stdio
+    /// instead of the string ABI (a QuickJS module built by Javy: args JSON
+    /// arrives on fd 0, the result leaves on fd 1). Empty and untouched for
+    /// every other guest.
+    fds: Fds,
+}
+
+/// fd 0/1/2 backing for a WASI guest, held host-side.
+///
+/// Deliberately three plain buffers rather than a filesystem: the whole point of
+/// this surface is that a guest gets a JSON in and a JSON out and can reach
+/// nothing else. `stdin` is **rewindable** because a Javy plugin reads a runtime
+/// config off fd 0 during `initialize-runtime` and the tool's own arguments have
+/// to be presented afterwards as a fresh stream — feeding one where the other is
+/// expected fails with `unknown field`, which reads like a bad argument rather
+/// than a protocol mistake.
+#[derive(Default)]
+pub struct Fds {
+    stdin: Vec<u8>,
+    stdin_at: usize,
+    stdout: Vec<u8>,
+    /// Bytes already forwarded from fd 2 to ktrace, so a chatty guest cannot
+    /// flood the trace (the same reason `host_log` counts).
+    stderr_bytes: u32,
+}
+
+/// Cap on fd 2 forwarded to ktrace per store.
+const STDERR_TRACE_CAP: u32 = 4096;
+
+impl Fds {
+    /// Present `bytes` as the guest's stdin, from the beginning.
+    pub fn set_stdin(&mut self, bytes: &[u8]) {
+        self.stdin.clear();
+        self.stdin.extend_from_slice(bytes);
+        self.stdin_at = 0;
+    }
+
+    /// Take everything the guest wrote to stdout, clearing it for the next call.
+    pub fn take_stdout(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.stdout)
+    }
+}
+
+impl HostState {
+    pub fn fds(&mut self) -> &mut Fds {
+        &mut self.fds
+    }
 }
 
 struct PageLimiter {
     max_bytes: usize,
     max_table_elems: u32,
+    max_instances: usize,
 }
 
 impl PageLimiter {
-    fn new(max_pages: u32, max_table_elems: u32) -> Self {
+    fn new(limits: &Limits) -> Self {
         Self {
-            max_bytes: (max_pages as usize).saturating_mul(PAGE_SIZE),
-            max_table_elems,
+            max_bytes: (limits.max_memory_pages as usize).saturating_mul(PAGE_SIZE),
+            max_table_elems: limits.max_table_elems,
+            max_instances: limits.max_instances,
         }
     }
 }
@@ -161,15 +226,15 @@ impl ResourceLimiter for PageLimiter {
     }
 
     fn instances(&self) -> usize {
-        1
+        self.max_instances
     }
 
     fn tables(&self) -> usize {
-        1
+        self.max_instances
     }
 
     fn memories(&self) -> usize {
-        1
+        self.max_instances
     }
 }
 
@@ -178,6 +243,44 @@ fn make_engine() -> Engine {
     config.consume_fuel(true);
     config.ignore_custom_sections(true);
     Engine::new(&config)
+}
+
+/// A store and linker on the **JS** import surface, for a caller that has to
+/// instantiate more than one module into the same store.
+///
+/// [`Session`] deliberately owns exactly one instance, so the QuickJS path cannot
+/// use it: a JS-derived `tools.wasm` imports the engine's `cabi_realloc`, `invoke`
+/// and `memory`, which means the plugin must be instantiated first and linked in.
+/// Handing out the pieces keeps that assembly in [`crate::agent::js_rt`] rather
+/// than growing a second shape into `Session`.
+pub fn js_store(
+    limits: Limits,
+    bind: HostBindings,
+) -> Result<(Store<HostState>, Linker<HostState>), &'static str> {
+    // Two instances share this store: the QuickJS engine and the module that
+    // imports it. Without this the second instantiation is refused outright.
+    let limits = limits.with_instances(2);
+    let engine = make_engine();
+    let host = HostState {
+        limiter: PageLimiter::new(&limits),
+        bind,
+        last_error: None,
+        log_count: 0,
+        fds: Fds::default(),
+    };
+    let mut store = Store::new(&engine, host);
+    store.limiter(|s| &mut s.limiter);
+    let fuel = if limits.fuel == 0 { DEFAULT_FUEL } else { limits.fuel };
+    store.set_fuel(fuel).map_err(|_| "fuel metering unavailable")?;
+    let mut linker = Linker::<HostState>::new(&engine);
+    register_host_imports(&mut linker)?;
+    register_wasi_imports(&mut linker)?;
+    Ok((store, linker))
+}
+
+/// Normalise a wasmi call error the way [`Session`] does, for callers outside it.
+pub fn map_trap_pub(err: wasmi::Error) -> &'static str {
+    map_trap(err)
 }
 
 /// Compile + validate module bytes. Pure: no execution.
@@ -262,6 +365,30 @@ impl Session {
         Self::instantiate_with(wasm, limits, HostBindings::default(), HostImportSet::Page)
     }
 
+    /// A JavaScript guest: the agent surface **plus** WASI stdio. See
+    /// [`HostImportSet::Js`] — the `chitti.*` half is identical to what a wasm
+    /// agent gets, so this widens the ABI, not the authority.
+    pub fn instantiate_js(
+        wasm: &[u8],
+        limits: Limits,
+        bind: HostBindings,
+    ) -> Result<Self, &'static str> {
+        Self::instantiate_with(wasm, limits, bind, HostImportSet::Js)
+    }
+
+    /// Present `bytes` as the guest's stdin, from the start. A WASI guest reads
+    /// its arguments here; rewindable because a Javy plugin consumes one stream
+    /// during `initialize-runtime` and the tool's arguments must follow as a new
+    /// one.
+    pub fn set_stdin(&mut self, bytes: &[u8]) {
+        self.store.data_mut().fds.set_stdin(bytes);
+    }
+
+    /// Take what the guest wrote to stdout, clearing it for the next call.
+    pub fn take_stdout(&mut self) -> Vec<u8> {
+        self.store.data_mut().fds.take_stdout()
+    }
+
     fn instantiate_with(
         wasm: &[u8],
         limits: Limits,
@@ -275,10 +402,11 @@ impl Session {
         let module = Module::new(&engine, wasm).map_err(|_| "wasm parse/validate failed")?;
 
         let host = HostState {
-            limiter: PageLimiter::new(limits.max_memory_pages, limits.max_table_elems),
+            limiter: PageLimiter::new(&limits),
             bind,
             last_error: None,
             log_count: 0,
+            fds: Fds::default(),
         };
         let mut store = Store::new(&engine, host);
         store.limiter(|s| &mut s.limiter);
@@ -295,6 +423,10 @@ impl Session {
         match imports {
             HostImportSet::Agent => register_host_imports(&mut linker)?,
             HostImportSet::Page => register_page_imports(&mut linker)?,
+            HostImportSet::Js => {
+                register_host_imports(&mut linker)?;
+                register_wasi_imports(&mut linker)?;
+            }
         }
         // wasmi 1.x runs the start function as part of instantiation.
         let instance = linker
@@ -480,6 +612,11 @@ enum HostImportSet {
     Agent,
     /// Browser page surface: `env` + WASI stubs only (no agent effects).
     Page,
+    /// A JavaScript guest: the **whole** agent surface plus WASI stdio, because
+    /// a QuickJS module reads its arguments from fd 0 and writes its result to
+    /// fd 1. The `chitti.*` half is the identical, already-gated set a wasm
+    /// agent gets — the JS reaches nothing a hand-written module could not.
+    Js,
 }
 
 /// Minimal imports for untrusted page WASM — no storage, UI, or sound.
@@ -505,17 +642,181 @@ fn register_page_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
             },
         )
         .map_err(|_| "define env.log")?;
-    // WASI stubs: return ENOSYS (-1) so modules that probe WASI don't get FS.
-    for (mod_name, field) in [
-        ("wasi_snapshot_preview1", "fd_write"),
-        ("wasi_snapshot_preview1", "fd_close"),
-        ("wasi_snapshot_preview1", "environ_get"),
-        ("wasi_snapshot_preview1", "environ_sizes_get"),
-        ("wasi_snapshot_preview1", "proc_exit"),
-    ] {
-        let _ = linker.func_wrap(mod_name, field, |_caller: Caller<'_, HostState>| -> i32 { -1 });
-    }
+    register_wasi_imports(linker)
+}
+
+/// WASI errno: bad file descriptor.
+const WASI_EBADF: i32 = 8;
+
+/// The `wasi_snapshot_preview1` surface, which is exactly the ten functions a
+/// Javy-compiled module imports — and no more. Only `fd_read` and `fd_write`
+/// move data, against the host-side [`Fds`]; the rest exist so a module that
+/// links WASI can instantiate at all.
+///
+/// **These signatures are load-bearing.** wasmi resolves an import by name *and*
+/// `FuncType`, so a stub of the wrong arity does not degrade gracefully — the
+/// module fails at instantiation with `"wasm instantiate failed (missing
+/// imports/limits?)"`, a message that says nothing about types. This replaced
+/// five stubs that were all declared `() -> i32` while real preview1 takes
+/// parameters, so no genuine WASI module could ever have loaded. Nothing noticed
+/// because the only module on this surface (`pdfrender.wasm`) has no import
+/// section at all, and no test instantiated a WASI importer — `a_wasi_module_can_
+/// instantiate_and_do_stdio` is now that test.
+///
+/// The clock reads zero and the RNG returns zeros. That is not laziness: it is
+/// what `javy build -C deterministic` assumes, and a tool below the determinism
+/// boundary should not be able to observe wall-clock time or entropy anyway.
+fn register_wasi_imports(linker: &mut Linker<HostState>) -> Result<(), &'static str> {
+    const W: &str = "wasi_snapshot_preview1";
+    // fd_read(fd, iovs, iovs_len, nread) -> errno. Drains stdin across the iovec
+    // list; a short read (0 bytes) is EOF, which is how the guest stops looping.
+    linker
+        .func_wrap(
+            W,
+            "fd_read",
+            |mut caller: Caller<'_, HostState>, fd: i32, iovs: i32, iovs_len: i32, nread: i32| -> i32 {
+                if fd != 0 {
+                    return WASI_EBADF;
+                }
+                let mut wrote = 0u32;
+                for i in 0..iovs_len.max(0) {
+                    let Some((ptr, len)) = read_iovec(&caller, iovs, i) else {
+                        return WASI_EBADF;
+                    };
+                    let at = caller.data().fds.stdin_at;
+                    let take = caller.data().fds.stdin.len().saturating_sub(at).min(len);
+                    if take == 0 {
+                        break;
+                    }
+                    let chunk = caller.data().fds.stdin[at..at + take].to_vec();
+                    if write_guest_bytes(&mut caller, ptr as i32, &chunk).is_err() {
+                        return WASI_EBADF;
+                    }
+                    caller.data_mut().fds.stdin_at += take;
+                    wrote += take as u32;
+                }
+                if write_guest_bytes(&mut caller, nread, &wrote.to_le_bytes()).is_err() {
+                    return WASI_EBADF;
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.fd_read")?;
+    // fd_write(fd, iovs, iovs_len, nwritten) -> errno. fd 1 is the result; fd 2
+    // is diagnostics and goes to ktrace, capped so a chatty guest cannot flood it.
+    linker
+        .func_wrap(
+            W,
+            "fd_write",
+            |mut caller: Caller<'_, HostState>, fd: i32, iovs: i32, iovs_len: i32, nwritten: i32| -> i32 {
+                if fd != 1 && fd != 2 {
+                    return WASI_EBADF;
+                }
+                let mut total = 0u32;
+                for i in 0..iovs_len.max(0) {
+                    let Some((ptr, len)) = read_iovec(&caller, iovs, i) else {
+                        return WASI_EBADF;
+                    };
+                    let Some(bytes) = read_guest_bytes(&caller, ptr as i32, len as i32) else {
+                        return WASI_EBADF;
+                    };
+                    if fd == 1 {
+                        caller.data_mut().fds.stdout.extend_from_slice(&bytes);
+                    } else {
+                        let used = caller.data().fds.stderr_bytes;
+                        if used < STDERR_TRACE_CAP {
+                            caller.data_mut().fds.stderr_bytes = used.saturating_add(bytes.len() as u32);
+                            let msg = String::from_utf8_lossy(&bytes);
+                            let preview: String = msg.chars().take(200).collect();
+                            crate::ktrace::log_fmt(format_args!("js.stderr> {}", preview.trim_end()));
+                        }
+                    }
+                    total += len as u32;
+                }
+                if write_guest_bytes(&mut caller, nwritten, &total.to_le_bytes()).is_err() {
+                    return WASI_EBADF;
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.fd_write")?;
+    linker
+        .func_wrap(W, "fd_close", |_c: Caller<'_, HostState>, _fd: i32| -> i32 { 0 })
+        .map_err(|_| "define wasi.fd_close")?;
+    linker
+        .func_wrap(
+            W,
+            "fd_seek",
+            |_c: Caller<'_, HostState>, _fd: i32, _off: i64, _whence: i32, _out: i32| -> i32 { WASI_EBADF },
+        )
+        .map_err(|_| "define wasi.fd_seek")?;
+    linker
+        .func_wrap(
+            W,
+            "fd_fdstat_get",
+            |_c: Caller<'_, HostState>, _fd: i32, _out: i32| -> i32 { 0 },
+        )
+        .map_err(|_| "define wasi.fd_fdstat_get")?;
+    // No environment: both counts written as zero, so `environ_get` has nothing
+    // to fill in.
+    linker
+        .func_wrap(
+            W,
+            "environ_sizes_get",
+            |mut caller: Caller<'_, HostState>, count: i32, size: i32| -> i32 {
+                if write_guest_bytes(&mut caller, count, &0u32.to_le_bytes()).is_err()
+                    || write_guest_bytes(&mut caller, size, &0u32.to_le_bytes()).is_err()
+                {
+                    return WASI_EBADF;
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.environ_sizes_get")?;
+    linker
+        .func_wrap(W, "environ_get", |_c: Caller<'_, HostState>, _a: i32, _b: i32| -> i32 { 0 })
+        .map_err(|_| "define wasi.environ_get")?;
+    linker
+        .func_wrap(
+            W,
+            "clock_time_get",
+            |mut caller: Caller<'_, HostState>, _id: i32, _prec: i64, out: i32| -> i32 {
+                if write_guest_bytes(&mut caller, out, &0u64.to_le_bytes()).is_err() {
+                    return WASI_EBADF;
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.clock_time_get")?;
+    linker
+        .func_wrap(
+            W,
+            "random_get",
+            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                let zeros = alloc::vec![0u8; len.max(0) as usize];
+                if write_guest_bytes(&mut caller, ptr, &zeros).is_err() {
+                    return WASI_EBADF;
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.random_get")?;
+    // A guest that exits is done, not broken: record nothing and return. The
+    // caller reads the result off fd 1 either way.
+    linker
+        .func_wrap(W, "proc_exit", |_c: Caller<'_, HostState>, _code: i32| {})
+        .map_err(|_| "define wasi.proc_exit")?;
     Ok(())
+}
+
+/// Read the `i`-th `iovec` (two little-endian u32s: buffer pointer, length) out
+/// of a guest-supplied array.
+fn read_iovec(caller: &Caller<'_, HostState>, iovs: i32, i: i32) -> Option<(usize, usize)> {
+    let base = iovs.checked_add(i.checked_mul(8)?)?;
+    let raw = read_guest_bytes(caller, base, 8)?;
+    let ptr = u32::from_le_bytes(raw[0..4].try_into().ok()?) as usize;
+    let len = u32::from_le_bytes(raw[4..8].try_into().ok()?) as usize;
+    Some((ptr, len))
 }
 
 fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static str> {
@@ -1426,6 +1727,39 @@ pub const FIXTURE_ECHO: &[u8] = &[
     0x0a, 0x08, 0x01, 0x06, 0x00, 0x20, 0x00, 0x20, 0x01, 0x0b,
 ];
 
+/// A module importing the **real** `wasi_snapshot_preview1` signatures: reads
+/// stdin into a buffer and echoes it to stdout, returning the byte count.
+/// 
+/// ```wat
+/// (import "wasi_snapshot_preview1" "fd_read"  (func (param i32 i32 i32 i32) (result i32)))
+/// (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32)))
+/// (memory (export "memory") 1)
+/// (func (export "echo") (result i32)  ;; iovecs at 0/16, counts at 8/24, buffer at 64
+///   ...)
+/// ```
+/// 
+/// Generated by `tools/wasmgen`-style emission and verified by running it under
+/// wasmi before being pasted here — the same out-of-band route the other fixtures
+/// in this file took (there is no `wat` crate in the kernel).
+pub const FIXTURE_WASI_ECHO: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0d, 0x02, 0x60,
+    0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f, 0x02,
+    0x44, 0x02, 0x16, 0x77, 0x61, 0x73, 0x69, 0x5f, 0x73, 0x6e, 0x61, 0x70,
+    0x73, 0x68, 0x6f, 0x74, 0x5f, 0x70, 0x72, 0x65, 0x76, 0x69, 0x65, 0x77,
+    0x31, 0x07, 0x66, 0x64, 0x5f, 0x72, 0x65, 0x61, 0x64, 0x00, 0x00, 0x16,
+    0x77, 0x61, 0x73, 0x69, 0x5f, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f,
+    0x74, 0x5f, 0x70, 0x72, 0x65, 0x76, 0x69, 0x65, 0x77, 0x31, 0x08, 0x66,
+    0x64, 0x5f, 0x77, 0x72, 0x69, 0x74, 0x65, 0x00, 0x00, 0x03, 0x02, 0x01,
+    0x01, 0x05, 0x03, 0x01, 0x00, 0x01, 0x07, 0x11, 0x02, 0x06, 0x6d, 0x65,
+    0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x04, 0x65, 0x63, 0x68, 0x6f, 0x00,
+    0x02, 0x0a, 0x40, 0x01, 0x3e, 0x00, 0x41, 0x00, 0x41, 0xc0, 0x00, 0x36,
+    0x02, 0x00, 0x41, 0x04, 0x41, 0x20, 0x36, 0x02, 0x00, 0x41, 0x00, 0x41,
+    0x00, 0x41, 0x01, 0x41, 0x08, 0x10, 0x00, 0x1a, 0x41, 0x10, 0x41, 0xc0,
+    0x00, 0x36, 0x02, 0x00, 0x41, 0x14, 0x41, 0x08, 0x28, 0x02, 0x00, 0x36,
+    0x02, 0x00, 0x41, 0x01, 0x41, 0x10, 0x41, 0x01, 0x41, 0x18, 0x10, 0x01,
+    0x1a, 0x41, 0x08, 0x28, 0x02, 0x00, 0x0b,
+];
+
 /// `memory.grow` bomb for page-limiter tests.
 pub const FIXTURE_GROW: &[u8] = &[
     0x00, 0x61, 0x73, 0x6d,
@@ -1511,6 +1845,54 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<Session>();
         assert_send::<HostState>();
+    }
+
+    /// A module that imports the **real** WASI signatures instantiates, and fd 0
+    /// / fd 1 actually move bytes.
+    ///
+    /// Nothing tested this surface before, which is exactly why five stubs
+    /// declared `() -> i32` — the wrong arity for every one of them — sat here
+    /// unnoticed. wasmi resolves an import by name *and* type, so the symptom was
+    /// not a wrong result but `"wasm instantiate failed (missing imports/limits?)"`,
+    /// a message that never mentions types. The only module on the old surface
+    /// (`pdfrender.wasm`) has no imports at all, so nothing ever asked.
+    #[test_case]
+    fn a_wasi_module_can_instantiate_and_do_stdio() {
+        let mut s = Session::instantiate_js(
+            FIXTURE_WASI_ECHO,
+            Limits::default().with_fuel(200_000),
+            HostBindings::default(),
+        )
+        .expect("a real WASI importer must instantiate");
+        let msg = br#"{"hello":"wasi"}"#;
+        s.set_stdin(msg);
+        let n = s.call_i32("echo").expect("echo");
+        assert_eq!(n as usize, msg.len(), "fd_read must report what it handed over");
+        assert_eq!(s.take_stdout(), msg.to_vec(), "fd_write must carry the bytes through");
+        // Draining is real: a second call reads EOF and echoes nothing.
+        let n2 = s.call_i32("echo").expect("echo again");
+        assert_eq!(n2, 0, "stdin is consumed, not re-served");
+        assert!(s.take_stdout().is_empty());
+    }
+
+    /// The same guest instantiates on the **Page** surface too, because both sets
+    /// register one shared shim.
+    ///
+    /// So the fd plumbing is *present* for a browser module, not absent — worth
+    /// stating plainly rather than implying isolation that is not implemented.
+    /// What makes it inert there is that nothing on the page path ever calls
+    /// `set_stdin`/`take_stdout`: stdin is empty and stdout is dropped, and the
+    /// buffers live in the per-`Store` `HostState`, so no two guests share them.
+    /// If a page ever needs to be denied stdio outright, that is a separate,
+    /// deliberate change — a distinct shim for the Page set.
+    #[test_case]
+    fn page_surface_links_the_same_wasi_shim() {
+        let mut s = Session::instantiate_page(FIXTURE_WASI_ECHO, Limits::default().with_fuel(200_000))
+            .expect("page surface must still instantiate a WASI importer");
+        s.set_stdin(b"ignored");
+        let n = s.call_i32("echo").expect("echo");
+        assert_eq!(n, 7, "the shim is shared, so fd 0 still reads");
+        assert_eq!(s.take_stdout(), b"ignored".to_vec());
     }
 
     #[test_case]

@@ -514,6 +514,29 @@ cp target/wasm32-unknown-unknown/release/<crate>.wasm ../../agents/<name>/assets
 # apps-wasm: copy the same module to every app package that ships it
 ```
 
+### Or write the tools in JavaScript, on the machine
+
+A package's `assets/tools.wasm` does not have to come from Rust. `/agents new
+<name>` scaffolds a package whose `tools.js` exports one function per tool, and
+`/agents build <name>` compiles it to that same `assets/tools.wasm` **on the
+running OS** — QuickJS is in the image (`assets/wasm/javy-plugin.wasm`), so no host
+toolchain is involved:
+
+```text
+/agents new demo                     # SOUL.md + manifest.json + a working tools.js
+/open ~/agents/demo/tools.js         # edit
+/agents build demo                   # -> assets/tools.wasm  (~90 ms)
+/js call ~/agents/demo/assets/tools.wasm demo_sum '{"xs":[1,2,3]}'
+```
+
+The lower-level form is `/js build <in.js> [-o out.wasm] [--tools a,b]`; exports are
+scanned from `export function <name>` when `--tools` is omitted. The shape is fixed
+by Javy: exported functions take **no arguments** and their **return value is
+dropped**, so arguments arrive as JSON on stdin and the result leaves as JSON on
+stdout (`readArgs()` / `reply()` in the scaffold). Module top level re-runs on every
+call, so **JS globals do not persist** — durable state belongs in storage, which is
+why package-UI apps (whose guest statics *are* their state) stay Rust.
+
 Modules are string-ABI (`export(args_ptr, args_len) -> i64 = (ptr<<32)|len`),
 no_std, and run under manifest-declared fuel + memory limits — see the Apps
 bullet in [CLAUDE.md](CLAUDE.md) for the ABI contract and gotchas. `pdf-wasm`

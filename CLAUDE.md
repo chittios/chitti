@@ -219,6 +219,13 @@ a memory-page limiter, a per-call fuel bound. Five things that path pins down:
   (340x on the worst page) to **3-30x**. SIMD also *lowered* fuel use 3x — a vector op does
   several scalars' work and is charged once — so a fuel budget does not survive a change in
   how the guest is compiled.
+- **The WASI stubs were all declared `() -> i32`** — the wrong arity for every one
+  of the five. wasmi resolves an import by name *and* `FuncType`, so no real WASI
+  module could ever have instantiated, and the symptom was again
+  `"wasm instantiate failed (missing imports/limits?)"`. Nothing noticed because the
+  only module on that surface (`pdfrender.wasm`) has no import section at all and no
+  test instantiated a WASI importer. `register_wasi_imports` now implements the ten
+  functions Javy needs, with fd 0/1 backed by host-side buffers.
 - **Fuel metering costs 3.7%**, measured with it off. It stays on: that is the only bound on
   a runaway guest, and 3.7% is not a price worth arguing about.
 - **In-kernel is ~3x slower than the host on heavy pages and equal on light ones**, which is
@@ -972,6 +979,58 @@ FDT claims a GICv3 but carries no readable `reg`.
   kernel `json_str` unescapes `\n`; `image/inflate.rs` is raw RFC 1951 (strip
   the zlib header) and its `#[test_case]` tests need a shim under host
   `cargo test`.
+- **Agent tools in JavaScript, compiled on the machine.** A package's
+  `assets/tools.wasm` need not come from Rust: `/agents new <name>` scaffolds
+  `~/agents/<name>/{SOUL.md,manifest.json,tools.js}` with two working tools, and
+  `/agents build <name>` compiles `tools.js` into that same `assets/tools.wasm`
+  **on the running OS** (~90 ms). The compiler is a wasm module in the image —
+  [Javy](https://github.com/bytecodealliance/javy)'s QuickJS plugin
+  (`assets/wasm/javy-plugin.wasm`, 1.3 MiB, Apache-2.0 + MIT) — driven by
+  `agent/js_rt.rs`, with `agent/jsmod.rs` wrapping the bytecode into a module.
+  Lower-level: `/js build <in.js> [-o out] [--tools a,b]` and
+  `/js call <module.wasm> <tool> '<args json>'`.
+  **There is deliberately no new `ToolBinding`, no `js` manifest field and no
+  second kind of agent** — JavaScript is a source language, the artifact and the
+  manifest are the ordinary ones, so `effect_of`/`origin_of`/`paper-check`/the
+  `redteam` census are untouched. Seven things this path pins down:
+  - **`compile-src` returns bytecode, not a module**, so `jsmod::emit` writes the
+    wasm itself. It is a fixed template decoded from `javy build -C dynamic`: three
+    types, three imports from the plugin's namespace, one function + one export per
+    tool, and two passive data segments (bytecode, names). Each body reallocs and
+    `memory.init`s its inputs then calls `invoke`; `memory.init` takes a source
+    offset, so one names segment serves every tool. **The emitted module exports the
+    same names a Rust module would**, which is why nothing downstream changed.
+  - **A wrong LEB128 length still validates.** So the tests execute the output
+    (`javascript_compiles_and_runs_on_this_machine`) and validate it at 1/127/128/
+    300/16384-byte bytecode lengths, rather than diffing against a golden blob.
+  - **`initialize-runtime` reads a config JSON off fd 0.** Feed it `{}` and rewind
+    fd 0 before the tool's arguments, or it eats them and fails `unknown field 'q',
+    expected one of 'javy-stream-io',…` — which reads like a bad argument.
+  - **`compile-src`'s result is a 3-word area** `[discriminant, ptr, len]`. Read as
+    two words you get a plausible pointer and QuickJS rejects it with
+    `invalid version (0 expected=26)`.
+  - **`invoke` resolves an ESM export verbatim** — snake_case works. The Javy CLI's
+    kebab→camel mapping is the CLI's convention, and this emitter bypasses the CLI.
+  - **The `ResourceLimiter` capped instances at 1**, and the JS path needs two in
+    one store (engine + module). wasmi refuses the second with `tried to instantiate
+    too many instances`, which reads like a problem with the module. Now
+    `Limits::with_instances`, defaulted to 1 so every other guest is unchanged.
+  - **A syntax error costs the engine instance**: the plugin panics inside its own
+    WASI shim rather than returning `compile-src`'s error arm, so the session is
+    poisoned. `build_module` therefore starts a fresh session per build — a *cached*
+    compiler would reject every good script after one bad one.
+  Contract differences from a Rust tool, both stated because they surface as
+  confusing bugs otherwise: exported functions take **no arguments** and their
+  **return value is dropped** (args JSON in on fd 0, result JSON out on fd 1), and
+  **module top level re-runs per call**, so JS globals do not persist — durable state
+  goes through storage, and package-UI apps (whose guest statics *are* their state)
+  stay Rust. A JS call costs **3-4 Mfuel before the script does anything**, hence
+  `js_rt`'s budgets rather than `DEFAULT_FUEL`'s 5 M.
+  **Not yet done** (see `~/.claude/plans/start-the-plan-lazy-harp.md`): a custom
+  plugin exposing the gated `chitti.host_*` surface to JS, so a JS tool currently
+  has stdio and nothing else; runtime ABI detection in `call_agent_export`, so a
+  JS-built `tools.wasm` is not yet reachable as an installed agent's tool; and
+  `/agents validate|install --path|reload|test` with the persistence that needs.
 - **Messaging channels** (`msgchan/`) — external inbox adapters (Telegram
   live; Discord/Slack/webhooks follow the same shape): a named instance +
   backend + access policy delivering inbound DMs into the shell agent and

@@ -74,6 +74,25 @@ source under `~/.cargo/registry/` and upstream.
 
 ---
 
+## Javy + QuickJS — `assets/wasm/javy-plugin.wasm` (JavaScript engine)
+
+Agent tools can be written in JavaScript and compiled **on the machine**: the
+compiler and the engine are one wasm module, a [Javy](https://github.com/bytecodealliance/javy)
+plugin (v9.1.0) built on **QuickJS**. `kernel/src/agent/js_rt.rs` drives its
+`compile-src` to turn a script into QuickJS bytecode, and
+`kernel/src/agent/jsmod.rs` wraps that bytecode into an ordinary `assets/tools.wasm`
+which then runs under the `wasmi` sandbox above, with the same fuel and memory
+limits every other guest gets.
+
+The plugin binary is checked in and `include_bytes!`d into the kernel image; nothing
+of its source is vendored here. It is the stock `plugin.wasm` asset from the Javy
+release, which embeds QuickJS.
+
+Javy is licensed under **Apache-2.0**; QuickJS (Fabrice Bellard, Charlie Gordon) is
+**MIT**. Both license texts ship with their upstream sources.
+
+---
+
 ## hayro + vello_cpu — crates.io (PDF page rasterizer, `assets/wasm/pdfrender.wasm`)
 
 The PDF viewer renders real pages with [hayro](https://github.com/LaurenzV/hayro)

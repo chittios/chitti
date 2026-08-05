@@ -961,6 +961,102 @@ fn run_js(arg: &str) {
             serial_println!("js> running {full} ({} bytes)", bytes.len());
             js_run_source(&source, false, &argv);
         }
+        JsCli::Build { input, output, tools } => run_js_build(&input, output.as_deref(), &tools),
+        JsCli::Call { module, tool, args } => run_js_call(&module, &tool, &args),
+    }
+}
+
+/// `/js build` — compile a script to an agent's `tools.wasm` on this machine.
+///
+/// The whole point of the JavaScript path: no host toolchain, one artifact, and
+/// the same `tools.wasm` a Rust module would have produced.
+fn run_js_build(input: &str, output: Option<&str>, tools: &[String]) {
+    let src_path = resolve_path(input);
+    let Some(bytes) = read_mounted(&src_path).or_else(|| crate::synapse::fs::read(&src_path)) else {
+        serial_println!("js> cannot open '{src_path}'");
+        return;
+    };
+    let Ok(src) = core::str::from_utf8(&bytes) else {
+        serial_println!("js> {src_path}: not valid UTF-8");
+        return;
+    };
+    // Exports come from the script unless the caller named them, so the common
+    // case needs no flags and the two can never silently disagree.
+    let names: alloc::vec::Vec<String> = if tools.is_empty() {
+        crate::agent::jsmod::scan_exports(src)
+    } else {
+        tools.to_vec()
+    };
+    if names.is_empty() {
+        serial_println!("js> no tools to export: add `export function <name>() {{…}}` or pass --tools");
+        return;
+    }
+    let refs: alloc::vec::Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let t0 = crate::arch::now_ms();
+    let module = match crate::agent::js_rt::build_module(src, &refs) {
+        Ok(m) => m,
+        Err(e) => {
+            serial_println!("js> build failed: {e}");
+            return;
+        }
+    };
+    let out_path = match output {
+        Some(o) => resolve_path(o),
+        // Default beside the source: `tools.js` -> `tools.wasm`, which is the name
+        // a package manifest already points at.
+        None => alloc::format!("{}.wasm", src_path.strip_suffix(".js").unwrap_or(&src_path)),
+    };
+    crate::synapse::fs::write(&out_path, &module);
+    serial_println!(
+        "js> built {out_path} — {} bytes, {} tool(s): {} (in {} ms)",
+        module.len(),
+        names.len(),
+        names.join(", "),
+        crate::arch::now_ms().saturating_sub(t0)
+    );
+}
+
+/// `/js call` — run one tool of a JS-derived module, args JSON in, JSON out.
+fn run_js_call(module: &str, tool: &str, args: &str) {
+    let path = resolve_path(module);
+    let Some(wasm) = read_mounted(&path).or_else(|| crate::synapse::fs::read(&path)) else {
+        serial_println!("js> cannot open '{path}'");
+        return;
+    };
+    // A stale artifact is the one failure worth naming before running: QuickJS
+    // would otherwise reject its own bytecode with `invalid version`, which reads
+    // like a broken module rather than one built against another engine.
+    let want = crate::agent::js_rt::JsSession::plugin_stamp();
+    match crate::agent::jsmod::plugin_stamp(&wasm) {
+        Some(got) if got == want => {}
+        Some(got) => {
+            serial_println!("js> {path} was built against '{got}', this machine has '{want}' — rebuild with /js build");
+            return;
+        }
+        None => serial_println!("js> note: {path} carries no plugin stamp (not built here?)"),
+    }
+    let limits = crate::agent::wasm_rt::Limits::default()
+        .with_fuel(crate::agent::js_rt::JS_CALL_FUEL)
+        .with_pages(crate::agent::js_rt::JS_MEM_PAGES)
+        .with_table_elems(crate::agent::js_rt::JS_TABLE_ELEMS);
+    let t0 = crate::arch::now_ms();
+    let mut js = match crate::agent::js_rt::JsSession::with_module(
+        &wasm,
+        limits,
+        crate::agent::wasm_rt::HostBindings::default(),
+    ) {
+        Ok(j) => j,
+        Err(e) => {
+            serial_println!("js> {e}");
+            return;
+        }
+    };
+    match js.call(tool, args) {
+        Ok(out) => serial_println!(
+            "js> {tool} -> {out}  ({} ms)",
+            crate::arch::now_ms().saturating_sub(t0)
+        ),
+        Err(e) => serial_println!("js> {tool} failed: {e}"),
     }
 }
 
@@ -970,6 +1066,10 @@ fn print_js_usage() {
     serial_println!("  /js -p \"expr\"                 evaluate and print the result");
     serial_println!("  /js script.js [arg…]          run a .js file; process.argv has the args");
     serial_println!("  /js <expression>              bare code (compat): /js 1+2  →  js= 3");
+    serial_println!("js> compile JavaScript to a wasm agent tool (QuickJS, on this machine):");
+    serial_println!("  /js build tools.js [-o tools.wasm] [--tools a,b]");
+    serial_println!("      exports are scanned from `export function <name>` unless --tools is given");
+    serial_println!("  /js call tools.wasm <tool> '{{\"k\":1}}'   run one tool; args JSON in, JSON out");
 }
 
 /// How `/js` was invoked after flag parsing.
@@ -984,6 +1084,20 @@ enum JsCli {
     File {
         path: String,
         argv: alloc::vec::Vec<String>,
+    },
+    /// `/js build <in.js> [-o out.wasm] [--tools a,b]` — compile JavaScript to a
+    /// `tools.wasm` on this machine.
+    Build {
+        input: String,
+        output: Option<String>,
+        tools: alloc::vec::Vec<String>,
+    },
+    /// `/js call <module.wasm> <tool> ['<args json>']` — run one tool of a
+    /// JS-derived module.
+    Call {
+        module: String,
+        tool: String,
+        args: String,
     },
 }
 
@@ -1026,6 +1140,46 @@ fn parse_js_cli(arg: &str) -> Result<JsCli, String> {
             source: code.clone(),
             print: true,
             argv,
+        });
+    }
+    // Subcommands come before the "bare code" fallback: `build`/`call` would
+    // otherwise be evaluated as JavaScript identifiers.
+    if t0 == "build" {
+        let Some(input) = tokens.get(1) else {
+            return Err(String::from("usage: /js build <in.js> [-o <out.wasm>] [--tools a,b]"));
+        };
+        let mut output = None;
+        let mut tools = alloc::vec::Vec::new();
+        let mut i = 2;
+        while i < tokens.len() {
+            match tokens[i].as_str() {
+                "-o" | "--out" => {
+                    output = tokens.get(i + 1).cloned();
+                    if output.is_none() {
+                        return Err(String::from("missing path after -o"));
+                    }
+                    i += 2;
+                }
+                "--tools" => {
+                    let Some(list) = tokens.get(i + 1) else {
+                        return Err(String::from("missing tool list after --tools"));
+                    };
+                    tools = list.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+                    i += 2;
+                }
+                other => return Err(alloc::format!("unknown build option '{other}'")),
+            }
+        }
+        return Ok(JsCli::Build { input: input.clone(), output, tools });
+    }
+    if t0 == "call" {
+        let (Some(module), Some(tool)) = (tokens.get(1), tokens.get(2)) else {
+            return Err(String::from("usage: /js call <module.wasm> <tool> ['<args json>']"));
+        };
+        return Ok(JsCli::Call {
+            module: module.clone(),
+            tool: tool.clone(),
+            args: tokens.get(3).cloned().unwrap_or_else(|| String::from("{}")),
         });
     }
     if t0.starts_with('-') && t0 != "-" {
