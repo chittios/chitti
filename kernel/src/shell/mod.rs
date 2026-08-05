@@ -6016,10 +6016,15 @@ fn next_seq_byte() -> Option<u8> {
 /// `ESC[201~`, which is consumed. Content bytes (including newlines) are
 /// returned verbatim; a stray CSI inside the paste is skipped. Bounded in total
 /// length so a malformed stream can't spin forever.
+///
+/// Accumulated as **bytes** and decoded once at the end. Pushing each byte as a `char`
+/// re-encodes every byte of a multi-byte character as its own Latin-1 codepoint, so
+/// pasting anything but ASCII — Tamil, an em dash, an emoji — produced mojibake (and a
+/// string twice the size), the same defect the markdown highlighter had.
 fn read_bracketed_paste() -> String {
-    let mut out = String::new();
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     const CAP: usize = 256 * 1024;
-    while out.len() < CAP {
+    while buf.len() < CAP {
         let b = match next_seq_byte() {
             Some(b) => b,
             None => break, // paced-out: treat what we have as the paste
@@ -6043,10 +6048,12 @@ fn read_bracketed_paste() -> String {
             }
             // Any other CSI inside a paste is ignored (very unusual).
         } else {
-            out.push(b as char);
+            buf.push(b);
         }
     }
-    out
+    // Lossy: a paste is somebody else's clipboard, so invalid UTF-8 is possible and a
+    // replacement char is the right answer — never a panic, and never a silent drop.
+    alloc::string::String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Paint the suggestion popup for an already-built item list (↑/↓ selection).

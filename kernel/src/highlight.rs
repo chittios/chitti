@@ -383,11 +383,19 @@ fn lex_md(b: &[u8], st: &mut State, out: &mut [Class]) {
 /// Render one line as ANSI-coloured text (24-bit SGR runs + trailing reset).
 /// Bytes classified [`Class::Text`] are left uncoloured, so the surrounding
 /// stream's default colour shows through.
+///
+/// Iterates **characters**, not bytes. `classes` is a per-byte array, so the class comes
+/// from the char's first byte — but the char itself must be pushed whole. Pushing
+/// `byte as char` re-encodes each byte of a multi-byte character as its own Latin-1
+/// codepoint (`E0 AE 9F` -> `à ® Ÿ`), which is exactly the mojibake Tamil, Devanagari, CJK
+/// and even a `→` came out as. Nothing about it looks like a text bug from the outside: the
+/// fallback fonts load and report success, because the scalars being asked for really are
+/// Latin-1 letters that Geist Mono has.
 pub fn ansi_line(lang: Lang, line: &str, st: &mut State) -> String {
     let cls = classes(lang, line, st);
     let mut out = String::with_capacity(line.len() + 16);
     let mut cur = Class::Text;
-    for (i, ch) in line.bytes().enumerate() {
+    for (i, ch) in line.char_indices() {
         let c = cls[i];
         if c != cur {
             if c == Class::Text {
@@ -398,7 +406,7 @@ pub fn ansi_line(lang: Lang, line: &str, st: &mut State) -> String {
             }
             cur = c;
         }
-        out.push(ch as char);
+        out.push(ch);
     }
     if cur != Class::Text {
         out.push_str("\x1b[0m");
@@ -511,6 +519,27 @@ fn render_md_line(line: &str, st: &mut State) -> String {
     render_inline_md(line)
 }
 
+/// Copy the whole character at byte offset `i` of `s` into `out`, returning how far to
+/// advance.
+///
+/// The markdown scanners walk bytes because every marker they look for is ASCII, and an
+/// ASCII byte can never occur inside a multi-byte UTF-8 sequence (continuation bytes are
+/// all >= 0x80) — so byte scanning is correct for *finding* markers. It is only the
+/// fallthrough copy that has to be character-aware: `out.push(b[i] as char)` turns each
+/// byte into its own Latin-1 codepoint, which is how a line of Tamil became
+/// `à®Ÿà®¤à¯...` on screen while every fallback font reported loading fine.
+fn push_char_at(out: &mut String, s: &str, i: usize) -> usize {
+    match s.get(i..).and_then(|t| t.chars().next()) {
+        Some(ch) => {
+            out.push(ch);
+            ch.len_utf8()
+        }
+        // `i` is not a char boundary, which the marker scans should make impossible.
+        // Skip the byte rather than panic: a garbled glyph beats a dead shell.
+        None => 1,
+    }
+}
+
 /// Remove common inline markdown markers, keep plain text only.
 fn strip_inline_markers(s: &str) -> String {
     let b = s.as_bytes();
@@ -536,8 +565,7 @@ fn strip_inline_markers(s: &str) -> String {
             i += 1;
             continue;
         }
-        out.push(b[i] as char);
-        i += 1;
+        i += push_char_at(&mut out, s, i);
     }
     out
 }
@@ -578,8 +606,7 @@ fn render_inline_md(s: &str) -> String {
                 }
             }
         }
-        out.push(b[i] as char);
-        i += 1;
+        i += push_char_at(&mut out, s, i);
     }
     out
 }
@@ -798,6 +825,49 @@ mod tests {
         assert_eq!(lang_for_tag("go"), Some(Lang::Go));
         let c = classes(Lang::Go, "func main()", &mut State::default());
         assert_eq!(c[0], Class::Keyword, "func is a Go keyword");
+    }
+
+    /// Non-ASCII text must survive every highlight path **byte-for-byte**.
+    ///
+    /// All three paths copied their output a byte at a time with `b[i] as char`, which
+    /// re-encodes each byte of a multi-byte character as its own Latin-1 codepoint: a line
+    /// of Tamil arrived as `à®Ÿà®¤à¯…`, and a `→` in a reply as `â††`. It looked like a
+    /// font problem and was not — every fallback face loaded and reported success, because
+    /// the scalars being requested really were Latin-1 letters that Geist Mono has.
+    #[test_case]
+    fn non_ascii_text_survives_every_highlight_path() {
+        // Tamil (3-byte chars), Devanagari, CJK, an arrow, and an emoji (4-byte).
+        for sample in [
+            "தமிழ் உரை",
+            "नमस्ते",
+            "日本語のテキスト",
+            "tools.js → assets/tools.wasm",
+            "done 🎉 ok",
+            "mixed தமிழ் and ASCII",
+        ] {
+            // `ansi_line` for every language, since each runs its own lexer over the bytes.
+            for lang in [Lang::Md, Lang::Json, Lang::Rust, Lang::Python, Lang::Sh, Lang::Go] {
+                let out = ansi_line(lang, sample, &mut State::default());
+                let plain = strip_ansi(&out);
+                assert_eq!(plain, sample, "ansi_line({lang:?}) mangled {sample:?}");
+            }
+            // ...and the markdown document renderer, which strips markers as it copies.
+            let doc = strip_ansi(&render_md_document(sample));
+            assert!(doc.contains(sample), "render_md_document mangled {sample:?}: {doc:?}");
+        }
+
+        // Markers around non-ASCII still work, and the text between them is intact.
+        let bold = strip_ansi(&render_md_document("**தமிழ்** plain"));
+        assert!(bold.contains("தமிழ்"), "bold content mangled: {bold:?}");
+        assert!(!bold.contains("**"), "bold markers not stripped: {bold:?}");
+        let code = strip_ansi(&render_md_document("run `தமிழ்` now"));
+        assert!(code.contains("தமிழ்"), "inline code mangled: {code:?}");
+
+        // The specific corruption, stated as a negative so a regression is unmistakable:
+        // `à` is what byte 0xE0 becomes when pushed as a char.
+        let out = strip_ansi(&ansi_line(Lang::Md, "தமிழ்", &mut State::default()));
+        assert!(!out.contains('à'), "byte-as-char mojibake is back: {out:?}");
+        assert_eq!(out.chars().count(), "தமிழ்".chars().count());
     }
 
     #[test_case]
