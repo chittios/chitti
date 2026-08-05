@@ -630,7 +630,13 @@ impl<'a> Model<'a> {
         let token_embd = qtensor(&gguf, "token_embd.weight", dim, vocab)?;
         // Untied output projection if the GGUF has one (the 9B); else tied.
         let output = qtensor(&gguf, "output.weight", dim, vocab).ok();
-        let output_norm = f32_tensor(&gguf, "output_norm.weight", dim)?;
+        // LFM2 ships its final RMS norm under `token_embd_norm.weight` (a wrong
+        // name llama.cpp special-cases via LLM_TENSOR_OUTPUT_NORM_LFM2); every
+        // other family calls it `output_norm.weight`.
+        let output_norm = match c.family {
+            Family::Lfm2 => f32_tensor(&gguf, "token_embd_norm.weight", dim)?,
+            _ => f32_tensor(&gguf, "output_norm.weight", dim)?,
+        };
         // Gemma p-RoPE frequency divisors for global layers (one shared root
         // tensor, `head_dim_global/2` entries). Absent elsewhere.
         let rope_freqs: Option<&[f32]> = c
