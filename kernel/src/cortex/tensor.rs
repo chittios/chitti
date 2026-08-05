@@ -1345,7 +1345,7 @@ pub fn matvec_q4_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &
 unsafe fn sdot_one_row_q6_k(row: *const u8, xq: *const i8, xs: *const f32, superblocks: usize) -> f32 {
     use core::arch::aarch64::{
         vaddq_s32, vaddvq_s32, vandq_u8, vdotq_s32, vdupq_n_s32, vdupq_n_s8, vdupq_n_u8, vorrq_u8,
-        vreinterpretq_s8_u8, vshlq_n_u8, vshrq_n_u8,
+        vreinterpretq_s8_u8, vshlq_n_u8, vshlq_u8, vshrq_n_u8,
     };
     let niblet = vdupq_n_u8(0x0f);
     let three = vdupq_n_u8(0x03);
@@ -1364,7 +1364,12 @@ unsafe fn sdot_one_row_q6_k(row: *const u8, xq: *const i8, xs: *const f32, super
                 let ql16 = ldq_u8(ql.add(half * 64 + 16 * (kk % 4)));
                 let lo = if kk < 4 { vandq_u8(ql16, niblet) } else { vshrq_n_u8(ql16, 4) };
                 let qh16 = ldq_u8(qh.add(half * 32 + 16 * (kk % 2)));
-                let hi = vandq_u8(vshrq_n_u8(qh16, (kk / 2) * 2), three);
+                // The 2-bit field `(kk/2)*2` is a runtime value, so use a
+                // variable (negative = right) shift rather than an immediate.
+                let hi = vandq_u8(
+                    vshlq_u8(qh16, vdupq_n_s8(-(((kk / 2) * 2) as i8))),
+                    three,
+                );
                 let code = vreinterpretq_s8_u8(vorrq_u8(lo, vshlq_n_u8(hi, 4)));
                 let x16 = ldq_s8(xq.add(b * QK_K + k * 16));
                 let qd = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), code, x16));
