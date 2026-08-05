@@ -614,6 +614,7 @@ fn worker_loop(slot: usize) -> ! {
                     0 => tensor::matmul_q8_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, m_count, n_rows, rs, re, n_cols),
                     1 => tensor::matvec_q4_0_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
                     3 => tensor::matvec_q4_k_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
+                    12 => tensor::matvec_q6_k_sdot_rows(w, xq as *const i8, xs as *const f32, y, rs, re, n_cols),
                     // Q1/Q2: static contiguous row ranges (not work-steal).
                     // Fine-grained steal re-ran Q1 act-sum precompute per slab
                     // and shredded sequential weight locality — measured ~1 t/s
@@ -857,6 +858,43 @@ pub unsafe fn matvec_q4_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *
     add_busy(0, super::cycle_count().wrapping_sub(t0));
     // SAFETY: same contract as the chunk above, over the straggler's range.
     barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q4_k_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
+}
+
+/// `y = W·x` for Q6_K weights split across online cores by **contiguous** row
+/// range (`tensor::matvec_q6_k_sdot_rows`). Falls back to single-core when
+/// only the BSP is online or the matrix is small.
+///
+/// # Safety
+/// Same contract as `tensor::matvec_q6_k_sdot_rows` over `[0, n_rows)`.
+pub unsafe fn matvec_q6_k_sdot(w: *const u8, xq: *const i8, xs: *const f32, y: *mut f32, n_rows: usize, n_cols: usize) {
+    let workers = fleet_workers();
+    if workers == 0 || n_rows < PARALLEL_MIN_ROWS {
+        // SAFETY: caller's contract; whole range on this core.
+        unsafe { tensor::matvec_q6_k_sdot_rows(w, xq, xs, y, 0, n_rows, n_cols) };
+        return;
+    }
+    let n_parts = workers + 1;
+    let boundary = |k: usize| k * n_rows / n_parts;
+    JOB.w.store(w as *mut u8, Ordering::Relaxed);
+    JOB.xq.store(xq as *mut i8, Ordering::Relaxed);
+    JOB.xs.store(xs as *mut f32, Ordering::Relaxed);
+    JOB.y.store(y, Ordering::Relaxed);
+    JOB.n_cols.store(n_cols, Ordering::Relaxed);
+    JOB.mode.store(12, Ordering::Relaxed); // Q6_K SDOT
+    for s in 0..workers {
+        JOB.row_start[s].store(boundary(s + 1), Ordering::Relaxed);
+        JOB.row_end[s].store(boundary(s + 2), Ordering::Relaxed);
+    }
+    clear_unused_slots(workers);
+    let g = JOB.go.load(Ordering::Relaxed) + 1;
+    JOB.go.store(g, Ordering::Release);
+    signal_workers(); // wake WFE-parked workers
+    // SAFETY: disjoint row range [0, boundary(1)); caller's contract.
+    let t0 = super::cycle_count();
+    unsafe { tensor::matvec_q6_k_sdot_rows(w, xq, xs, y, 0, boundary(1), n_cols) };
+    add_busy(0, super::cycle_count().wrapping_sub(t0));
+    // SAFETY: same contract as the chunk above, over the straggler's range.
+    barrier(workers, g, &|rs, re| unsafe { tensor::matvec_q6_k_sdot_rows(w, xq, xs, y, rs, re, n_cols) });
 }
 
 /// `y = W·x` for Q2_0 weights split across online cores by **contiguous**

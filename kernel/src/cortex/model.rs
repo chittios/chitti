@@ -179,6 +179,10 @@ fn matvec_qw(qw: QWeight, x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32
         tensor::matvec_q4_k_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
         return;
     }
+    if qw.qt == tensor::QT_Q6_K && n_cols % tensor::QK_K == 0 {
+        tensor::matvec_q6_k_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
+        return;
+    }
     if qw.qt == tensor::QT_Q2_0 && n_cols % tensor::QK2_0 == 0 {
         tensor::matvec_q2_0_fast(qw.data, x, y, xq, xs, n_rows, n_cols);
         return;

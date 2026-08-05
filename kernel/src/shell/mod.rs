@@ -3682,7 +3682,13 @@ impl ChatSession {
             None;
         let mut nudged = false;
         let mut tools_this_turn = 0u32;
-        let remaining = limits.max_tool_calls.saturating_sub(session.budget.tool_calls_used);
+        // `max_tool_calls == 0` means **unlimited** (the shell agent); 0 would
+        // otherwise read as "0 remaining" here and stop the turn immediately.
+        let remaining = if limits.max_tool_calls == 0 {
+            u32::MAX
+        } else {
+            limits.max_tool_calls.saturating_sub(session.budget.tool_calls_used)
+        };
         if remaining == 0 {
             serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
             finish_chat_turn(self, session);
@@ -3690,7 +3696,9 @@ impl ChatSession {
         }
         let max_this_turn = MAX_TOOLS_PER_TURN.min(remaining);
         loop {
-            if tools_this_turn >= max_this_turn || session.budget.tool_calls_used >= limits.max_tool_calls {
+            if tools_this_turn >= max_this_turn
+                || (limits.max_tool_calls != 0 && session.budget.tool_calls_used >= limits.max_tool_calls)
+            {
                 serial_println!("\x1b[33m[tool-call budget reached]\x1b[0m");
                 let worked = crate::arch::now_ms().saturating_sub(turn_t0) as f32 / 1000.0;
                 print_turn_footer(self.last_thought_secs, worked);

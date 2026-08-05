@@ -1325,11 +1325,108 @@ pub fn matvec_q4_0_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &
         unsafe {
             crate::arch::aarch64::smp::matvec_q4_0_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), n_rows, n_cols)
         };
+    }    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (&mut *xq, &mut *xs);
+        matvec_q4_0(w, x, y, n_rows, n_cols);
+    }
+}
+
+/// SDOT one row of Q6_K weights against an int8-quantized activation row.
+///
+/// Q6_K super-block (256 elements): 4-bit `ql` (128 bytes) + 2-bit `qh`
+/// (64 bytes) = 6-bit codes 0..63, biased by −32, with a per-16-element `i8`
+/// scale (`scales[16]`) and an f16 block scale `d`. Each 16-element sub-block
+/// `k` reads 16 `ql` bytes (low nibble for `k%4 < 2`, high otherwise), 16 `qh`
+/// bytes (2-bit field `(k/2)*2`), combines to the code, and accumulates
+/// `d · sc[k] · (SDOT(code, x) − 32·Σx) · xsb` (the −32 bias via the
+/// activation sum, exactly llama.cpp's `vec_dot_q6_K_q8_K`).
+#[cfg(target_arch = "aarch64")]
+unsafe fn sdot_one_row_q6_k(row: *const u8, xq: *const i8, xs: *const f32, superblocks: usize) -> f32 {
+    use core::arch::aarch64::{
+        vaddq_s32, vaddvq_s32, vandq_u8, vdotq_s32, vdupq_n_s32, vdupq_n_s8, vdupq_n_u8, vorrq_u8,
+        vreinterpretq_s8_u8, vshlq_n_u8, vshrq_n_u8,
+    };
+    let niblet = vdupq_n_u8(0x0f);
+    let three = vdupq_n_u8(0x03);
+    let ones = vdupq_n_s8(1);
+    unsafe {
+        let mut acc = 0.0f32;
+        for b in 0..superblocks {
+            let base = b * Q6_K_BLOCK_BYTES;
+            let ql = row.add(base);
+            let qh = row.add(base + 128);
+            let sc = row.add(base + 192);
+            let d = f16_to_f32(u16::from_le_bytes([*row.add(base + 208), *row.add(base + 209)]));
+            for k in 0..16 {
+                let half = k / 8;
+                let kk = k % 8;
+                let ql16 = ldq_u8(ql.add(half * 64 + 16 * (kk % 4)));
+                let lo = if kk < 4 { vandq_u8(ql16, niblet) } else { vshrq_n_u8(ql16, 4) };
+                let qh16 = ldq_u8(qh.add(half * 32 + 16 * (kk % 2)));
+                let hi = vandq_u8(vshrq_n_u8(qh16, (kk / 2) * 2), three);
+                let code = vreinterpretq_s8_u8(vorrq_u8(lo, vshlq_n_u8(hi, 4)));
+                let x16 = ldq_s8(xq.add(b * QK_K + k * 16));
+                let qd = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), code, x16));
+                let sx = vaddvq_s32(vdotq_s32(vdupq_n_s32(0), ones, x16));
+                let s = *sc.add(k) as i8 as f32;
+                let xsb = *xs.add(b * (QK_K / QK) + k / 2);
+                acc += d * s * xsb * (qd as f32 - 32.0 * sx as f32);
+            }
+        }
+        acc
+    }
+}
+
+/// Q6_K rows over `[row_start, row_end)` against int8-quantized activations.
+///
+/// # Safety
+/// `w` = rows of `n_cols/QK_K` Q6_K super-blocks; `xq` = `n_cols` i8;
+/// `xs` = `n_cols/QK` f32; `y` = `n_rows` f32; ranges in bounds and disjoint.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn matvec_q6_k_sdot_rows(
+    w: *const u8,
+    xq: *const i8,
+    xs: *const f32,
+    y: *mut f32,
+    row_start: usize,
+    row_end: usize,
+    n_cols: usize,
+) {
+    let superblocks = n_cols / QK_K;
+    let row_bytes = superblocks * Q6_K_BLOCK_BYTES;
+    // SAFETY: caller's contract.
+    unsafe {
+        for r in row_start..row_end {
+            *y.add(r) = sdot_one_row_q6_k(w.add(r * row_bytes), xq, xs, superblocks);
+        }
+    }
+}
+
+/// `y = W·x` for Q6_K weights: quantize the activation once to int8 and run
+/// the SDOT row kernel across cores (aarch64); elsewhere the exact generic
+/// dequant path. Requires `n_cols % QK_K == 0` (Q6_K super-blocks).
+pub fn matvec_q6_k_fast(w: &[u8], x: &[f32], y: &mut [f32], xq: &mut [i8], xs: &mut [f32], n_rows: usize, n_cols: usize) {
+    debug_assert_eq!(n_cols % QK_K, 0);
+    debug_assert_eq!(x.len(), n_cols);
+    debug_assert_eq!(y.len(), n_rows);
+    debug_assert!(xq.len() >= n_cols && xs.len() >= n_cols / QK);
+    #[cfg(target_arch = "aarch64")]
+    {
+        let xq = &mut xq[..n_cols];
+        let xs = &mut xs[..n_cols / QK];
+        quantize_activations_q8(x, xq, xs);
+        // SAFETY: `w` holds `n_rows` Q6_K rows of `n_cols/QK_K` super-blocks;
+        // `xq`/`xs` are the just-computed quantized activation.
+        unsafe {
+            crate::arch::aarch64::smp::matvec_q6_k_sdot(w.as_ptr(), xq.as_ptr(), xs.as_ptr(), y.as_mut_ptr(), n_rows, n_cols)
+        };
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = (&mut *xq, &mut *xs);
-        matvec_q4_0(w, x, y, n_rows, n_cols);
+        // SAFETY: caller's slices sized per the debug asserts above.
+        unsafe { matvec_quant_rows(QT_Q6_K, w.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n_rows, n_cols) };
     }
 }
 
@@ -3791,6 +3888,52 @@ mod tests {
         assert!(
             (got as f64 - want).abs() <= 1e-2 + 1e-3 * want.abs(),
             "sdot_q2_0: got {got} want {want}"
+        );
+    }
+
+    /// The Q6_K NEON SDOT row kernel must match an f64 dot of the dequantized
+    /// weight row against the dequantized int8 activation. Pins the 4-bit `ql`
+    /// + 2-bit `qh` unpack (which sub-block reads which nibble/field) and the
+    /// per-16 scale + `−32` bias — the parts a swapped index would corrupt.
+    /// aarch64-only (the kernel is NEON); x86 runs the exact generic fallback.
+    #[cfg(target_arch = "aarch64")]
+    #[test_case]
+    fn sdot_q6_k_matches_dequant_reference() {
+        let (blocks, n_cols) = (2usize, 512usize); // 2 Q6_K super-blocks of 256
+        let mut seed = 0x6A11u32;
+        let mut row = Vec::new();
+        for _ in 0..blocks {
+            for _ in 0..128 {
+                row.push((lcg(&mut seed) & 0xff) as u8); // ql
+            }
+            for _ in 0..64 {
+                row.push((lcg(&mut seed) & 0xff) as u8); // qh
+            }
+            for _ in 0..16 {
+                row.push((lcg(&mut seed) & 0xff) as u8); // scales (signed i8)
+            }
+            row.extend_from_slice(&F16_HALF); // d = 0.5
+        }
+        let x: Vec<f32> = (0..n_cols).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+        let mut xq = alloc::vec![0i8; n_cols];
+        let mut xs = alloc::vec![0.0f32; n_cols / QK];
+        quantize_activations_q8(&x, &mut xq, &mut xs);
+
+        let mut want = 0.0f64;
+        let mut dq = [0.0f32; QK_K];
+        for b in 0..blocks {
+            dequant_q6_k_block(&row[b * Q6_K_BLOCK_BYTES..(b + 1) * Q6_K_BLOCK_BYTES], &mut dq);
+            for i in 0..QK_K {
+                let col = b * QK_K + i;
+                let xdeq = xs[col / QK] as f64 * xq[col] as f64;
+                want += dq[i] as f64 * xdeq;
+            }
+        }
+        // SAFETY: row = `blocks` Q6_K super-blocks; xq/xs sized for `n_cols`.
+        let got = unsafe { sdot_one_row_q6_k(row.as_ptr(), xq.as_ptr(), xs.as_ptr(), blocks) };
+        assert!(
+            (got as f64 - want).abs() <= 1e-2 + 1e-3 * want.abs(),
+            "sdot_q6_k: got {got} want {want}"
         );
     }
 
