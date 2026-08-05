@@ -1082,6 +1082,21 @@ impl<'a> Model<'a> {
                     t = phase_mark(&PHASE_DELTA, t);
                     self.batched_proj(out_w, &delta_o, &mut proj_out, &mut xq, &mut xs, m, dim, value_dim);
                 }
+                // LFM2: correctness-first — the sequential per-token layers run
+                // for each position in the window (a batched LFM2 attention +
+                // windowed shortconv is a perf follow-on). The shortconv's
+                // per-layer state and the attention's KV cache append exactly
+                // as decode does, so the two paths cannot drift.
+                LayerKind::Lfm2Attn { .. } | LayerKind::ShortConv { .. } => {
+                    for mi in 0..m {
+                        s.norm.copy_from_slice(&norm[mi * dim..(mi + 1) * dim]);
+                        match &self.layers[l].kind {
+                            LayerKind::Lfm2Attn { .. } => self.lfm2_attn_layer(l, pos0 + mi, cache, s),
+                            _ => self.shortconv_layer(l, cache, s),
+                        }
+                        proj_out[mi * dim..(mi + 1) * dim].copy_from_slice(&s.proj);
+                    }
+                }
             }
             t = phase_mark(&PHASE_PROJ, t);
             // Gemma sandwich: normalize the block output before its residual.
