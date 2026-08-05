@@ -964,6 +964,12 @@ impl<'a> Model<'a> {
         let ao = nq * hd; // attn_out / o-proj input width
         let (conv_dim, value_dim, nh) =
             c.ssm.map(|s| (s.conv_dim(), s.inner, s.dt_rank)).unwrap_or((0, 0, 0));
+        // LFM2 shortconv staging: the 3-way in_proj needs 3*dim, and the conv
+        // output is dim-wide (reuses the DeltaNet qkv/delta_o slots).
+        let lfm2_sc = c.family == Family::Lfm2;
+        let qkv_w = conv_dim.max(if lfm2_sc { 3 * dim } else { 0 });
+        let delta_w = value_dim.max(if lfm2_sc { dim } else { 0 });
+        let sc_d = c.shortconv_l_cache.saturating_sub(1);
         let m = prompt.len();
         // Gemma has *two* attention geometries and every buffer must cover the
         // wider one — global layers carry `head_dim_global` (512 on E4B) against
@@ -986,12 +992,13 @@ impl<'a> Model<'a> {
         // One scores row per position, each `pos0 + mi + 1` long — the rows must
         // be separate because every position's attention runs concurrently.
         let mut scores = alloc::vec![0.0f32; m * (pos0 + m)];
-        let mut qkv = alloc::vec![0.0f32; m * conv_dim];
+        let mut qkv = alloc::vec![0.0f32; m * qkv_w];
         let mut conv_act = alloc::vec![0.0f32; m * conv_dim];
         let mut z = alloc::vec![0.0f32; m * value_dim];
         let mut gates = alloc::vec![0.0f32; m * nh];
         let mut betas = alloc::vec![0.0f32; m * nh];
-        let mut delta_o = alloc::vec![0.0f32; m * value_dim];
+        let mut delta_o = alloc::vec![0.0f32; m * delta_w];
+        let mut conv_in = alloc::vec![0.0f32; (sc_d + m) * dim];
         let mut ffn_gate = alloc::vec![0.0f32; m * ffn];
         let mut ffn_up = alloc::vec![0.0f32; m * ffn];
         let mut ffn_act = alloc::vec![0.0f32; m * ffn];
@@ -1092,20 +1099,29 @@ impl<'a> Model<'a> {
                     t = phase_mark(&PHASE_DELTA, t);
                     self.batched_proj(out_w, &delta_o, &mut proj_out, &mut xq, &mut xs, m, dim, value_dim);
                 }
-                // LFM2: correctness-first — the sequential per-token layers run
-                // for each position in the window (a batched LFM2 attention +
-                // windowed shortconv is a perf follow-on). The shortconv's
-                // per-layer state and the attention's KV cache append exactly
-                // as decode does, so the two paths cannot drift.
-                LayerKind::Lfm2Attn { .. } | LayerKind::ShortConv { .. } => {
-                    for mi in 0..m {
-                        s.norm.copy_from_slice(&norm[mi * dim..(mi + 1) * dim]);
-                        match &self.layers[l].kind {
-                            LayerKind::Lfm2Attn { .. } => self.lfm2_attn_layer(l, pos0 + mi, cache, s),
-                            _ => self.shortconv_layer(l, cache, s),
-                        }
-                        proj_out[mi * dim..(mi + 1) * dim].copy_from_slice(&s.proj);
-                    }
+                // LFM2: batched projections (Q4_0 → i8mm) + window-wide
+                // attention / windowed shortconv cores, so prefill runs at
+                // batched speed instead of one position at a time.
+                LayerKind::Lfm2Attn { q: q_w, k: k_w, v: v_w, o: o_w, n_kv, .. } => {
+                    let (q_w, k_w, v_w, o_w, n_kv) = (*q_w, *k_w, *v_w, *o_w, *n_kv);
+                    let lkv = n_kv * hd;
+                    let lq = nq * hd;
+                    self.batched_proj(q_w, &norm, &mut q, &mut xq, &mut xs, m, lq, dim);
+                    self.batched_proj(k_w, &norm, &mut k, &mut xq, &mut xs, m, lkv, dim);
+                    self.batched_proj(v_w, &norm, &mut v, &mut xq, &mut xs, m, lkv, dim);
+                    t = phase_mark(&PHASE_PROJ, t);
+                    self.lfm2_attn_core_batched(l, pos0, m, &mut q, &mut k, &v, cache, &mut scores, &mut attn_out);
+                    t = phase_mark(&PHASE_ATTN, t);
+                    self.batched_proj(o_w, &attn_out, &mut proj_out, &mut xq, &mut xs, m, dim, lq);
+                }
+                LayerKind::ShortConv { in_proj, out_proj, .. } => {
+                    let (in_proj, out_proj) = (*in_proj, *out_proj);
+                    let plen = 3 * dim;
+                    self.batched_proj(in_proj, &norm, &mut qkv, &mut xq, &mut xs, m, plen, dim);
+                    t = phase_mark(&PHASE_PROJ, t);
+                    self.shortconv_core_batched(l, cache, m, &qkv, &mut conv_in, &mut delta_o);
+                    t = phase_mark(&PHASE_DELTA, t);
+                    self.batched_proj(out_proj, &delta_o, &mut proj_out, &mut xq, &mut xs, m, dim, dim);
                 }
             }
             t = phase_mark(&PHASE_PROJ, t);
@@ -1626,10 +1642,176 @@ impl<'a> Model<'a> {
     /// causal depthwise conv1d over the cached per-layer state (d_conv
     /// columns, prepended causally) → `y = c·conv(bx)` → out_proj. Decode is
     /// one token per call, so the conv consumes exactly state ++ [current].
-    fn shortconv_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
+    /// Window-wide LFM2 attention: the batched twin of
+    /// [`Self::lfm2_attn_layer`], fanning out over **positions** (each
+    /// `(position, head)` is independent once the window's K/V exist). No
+    /// gate — unlike QwenHybrid — so `q` rows are `nq*head_dim` wide.
+    fn lfm2_attn_core_batched(
+        &self,
+        l: usize,
+        pos0: usize,
+        m: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &[f32],
+        cache: &mut Cache,
+        scores: &mut [f32],
+        out: &mut [f32],
+    ) {
+        let c = &self.config;
+        let hd = c.head_dim;
+        let nq = c.head_count;
+        let (q_norm, k_norm, n_kv) = match &self.layers[l].kind {
+            LayerKind::Lfm2Attn { q_norm, k_norm, n_kv, .. } => (*q_norm, *k_norm, *n_kv),
+            _ => unreachable!(),
+        };
+        let kv_dim = n_kv * hd;
+        let qdim = nq * hd;
+        let ao = nq * hd;
+        let group = nq / n_kv;
+        let scale = 1.0 / tensor_sqrtf(hd as f32);
+
+        // Per-head QK norms + full RoPE (V left bare), order-independent per
+        // absolute position.
+        for mi in 0..m {
+            let pos = pos0 + mi;
+            for h in 0..nq {
+                let qh = &mut q[mi * qdim + h * hd..mi * qdim + (h + 1) * hd];
+                tensor::rmsnorm_inplace(qh, q_norm, c.rms_eps);
+                tensor::rope_ext(qh, pos, hd, c.rope_freq_base, None);
+            }
+            for h in 0..n_kv {
+                let kh = &mut k[mi * kv_dim + h * hd..mi * kv_dim + (h + 1) * hd];
+                tensor::rmsnorm_inplace(kh, k_norm, c.rms_eps);
+                tensor::rope_ext(kh, pos, hd, c.rope_freq_base, None);
+            }
+        }
+
+        cache.attn_k[l].extend_from_slice(&k[..m * kv_dim]);
+        cache.attn_v[l].extend_from_slice(&v[..m * kv_dim]);
+
+        struct Ctx {
+            q: *const f32,
+            kc: *const f32,
+            vc: *const f32,
+            scores: *mut f32,
+            out: *mut f32,
+            pos0: usize,
+            nq: usize,
+            hd: usize,
+            kv_dim: usize,
+            group: usize,
+            qdim: usize,
+            ao: usize,
+            sl: usize,
+            scale: f32,
+        }
+        unsafe fn positions(start: usize, end: usize, ctx: *mut u8) {
+            let c = unsafe { &*(ctx as *const Ctx) };
+            for mi in start..end {
+                let pos = c.pos0 + mi;
+                let sc = unsafe { core::slice::from_raw_parts_mut(c.scores.add(mi * c.sl), pos + 1) };
+                for h in 0..c.nq {
+                    let kvh = h / c.group;
+                    let q_head =
+                        unsafe { core::slice::from_raw_parts(c.q.add(mi * c.qdim + h * c.hd), c.hd) };
+                    for t in 0..=pos {
+                        let k_t =
+                            unsafe { core::slice::from_raw_parts(c.kc.add(t * c.kv_dim + kvh * c.hd), c.hd) };
+                        sc[t] = tensor::dot_f32(q_head, k_t) * c.scale;
+                    }
+                    tensor::softmax(sc);
+                    let o = unsafe { core::slice::from_raw_parts_mut(c.out.add(mi * c.ao + h * c.hd), c.hd) };
+                    o.iter_mut().for_each(|x| *x = 0.0);
+                    for t in 0..=pos {
+                        let v_t =
+                            unsafe { core::slice::from_raw_parts(c.vc.add(t * c.kv_dim + kvh * c.hd), c.hd) };
+                        let w = sc[t];
+                        for i in 0..c.hd {
+                            o[i] += w * v_t[i];
+                        }
+                    }
+                }
+            }
+        }
+        let mut ctx = Ctx {
+            q: q.as_ptr(),
+            kc: cache.attn_k[l].as_ptr(),
+            vc: cache.attn_v[l].as_ptr(),
+            scores: scores.as_mut_ptr(),
+            out: out.as_mut_ptr(),
+            pos0,
+            nq,
+            hd,
+            kv_dim,
+            group,
+            qdim,
+            ao,
+            sl: pos0 + m,
+            scale,
+        };
+        // SAFETY: `positions` is safe on disjoint position ranges sharing `ctx`,
+        // and `ctx` lives until `parallel_for` returns.
+        unsafe { crate::arch::parallel_for(m, 1, positions, &mut ctx as *mut Ctx as *mut u8) };
+    }
+
+    /// Window-wide LFM2 **shortconv**: the batched twin of
+    /// [`Self::shortconv_layer`]. The window's `b·x` product is padded with the
+    /// cached per-layer state columns, run through the causal depthwise conv,
+    /// gated by `c`, and the state advanced — one pass over the whole window.
+    fn shortconv_core_batched(
+        &self,
+        l: usize,
+        cache: &mut Cache,
+        m: usize,
+        qkv: &[f32],
+        conv_in: &mut [f32],
+        out: &mut [f32],
+    ) {
         let c = &self.config;
         let dim = c.embedding_length;
-        let (conv, in_proj, out_proj) = match &self.layers[l].kind {
+        let k = c.shortconv_l_cache;
+        let d = k.saturating_sub(1);
+        let conv = match &self.layers[l].kind {
+            LayerKind::ShortConv { conv, .. } => *conv,
+            _ => unreachable!(),
+        };
+        let state = &mut cache.shortconv_state[l];
+        // bx = b·x per position; the window is padded with the cached state.
+        for mi in 0..m {
+            let base = mi * 3 * dim;
+            for i in 0..dim {
+                conv_in[(d + mi) * dim + i] = qkv[base + i] * qkv[base + 2 * dim + i];
+            }
+        }
+        for j in 0..d {
+            for i in 0..dim {
+                conv_in[j * dim + i] = state[j * dim + i];
+            }
+        }
+        // Causal depthwise conv: position `mi` reads taps `conv_in[mi..mi+k]`.
+        for mi in 0..m {
+            let base = mi * 3 * dim;
+            for i in 0..dim {
+                let mut acc = 0.0f32;
+                for j in 0..k {
+                    acc += conv[i * k + j] * conv_in[(mi + j) * dim + i];
+                }
+                // y = c · conv_out.
+                out[mi * dim + i] = qkv[base + dim + i] * acc;
+            }
+        }
+        // New state = last `d` columns of the padded window.
+        for j in 0..d {
+            for i in 0..dim {
+                state[j * dim + i] = conv_in[(m + j) * dim + i];
+            }
+        }
+    }
+
+    fn shortconv_layer(&self, l: usize, cache: &mut Cache, s: &mut State) {
+        let c = &self.config;
+        let dim = c.embedding_length;        let (conv, in_proj, out_proj) = match &self.layers[l].kind {
             LayerKind::ShortConv { conv, in_proj, out_proj } => (*conv, *in_proj, *out_proj),
             _ => unreachable!(),
         };

@@ -478,8 +478,72 @@ fn dsml_params_json(body: &str) -> String {
 pub(crate) fn parse_tool_calls(
     text: &str,
 ) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+    // LFM2.x's *native* tool-call syntax is `<|tool_call_start|>[name(args)]
+    // <|tool_call_end|>` (or JSON inside the same markers) — the model emits it
+    // regardless of the `<tool_call>` JSON the prompt asks for. Scan the raw
+    // text first, so the markers survive before `undecorate_tool_tags` touches
+    // anything; the standard JSON/DSML containers run after.
+    let lfm = parse_lfm2_tool_calls(text);
+    if !lfm.is_empty() {
+        return lfm;
+    }
     let undecorated = undecorate_tool_tags(text);
     parse_tool_calls_bare(undecorated.as_ref())
+}
+
+/// LFM2.x tool-call syntax: `<|tool_call_start|>[name(args)]<|tool_call_end|>`,
+/// or `{"name":…,"arguments":…}` wrapped in the same markers. The bracket
+/// arguments are wrapped as `{"args": "…"}` (the free-form shell shape).
+fn parse_lfm2_tool_calls(text: &str) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+    use alloc::string::ToString;
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while let Some(rel) = text[i..].find("<|tool_call_start|>") {
+        let start = i + rel;
+        let body_at = start + "<|tool_call_start|>".len();
+        let after = &text[body_at..];
+        let end = after.find("<|tool_call_end|>").unwrap_or(after.len());
+        let block = after[..end].trim();
+        // JSON object form inside the markers.
+        if block.starts_with('{') {
+            if let Some(obj) = extract_balanced_json_object(block) {
+                if let Some(name) = json_str(&obj, "name") {
+                    let name = name.trim().trim_start_matches('/').to_string();
+                    if !name.is_empty() {
+                        out.push((name, extract_arguments_json(&obj)));
+                    }
+                }
+            }
+        } else if let Some((name, args)) = parse_lfm_bracket_call(block) {
+            out.push((name, args));
+        } else {
+            crate::ktrace::log_fmt(format_args!(
+                "chat.toolcall: unparsable LFM tool-call body: {:.120}",
+                block
+            ));
+        }
+        i = body_at + end.max(1);
+    }
+    out
+}
+
+/// `[name(args)]` → `(name, {"args": "…"})`. The argument string is kept raw
+/// (the shell tool layer parses free-form args); an empty call yields `{}`.
+fn parse_lfm_bracket_call(block: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+    let block = block.trim();
+    let body = block.strip_prefix('[')?.strip_suffix(']')?;
+    let (name, rest) = body.split_once('(')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args = rest.strip_suffix(')').unwrap_or("").trim();
+    let args = if args.is_empty() {
+        alloc::string::String::from("{}")
+    } else {
+        alloc::format!("{{\"args\": \"{}\"}}", args.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    Some((name.to_string(), args))
 }
 
 /// Opening container tags a JSON tool call may be wrapped in, longest first so

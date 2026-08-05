@@ -9003,8 +9003,7 @@ mod agent_flow_tests {
     /// args object (not a flattened shell line). A leading `/` on the name is
     /// stripped (models drift into `/ls`).
     #[test_case]
-    fn parse_tool_call_qwen_json() {
-        let (name, args) = parse_tool_call("<tool_call>{\"name\": \"ls\", \"arguments\": {\"args\": \"/mnt\"}}</tool_call>").unwrap();
+    fn parse_tool_call_qwen_json() {        let (name, args) = parse_tool_call("<tool_call>{\"name\": \"ls\", \"arguments\": {\"args\": \"/mnt\"}}</tool_call>").unwrap();
         assert_eq!(name, "ls");
         assert!(args.contains("\"args\""), "got {args}");
         assert!(args.contains("/mnt"), "got {args}");
@@ -9032,13 +9031,40 @@ mod agent_flow_tests {
         assert!(args.contains("colour"), "got {args}");
     }
 
+    /// LFM2.x's native tool-call syntax — `<|tool_call_start|>[name(args)]
+    /// <|tool_call_end|>` — is parsed even though the prompt asks for the
+    /// Qwen `<tool_call>` JSON form.
+    #[test_case]
+    fn parse_tool_call_lfm2_brackets() {
+        let calls = parse_tool_calls(
+            "I'll look that up.\n<|tool_call_start|>[docs()]<|tool_call_end|>\n\nLet me check.",
+        );
+        assert_eq!(calls.len(), 1, "got {calls:?}");
+        assert_eq!(calls[0].0, "docs");
+        assert_eq!(calls[0].1, "{}");
+        // With an argument, wrapped as the free-form shell `args`.
+        let calls = parse_tool_calls("<|tool_call_start|>[http(url=\"https://x\")]<|tool_call_end|>");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "http");
+        assert!(calls[0].1.contains("https://x"), "got {}", calls[0].1);
+        // JSON inside the markers works too.
+        let calls = parse_tool_calls(
+            "<|tool_call_start|>{\"name\": \"memory_add\", \"arguments\": {\"key\": \"k\", \"value\": \"v\"}}<|tool_call_end|>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "memory_add");
+        assert!(calls[0].1.contains("\"key\""), "got {}", calls[0].1);
+        // The Qwen form still parses (LFM parser must not steal it).
+        let (name, _) = parse_tool_call("<tool_call>{\"name\": \"ls\", \"arguments\": {\"args\": \"/mnt\"}}</tool_call>").unwrap();
+        assert_eq!(name, "ls");
+    }
+
     /// An app agent's tools come from its **manifest ∩ registry**, in manifest
     /// order. This replaced a hardcoded twelve-name `matches!` that was a copy of
     /// chess's manifest — so notes/paint/snake were gated on chess tools — and
     /// which had already drifted from the prompt printed beside it.
     #[test_case]
-    fn ui_agent_toolset_is_manifest_intersect_registry() {
-        let declared = alloc::vec![
+    fn ui_agent_toolset_is_manifest_intersect_registry() {        let declared = alloc::vec![
             String::from("board_set"),
             String::from("not_a_registered_tool"),
             String::from("storage_set"),
