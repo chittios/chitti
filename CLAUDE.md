@@ -865,6 +865,17 @@ FDT claims a GICv3 but carries no readable `reg`.
   saved/resumed/forked over the memory store (postcard).
 - **Tools** (`tools/`) — MCP-shaped registry → Router → Synapse cap+taint gate;
   builtin toolset; provider registration.
+- **The OS can explain its own extension mechanism.** `build-agent` is a bundled
+  skill (`skills/bundled.rs`): its L0 description triggers on "new agent", "new tool",
+  "extend", its L1 body is the whole loop (`agents new|build|validate|install --path|
+  test|reload`, the `export function` contract, the `Chitti` surface, and what each
+  failure message means), and its L2 asset is a complete working `tools.js` so an
+  agent copies correct code instead of reconstructing the ABI from prose. Adding it
+  found a small pre-existing wrongness worth knowing about: two bundled skills
+  declared `Asset.bytes` by hand and had drifted from their payloads (64 vs 77, 80 vs
+  84). Sizes are computed now, and `bundled_skill_assets_are_declared_and_present`
+  pins every declared asset to a real payload — which also guards the trap that
+  `place_trusted` **silently drops an undeclared payload**.
 - **Skills** (`skills/`) — L0/L1/L2 progressive disclosure, signed install with
   consent + capability subsetting, installable skill-agents. **Agents as
   installable apps**: a package is markdown (SOUL.md persona + `skills/*.md`

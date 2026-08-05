@@ -2611,6 +2611,21 @@ def s_skills_bundled(g):
     )
     if not ok:
         return False, "bundled L0 skills not listed"
+    # `build-agent` is how the OS explains its own extension mechanism, so it must be
+    # in the index and its body must name the commands that actually exist — a skill
+    # that teaches a loop which does not work is worse than no skill.
+    if not g.wait_for("build-agent", 5, m):
+        return False, "the build-agent skill is not in the L0 index"
+    m = g.mark()
+    g.send("/skills load build-agent")
+    # The console only previews the first part of a body (the rest goes to the agent's
+    # context), so assert it loaded and that the loop starts where it should. That the
+    # body names every command is asserted where the whole text is available, in
+    # `the_build_agent_skill_describes_the_real_commands`.
+    if not g.wait_for("loaded skill 'build-agent'", 20, m):
+        return False, "the build-agent skill did not load"
+    if not g.wait_for("agents new", 10, m):
+        return False, "the build-agent body does not start with the scaffold step"
     m = g.mark()
     g.send("/skills load remember")
     if not g.wait_for("memory_add", 15, m):
