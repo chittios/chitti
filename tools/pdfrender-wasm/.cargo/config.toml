@@ -1,0 +1,17 @@
+# **simd128 is not optional here — it is worth 1.5x, and up to 5.8x on the pages
+# that hurt.** vello_cpu's per-pixel pipelines go through `fearless_simd`, which
+# has a `wasm.rs` backend gated on `target_feature = "simd128"`; without this flag
+# that backend is compiled out and every blend runs a lane at a time. Measured on
+# a real document (`tools/pdfbench`): a 117-page book's first 8 pages 2106 -> 1381
+# ms, and the Transformer paper's heaviest page 5862 -> 1029 ms.
+#
+# It lives in the crate's `.cargo/config.toml` rather than in a RUSTFLAGS export
+# so the checked-in module cannot be rebuilt *without* it by someone who did not
+# know to set it — a module built scalar would still run, just several times
+# slower, which is the kind of regression nothing would catch.
+#
+# The kernel side must match: a simd128 module needs `wasmi`'s `simd` feature to
+# run at all (wasmi 0.40 rejected these opcodes at validation). Both moved in the
+# same commit for that reason.
+[target.wasm32-unknown-unknown]
+rustflags = ["-Ctarget-feature=+simd128"]

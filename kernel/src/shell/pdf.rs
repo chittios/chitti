@@ -24,9 +24,11 @@
 //! # Performance, and why the numbers shaped the design
 //!
 //! Measured with `tools/pdfbench` (native and wasmi, same crate, on the host):
-//! a dense LaTeX page is ~10-35 ms native and ~0.4-0.9 s under wasmi at a
-//! pane-fit scale — the interpreter tax is 30-90x, since the SIMD blend paths
-//! vello_cpu picks natively are lost. Three consequences:
+//! a dense LaTeX page is ~10-35 ms native and ~0.15-0.4 s under wasmi at a
+//! pane-fit scale. The interpreter tax is **3-30x**, which it only is because the
+//! guest is built with `simd128` and run on a wasmi with the `simd` feature: as
+//! plain scalar wasm on wasmi 0.40 the same pages were 30-90x, and the blend-heavy
+//! ones up to 340x. Three consequences, all of which survive the speedup:
 //!
 //! * **A render is a bounded unit of work with a pump around it.** The kernel is
 //!   cooperative, so the viewer renders one page per user action and pumps
@@ -69,12 +71,18 @@ const PDF_MEM_PAGES: u32 = 2048;
 /// Fuel for one page render.
 ///
 /// Same source: the paper's heaviest page (a full-page attention-matrix figure)
-/// costs ~2.6 Gfuel at pane-fit and **7.7 Gfuel** at full zoom, so this is ~2x
-/// headroom over the worst thing actually observed. It stays a bound rather than
-/// a formality — a render is the one call the shell cannot interrupt from
-/// outside (wasmi has no yield point), so fuel is the Ctrl+C rule's backstop.
+/// costs **2.4 Gfuel** at full zoom, so this is ~3x headroom over the worst thing
+/// actually observed, and at the measured ~770 Mfuel/s it bounds a runaway to
+/// ~10 s. It stays a real bound rather than a formality — a render is the one
+/// call the shell cannot interrupt from outside (wasmi has no yield point), so
+/// fuel is the Ctrl+C rule's backstop.
+///
+/// NB the same page cost 7.7 Gfuel before the guest was built with `simd128`: a
+/// vector instruction does the work of several scalar ones and is charged once, so
+/// enabling SIMD *lowered* fuel use as well as wall time. A fuel budget is
+/// therefore not portable across a change in how the guest is compiled.
 #[cfg(not(feature = "server"))]
-const PDF_RENDER_FUEL: u64 = 16_000_000_000;
+const PDF_RENDER_FUEL: u64 = 8_000_000_000;
 
 /// Fuel for parsing a document (xref, page tree). Cheap next to a render
 /// (~30-45 ms), but a crafted xref loop is exactly the sort of thing that should
@@ -371,12 +379,17 @@ pub(super) fn run_pdf(arg: &str) {
         "" | "status" => {
             let s = PDF.with(|s| {
                 s.as_ref().map(|t| {
+                    // The render time belongs in the status line, not just the
+                    // HUD: it is the answer to "why was that slow", and over a
+                    // serial console the HUD is invisible — which is also what
+                    // makes the figure testable outside the framebuffer.
                     alloc::format!(
-                        "pdf> {} — page {}/{} at {}%{}",
+                        "pdf> {} — page {}/{} at {}% ({} ms){}",
                         t.path,
                         t.view.page + 1,
                         t.view.pages,
                         t.permille / 10,
+                        t.last_ms,
                         if t.rendered.is_some() { "" } else { " (page not rendered)" }
                     )
                 })

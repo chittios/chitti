@@ -16,6 +16,11 @@
 //! Host rather than in-kernel on purpose (the `pngbench`/`onnxdiff` pattern):
 //! both answers are properties of wasmi and this code, not of QEMU.
 //!
+//! Runs the **same interpreter the kernel does** — wasmi 1.1 with the `simd`
+//! feature — because that pairing is itself worth 2.2x over wasmi 0.40 without
+//! it, and a harness on the old one would now be measuring a program the OS does
+//! not run.
+//!
 //! ```text
 //! cargo run --release -- <file.pdf> [scale] [pages]
 //! ```
@@ -135,7 +140,7 @@ fn render_native(pdf: &[u8], scale: f32, pages: u32) -> Vec<Rendered> {
     out
 }
 
-/// The renderer under wasmi 0.40 with fuel metering on — the kernel's setup
+/// The renderer under wasmi 1.1 + `simd` with fuel metering on — the kernel's setup
 /// (`agent::wasm_rt::make_engine`), so the timings transfer.
 fn render_wasm(pdf: &[u8], scale: f32, pages: u32) -> Vec<Rendered> {
     let bytes = std::fs::read(MODULE).unwrap_or_else(|e| {
@@ -150,11 +155,10 @@ fn render_wasm(pdf: &[u8], scale: f32, pages: u32) -> Vec<Rendered> {
     let mut store = wasmi::Store::new(&engine, ());
     store.set_fuel(u64::MAX / 2).unwrap();
     let linker = wasmi::Linker::<()>::new(&engine);
+    // wasmi 1.x runs the start function as part of instantiation.
     let inst = linker
-        .instantiate(&mut store, &module)
-        .expect("instantiate")
-        .start(&mut store)
-        .expect("start");
+        .instantiate_and_start(&mut store, &module)
+        .expect("instantiate");
     let mem = inst.get_memory(&store, "memory").expect("memory export");
     let alloc = inst.get_typed_func::<i32, i32>(&store, "chitti_alloc").unwrap();
     let open = inst.get_typed_func::<(i32, i32), i32>(&store, "pdf_open").unwrap();

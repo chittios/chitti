@@ -39,7 +39,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use wasmi::errors::{MemoryError, TableError};
+use wasmi_core::LimiterError;
 use wasmi::{Caller, Config, Engine, Extern, Linker, Memory, Module, ResourceLimiter, Store};
 
 /// Default instruction fuel when a tool entry does not specify one.
@@ -146,17 +146,18 @@ impl ResourceLimiter for PageLimiter {
         _current: usize,
         desired: usize,
         _maximum: Option<usize>,
-    ) -> Result<bool, MemoryError> {
+    ) -> Result<bool, LimiterError> {
         Ok(desired <= self.max_bytes)
     }
 
+    // wasmi 1.x counts table elements in `usize`, not `u32`.
     fn table_growing(
         &mut self,
-        _current: u32,
-        desired: u32,
-        _maximum: Option<u32>,
-    ) -> Result<bool, TableError> {
-        Ok(desired <= self.max_table_elems)
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool, LimiterError> {
+        Ok(desired <= self.max_table_elems as usize)
     }
 
     fn instances(&self) -> usize {
@@ -295,11 +296,10 @@ impl Session {
             HostImportSet::Agent => register_host_imports(&mut linker)?,
             HostImportSet::Page => register_page_imports(&mut linker)?,
         }
+        // wasmi 1.x runs the start function as part of instantiation.
         let instance = linker
-            .instantiate(&mut store, &module)
-            .map_err(|_| "wasm instantiate failed (missing imports?)")?
-            .start(&mut store)
-            .map_err(|_| "wasm start function failed")?;
+            .instantiate_and_start(&mut store, &module)
+            .map_err(|_| "wasm instantiate failed (missing imports/limits?)")?;
 
         Ok(Self { store, instance })
     }
@@ -429,7 +429,8 @@ impl Session {
             .instance
             .get_memory(&self.store, "memory")
             .ok_or("guest did not export memory")?;
-        let need_pages = ((len + PAGE_SIZE - 1) / PAGE_SIZE) as u32;
+        // Page counts are `u64` in wasmi 1.x (memory64 support).
+        let need_pages = len.div_ceil(PAGE_SIZE) as u64;
         let cur = mem.size(&self.store);
         if cur < need_pages {
             mem.grow(&mut self.store, need_pages - cur)
@@ -1489,6 +1490,27 @@ mod tests {
         )
         .expect("echo");
         assert_eq!(out, r#"{"from":"e2"}"#);
+    }
+
+    /// A live instance can be **moved to another core**, which is the only form
+    /// of SMP available to a wasm guest here.
+    ///
+    /// wasmi is a single-threaded interpreter and the kernel implements none of
+    /// the wasm `threads` proposal, so nothing inside one call can be split
+    /// across cores. What *is* possible is loaning a whole `Session` to an SMP
+    /// worker the way the video player loans its decoder (`smp::async_submit`):
+    /// the UI keeps pumping on the BSP while a page renders elsewhere, and the
+    /// next page can be rendered ahead while the reader looks at this one.
+    ///
+    /// That requires `Session: Send`, which is a property of wasmi's types plus
+    /// our `HostState` and is easy to lose by accident — one `Rc` in host state
+    /// would end it. This asserts it at compile time so the groundwork cannot rot
+    /// before the render-ahead path is built on it.
+    #[test_case]
+    fn a_session_is_send_so_it_can_be_loaned_to_an_smp_worker() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Session>();
+        assert_send::<HostState>();
     }
 
     #[test_case]

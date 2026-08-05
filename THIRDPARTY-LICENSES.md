@@ -57,9 +57,12 @@ Full license texts ship in each crate's source under
 
 ## wasmi — crates.io (WebAssembly interpreter)
 
-Agent-authored tools (`assets/tools.wasm`) run on
-[wasmi](https://github.com/wasmi-labs/wasmi) 0.40 — a pure-Rust, `no_std` +
-alloc WebAssembly **interpreter** (not a JIT). Fuel metering and
+Agent-authored tools (`assets/tools.wasm`) and the PDF rasterizer run on
+[wasmi](https://github.com/wasmi-labs/wasmi) 1.1 with the `simd` feature — a
+pure-Rust, `no_std` + alloc WebAssembly **interpreter** (not a JIT). `simd` is
+what lets a guest compiled with `-Ctarget-feature=+simd128` execute vector
+instructions rather than scalarized ones; `wasmi_core` is also a direct dependency
+purely to name the `LimiterError` type wasmi does not re-export. Fuel metering and
 `ResourceLimiter` bound instruction count and linear memory; guests may only
 touch the world through capability-gated host imports registered by
 `kernel/src/agent/wasm_rt.rs`. wasmi and its crates (`wasmi_core`,

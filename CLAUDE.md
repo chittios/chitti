@@ -207,9 +207,38 @@ a memory-page limiter, a per-call fuel bound. Five things that path pins down:
   ~7.0 s under wasmi, `3` in ~0.82 s — and the `3` module is *smaller* (4.1 vs 5.4 MiB), so
   there is no trade to make: the size profile drops the inlining vello_cpu's per-pixel
   pipelines are built around. `tools/pdfbench` is the permanent harness (native *and* wasm,
-  same crate, seconds on the host — the `pngbench` pattern); the interpreter tax is
-  **30-90x**, worse than PNG's 47-67x because the SIMD blend paths are lost entirely.
-  In-kernel: ~70-150 ms for a simple page, ~990 ms for a page of this repo's own paper.
+  same crate, seconds on the host — the `pngbench` pattern).
+- **Then wasm SIMD was worth another 2.2x, and it takes both halves.** The guest is built
+  with `-Ctarget-feature=+simd128` (pinned in `tools/pdfrender-wasm/.cargo/config.toml`, not
+  an env var, so a rebuild cannot silently lose it) and the kernel runs **wasmi 1.1 with the
+  `simd` feature**. Separated on one real document: the 0.40 -> 1.1 interpreter alone is
+  **1.43x**, SIMD on top is another **1.53x**, and on a blend-heavy page — vello_cpu's
+  per-pixel pipelines are exactly what vectorizes — it reaches **5.8x** (6850 -> 1181 ms).
+  Both halves are required: wasmi 0.40 *rejects* a simd128 module at validation, and a
+  scalar module gains nothing from the feature. The interpreter tax fell from 30-90x
+  (340x on the worst page) to **3-30x**. SIMD also *lowered* fuel use 3x — a vector op does
+  several scalars' work and is charged once — so a fuel budget does not survive a change in
+  how the guest is compiled.
+- **Fuel metering costs 3.7%**, measured with it off. It stays on: that is the only bound on
+  a runaway guest, and 3.7% is not a price worth arguing about.
+- **In-kernel is ~3x slower than the host on heavy pages and equal on light ones**, which is
+  not the allocator: re-rendering a page with the guest's arena already grown is only 6%
+  faster than the cold render. It scales with the *working set* (a heavy page holds 56 MiB
+  of glyph and image caches), so the suspect is guest TLB pressure under stage-2
+  translation, and the lever would be huge pages for the kernel heap — unmeasured, so
+  stated as a hypothesis. Release and debug kernels time the same here, so the harness's
+  debug boots are fine to measure on. Real figures (aarch64 HVF): **445 ms** for page 1 of
+  a 117-page book, **565 ms** for a paper's first page, ~3.1-3.9 s for its two
+  attention-matrix figure pages.
+- **SMP for wasmi does not exist and cannot exist inside a call.** wasmi is a
+  single-threaded interpreter and none of the wasm `threads` proposal is implemented, so
+  there is no way to split one render across cores; vello_cpu's own `multithreading`
+  feature needs rayon and is off. What *is* available is loaning a whole `Session` to an
+  SMP worker the way the video player loans its decoder (`smp::async_submit`) — which buys
+  a live UI during a render and a next-page render-ahead, not a faster render.
+  `Session: Send` is asserted at compile time
+  (`a_session_is_send_so_it_can_be_loaned_to_an_smp_worker`) so that groundwork cannot rot;
+  the render-ahead path itself is **not built**.
 - **The `ResourceLimiter` capped function tables at a hardcoded 256**, and a renderer built
   on trait objects declares **693**. The failure is
   `wasm instantiate failed (missing imports?)` — the one message that does not mention

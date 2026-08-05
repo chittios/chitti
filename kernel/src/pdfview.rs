@@ -27,10 +27,13 @@ use alloc::vec::Vec;
 /// satisfy. This one is a *latency* limit, and it exists because of what a real
 /// document measured: the two attention-matrix pages of the Transformer paper
 /// (arXiv:1706.03762 — measured with `tools/pdfbench`, not shipped in `/samples`)
-/// take ~6.9 s at a pane-fit scale and **20.7 s at 8 MP** under the interpreter.
-/// A pane-fit render is ~0.5-1.5 MP, so this never binds in ordinary use; it
-/// only stops a 400% zoom on a pathological page from freezing the console for
-/// twenty seconds, at the cost of slightly softer text at extreme zoom.
+/// are ~1.2 s at a pane-fit scale and **~3-6 s at 8 MP**, and were 6.9 s / 20.7 s
+/// before the guest gained `simd128`. A pane-fit render is ~0.5-1.5 MP, so this
+/// never binds in ordinary use; it only stops a 400% zoom on a pathological page
+/// from freezing the console for several seconds, at the cost of slightly softer
+/// text at extreme zoom. It stayed at 4 MP through the SIMD speedup deliberately:
+/// what a user feels is the freeze, and 4 MP still allows ~2.8x linear zoom over
+/// pane fit.
 ///
 /// Keep it **at or below** the guest's number: above it, the host would ask for
 /// renders the guest is bound to refuse.

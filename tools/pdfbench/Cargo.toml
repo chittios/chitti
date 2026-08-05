@@ -12,7 +12,10 @@ publish = false
 [workspace]
 
 [dependencies]
-wasmi = "0.40"
+# **Match the kernel exactly** (`kernel/Cargo.toml`): same version, same `simd`
+# feature. A harness on a different interpreter measures a different program —
+# the whole value of the numbers here is that they transfer.
+wasmi = { version = "1.1", default-features = false, features = ["simd", "std"] }
 # The renderer itself, as an rlib, for the native side of the comparison.
 chitti-pdfrender-wasm = { path = "../pdfrender-wasm" }
 

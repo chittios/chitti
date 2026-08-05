@@ -121,7 +121,18 @@ rust_h264 = { path = "../third_party/rust_h264", default-features = false }
 # no_std + alloc; fuel metering + ResourceLimiter keep guests bounded.
 # Effects only via host imports (W2+); guest is below the determinism boundary.
 # MIT/Apache-2.0 — see THIRDPARTY-LICENSES.md.
-wasmi = { version = "0.40", default-features = false }
+# wasmi 1.x with the **simd** proposal enabled: the interpreter is what the PDF
+# rasterizer's cost is made of, and turning both on is worth 2.2x on a real
+# document (1.43x from the 0.40 -> 1.1 interpreter, another 1.53x from SIMD; up
+# to 5.8x on a blend-heavy page). `simd` is what lets a guest built with
+# `-Ctarget-feature=+simd128` use vector instructions instead of scalarizing
+# them, which is where vello_cpu's per-pixel pipelines live. Still no_std.
+wasmi = { version = "1.1", default-features = false, features = ["simd"] }
+# `wasmi_core` only for the name `LimiterError`: wasmi 1.1 re-exports the
+# `ResourceLimiter` trait but not the error type its methods return, so the impl
+# in `agent/wasm_rt.rs` cannot spell its own signature without this. Already in
+# the tree as wasmi's own dependency — this adds a path, not code.
+wasmi_core = { version = "1.1", default-features = false }
 
 # Pull-based HTML/XML tokenizer for the browser agent (`browser::html`).
 # Pure Rust, zero deps, no_std via default-features = false. MIT OR Apache-2.0.
