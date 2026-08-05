@@ -1886,6 +1886,19 @@ def s_js_agent_build(g):
     if not g.wait_for('"name":"chitti"', 120, m):
         return False, "arguments did not reach the compiled JS tool"
 
+    # The scaffolded `_note` tool reaches the **gated host surface**
+    # (`Chitti.storage`), which is what our own QuickJS plugin adds over the stock
+    # one. Storage is scoped to an agent identity, and `/js call` is a debug command
+    # that has none — so the right outcome here is a **refusal**, and what this
+    # asserts is that the gate holds and says why in words a developer can act on.
+    # (The positive path, with an identity, is covered by the in-kernel test
+    # `javascript_reaches_the_gated_host_surface`; `/agents test` will be the
+    # identity-bearing command.)
+    m = g.mark()
+    g.send(f"/js call {wasm} jsdemo_note '{{\"text\":\"remember me\"}}'")
+    if not g.wait_for("no such capability", 120, m):
+        return False, "an unbound JS tool should be refused by the capability gate, with a reason"
+
     # A tool the module does not export fails as a tool error, not a crash, and the
     # shell stays usable afterwards.
     m = g.mark()
@@ -1907,7 +1920,7 @@ def s_js_agent_build(g):
     g.send("/js call /tmp_js/rebuilt.wasm jsdemo_sum '{\"xs\":[5,5]}'")
     if not g.wait_for('"sum":10', 120, m):
         return False, "the rebuilt module did not run"
-    return True, "JS authored, compiled (QuickJS in wasm) and run on the machine: scaffold -> build -> call"
+    return True, "JS authored, compiled and run on the machine; the host-surface gate refuses an unbound tool with a legible reason"
 
 
 def s_open_pdf(g):

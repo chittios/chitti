@@ -1056,7 +1056,15 @@ fn run_js_call(module: &str, tool: &str, args: &str) {
             "js> {tool} -> {out}  ({} ms)",
             crate::arch::now_ms().saturating_sub(t0)
         ),
-        Err(e) => serial_println!("js> {tool} failed: {e}"),
+        Err(e) => {
+            // A JS exception reaches us as a trap whose message is "wasm
+            // unreachable"; the actual reason is what the guest printed to stderr
+            // on its way out, so lead with that.
+            match js.last_stderr() {
+                Some(why) => serial_println!("js> {tool} failed: {why}"),
+                None => serial_println!("js> {tool} failed: {e}"),
+            }
+        }
     }
 }
 

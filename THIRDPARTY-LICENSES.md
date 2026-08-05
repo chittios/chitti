@@ -84,12 +84,17 @@ plugin (v9.1.0) built on **QuickJS**. `kernel/src/agent/js_rt.rs` drives its
 which then runs under the `wasmi` sandbox above, with the same fuel and memory
 limits every other guest gets.
 
-The plugin binary is checked in and `include_bytes!`d into the kernel image; nothing
-of its source is vendored here. It is the stock `plugin.wasm` asset from the Javy
-release, which embeds QuickJS.
+The plugin binary is checked in and `include_bytes!`d into the kernel image. It is
+**our own** plugin, not the stock release asset: `tools/javy-plugin/` is a small Rust
+`cdylib` on `javy-plugin-api` 7.1.0 that exposes the kernel's gated `chitti.host_*`
+imports to scripts as a `Chitti` global, built by `cargo xtask javy-plugin` (which
+fetches the Javy CLI to run its required `init-plugin` step). Only that ~90-line
+source file is ours; QuickJS, the Javy runtime and `rquickjs` come from the
+dependency tree and are not vendored here.
 
-Javy is licensed under **Apache-2.0**; QuickJS (Fabrice Bellard, Charlie Gordon) is
-**MIT**. Both license texts ship with their upstream sources.
+Javy and `javy-plugin-api` are licensed under **Apache-2.0**; QuickJS (Fabrice
+Bellard, Charlie Gordon) is **MIT**; `rquickjs` is **MIT**. All license texts ship
+with their upstream sources.
 
 ---
 

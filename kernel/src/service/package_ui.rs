@@ -226,6 +226,16 @@ pub fn call_agent_export(agent_id: u64, export: &str, args_json: &str) -> Result
     if wasm.is_empty() {
         return Err("tools.wasm empty");
     }
+    // **Which ABI the module speaks is a property of the module**, not of the
+    // manifest: a JavaScript-derived `tools.wasm` imports the QuickJS engine, and
+    // nothing else in the system does. So a package written in JS and one written
+    // in Rust are the same artifact at the same path with the same manifest, and
+    // they cannot be confused or mislabelled — there is no flag to get wrong.
+    if let Some(ns) = crate::agent::js_rt::JsSession::namespace() {
+        if crate::agent::jsmod::links_plugin(&wasm, ns) {
+            return call_js_export(agent_id, &wasm, export, args_json);
+        }
+    }
     wasm_rt::call_string_bound(
         &wasm,
         export,
@@ -233,6 +243,45 @@ pub fn call_agent_export(agent_id: u64, export: &str, args_json: &str) -> Result
         Limits::default().with_fuel(crate::agent::system::manifest_fuel(agent_id).unwrap_or(CALL_FUEL)),
         bindings_for(agent_id),
     )
+}
+
+/// Run one tool of a JavaScript-derived module: arguments as JSON on fd 0, result
+/// as JSON on fd 1.
+///
+/// A fresh instance per call, deliberately. The engine's module top level re-runs
+/// on every `invoke`, so JS globals cannot carry state between calls anyway —
+/// caching an instance would buy the ~50 ms of engine start-up at the cost of a
+/// staleness bug the moment `/agents build` rewrites the module underneath it.
+fn call_js_export(
+    agent_id: u64,
+    wasm: &[u8],
+    export: &str,
+    args_json: &str,
+) -> Result<String, &'static str> {
+    // A module built against a different engine fails inside QuickJS with
+    // `invalid version`, which reads as a broken tool rather than a stale build.
+    // Name it before running, while we still can.
+    let want = crate::agent::js_rt::JsSession::plugin_stamp();
+    if let Some(got) = crate::agent::jsmod::plugin_stamp(wasm) {
+        if got != want {
+            crate::ktrace::log_fmt(format_args!(
+                "js: agent {agent_id} tools.wasm built against '{got}', engine is '{want}'"
+            ));
+            return Err("tools.wasm was built against another JS engine -- rebuild it");
+        }
+    }
+    let limits = wasm_rt::Limits::default()
+        // A manifest may raise the budget; it may not lower it below what the
+        // engine needs to start (see JS_MIN_CALL_FUEL).
+        .with_fuel(
+            crate::agent::system::manifest_fuel(agent_id)
+                .unwrap_or(crate::agent::js_rt::JS_CALL_FUEL)
+                .max(crate::agent::js_rt::JS_MIN_CALL_FUEL),
+        )
+        .with_pages(crate::agent::js_rt::JS_MEM_PAGES)
+        .with_table_elems(crate::agent::js_rt::JS_TABLE_ELEMS);
+    let mut js = crate::agent::js_rt::JsSession::with_module(wasm, limits, bindings_for(agent_id))?;
+    js.call(export, args_json)
 }
 
 /// Call a guest export on the app that owns `surface`.
@@ -836,6 +885,64 @@ pub fn key(c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A JavaScript-derived `tools.wasm` is reachable as an ordinary agent tool.**
+    ///
+    /// This is the whole claim of the JS path: the artifact, the path and the
+    /// manifest are the ones a Rust package uses, so the tool router needs no new
+    /// binding and `call_agent_export` is the single entry point for both. What
+    /// decides the ABI is the module's own imports, checked here by going through
+    /// the *real* entry point rather than calling the JS runtime directly.
+    #[test_case]
+    fn a_javascript_module_answers_through_the_ordinary_tool_path() {
+        const SRC: &str = r#"
+            function readArgs() {
+              const chunks = []; const buf = new Uint8Array(1024); let n;
+              while ((n = Javy.IO.readSync(0, buf)) > 0) chunks.push(buf.slice(0, n));
+              let total = 0; for (const c of chunks) total += c.length;
+              const all = new Uint8Array(total); let at = 0;
+              for (const c of chunks) { all.set(c, at); at += c.length; }
+              return JSON.parse(new TextDecoder().decode(all) || "{}");
+            }
+            function reply(v) { Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(v))); }
+            export function probe_double() { const a = readArgs(); reply({ doubled: (a.n || 0) * 2 }); }
+        "#;
+        // A throwaway agent id, outside the system range, with a module in the
+        // place `place_agent_home` would have written one.
+        let agent_id = 31_337u64;
+        let wasm = crate::agent::js_rt::build_module(SRC, &["probe_double"]).expect("build");
+        let path = format!("{}/assets/tools.wasm", crate::agent::home::path(agent_id));
+        crate::synapse::fs::write(&path, &wasm);
+
+        let out = call_agent_export(agent_id, "probe_double", r#"{"n":21}"#)
+            .expect("a JS module must answer through call_agent_export");
+        assert!(out.contains(r#""doubled":42"#), "got {out}");
+
+        // A tool the module does not export is an error, not a panic or an empty
+        // success — the caller has to be able to tell.
+        assert!(call_agent_export(agent_id, "no_such_tool", "{}").is_err());
+
+        // And the ordinary Rust path is untouched: a module that does not import the
+        // engine still goes through the string ABI.
+        let rust_path = format!("{}/assets/tools.wasm", crate::agent::home::path(agent_id + 1));
+        crate::synapse::fs::write(rust_path.as_str(), crate::agent::wasm_rt::FIXTURE_ECHO);
+        let echoed = call_agent_export(agent_id + 1, "echo", r#"{"a":1}"#).expect("string ABI");
+        assert_eq!(echoed, r#"{"a":1}"#);
+    }
+
+    /// A module built by a different engine is refused with a rebuild hint rather
+    /// than failing deep inside QuickJS as `invalid version`.
+    #[test_case]
+    fn a_stale_javascript_module_is_named_not_run() {
+        let agent_id = 31_339u64;
+        let bc = alloc::vec![1u8, 2, 3, 4];
+        let ns = crate::agent::js_rt::JsSession::namespace().expect("namespace");
+        let stale = crate::agent::jsmod::emit(ns, "some-older-engine@1", &bc, &["t"]).expect("emit");
+        let path = format!("{}/assets/tools.wasm", crate::agent::home::path(agent_id));
+        crate::synapse::fs::write(&path, &stale);
+        let err = call_agent_export(agent_id, "t", "{}").unwrap_err();
+        assert!(err.contains("rebuild"), "got {err}");
+    }
 
     /// An app's model turn is told its surface id; when the model omits the
     /// argument anyway the runtime fills it in. A running app owns exactly one

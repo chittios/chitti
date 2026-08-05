@@ -971,6 +971,7 @@ const MANIFEST_TEMPLATE: &str = r#"{
   "toolset": [
     "@NAME@_echo",
     "@NAME@_sum",
+    "@NAME@_note",
     "memory_add",
     "memory_get"
   ],
@@ -1024,5 +1025,24 @@ export function @NAME@_sum() {
   const args = readArgs();
   const xs = Array.isArray(args.xs) ? args.xs : [];
   reply({ ok: true, sum: xs.reduce((s, x) => s + Number(x), 0), count: xs.length });
+}
+
+// The `Chitti` global is the same capability-gated host surface a Rust tool module
+// gets: storage, this agent's own files, hashing, logging, and http when the
+// manifest grants a `net` capability. Anything this agent may not do **throws**, so
+// a refusal can never be mistaken for an empty result.
+//
+// Note module top level re-runs on every call, so a JS global would not survive
+// between tools -- durable state goes in storage.
+export function @NAME@_note() {
+  const args = readArgs();
+  if (typeof args.text === "string") {
+    Chitti.storageSet(true, "note", args.text);   // true = durable
+    Chitti.log("@NAME@ saved a note");
+    reply({ ok: true, saved: args.text.length });
+  } else {
+    // `null` when nothing was ever stored -- distinct from a refusal, which throws.
+    reply({ ok: true, note: Chitti.storageGet(true, "note") });
+  }
 }
 "#;

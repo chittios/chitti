@@ -1026,11 +1026,34 @@ FDT claims a GICv3 but carries no readable `reg`.
   goes through storage, and package-UI apps (whose guest statics *are* their state)
   stay Rust. A JS call costs **3-4 Mfuel before the script does anything**, hence
   `js_rt`'s budgets rather than `DEFAULT_FUEL`'s 5 M.
-  **Not yet done** (see `~/.claude/plans/start-the-plan-lazy-harp.md`): a custom
-  plugin exposing the gated `chitti.host_*` surface to JS, so a JS tool currently
-  has stdio and nothing else; runtime ABI detection in `call_agent_export`, so a
-  JS-built `tools.wasm` is not yet reachable as an installed agent's tool; and
-  `/agents validate|install --path|reload|test` with the persistence that needs.
+  **A JS tool reaches the same gated surface a Rust one does.** The engine is *our*
+  Javy plugin (`tools/javy-plugin/`, `javy-plugin-api` 7.1.0, rebuilt by
+  `cargo xtask javy-plugin`), which imports the `chitti.host_*` functions and exposes
+  them as a `Chitti` global — `storageGet/Set/Remove/List`, `fsRead/Write/List/Exists`,
+  `uiDraw`, `hud`, `http`, `log`, `sha1`, `home`, `userHome`, `nowMs/nowUnix`. Same
+  imports, same gates, so **the authority does not widen**: only who can call it.
+  Refusals **throw** into the script rather than returning empty, and "no value"
+  returns `null` (localStorage's shape) because `JSON.stringify` drops `undefined`,
+  which would erase the distinction. Three more traps here:
+  - **Do not strip the plugin crate.** `javy init-plugin` validates through binaryen,
+    which reads the `target_features` custom section to know which wasm features to
+    permit; stripped, every bulk-memory instruction fails with
+    `[--enable-bulk-memory]` — an error naming a *flag*, not the missing section.
+  - **`javy-plugin-api` 7.1.0 pairs with CLI v9.1.0.** The published docs say 5.0.0;
+    the truth is in `crates/plugin/Cargo.toml` at the release tag, and a mismatch
+    surfaces only at `init-plugin`.
+  - **A JS exception arrives as a trap** whose message is `wasm unreachable`. The
+    reason is the last thing the guest wrote to fd 2, so `Fds::last_stderr` keeps it
+    and `/js call` leads with that instead ("storageSet: refused: this agent has no
+    such capability bound").
+  Rebuilding the plugin changes its stamp, so **every `tools.wasm` built against the
+  old one becomes stale** — detected and reported as "rebuild it", not failed inside
+  QuickJS.
+  **Not yet done** (see `~/.claude/plans/start-the-plan-lazy-harp.md`):
+  `/agents validate|install --path|reload|test`, and the id allocation + boot
+  reinstall they need — so a local JS package can be built and called by path today,
+  but not yet *installed* as an agent. Note also that install records are written to
+  the store and never read back, so that persistence is a prerequisite.
 - **Messaging channels** (`msgchan/`) — external inbox adapters (Telegram
   live; Discord/Slack/webhooks follow the same shape): a named instance +
   backend + access policy delivering inbound DMs into the shell agent and

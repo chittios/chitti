@@ -1,0 +1,51 @@
+# ChittiOS's own Javy plugin: QuickJS plus the kernel's gated host surface.
+#
+# Why not the stock `plugin.wasm` from a Javy release: that one gives a script
+# stdio and nothing else. An agent's tools need what a Rust tool module already
+# gets — the `chitti.host_*` imports — and the way to add them to a JS runtime is
+# to build your own plugin (upstream `docs/docs-using-extending.md`).
+#
+# Build (see `cargo xtask javy-plugin`, which does all of this):
+#   cargo build --release --target wasm32-wasip1
+#   javy init-plugin target/wasm32-wasip1/release/chitti_javy_plugin.wasm \
+#        -o ../../assets/wasm/javy-plugin.wasm
+#
+# The `init-plugin` step is not optional: it runs the runtime's own initialization
+# and lowers the component to a core module. A plugin that skips it is rejected.
+[package]
+name = "chitti-javy-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "QuickJS plugin for ChittiOS: the JS engine plus the gated chitti.host_* surface"
+
+# Stand-alone crate (not part of the root workspace / host xtask).
+[workspace]
+
+[lib]
+name = "chitti_javy_plugin"
+crate-type = ["cdylib"]
+
+[package.metadata.javy]
+targets = ["wasip1"]
+
+[dependencies]
+# 7.1.0 is the version that pairs with the Javy CLI v9.1.0 whose `init-plugin` we
+# run — checked against `crates/plugin/Cargo.toml` at the v9.1.0 tag, because the
+# published docs still say 5.0.0 and a mismatch surfaces only at `init-plugin`.
+javy-plugin-api = { version = "7.1.0", features = ["json"] }
+
+[profile.release]
+# Same reasoning as the PDF rasterizer: the interpreter is the cost, so optimise
+# for speed. The plugin is ~1.3 MiB either way.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+# **Do not strip.** Stripping removes the `target_features` custom section, and
+# `javy init-plugin` runs the module through binaryen, which reads that section to
+# decide which wasm features to permit. Without it every bulk-memory instruction
+# fails validation with `Bulk memory operations require bulk memory
+# [--enable-bulk-memory]` — an error that points at a missing *flag*, not at a
+# missing section, so it reads as a toolchain problem rather than our profile.
+strip = false

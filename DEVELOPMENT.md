@@ -529,6 +529,17 @@ toolchain is involved:
 /js call ~/agents/demo/assets/tools.wasm demo_sum '{"xs":[1,2,3]}'
 ```
 
+Scripts reach the kernel's gated host surface through a `Chitti` global —
+`Chitti.storageGet/Set`, `fsRead/fsWrite/fsList/fsExists`, `uiDraw`, `hud`, `http`,
+`log`, `sha1`, `home` — which are **the same `chitti.host_*` imports a Rust tool
+module calls**, gated by the same code. Anything the agent's manifest does not grant
+**throws**, so a refusal is never mistaken for an empty result; storage needs an agent
+identity, so it refuses under the identity-less `/js call` (use it from an installed
+agent). The engine itself is `assets/wasm/javy-plugin.wasm`, rebuilt with
+`cargo xtask javy-plugin` from `tools/javy-plugin/` — note that crate must **not** be
+stripped, because `javy init-plugin` validates through binaryen, which reads the
+`target_features` custom section to decide which wasm features to allow.
+
 The lower-level form is `/js build <in.js> [-o out.wasm] [--tools a,b]`; exports are
 scanned from `export function <name>` when `--tools` is omitted. The shape is fixed
 by Javy: exported functions take **no arguments** and their **return value is

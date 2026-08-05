@@ -164,6 +164,14 @@ pub struct Fds {
     /// Bytes already forwarded from fd 2 to ktrace, so a chatty guest cannot
     /// flood the trace (the same reason `host_log` counts).
     stderr_bytes: u32,
+    /// The most recent line the guest wrote to fd 2.
+    ///
+    /// Kept because a JavaScript exception arrives as a **trap**, and a trap's own
+    /// message is `wasm unreachable` — true and useless. The reason ("refused: this
+    /// agent has no such capability bound") is what the guest printed to stderr just
+    /// before dying, so holding on to it is the difference between a usable error and
+    /// a shrug.
+    last_stderr: String,
 }
 
 /// Cap on fd 2 forwarded to ktrace per store.
@@ -181,11 +189,21 @@ impl Fds {
     pub fn take_stdout(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.stdout)
     }
+
+    /// The last thing the guest said on stderr, if anything.
+    pub fn last_stderr(&self) -> Option<&str> {
+        let t = self.last_stderr.trim();
+        (!t.is_empty()).then_some(t)
+    }
 }
 
 impl HostState {
     pub fn fds(&mut self) -> &mut Fds {
         &mut self.fds
+    }
+
+    pub fn fds_ref(&self) -> &Fds {
+        &self.fds
     }
 }
 
@@ -729,6 +747,15 @@ fn register_wasi_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                             let msg = String::from_utf8_lossy(&bytes);
                             let preview: String = msg.chars().take(200).collect();
                             crate::ktrace::log_fmt(format_args!("js.stderr> {}", preview.trim_end()));
+                        }
+                        // Kept regardless of the trace cap: this is what a failed call
+                        // reports back, and the *last* line is the interesting one.
+                        {
+                            let msg = String::from_utf8_lossy(&bytes);
+                            let line = msg.trim();
+                            if !line.is_empty() && !line.starts_with("note: run with") {
+                                caller.data_mut().fds.last_stderr = String::from(line);
+                            }
                         }
                     }
                     total += len as u32;

@@ -787,6 +787,7 @@ fn main() {
         // Fetch the `/samples/` corpus (images/videos/audios/misc). The build
         // paths call this for you when CHITTI_SAMPLE_FILES is set.
         "sample-files" | "samples" => cmd_sample_files(&rest),
+        "javy-plugin" => cmd_javy_plugin(),
         "wifi-assets" => cmd_wifi_assets(),
         "iwlwifi-assets" => cmd_iwlwifi_assets(),
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
@@ -819,6 +820,8 @@ fn usage() -> String {
      sample-files [--refresh]: fetch the /samples corpus (images/videos/audios/misc) into \
      assets/samples/; embedded into the image and seeded to /samples/ at boot. \
      CHITTI_SAMPLE_FILES=1 (default in `make run` / `make vbox`) fetches + embeds it automatically.\n\
+     javy-plugin: rebuild assets/wasm/javy-plugin.wasm (the JS engine + chitti host surface) \
+     from tools/javy-plugin; fetches the Javy CLI, needs `rustup target add wasm32-wasip1`.\n\
      wifi-assets: extract Apple FullMAC firmware from macOS into assets/wifi/ (for /wifi load).\n\
      iwlwifi-assets: fetch Intel WiFi firmware from linux-firmware into assets/wifi/iwl/.\n\
      usb-ids [bt|cam|all]: grep host USB for Bluetooth/camera vid:pid (see make usb-list / USB_BT=1).\n\
@@ -3982,6 +3985,99 @@ fn cmd_voice_assets() -> Result<(), String> {
 /// API version is a property of the file rather than the chip, so this walks candidates
 /// newest-first and stops at the first one the upstream tree actually has — exactly what
 /// the in-kernel loader does with the local directory.
+/// `cargo xtask javy-plugin` — rebuild `assets/wasm/javy-plugin.wasm`.
+///
+/// The JS engine agents' `tools.js` is compiled by is our own Javy plugin: QuickJS
+/// plus the kernel's gated `chitti.host_*` imports. Three steps, each of which fails
+/// in a way that does not name its cause, so they live here rather than in a comment:
+///
+/// 1. `cargo build --target wasm32-wasip1` — the target must be installed
+///    (`rustup target add wasm32-wasip1`), and building QuickJS from C pulls a
+///    wasi-sdk into the target dir on first run.
+/// 2. `javy init-plugin` — **not optional**: it runs the runtime's own
+///    initialization and lowers the component to a core module. It also validates
+///    through binaryen, which reads the module's `target_features` custom section to
+///    decide which wasm features to allow — so the crate must **not** be stripped,
+///    or every bulk-memory instruction fails with `[--enable-bulk-memory]`.
+/// 3. The result replaces the checked-in blob. Its namespace (`chitti_js_v1`) and
+///    size form the stamp `jsmod::emit` writes into every module built against it,
+///    so **existing `tools.wasm` artifacts become stale and must be rebuilt** —
+///    which the kernel detects and reports rather than failing inside QuickJS.
+///
+/// The Javy CLI is fetched to the target dir if absent (the `iwlwifi-assets`
+/// pattern: fetched, never committed).
+fn cmd_javy_plugin() -> Result<(), String> {
+    const JAVY_VERSION: &str = "v9.1.0";
+    let root = repo_root();
+    let dir = root.join("tools/javy-plugin");
+    let target_dir = dir.join("target");
+    fs::create_dir_all(&target_dir).map_err(|e| format!("mkdir: {e}"))?;
+
+    // 1. The CLI. `javy-plugin-api`'s version must match this release — checked
+    // against `crates/plugin/Cargo.toml` at the tag, because a mismatch surfaces
+    // only at `init-plugin`.
+    let javy = target_dir.join("javy");
+    if !javy.exists() {
+        let arch = if cfg!(target_arch = "aarch64") { "arm" } else { "x86_64" };
+        let os = if cfg!(target_os = "macos") { "macos" } else { "linux" };
+        let url = format!(
+            "https://github.com/bytecodealliance/javy/releases/download/{JAVY_VERSION}/javy-{arch}-{os}-{JAVY_VERSION}.gz"
+        );
+        eprintln!("javy-plugin: fetching the Javy CLI {JAVY_VERSION} ({arch}-{os})…");
+        let gz = target_dir.join("javy.gz");
+        let st = Command::new("curl")
+            .args(["-sSL", "-o"])
+            .arg(&gz)
+            .arg(&url)
+            .status()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !st.success() {
+            return Err(format!("could not download {url}"));
+        }
+        let st = Command::new("gunzip").arg("-f").arg(&gz).status().map_err(|e| format!("gunzip: {e}"))?;
+        if !st.success() {
+            return Err(String::from("could not gunzip the Javy CLI"));
+        }
+        let _ = Command::new("chmod").arg("+x").arg(&javy).status();
+    }
+
+    // 2. Build the plugin for wasip1.
+    eprintln!("javy-plugin: building tools/javy-plugin for wasm32-wasip1…");
+    let st = Command::new("cargo")
+        .current_dir(&dir)
+        .args(["build", "--release", "--target", "wasm32-wasip1"])
+        .status()
+        .map_err(|e| format!("cargo: {e}"))?;
+    if !st.success() {
+        return Err(String::from(
+            "plugin build failed (is wasm32-wasip1 installed? `rustup target add wasm32-wasip1`)",
+        ));
+    }
+
+    // 3. Initialize it and replace the blob.
+    let built = dir.join("target/wasm32-wasip1/release/chitti_javy_plugin.wasm");
+    let out = root.join("assets/wasm/javy-plugin.wasm");
+    eprintln!("javy-plugin: javy init-plugin → {}", out.display());
+    let st = Command::new(&javy)
+        .arg("init-plugin")
+        .arg(&built)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .map_err(|e| format!("javy init-plugin: {e}"))?;
+    if !st.success() {
+        return Err(String::from(
+            "javy init-plugin failed (if it complains about bulk memory, the crate was stripped: \
+             binaryen reads the `target_features` custom section)",
+        ));
+    }
+    let size = fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    eprintln!("javy-plugin: wrote {} ({} KiB)", out.display(), size / 1024);
+    eprintln!("javy-plugin: NOTE every existing tools.wasm built by /agents build is now stale");
+    eprintln!("             (the kernel detects the stamp mismatch and asks for a rebuild)");
+    Ok(())
+}
+
 fn cmd_iwlwifi_assets() -> Result<(), String> {
     let out = repo_root().join("assets/wifi/iwl");
     fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;

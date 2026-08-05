@@ -69,6 +69,15 @@ pub const JS_COMPILE_FUEL: u64 = 2_000_000_000;
 /// script runs, so this is not a tight budget — it is a runaway bound.
 pub const JS_CALL_FUEL: u64 = 400_000_000;
 
+/// Floor on per-call fuel for a JS guest, whatever a manifest says.
+///
+/// The engine's own start-up is ~3-4 Mfuel before the script runs, and existing
+/// package manifests declare 2 M — a number chosen for a hand-written Rust tool. A
+/// manifest like that would make every JS call trap during start-up, which looks
+/// like a broken tool rather than a budget set for a different language. So a
+/// manifest can raise the budget but not lower it past the point of working.
+pub const JS_MIN_CALL_FUEL: u64 = 50_000_000;
+
 /// Linear-memory ceiling for a JS guest, in 64 KiB pages (16 MiB). QuickJS plus a
 /// compiled script sits around 3 MiB; this leaves room for the data a tool builds.
 pub const JS_MEM_PAGES: u32 = 256;
@@ -244,6 +253,11 @@ impl JsSession {
         String::from_utf8(out).map_err(|_| "tool output is not utf-8")
     }
 
+    /// The guest's own last words on stderr — the reason behind a trap.
+    pub fn last_stderr(&self) -> Option<&str> {
+        self.store.data().fds_ref().last_stderr()
+    }
+
     /// Tool names the linked module exports.
     pub fn exports(&self) -> Vec<String> {
         let Some(m) = self.module else { return Vec::new() };
@@ -363,6 +377,61 @@ mod tests {
         );
         // ...and starting fresh works, which is the path users actually take.
         assert!(build_module("export function t() {}", &["t"]).is_ok());
+    }
+
+    /// **JavaScript reaches the kernel's gated host surface**, through the very
+    /// same `chitti.host_*` imports a hand-written Rust tool module calls.
+    ///
+    /// This is what our own plugin buys over the stock one, which gives a script
+    /// stdio and nothing else. The authority does not widen: these are the same
+    /// imports, gated by the same code, so what a JS tool may do is exactly what a
+    /// wasm tool with the same manifest may do.
+    #[test_case]
+    fn javascript_reaches_the_gated_host_surface() {
+        const SRC: &str = r#"
+            function reply(v) { Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(v))); }
+            export function probe() {
+              Chitti.log("hello from a js tool");
+              Chitti.storageSet(false, "k", "v1");
+              const got = Chitti.storageGet(false, "k");
+              const missing = Chitti.storageGet(false, "nope");
+              reply({ got, missing, home: Chitti.home(), sha1: Chitti.sha1("abc") });
+            }
+        "#;
+        let wasm = build_module(SRC, &["probe"]).expect("build");
+        // A real agent identity: storage is scoped to it, and `host_home` needs it.
+        let bind = HostBindings { agent_id: 4242, task: 0, surface: 0 };
+        let mut js = JsSession::with_module(&wasm, limits(), bind).expect("link");
+        let out = js.call("probe", "{}").expect("probe");
+        assert!(out.contains(r#""got":"v1""#), "storage round-trip failed: {out}");
+        // A key that holds nothing is `null`, *not* an exception — the script has to
+        // be able to tell "no value" from "not allowed".
+        assert!(out.contains(r#""missing":null"#), "a missing key must read as null: {out}");
+        assert!(out.contains("/agent/4242"), "the agent's own home should be visible: {out}");
+        // SHA-1("abc") — a known digest, so this is the host's hasher and not a stub.
+        assert!(
+            out.contains("a9993e364706816aba3e25717850c26c9cd0d89d"),
+            "host_sha1 did not produce the known digest: {out}"
+        );
+        crate::agent::storage::clear_session(4242);
+    }
+
+    /// A capability the agent does not hold becomes a **thrown JS exception**, not an
+    /// empty success. Drawing needs a bound surface; this identity has none.
+    #[test_case]
+    fn a_refused_capability_throws_into_the_script() {
+        const SRC: &str = r#"
+            function reply(v) { Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(v))); }
+            export function probe() {
+              try { Chitti.uiDraw("clear 000000"); reply({ drew: true }); }
+              catch (e) { reply({ refused: String(e) }); }
+            }
+        "#;
+        let wasm = build_module(SRC, &["probe"]).expect("build");
+        let mut js = JsSession::with_module(&wasm, limits(), HostBindings::default()).expect("link");
+        let out = js.call("probe", "{}").expect("probe");
+        assert!(out.contains("refused"), "an unbound surface must refuse: {out}");
+        assert!(!out.contains(r#""drew":true"#), "and must not look like it worked: {out}");
     }
 
     #[test_case]
