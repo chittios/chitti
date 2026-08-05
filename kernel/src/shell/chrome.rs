@@ -22,17 +22,26 @@ pub const DIAMOND: &str = "*";
 /// Vertical connector down the left edge of a tool call's output, on the wire.
 pub const TOOL_PIPE: &str = "|";
 
-/// The Font Awesome glyph the **compositor** draws in place of a wire-level chrome
-/// marker, or `None` for anything else.
+/// The glyph the **compositor** draws in place of a wire-level chrome marker, or `None`
+/// for anything else.
 ///
-/// Called only for column 0 of a line the pane has already classified as a tool block,
-/// so it never sees ordinary text: a `*` or `|` a user typed is not in that band. Pure,
-/// so the mapping is checked without a framebuffer — `framebuffer/` is
-/// `#[cfg(not(test))]` and a test written in there would never even compile.
+/// Called only for column 0 of a line the pane has already classified as a tool block, so
+/// it never sees ordinary text: a `*` or `|` a user typed is not in that band. Pure, so
+/// the mapping is checked without a framebuffer — `framebuffer/` is `#[cfg(not(test))]`
+/// and a test written in there would never even compile.
+///
+/// The bullet is Font Awesome; the connector is **box-drawing U+2502**, not an icon.
+/// FA Free has no single vertical rule (`pipe` is a Pro glyph) and the nearest thing,
+/// `grip-lines-vertical`, is two parallel bars that read as a stray `‖` in running text.
+/// A box-drawing rule is also the better shape mechanically: it fills the full mono cell
+/// height, so consecutive rows join into one unbroken line down the block, where an icon
+/// is centred in a square and leaves a gap at every row boundary. Both bundled UI faces
+/// (Geist Mono, Ubuntu Mono) carry U+2502 — checked in their cmaps, since a missing glyph
+/// here renders as nothing at all rather than as an error.
 pub fn tool_chrome_icon(ch: char) -> Option<char> {
     match ch {
         '*' => Some(crate::icons::fa::CIRCLE),
-        '|' => Some(crate::icons::fa::GRIP_LINES_VERTICAL),
+        '|' => Some('\u{2502}'),
         _ => None,
     }
 }
@@ -220,15 +229,18 @@ mod tests {
         assert_eq!(TOOL_PIPE, "|", "the wire connector must stay ASCII");
         assert!(DIAMOND.is_ascii() && TOOL_PIPE.is_ascii());
 
-        // Each wire marker maps to a real Font Awesome glyph...
-        let mark = tool_chrome_icon('*').expect("the bullet maps to an icon");
-        let pipe = tool_chrome_icon('|').expect("the connector maps to an icon");
+        // The bullet is a Font Awesome glyph, in the range the FA fallback face is
+        // consulted for — outside it, it would resolve to a mono glyph or tofu.
+        let mark = tool_chrome_icon('*').expect("the bullet maps to a glyph");
         assert_eq!(mark, crate::icons::fa::CIRCLE);
-        assert_eq!(pipe, crate::icons::fa::GRIP_LINES_VERTICAL);
-        // ...and both are in the range the FA fallback face is consulted for, or they
-        // would resolve to a monospace glyph (or tofu) instead of an icon.
-        assert!(crate::icons::is_icon(mark));
-        assert!(crate::icons::is_icon(pipe));
+        assert!(crate::icons::is_icon(mark), "the bullet must reach the FA face");
+
+        // The connector is box-drawing U+2502 and must **not** be an icon: icons are
+        // centred in a square cell, so consecutive rows would leave a gap instead of one
+        // unbroken rule. `is_icon` is also what `band_glyph` keys the inline sizing on.
+        let pipe = tool_chrome_icon('|').expect("the connector maps to a glyph");
+        assert_eq!(pipe, '\u{2502}');
+        assert!(!crate::icons::is_icon(pipe), "the rule must fill the full cell height");
 
         // Everything else is left exactly as printed — the substitution runs on column 0
         // of a tool line, and ordinary text must survive it untouched.

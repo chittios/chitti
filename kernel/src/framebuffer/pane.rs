@@ -68,11 +68,72 @@ impl Pane {
     /// its icons back into `*` and `|` as the cells were repainted.
     fn band_glyph(band: Band, c: usize, ch: char) -> (char, bool) {
         if band == Band::Tool && c == 0 {
-            if let Some(icon) = crate::shell::chrome::tool_chrome_icon(ch) {
-                return (icon, true);
+            if let Some(g) = crate::shell::chrome::tool_chrome_icon(ch) {
+                // Only a Font Awesome glyph needs the one-cell treatment. The connector is
+                // box-drawing, which *wants* the full mono cell: at cell height the rules
+                // on consecutive rows meet and form one unbroken line, while squeezing it
+                // into a `cw` square would leave a gap at every row boundary.
+                return (g, crate::icons::is_icon(g));
             }
         }
         (ch, false)
+    }
+
+    /// Carry per-line metadata — folds and both bands — from `old`, shifting every index
+    /// down by `dropped` lines trimmed off the front of the scrollback.
+    ///
+    /// **A pane is rebuilt far more often than it looks.** `/theme`, a font-scale change, a
+    /// divider drag, a pane-count change and fullscreen all build a fresh `Pane` and adopt
+    /// the old one's text. Nothing carried this metadata across, so changing the theme
+    /// silently dropped every band: the tool-call tint vanished and its chrome reverted to
+    /// the raw `*` and `|` in the byte stream. (The user-prompt band had the same bug, and
+    /// so do the click-to-expand folds — all three are line-indexed the same way, so they
+    /// are carried together here.)
+    fn take_line_meta(&mut self, old: &Pane, dropped: usize) {
+        let shift = |v: &[usize]| -> Vec<usize> {
+            v.iter().filter(|&&gi| gi >= dropped).map(|&gi| gi - dropped).collect()
+        };
+        self.user_band = shift(&old.user_band);
+        self.tool_band = shift(&old.tool_band);
+        self.folds = old
+            .folds
+            .iter()
+            .filter(|(gi, _)| *gi >= dropped)
+            .map(|(gi, s)| (gi - dropped, s.clone()))
+            .collect();
+        self.evicted = old.evicted;
+    }
+
+    /// Carry line metadata across a **re-wrap**, using the reflow's source mapping.
+    ///
+    /// `srcmap[i]` is the inclusive range of old rows that produced new row `i`, so a new
+    /// row is banded when any old row of its logical line was. Folds anchor to the *first*
+    /// new row of their old line — a fold is a click target, and duplicating it across
+    /// every wrapped row would make one "N more…" line expand several times.
+    fn remap_line_meta(&mut self, old: &Pane, srcmap: &[(usize, usize)], dropped: usize) {
+        let carry = |src: &[usize]| -> Vec<usize> {
+            let mut out = Vec::new();
+            for (i, &(lo, hi)) in srcmap.iter().enumerate() {
+                if i < dropped {
+                    continue;
+                }
+                if src.iter().any(|&gi| gi >= lo && gi <= hi) {
+                    out.push(i - dropped);
+                }
+            }
+            out
+        };
+        self.user_band = carry(&old.user_band);
+        self.tool_band = carry(&old.tool_band);
+        self.folds = old
+            .folds
+            .iter()
+            .filter_map(|(gi, s)| {
+                let i = srcmap.iter().position(|&(lo, hi)| *gi >= lo && *gi <= hi)?;
+                (i >= dropped).then(|| (i - dropped, s.clone()))
+            })
+            .collect();
+        self.evicted = old.evicted;
     }
 
     /// Which elevated band, if any, line `gi` belongs to.
@@ -155,6 +216,9 @@ impl Pane {
         self.esc = old.esc;
         self.csi = old.csi;
         self.csi_len = old.csi_len;
+        // Nothing was dropped: hist and grid are cloned whole, so every index still lands
+        // on the line it described.
+        self.take_line_meta(old, 0);
     }
 
     /// Carry another pane's text (scrollback + grid + cursor + colour state)
@@ -207,9 +271,15 @@ impl Pane {
                 }
             }
             self.hist = abs.into_iter().take(start).collect();
+            let mut dropped = 0usize;
             while self.hist.len() > HIST_MAX {
                 self.hist.pop_front();
+                dropped += 1;
             }
+            // Absolute indices are unchanged by this path — `abs` is the old pane's lines
+            // in order, and the split back into hist+grid preserves position — except for
+            // whatever the ring trimmed off the front.
+            self.take_line_meta(old, dropped);
             let old_line = old.hist.len() + old.row.min(old.rows.saturating_sub(1)) as usize;
             self.row = if old_line >= start {
                 (old_line - start).min(rows.saturating_sub(1)) as u64
@@ -242,7 +312,8 @@ impl Pane {
         // Same layout as textsel::Cell — Rgb is (u8,u8,u8).
         let as_ts: alloc::vec::Vec<alloc::vec::Vec<crate::textsel::Cell>> =
             abs.iter().map(|l| l.iter().map(|&(b, c)| (b, c)).collect()).collect();
-        let reflowed = crate::textsel::reflow_lines(&as_ts, ocols, cols, ('\0', self.default_fg));
+        let (reflowed, srcmap) =
+            crate::textsel::reflow_lines_mapped(&as_ts, ocols, cols, ('\0', self.default_fg));
         let (new_line, new_col) =
             crate::textsel::reflow_cursor(&as_ts, ocols, cols, old_line, old.col as usize);
         // Place the tail of the reflow into the live grid; the rest is hist.
@@ -260,9 +331,16 @@ impl Pane {
             }
         }
         self.hist = reflowed.into_iter().take(start).collect();
+        let mut dropped = 0usize;
         while self.hist.len() > HIST_MAX {
             self.hist.pop_front();
+            dropped += 1;
         }
+        // Remap the line metadata through the reflow: an output row inherits a band or a
+        // fold when *any* source row of its logical line carried it. A re-wrap changes
+        // every index, so without this a divider drag or a font-scale change loses the
+        // tool-call tint exactly the way a theme switch used to.
+        self.remap_line_meta(old, &srcmap, dropped);
         self.row = if new_line >= start {
             (new_line - start).min(rows.saturating_sub(1)) as u64
         } else {

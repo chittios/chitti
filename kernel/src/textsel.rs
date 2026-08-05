@@ -82,12 +82,34 @@ fn trim_cells(line: &[Cell]) -> &[Cell] {
 /// Returns the full reflowed line list (oldest first), each padded to exactly
 /// `new_cols` cells.
 pub fn reflow_lines(lines: &[Vec<Cell>], old_cols: usize, new_cols: usize, empty: Cell) -> VecDeque<Vec<Cell>> {
+    reflow_lines_mapped(lines, old_cols, new_cols, empty).0
+}
+
+/// [`reflow_lines`], plus for each output row the **inclusive range of source rows** whose
+/// logical line it came from.
+///
+/// Line-indexed metadata — the chat pane's prompt/tool-call bands and its click-to-expand
+/// folds — has to move with the text when the pane is rebuilt at a new width, and after a
+/// re-wrap a row's index bears no fixed relation to where it started. The mapping is
+/// produced by the same pass that does the reflow rather than by a second copy of the
+/// soft-join rule, so the two cannot disagree about where a logical line began.
+pub fn reflow_lines_mapped(
+    lines: &[Vec<Cell>],
+    old_cols: usize,
+    new_cols: usize,
+    empty: Cell,
+) -> (VecDeque<Vec<Cell>>, Vec<(usize, usize)>) {
     let new_cols = new_cols.max(1);
     let old_cols = old_cols.max(1);
-    // 1. Soft-join full-width rows into logical lines.
-    let mut logical: Vec<Vec<Cell>> = Vec::new();
+    // 1. Soft-join full-width rows into logical lines, remembering which source rows each
+    //    one consumed.
+    let mut logical: Vec<(Vec<Cell>, usize, usize)> = Vec::new();
     let mut cur: Vec<Cell> = Vec::new();
-    for line in lines {
+    let mut first_src = 0usize;
+    for (src, line) in lines.iter().enumerate() {
+        if cur.is_empty() {
+            first_src = src;
+        }
         let content = trim_cells(line);
         // A stored row is "full" (soft-wrap candidate) when its non-pad length
         // equals the old width — i.e. the writer filled the whole row and
@@ -95,17 +117,20 @@ pub fn reflow_lines(lines: &[Vec<Cell>], old_cols: usize, new_cols: usize, empty
         let was_full = content.len() >= old_cols;
         cur.extend_from_slice(content);
         if !was_full {
-            logical.push(core::mem::take(&mut cur));
+            logical.push((core::mem::take(&mut cur), first_src, src));
         }
     }
     if !cur.is_empty() {
-        logical.push(cur);
+        let last = lines.len().saturating_sub(1);
+        logical.push((cur, first_src, last));
     }
     // 2. Re-wrap each logical line into `new_cols` chunks.
     let mut out: VecDeque<Vec<Cell>> = VecDeque::new();
-    for log in logical {
+    let mut map: Vec<(usize, usize)> = Vec::new();
+    for (log, lo, hi) in logical {
         if log.is_empty() {
             out.push_back(alloc::vec![empty; new_cols]);
+            map.push((lo, hi));
             continue;
         }
         let mut i = 0;
@@ -114,10 +139,11 @@ pub fn reflow_lines(lines: &[Vec<Cell>], old_cols: usize, new_cols: usize, empty
             let mut row = log[i..end].to_vec();
             row.resize(new_cols, empty);
             out.push_back(row);
+            map.push((lo, hi));
             i = end;
         }
     }
-    out
+    (out, map)
 }
 
 /// Fit `s` into at most `max` columns, appending `..` when truncated.
@@ -321,6 +347,51 @@ mod tests {
         assert_eq!(t0, "abcd");
         assert_eq!(t1, "efgh");
         assert_eq!(t2, "ij");
+    }
+
+    /// The source mapping must line up with the reflow it came from, in both directions.
+    ///
+    /// It exists so line-indexed metadata (the chat pane's prompt/tool-call bands and its
+    /// folds) survives a re-wrap. If it drifts, a band lands on the wrong line and tints
+    /// text that is not a tool call — a wrong answer that looks like a rendering glitch.
+    #[test_case]
+    fn a_reflow_reports_which_source_rows_each_output_row_came_from() {
+        // Joining: two full 8-col rows become one 16-col row covering sources 0..=1.
+        let (out, map) = reflow_lines_mapped(&[cells("hello wo"), cells("rld!!!!!")], 8, 16, ('\0', FG));
+        assert_eq!(out.len(), map.len(), "one mapping entry per output row");
+        assert_eq!(out.len(), 1);
+        assert_eq!(map[0], (0, 1), "the joined row came from both source rows");
+
+        // Splitting: one 10-col row becomes three 4-col rows, all from source 0.
+        let (out, map) = reflow_lines_mapped(&[cells("abcdefghij")], 10, 4, ('\0', FG));
+        assert_eq!(out.len(), 3);
+        assert_eq!(map, alloc::vec![(0, 0), (0, 0), (0, 0)]);
+
+        // Hard newlines: each short line maps to exactly itself.
+        let (out, map) = reflow_lines_mapped(&[cells("hi"), cells("yo"), cells("!")], 40, 80, ('\0', FG));
+        assert_eq!(out.len(), 3);
+        assert_eq!(map, alloc::vec![(0, 0), (1, 1), (2, 2)]);
+
+        // Mixed: a wrapped pair, then a short line. The short line must not be absorbed
+        // into the preceding logical line's range, or its band would spread onto it.
+        let (out, map) =
+            reflow_lines_mapped(&[cells("12345678"), cells("90"), cells("tail")], 8, 8, ('\0', FG));
+        assert_eq!(out.len(), map.len());
+        let last = map.last().copied().unwrap();
+        assert_eq!(last, (2, 2), "the trailing short line stays its own logical line");
+
+        // And the delegating wrapper must agree with the mapped version exactly — one
+        // implementation, so a future edit cannot make the map describe a different reflow.
+        for (lines, oc, nc) in [
+            (alloc::vec![cells("hello wo"), cells("rld!!!!!")], 8usize, 16usize),
+            (alloc::vec![cells("abcdefghij")], 10, 4),
+            (alloc::vec![cells("hi"), cells("yo")], 40, 80),
+        ] {
+            let plain = reflow_lines(&lines, oc, nc, ('\0', FG));
+            let (mapped, m) = reflow_lines_mapped(&lines, oc, nc, ('\0', FG));
+            assert_eq!(plain, mapped);
+            assert_eq!(m.len(), plain.len());
+        }
     }
 
     #[test_case]
