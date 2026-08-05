@@ -1778,14 +1778,17 @@ Five rules it follows, each of which is a way this could have gone wrong:
   needed twice the memory. So `/samples/misc/` carries the shapes that actually
   differ: `pdflatex-4-pages.pdf` (24 KiB — the cheap multi-page case for e2e),
   `pdflatex-image.pdf` (an embedded colour JPEG, i.e. DCTDecode, which no
-  vector-only document reaches), `geotopo.pdf` (**117 pages** with 19 JPEG
-  figures — long-document navigation, ~0.5 s/page) and `attention.pdf` (the
-  Transformer paper: 15 pages, Type 1 fonts, translucent-fill diagrams, and the
-  two attention-matrix pages that are the heaviest thing measured anywhere here
-  — 56 MiB of guest memory, ~6.9 s each). Note `attention.pdf` is the one entry
-  whose licence is **not** permissive (arXiv non-exclusive distribution), which
-  is tolerable only because the corpus is fetched and never committed; a
-  published image should drop it.
+  vector-only document reaches) and `geotopo.pdf` (**117 pages** with 19 JPEG
+  figures — long-document navigation, ~0.5 s/page).
+- **Freely redistributable is a stricter rule than "fetched, never committed".**
+  A `CHITTI_SAMPLE_FILES` build embeds these bytes in a kernel image and images
+  get passed around, so it is not enough that the *tree* carries no copy. That is
+  why the corpus holds no arXiv paper: the default arXiv licence lets arXiv
+  distribute the PDF, not third parties. Fetch such a document on the running OS
+  with `/http -O <url>` instead — which is also how the renderer's limits were
+  measured (the Transformer paper, arXiv:1706.03762, whose two attention-matrix
+  pages remain the heaviest thing measured here: 56 MiB of guest memory and
+  ~6.9 s each at pane fit). Reproduce with `tools/pdfbench` on any local copy.
 
 ## Conventions
 

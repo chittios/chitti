@@ -55,8 +55,9 @@ static RENDER_WASM: &[u8] = include_bytes!("../../../assets/wasm/pdfrender.wasm"
 /// Linear-memory ceiling for the renderer, in 64 KiB pages (128 MiB).
 ///
 /// Measured on a **real** document, which is the only way this number is worth
-/// anything: the Transformer paper (`/samples/misc/attention.pdf`) peaks at
-/// 56 MiB of linear memory at a pane-fit scale and **70 MiB** at full zoom — the
+/// anything: the Transformer paper (arXiv:1706.03762 — not in `/samples`, its
+/// licence is not redistributable; fetch it with `/http -O` to re-measure) peaks
+/// at 56 MiB of linear memory at a pane-fit scale and **70 MiB** at full zoom — the
 /// glyph and decoded-image caches, not the pixmap. A synthetic one-page fixture
 /// had suggested 33 MiB, and a 64 MiB cap sized from it would have failed on
 /// page 3 of the first real paper anyone opened. The limiter is what turns "this

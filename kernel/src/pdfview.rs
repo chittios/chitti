@@ -26,6 +26,7 @@ use alloc::vec::Vec;
 /// point past which it refuses rather than trapping on an allocation it cannot
 /// satisfy. This one is a *latency* limit, and it exists because of what a real
 /// document measured: the two attention-matrix pages of the Transformer paper
+/// (arXiv:1706.03762 — measured with `tools/pdfbench`, not shipped in `/samples`)
 /// take ~6.9 s at a pane-fit scale and **20.7 s at 8 MP** under the interpreter.
 /// A pane-fit render is ~0.5-1.5 MP, so this never binds in ordinary use; it
 /// only stops a 400% zoom on a pathological page from freezing the console for

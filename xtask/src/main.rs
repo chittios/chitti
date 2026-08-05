@@ -3499,6 +3499,14 @@ impl SampleFile {
     }
 }
 
+/// Every entry must be **freely redistributable**, and that is a stricter rule
+/// than "fetched, never committed" implies. A build with `CHITTI_SAMPLE_FILES`
+/// embeds these bytes in a kernel image, and images get passed around — so an
+/// arXiv paper under the default non-exclusive distribution licence (which
+/// permits arXiv to distribute it, not third parties) does not belong here even
+/// though this tree would carry no copy of it. `/http -O <url>` fetches such a
+/// document in seconds on the running OS, which is where it should come from.
+///
 /// The sample corpus. Chosen to cover **every decoder `/open` can reach** —
 /// PNG (RGB / RGBA / grayscale), baseline JPEG, H.264+AAC mp4, PCM WAV, MP3
 /// (with an ID3v2 tag, which the decoder must skip), ADTS AAC, PDF — plus the
@@ -3635,25 +3643,6 @@ const SAMPLE_FILES: &[SampleFile] = &[
         // interpreter, so it is also the demonstration that a long document stays
         // usable where a figure-dense paper does not.
         note: "117-page LaTeX book with 19 embedded JPEG figures (Martin Thoma, GeoTopo) — long-document navigation + the raster-image path at scale (py-pdf/sample-files, CC-BY-SA-4.0)",
-        openable: true,
-    },
-    SampleFile {
-        category: "misc",
-        name: "attention.pdf",
-        url: "https://arxiv.org/pdf/1706.03762v7",
-        // The real-world case for the page renderer, and the one that set its
-        // limits: 15 pages, Computer Modern Type 1 fonts, the Transformer
-        // architecture diagram (translucent fills), and two full-page
-        // attention-matrix figures that are the heaviest pages measured
-        // anywhere — 56 MiB of guest memory and ~6.9 s each at pane fit.
-        //
-        // NB its licence is **not** permissive like the rest of this corpus:
-        // arXiv's non-exclusive distribution licence lets arXiv distribute it,
-        // not third parties. That is fine here only because the corpus is
-        // fetched and never committed, so this tree redistributes nothing — the
-        // same rule the voice and WiFi assets follow. Anyone publishing a built
-        // image should drop this entry.
-        note: "\"Attention Is All You Need\" (Vaswani et al., arXiv:1706.03762v7) — 15 pages, Type 1 fonts, vector figures; the renderer's real-world stress case. Licence: arXiv non-exclusive distribution (NOT freely redistributable — fetched here, never committed)",
         openable: true,
     },
     SampleFile {
