@@ -19,11 +19,21 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Ceiling on one rendered page in pixels. **Mirrors `MAX_PIXELS` in
-/// `tools/pdfrender-wasm`**: the guest refuses a larger render (rather than
-/// trapping on an allocation it cannot satisfy), so the host must clamp to the
-/// same number or it would ask for refusals it could have avoided.
-pub const MAX_PIXELS: u64 = 8_300_000;
+/// The host's **render budget** for one page, in pixels.
+///
+/// There are deliberately two ceilings, and this is the lower one. The guest's
+/// `MAX_PIXELS` (8.3 MP, in `tools/pdfrender-wasm`) is a *safety* limit — the
+/// point past which it refuses rather than trapping on an allocation it cannot
+/// satisfy. This one is a *latency* limit, and it exists because of what a real
+/// document measured: the two attention-matrix pages of the Transformer paper
+/// take ~6.9 s at a pane-fit scale and **20.7 s at 8 MP** under the interpreter.
+/// A pane-fit render is ~0.5-1.5 MP, so this never binds in ordinary use; it
+/// only stops a 400% zoom on a pathological page from freezing the console for
+/// twenty seconds, at the cost of slightly softer text at extreme zoom.
+///
+/// Keep it **at or below** the guest's number: above it, the host would ask for
+/// renders the guest is bound to refuse.
+pub const MAX_PIXELS: u64 = 4_000_000;
 
 /// Zoom is a percentage of the fit scale, so 100 always means "as the fit mode
 /// chose" and the bounds are about how far from that a user can go.

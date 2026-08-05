@@ -1739,7 +1739,7 @@ cargo xtask sample-files [--refresh]   # fetch the /samples corpus into assets/s
 
 **Every decoder needs a file, and a fresh boot has none** — which made the media
 stack (ring-3 PNG/JPEG, H.264+AAC, MP3/WAV/AAC, the PDF wasm, the editor's
-highlighters) awkward to even try without `/http -O` first. So a ~10 MiB corpus is
+highlighters) awkward to even try without `/http -O` first. So a ~15 MiB corpus is
 embedded in the image and seeded into the store at boot — `/samples/images/`,
 `/samples/videos/`, `/samples/audios/`, `/samples/misc/`, `/samples/js/`
 (authored scripts for `/js`, from `assets/samples-src/js/`), plus a
@@ -1773,6 +1773,19 @@ Five rules it follows, each of which is a way this could have gone wrong:
   the next decoder's input, marked unopenable, and the corpus test asserts every
   *openable* entry has an extension `/open` really handles — so a `.flac` cannot
   creep in as a file that only ever errors.
+- **A one-page fixture is not a document, and the PDF set says so.** A synthetic
+  single page had made the renderer's limits look generous; the first real paper
+  needed twice the memory. So `/samples/misc/` carries the shapes that actually
+  differ: `pdflatex-4-pages.pdf` (24 KiB — the cheap multi-page case for e2e),
+  `pdflatex-image.pdf` (an embedded colour JPEG, i.e. DCTDecode, which no
+  vector-only document reaches), `geotopo.pdf` (**117 pages** with 19 JPEG
+  figures — long-document navigation, ~0.5 s/page) and `attention.pdf` (the
+  Transformer paper: 15 pages, Type 1 fonts, translucent-fill diagrams, and the
+  two attention-matrix pages that are the heaviest thing measured anywhere here
+  — 56 MiB of guest memory, ~6.9 s each). Note `attention.pdf` is the one entry
+  whose licence is **not** permissive (arXiv non-exclusive distribution), which
+  is tolerable only because the corpus is fetched and never committed; a
+  published image should drop it.
 
 ## Conventions
 

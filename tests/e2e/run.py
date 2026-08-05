@@ -1762,7 +1762,12 @@ def s_samples(g):
         g.send(f"/ls /samples/{cat}")
         if not g.wait_for(f"ls> /samples/{cat}", 12, m):
             return False, f"/ls /samples/{cat} failed"
-        if expect not in g.text()[m:]:
+        # **Wait** for the entry rather than snapshotting the buffer the instant
+        # the `ls>` header lands: serial arrives in chunks, so the listing that
+        # follows the header may not have been read yet. Snapshotting passed for
+        # as long as the timing happened to favour it and then failed the moment
+        # the corpus grew enough to shift it.
+        if not g.wait_for(expect, 12, m):
             return False, f"/samples/{cat} has no {expect} file"
 
     # A PNG decode (in ring 3) proves the bytes survived the embed intact.
@@ -1793,13 +1798,25 @@ def s_samples(g):
         return False, "sample mp4 has no audio track"
     g.send_raw(b"\x03")
     g.wait_quiet(0.5, 15)
-    # PDF: rendered by the hayro rasterizer into the viewer tab.
+    # PDF: rendered by the hayro rasterizer into the viewer tab. The corpus
+    # carries a **multi-page document with embedded JPEG figures** (a 117-page
+    # LaTeX book) precisely so this is not a one-page smoke test: a page deep in
+    # the document exercises page navigation, per-page geometry and the
+    # raster-image path together.
     m = g.mark()
-    g.send("/open /samples/misc/minimal.pdf")
-    if not g.wait_for("page(s)", 60, m):
+    g.send("/open /samples/misc/geotopo.pdf")
+    if not g.wait_for("page(s)", 90, m):
         return False, "sample PDF was not opened"
-    if not g.wait_for("rendered in", 60, m):
+    if not g.wait_for("rendered in", 90, m):
         return False, "sample PDF produced no rendered page"
+    m = g.mark()
+    g.send("/pdf page 24")   # a page whose figures are photographic JPEGs
+    if not g.wait_for("pdf> page 24", 90, m):
+        return False, "could not navigate into the sample document"
+    m = g.mark()
+    g.send("/pdf")
+    if not g.wait_for("page 24/117", 20, m):
+        return False, "/pdf did not report the navigated page of the sample"
     # Close it before typing again: a focused viewer tab owns single-letter keys
     # (`p` prev page, `f` fit), so a command typed with the pane focused loses
     # those characters — `/cat /samples/README.md` arrived as `/cat /samles/REME.md`
@@ -1815,7 +1832,7 @@ def s_samples(g):
     g.send("/cat /samples/README.md")
     if not g.wait_for("ChittiOS sample files", 15, m):
         return False, "/samples/README.md (provenance record) missing"
-    return True, "/samples seeded: png+jpeg decoded, wav opened, mp4 decoded, pdf rendered, README present"
+    return True, "/samples seeded: png+jpeg decoded, wav opened, mp4 decoded, 117-page pdf rendered + navigated, README present"
 
 
 def s_open_pdf(g):

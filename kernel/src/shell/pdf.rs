@@ -52,21 +52,28 @@ pub(super) const PDF_SURFACE: u32 = u32::MAX - 3;
 #[cfg(not(feature = "server"))]
 static RENDER_WASM: &[u8] = include_bytes!("../../../assets/wasm/pdfrender.wasm");
 
-/// Linear-memory ceiling for the renderer, in 64 KiB pages (64 MiB).
+/// Linear-memory ceiling for the renderer, in 64 KiB pages (128 MiB).
 ///
-/// Measured, not guessed: a 7.2 MP render (the practical worst case under
-/// `pdfview::MAX_PIXELS`) peaked at 33 MiB of linear memory in `pdfbench`, so
-/// this is ~2x headroom. The limiter is what turns "this document wants more
-/// memory than we will give it" into a refusal instead of kernel heap pressure.
+/// Measured on a **real** document, which is the only way this number is worth
+/// anything: the Transformer paper (`/samples/misc/attention.pdf`) peaks at
+/// 56 MiB of linear memory at a pane-fit scale and **70 MiB** at full zoom — the
+/// glyph and decoded-image caches, not the pixmap. A synthetic one-page fixture
+/// had suggested 33 MiB, and a 64 MiB cap sized from it would have failed on
+/// page 3 of the first real paper anyone opened. The limiter is what turns "this
+/// document wants more memory than we will give it" into a clean refusal rather
+/// than kernel heap pressure.
 #[cfg(not(feature = "server"))]
-const PDF_MEM_PAGES: u32 = 1024;
+const PDF_MEM_PAGES: u32 = 2048;
 
-/// Fuel for one page render. The same worst case measured ~1.0 Gfuel, so this is
-/// ~8x headroom while still bounding a pathological page to a few seconds rather
-/// than forever — the Ctrl+C rule's backstop for the one call we cannot
-/// interrupt from outside.
+/// Fuel for one page render.
+///
+/// Same source: the paper's heaviest page (a full-page attention-matrix figure)
+/// costs ~2.6 Gfuel at pane-fit and **7.7 Gfuel** at full zoom, so this is ~2x
+/// headroom over the worst thing actually observed. It stays a bound rather than
+/// a formality — a render is the one call the shell cannot interrupt from
+/// outside (wasmi has no yield point), so fuel is the Ctrl+C rule's backstop.
 #[cfg(not(feature = "server"))]
-const PDF_RENDER_FUEL: u64 = 8_000_000_000;
+const PDF_RENDER_FUEL: u64 = 16_000_000_000;
 
 /// Fuel for parsing a document (xref, page tree). Cheap next to a render
 /// (~30-45 ms), but a crafted xref loop is exactly the sort of thing that should
