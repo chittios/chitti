@@ -117,12 +117,24 @@ pub fn draw_status_menu(chip: StatusChip) {
         let close_w = close_w.max(cw * 2);
         let cx = ix + content_w.saturating_sub(close_w);
         let (iw, _) = sc.glyph_cell(mark);
+        // Hover chrome (same chip as the pane close button): fill an accent
+        // square so the mark reads as a button while the pointer is on it.
+        let hovered_close = POPUP_HOVER.with(|h| *h == Some(ModalHit::Close));
+        let close_bg = if hovered_close { sc.mix(bg, sc.theme.accent, 0.18) } else { bg };
+        if hovered_close {
+            sc.fill_rect(cx, y, close_w, ch, close_bg);
+        }
+        let close_ink = if hovered_close {
+            sc.lighten(sc.theme.accent, 0.35)
+        } else {
+            sc.theme.accent
+        };
         sc.blit_glyph(
             cx + close_w.saturating_sub(iw) / 2,
             y,
             mark,
-            sc.theme.accent,
-            bg,
+            close_ink,
+            close_bg,
         );
         // Dedicated close rect (must not share slot 0 with Yes / menu body).
         set_modal_close_rect((cx, y, close_w, ch));
@@ -275,7 +287,14 @@ fn draw_volume_menu_body(
     ];
     CHOOSE_COUNT.store(actions.len(), core::sync::atomic::Ordering::Relaxed);
     for (i, (text, _)) in actions.iter().enumerate() {
-        let row_bg = sc.theme.chat_bg;
+        // Hover chrome: accent-tinted row highlight + brighter label, matching
+        // the list browsers and tab bar (distinct from a pressed state).
+        let hovered = POPUP_HOVER.with(|h| *h == Some(ModalHit::Choose(i)));
+        let row_bg = if hovered {
+            sc.mix(sc.theme.chat_bg, sc.theme.accent, 0.14)
+        } else {
+            sc.theme.chat_bg
+        };
         sc.fill_rect(ix, y, content_w, ch, row_bg);
         let prefix = match i {
             0 => crate::icons::fa::VOLUME_XMARK,
@@ -286,7 +305,11 @@ fn draw_volume_menu_body(
             ix,
             y,
             &alloc::format!("{prefix}  {text}"),
-            sc.theme.chat_fg,
+            if hovered {
+                sc.lighten(sc.theme.chat_fg, 0.35)
+            } else {
+                sc.theme.chat_fg
+            },
             row_bg,
         );
         CHOOSE_RECTS.with(|c| c[i] = (ix, y, content_w, ch));

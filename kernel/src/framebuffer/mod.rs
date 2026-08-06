@@ -510,6 +510,13 @@ static CHOOSE_RECTS: Locked<[(u64, u64, u64, u64); 9]> =
 static CHOOSE_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Hovered interactive element of the open modal/popup, for hover chrome: a
+/// list-browser row (`/help`, `/agents`), a choose-option row, or the dedicated
+/// close mark. Computed by [`update_popup_hover`] on mouse move, read by the
+/// popup painters, cleared on dismiss. This is the popup analog of the tab-bar
+/// `HOVER_CLOSE`/`HOVER_TAB` statics in `tabs.rs`.
+static POPUP_HOVER: Locked<Option<ModalHit>> = Locked::new(None);
+
 /// True while a modal overlays the panes: upkeep ticks running under it (long
 /// compute pumps `shell::upkeep`) must not blink the pane caret into the box.
 static MODAL_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

@@ -18,20 +18,11 @@ pub fn modal_hit(x: u64, y: u64) -> ModalHit {
     if MODAL_CLOSE_RECT.with(|c| in_rect(x, y, *c)) {
         return ModalHit::Close;
     }
-    let r = MODAL_RECTS.with(|m| *m);
-    // Confirm: Yes/No in 0/1. List browsers also leave Close in slot 0 with 1/2
-    // empty — keep that path for older drawers that only set slot 0.
-    if in_rect(x, y, r[0]) {
-        if r[1] == (0, 0, 0, 0) && r[2] == (0, 0, 0, 0) {
-            return ModalHit::Close;
-        }
-        return ModalHit::Yes;
-    } else if in_rect(x, y, r[1]) {
-        return ModalHit::No;
-    } else if in_rect(x, y, r[2]) {
-        return ModalHit::Ok;
-    }
-    // List browser rows (/help, /agents).
+    // Specific clickable rows first — list-browser rows and choose-option rows.
+    // The status dropdown registers its whole panel as the modal body (slot 1)
+    // *and* its volume action rows as choose rows; the rows must win over the
+    // body rect that contains them, or a click on a row reads as a body click
+    // (the menu stays open and nothing happens — the rows were dead).
     if let Some(g) = LIST_BROWSER_GEOM.with(|g| *g) {
         if g.row_h > 0
             && g.list_w > 0
@@ -46,7 +37,6 @@ pub fn modal_hit(x: u64, y: u64) -> ModalHit {
             }
         }
     }
-    // Multi-choice options.
     let n = CHOOSE_COUNT.load(core::sync::atomic::Ordering::Relaxed).min(9);
     if n > 0 {
         let rects = CHOOSE_RECTS.with(|c| *c);
@@ -56,7 +46,41 @@ pub fn modal_hit(x: u64, y: u64) -> ModalHit {
             }
         }
     }
+    let r = MODAL_RECTS.with(|m| *m);
+    // Confirm: Yes/No in 0/1. List browsers also leave Close in slot 0 with 1/2
+    // empty — keep that path for older drawers that only set slot 0.
+    if in_rect(x, y, r[0]) {
+        if r[1] == (0, 0, 0, 0) && r[2] == (0, 0, 0, 0) {
+            return ModalHit::Close;
+        }
+        return ModalHit::Yes;
+    } else if in_rect(x, y, r[1]) {
+        return ModalHit::No;
+    } else if in_rect(x, y, r[2]) {
+        return ModalHit::Ok;
+    }
     ModalHit::None
+}
+
+/// Recompute the hovered element of the open popup from the pointer and update
+/// [`POPUP_HOVER`]. Returns true when the hover set changed (the caller
+/// repaints). The popup analog of `tabs::update_hover`: the list browsers
+/// (`/help`, `/agents`), the choose modal, and the status-bar dropdowns all
+/// read the hovered row / close mark from the same `modal_hit` geometry at
+/// paint time, so the renderer and the click routing cannot disagree.
+pub fn update_popup_hover(x: u64, y: u64) -> bool {
+    let h = modal_hit(x, y);
+    POPUP_HOVER.with(|cur| {
+        if *cur == Some(h) {
+            return false;
+        }
+        *cur = Some(h);
+        true
+    })
+}
+
+pub(super) fn clear_popup_hover() {
+    POPUP_HOVER.with(|p| *p = None);
 }
 
 /// Draw a multi-option question modal. `focus` is the highlighted option index.
@@ -102,13 +126,20 @@ pub fn draw_choose(title: &str, msg: &str, options: &[&str], focus: usize) {
                 y += ch;
             }
             for (i, line) in opt_lines.iter().enumerate() {
+                // Hover chrome: the row under the pointer gets an accent tint
+                // (distinct from the keyboard focus's elevated `chat_bg`).
+                let hovered = POPUP_HOVER.with(|h| *h == Some(ModalHit::Choose(i)));
                 let fg = if i == focus {
                     sc.theme.accent
+                } else if hovered {
+                    sc.lighten(sc.theme.chat_fg, 0.35)
                 } else {
                     sc.theme.chat_fg
                 };
                 let bg = if i == focus {
                     sc.theme.chat_bg
+                } else if hovered {
+                    sc.mix(sc.theme.status_bg, sc.theme.accent, 0.14)
                 } else {
                     sc.theme.status_bg
                 };
@@ -214,12 +245,23 @@ pub fn draw_about() {
         let cx = ix + content_w.saturating_sub(close_w);
         let close_y = by + BORDER + PAD / 2;
         let (iw, _) = sc.glyph_cell(mark);
+        // Hover chrome (same chip as the pane/status-menu close buttons).
+        let hovered_close = POPUP_HOVER.with(|h| *h == Some(ModalHit::Close));
+        let close_bg = if hovered_close { sc.mix(bg, sc.theme.accent, 0.18) } else { bg };
+        if hovered_close {
+            sc.fill_rect(cx, close_y, close_w, ch, close_bg);
+        }
+        let close_ink = if hovered_close {
+            sc.lighten(sc.theme.accent, 0.35)
+        } else {
+            sc.theme.accent
+        };
         sc.blit_glyph(
             cx + close_w.saturating_sub(iw) / 2,
             close_y,
             mark,
-            sc.theme.accent,
-            bg,
+            close_ink,
+            close_bg,
         );
         set_modal_close_rect((cx, close_y, close_w, ch));
 
@@ -414,7 +456,8 @@ pub fn draw_list_browser(
 
         let mut ly = list_top;
         let visible_n = rows.len().min(view_rows as usize);
-        for row in rows.iter().take(view_rows as usize) {
+        for (k, row) in rows.iter().take(view_rows as usize).enumerate() {
+            let abs = scroll + k;
             match row {
                 CommandsRow::Header(h) => {
                     let line = crate::textsel::ellipsize(h, (list_w / cw) as usize);
@@ -428,12 +471,28 @@ pub fn draw_list_browser(
                     shortcut,
                     selected,
                 } => {
-                    let row_bg = if *selected { sc.theme.status_bg } else { list_bg };
+                    // Hover chrome: the row under the pointer gets the same
+                    // accent-tinted highlight the tab bar uses, distinct from
+                    // the keyboard selection's elevated `status_bg`.
+                    let hovered = POPUP_HOVER.with(|h| *h == Some(ModalHit::ListRow(abs)));
+                    let row_bg = if *selected {
+                        sc.theme.status_bg
+                    } else if hovered {
+                        sc.mix(list_bg, sc.theme.accent, 0.14)
+                    } else {
+                        list_bg
+                    };
                     sc.fill_rect(ix, ly, list_w, ch, row_bg);
                     let mark = if *selected { "> " } else { "* " };
                     let mark_fg = if *selected { sc.theme.accent } else { sc.theme.composer_hint };
                     let mut px = sc.draw_str(ix + 2, ly, mark, mark_fg, row_bg);
-                    let title_fg = if *selected { sc.theme.accent } else { sc.theme.chat_fg };
+                    let title_fg = if *selected {
+                        sc.theme.accent
+                    } else if hovered {
+                        sc.lighten(sc.theme.chat_fg, 0.35)
+                    } else {
+                        sc.theme.chat_fg
+                    };
                     // Right column: shortcut if present, else /name.
                     let right = if !shortcut.is_empty() {
                         *shortcut
@@ -546,6 +605,7 @@ pub fn modal_dismiss() {
     MODAL_ON.store(false, core::sync::atomic::Ordering::Relaxed);
     MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
     clear_modal_close_rect();
+    clear_popup_hover();
     LIST_BROWSER_GEOM.with(|g| *g = None);
     CHOOSE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
     CHOOSE_RECTS.with(|c| *c = [(0, 0, 0, 0); 9]);

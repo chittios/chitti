@@ -51,6 +51,10 @@ pub fn focus_action_column(i: usize) {
             sc.draw_tab_bar_for(j);
             sc.draw_close_btn_for(j);
         }
+        // The scrollbar draws only on the focused pane, so the pane losing
+        // focus keeps its old thumb (and the pane gaining it shows none) until
+        // the interior happens to re-render. Repaint the text views now.
+        sc.repaint_text_views();
         if sc.chat.has_composer {
             sc.draw_composer();
         }
@@ -275,6 +279,9 @@ pub fn focus_toggle() -> bool {
                 sc.draw_tab_bar_for(j);
                 sc.draw_close_btn_for(j);
             }
+            // Move the scrollbar with focus: the pane losing focus must have
+            // its thumb repainted over, the pane gaining it must draw one.
+            sc.repaint_text_views();
             // Composer chrome reflects focus (accent border + caret only when
             // the chat holds keyboard focus). Force caret on so it is visible
             // the instant focus returns — no need to type first.
@@ -383,6 +390,25 @@ pub fn pane_hit(x: u64, y: u64) -> Option<bool> {
 // selection stays glued to its text while output scrolls past.
 
 impl Screen {
+    /// Re-render the **text-backed** panes after a focus change so the
+    /// scrollbar — drawn only on the focused pane — moves with it. The pane
+    /// losing focus must have its old thumb repainted over, the pane gaining it
+    /// must draw one, and a focus-change repaint of just the frames/tab bars
+    /// leaves the thumb frozen on the old pane until its interior happens to
+    /// re-render. `render_view` paints every visible cell in place (no
+    /// blank-then-repaint), so the thumb moves without flicker. Only panes that
+    /// draw their interior through `render_view` (the chat and ktrace views)
+    /// ever show a scrollbar; the editor/top/audio/surface views own their
+    /// interiors, repaint themselves, and never drew one.
+    pub(super) fn repaint_text_views(&self) {
+        self.render_view(&self.chat);
+        for a in &self.actions {
+            if a.right() == RightMode::Ktrace && a.pane.w > 0 {
+                self.render_view(&a.pane);
+            }
+        }
+    }
+
     /// Whether an action pane holds keyboard focus. Chat keeps focus by
     /// default so you can keep typing; Ctrl+Tab / a click / `/pane focus`
     /// moves it onto the band. The editor is the same rule now — opening it

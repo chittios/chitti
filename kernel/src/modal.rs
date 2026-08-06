@@ -202,6 +202,10 @@ pub fn about() {
         let t = crate::mouse::tick();
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
+            // Hover chrome on the popup's interactive rows (repaint on change).
+            if framebuffer::update_popup_hover(t.x, t.y) {
+                framebuffer::draw_about();
+            }
         }
         if t.pressed {
             match framebuffer::modal_hit(t.x, t.y) {
@@ -292,6 +296,10 @@ pub fn status_menu(chip: crate::framebuffer::StatusChip) {
         let t = crate::mouse::tick();
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
+            // Hover chrome on the dropdown's close mark / action rows.
+            if framebuffer::update_popup_hover(t.x, t.y) {
+                need_repaint = true;
+            }
         }
         // Scroll wheel over the volume menu (or while it is open) adjusts level.
         if chip == StatusChip::Volume && t.wheel != 0 {
@@ -396,6 +404,10 @@ pub fn choose(title: &str, question: &str, options: &[&str]) -> Option<usize> {
         let t = crate::mouse::tick();
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
+            // Hover chrome on the option rows (repaint on change).
+            if framebuffer::update_popup_hover(t.x, t.y) {
+                framebuffer::draw_choose(title, question, options, focus);
+            }
         }
         if t.pressed {
             match framebuffer::modal_hit(t.x, t.y) {
@@ -555,6 +567,10 @@ pub fn browse_commands() -> Option<String> {
         let t = crate::mouse::tick();
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
+            // Hover chrome on the command rows (repaint on change).
+            if framebuffer::update_popup_hover(t.x, t.y) {
+                paint(&query, &rows, sel, scroll, caret_on);
+            }
         }
         if t.wheel != 0 {
             // Wheel up (+): previous items; wheel down (−): next.
@@ -782,6 +798,10 @@ pub fn browse_agents() -> Option<String> {
         let t = crate::mouse::tick();
         if t.moved {
             framebuffer::cursor_move(t.x, t.y);
+            // Hover chrome on the agent rows (repaint on change).
+            if framebuffer::update_popup_hover(t.x, t.y) {
+                paint(&query, &rows, sel, scroll, caret_on);
+            }
         }
         if t.wheel != 0 {
             let steps = t.wheel.clamp(-3, 3);

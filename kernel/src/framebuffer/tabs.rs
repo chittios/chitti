@@ -403,12 +403,20 @@ pub fn update_hover(x: u64, y: u64) -> bool {
     .collect();
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
+            // The chrome repaint overlaps the cursor when it sits on a tab or
+            // close button. Without a restore/overlay pair the repaint paints
+            // over the sprite's saved patch, so the *next* `cursor_move`
+            // restores stale pixels and pokes holes in the chip/label — the
+            // hover highlight ends up with missing pixels. Restore before,
+            // overlay after, exactly like every other chrome repaint.
+            sc.cursor_restore();
             for i in panes {
                 if sc.column_visible(i) {
                     sc.draw_tab_bar_for(i);
                     sc.draw_close_btn_for(i);
                 }
             }
+            sc.cursor_overlay();
         }
     });
     true
