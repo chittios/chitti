@@ -1,5 +1,5 @@
-//! **Messaging channels** — external chat platforms (Telegram now; Discord /
-//! Slack / webhooks later) that deliver inbound messages into Chitti and send
+//! **Messaging channels** — external chat platforms (Telegram, Discord, Slack;
+//! webhooks later) that deliver inbound messages into Chitti and send
 //! replies back out.
 //!
 //! Distinct from [`crate::channel`] (cap-gated inter-agent byte pipes). These
@@ -11,6 +11,8 @@
 //! allow / pair / reply / status).
 
 pub mod telegram;
+pub mod discord;
+pub mod slack;
 
 use crate::json::Json;
 use crate::mm::Locked;
@@ -27,17 +29,23 @@ pub const CONFIG_PATH: &str = "/configs/core/channels.json";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Telegram,
+    Discord,
+    Slack,
 }
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Telegram => "telegram",
+            Kind::Discord => "discord",
+            Kind::Slack => "slack",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "telegram" | "tg" => Some(Kind::Telegram),
+            "discord" | "dc" => Some(Kind::Discord),
+            "slack" => Some(Kind::Slack),
             _ => None,
         }
     }
@@ -95,8 +103,16 @@ pub struct Instance {
     pub auto_agent: bool,
 }
 
-/// Normalised inbound message handed to the shell / agent.
+/// Platform-normalized inbound message (Telegram / Discord / Slack).
 #[derive(Clone, Debug)]
+pub struct RawMessage {
+    pub update_id: i64,
+    pub chat_id: String,
+    pub from_id: String,
+    pub from_name: String,
+    pub text: String,
+}
+
 pub struct Inbound {
     pub channel: String,
     pub kind: Kind,
@@ -224,7 +240,7 @@ pub fn list() -> Vec<Instance> {
 
 /// Available backend type names.
 pub fn types() -> &'static [&'static str] {
-    &["telegram"]
+    &["telegram", "discord", "slack"]
 }
 
 /// Add a channel instance. Fails if the name is taken or kind unknown.
@@ -295,11 +311,16 @@ pub fn start(name: &str) -> Result<(), &'static str> {
     save();
     // Probe identity for Telegram (short timeout; never nest with tick).
     if let Some(inst) = INSTANCES.with(|v| v.iter().find(|i| i.name == name).cloned()) {
-        if inst.kind == Kind::Telegram {
-            match with_busy(|| telegram::get_me(&inst.token)) {
+        let probe = match inst.kind {
+            Kind::Telegram => Some(with_busy(|| telegram::get_me(&inst.token))),
+            Kind::Discord => Some(with_busy(|| discord::get_me(&inst.token))),
+            Kind::Slack => Some(with_busy(|| slack::get_me(&inst.token))),
+        };
+        if let Some(result) = probe {
+            match result {
                 Some(Ok(bot)) => {
-                    crate::ktrace::log_fmt(format_args!("msgchan: {} online as @{}", name, bot));
-                    crate::serial_println!("channel> online as @{}", bot);
+                    crate::ktrace::log_fmt(format_args!("msgchan: {} online as {}", name, bot));
+                    crate::serial_println!("channel> online as {}", bot);
                 }
                 Some(Err(e)) => {
                     INSTANCES.with(|v| {
@@ -307,9 +328,8 @@ pub fn start(name: &str) -> Result<(), &'static str> {
                             i.last_error = Some(e.clone());
                         }
                     });
-                    // Still running — poll will keep trying; do not freeze the shell.
                     crate::serial_println!(
-                        "channel> getMe failed ({e}) — still started; will retry on poll (Ctrl+C to cancel waits)"
+                        "channel> probe failed ({e}) — still started; will retry on poll (Ctrl+C to cancel waits)"
                     );
                     save();
                 }
@@ -393,6 +413,10 @@ pub fn send(name: &str, peer: &str, text: &str) -> Result<(), String> {
         .ok_or_else(|| String::from("no such channel"))?;
     match inst.kind {
         Kind::Telegram => with_busy(|| telegram::send_message(&inst.token, peer, text))
+            .unwrap_or_else(|| Err(String::from("channel busy (try again)"))),
+        Kind::Discord => with_busy(|| discord::send_message(&inst.token, peer, text))
+            .unwrap_or_else(|| Err(String::from("channel busy (try again)"))),
+        Kind::Slack => with_busy(|| slack::send_message(&inst.token, peer, text))
             .unwrap_or_else(|| Err(String::from("channel busy (try again)"))),
     }
 }
@@ -496,7 +520,19 @@ fn poll_wave_named(only_name: Option<&str>, force: bool) {
         let prev_offset = inst.offset;
         let prev_err = inst.last_error.clone();
         let result = match inst.kind {
-            Kind::Telegram => telegram::poll(&mut inst),
+            Kind::Telegram => telegram::poll(&mut inst).map(|msgs| {
+                msgs.into_iter()
+                    .map(|m| RawMessage {
+                        update_id: m.update_id,
+                        chat_id: m.chat_id,
+                        from_id: m.from_id,
+                        from_name: m.from_name,
+                        text: m.text,
+                    })
+                    .collect()
+            }),
+            Kind::Discord => discord::poll(&mut inst),
+            Kind::Slack => slack::poll(&mut inst),
         };
         match result {
             Ok(msgs) => {
@@ -536,7 +572,16 @@ fn poll_wave_named(only_name: Option<&str>, force: bool) {
     }
 }
 
-fn handle_inbound(inst: &mut Instance, msg: telegram::TgMessage) {
+
+fn send_platform(inst: &Instance, peer: &str, text: &str) -> Result<(), String> {
+    match inst.kind {
+        Kind::Telegram => telegram::send_message(&inst.token, peer, text),
+        Kind::Discord => discord::send_message(&inst.token, peer, text),
+        Kind::Slack => slack::send_message(&inst.token, peer, text),
+    }
+}
+
+fn handle_inbound(inst: &mut Instance, msg: RawMessage) {
     let from_id = msg.from_id;
     let from_name = msg.from_name;
     let peer = msg.chat_id;
@@ -558,7 +603,7 @@ fn handle_inbound(inst: &mut Instance, msg: telegram::TgMessage) {
                         "Chitti pairing code: {code}\nOn the console: /channel pair {} {code}",
                         inst.name
                     );
-                    let _ = telegram::send_message(&inst.token, &peer, &notice);
+                    let _ = send_platform(inst, &peer, &notice);
                     crate::serial_println!(
                         "channel[{}]: pairing request from {} ({}) code={}",
                         inst.name,
@@ -588,17 +633,16 @@ fn handle_inbound(inst: &mut Instance, msg: telegram::TgMessage) {
     // Built-in remote commands (no agent).
     let t = text.trim();
     if t.eq_ignore_ascii_case("/ping") || t.eq_ignore_ascii_case("ping") {
-        let _ = telegram::send_message(&inst.token, &peer, "pong — ChittiOS channel is live");
+        let _ = send_platform(inst, &peer, "pong — ChittiOS channel is live");
         return;
     }
     if t.eq_ignore_ascii_case("/whoami") {
         let body = format!("you are {from_name} id={from_id} chat={peer}");
-        let _ = telegram::send_message(&inst.token, &peer, &body);
+        let _ = send_platform(inst, &peer, &body);
         return;
     }
     if t.eq_ignore_ascii_case("/help") {
-        let _ = telegram::send_message(
-            &inst.token,
+        let _ = send_platform(inst,
             &peer,
             "Chitti channel commands:\n/ping — liveness\n/whoami — your ids\n/help — this text\n\nOther messages go to the shell agent when auto_agent is on.",
         );
@@ -628,14 +672,10 @@ fn handle_inbound(inst: &mut Instance, msg: telegram::TgMessage) {
             ));
             // Immediate ack so Telegram users know the bot is working while
             // the shell wakes and runs inference (can take seconds).
-            let _ = telegram::send_message(
-                &inst.token,
-                &peer,
-                "… Chitti is thinking",
-            );
+            let _ = send_platform(inst, &peer, "… Chitti is thinking");
         } else {
-            let _ = telegram::send_message(
-                &inst.token,
+            let _ = send_platform(
+                inst,
                 &peer,
                 "Chitti is busy (inbound queue full). Try again in a moment.",
             );
@@ -661,7 +701,10 @@ mod tests {
     fn kind_and_policy_parse() {
         assert_eq!(Kind::parse("tg"), Some(Kind::Telegram));
         assert_eq!(Kind::parse("telegram"), Some(Kind::Telegram));
-        assert!(Kind::parse("discord").is_none());
+        assert_eq!(Kind::parse("discord"), Some(Kind::Discord));
+        assert_eq!(Kind::parse("slack"), Some(Kind::Slack));
+        assert_eq!(Kind::parse("dc"), Some(Kind::Discord));
+        assert!(Kind::parse("irc").is_none());
         assert_eq!(DmPolicy::parse("pairing"), Some(DmPolicy::Pairing));
         assert_eq!(DmPolicy::parse("open"), Some(DmPolicy::Open));
     }

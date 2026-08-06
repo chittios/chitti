@@ -3327,17 +3327,25 @@ fn execute_chat_tool_inner(
         };
         // Where the plan came from is part of what the human is approving. With
         // a hosted planner the prompt -- including whatever untrusted content
-        // this turn ingested -- has already gone to a third party, and the
-        // transport is plain HTTP today. That does not change what the call is
-        // authorised to do, but it changes who has already seen the context, and
-        // the person deciding should be told rather than have to remember.
+        // this turn ingested -- has already gone to a third party. That does
+        // not change what the call is authorised to do, but it changes who has
+        // already seen the context, and the person deciding should be told.
+        // Plain http:// is called out separately: https endpoints are verified.
         let planner = if crate::shell::remote::is_remote_active() {
-            "\n\nNOTE: the planner is a remote endpoint -- this turn's context, ingested content included, was sent off this machine in cleartext."
+            let clear = crate::shell::remote::active_config()
+                .as_ref()
+                .map(|c| crate::shell::remote::url_is_cleartext(&c.url))
+                .unwrap_or(false);
+            if clear {
+                "\n\nNOTE: the planner is a remote endpoint — this turn's context, ingested content included, was sent off this machine in cleartext (http://)."
+            } else {
+                "\n\nNOTE: the planner is a remote endpoint — this turn's context, ingested content included, was sent off this machine."
+            }
+        } else if session.remote_planner_used {
+            "\n\nNOTE: this session previously used a remote planner — earlier turns' context may have left the machine."
         } else {
             ""
         };
-        // Bound the args. A write's arguments can be a whole config file, and
-        // nobody audits 4 KB of JSON in a dialog — but more importantly the
         // dialog has to *fit*: an over-long body used to size the box past the
         // screen, and the modal then painted nothing while still waiting for a
         // key (an invisible approval prompt, indistinguishable from a hang).
@@ -5311,6 +5319,9 @@ fn run_model(
             *remote_chat = None; // fresh history against the new endpoint
             remote::save(true, Some(&cfg));
             serial_println!("model> remote backend active: {} ({})", cfg.url, cfg.model);
+            if let Some(w) = remote::cleartext_warning(&cfg.url) {
+                serial_println!("model> \x1b[33m{w}\x1b[0m");
+            }
             serial_println!("model> tip: /http get {}/v1/models to check reachability", cfg.url);
         }
         other => serial_println!("model> unknown '{}' — usage: /model [local | remote <url> [name] [key <k>]]", other),
@@ -7332,6 +7343,9 @@ fn ui_tick() {
         let t = crate::mouse::tick();
         if t.moved {
             crate::framebuffer::cursor_move(t.x, t.y);
+            // Hover chrome: highlight the close button / tab under the pointer
+            // (repaints only when the hover set changes).
+            crate::framebuffer::update_hover(t.x, t.y);
             // Hovering a divider or status-bar chip → hand cursor (macOS menu bar).
             // Skipped mid-drag.
             if DIVIDER_DRAG.with(|d| d.is_none()) {

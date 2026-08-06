@@ -1,7 +1,7 @@
 # Messaging channels
 
-**External chat platforms as agent inboxes** — Telegram today; Discord, Slack,
-webhooks, and others later. This is the OpenClaw-style *messaging* surface, not
+**External chat platforms as agent inboxes** — Telegram, Discord, and Slack
+today; webhooks later. This is the OpenClaw-style *messaging* surface, not
 the inter-agent byte pipes in `kernel/src/channel/` (those are the Linux
 pipe/socket analog between tasks).
 
@@ -15,6 +15,31 @@ loaded at boot (`msgchan::load`). Running instances are polled cooperatively fro
 `shell::upkeep` via `msgchan::tick()`.
 
 Shell command: **`/channel`** (alias `/channels`).
+
+---
+
+## Quick start — Discord
+
+Token form: `BOT_TOKEN#CHANNEL_ID` (bot token, hash, channel snowflake to poll).
+
+```text
+/channel add discord home <BOT_TOKEN>#<CHANNEL_ID> pairing
+/channel start home
+```
+
+Uses REST only (`GET /channels/{id}/messages`, `POST …/messages`) — no Gateway
+WebSocket. Invite the bot to the channel with Read Message History + Send Messages.
+
+## Quick start — Slack
+
+Token form: `xoxb-…#C01234567` (bot token, hash, channel id).
+
+```text
+/channel add slack home <BOT_TOKEN>#<CHANNEL_ID> pairing
+/channel start home
+```
+
+Uses `conversations.history` + `chat.postMessage`. The bot must be in the channel.
 
 ---
 

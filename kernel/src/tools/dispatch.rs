@@ -657,30 +657,12 @@ impl Router {
                 }
             }
             ToolBinding::AgentMemory => {
-                // The session's agent owns the memory namespace
-                // (`/agent/<id>/memory/`). Mutating tools re-enter the system
-                // prompt (MEMORY.md / stored facts), so under taint they are
-                // refused — same defence as SOUL.md writes at the Synapse gate.
-                let agent_id = session.agent.manifest_id.0;
-                let mutating = matches!(
-                    call.tool.as_str(),
-                    "memory_add" | "remember" | "memory_md_append"
-                );
-                if mutating && self.justification(session).blocks_destructive() {
-                    return ToolOutcome::error(alloc::format!(
-                        "refused: '{}' justified by untrusted content (would launder into system prompt)",
-                        call.tool
-                    ));
-                }
-                let out = crate::agent::home::run_memory_tool(&call.tool, agent_id, &call.args);
-                if out.starts_with("error:") {
-                    ToolOutcome::error(out)
-                } else {
-                    // Mutating under taint is refused above, so recalls cannot
-                    // launder *new* untrusted content. Tag as system-trusted
-                    // (durable agent state), matching skill-body steering.
-                    ToolOutcome::ok(out, Provenance::SystemTrusted)
-                }
+                // Lower to `mem_fs_*` through the executor so capability, scope,
+                // and audit apply. The binding stays `AgentMemory` because
+                // `mem_fs_write` is Effect::INERT in the registry (a generic
+                // store write), while agent-memory mutation re-enters the system
+                // prompt and must stay irreversible at the router gate above.
+                self.call_agent_memory(session, caller, call)
             }
             ToolBinding::AgentStorage => {
                 // `storage_*` is DURABLE (`/agent/<id>/storage/<key>`), so it
@@ -1160,6 +1142,185 @@ impl Router {
                 }
                 ToolOutcome::ok(out, Provenance::UntrustedIngested)
             }
+        }
+    }
+
+    /// Agent durable memory (`memory_add`/`get`/`list`/`search`) lowered to
+    /// `mem_fs_write` / `mem_fs_read` / `mem_fs_search` so every mutation is
+    /// capability-scoped and audited. Presentation (key sanitise, resolve,
+    /// miss diagnostics) stays in [`crate::agent::home`]; the store touch
+    /// goes through the executor.
+    fn call_agent_memory(
+        &self,
+        session: &Session,
+        caller: crate::sched::TaskId,
+        call: &ToolCall,
+    ) -> ToolOutcome {
+        let agent_id = session.agent.manifest_id.0;
+        let json_key = todo::json_str(&call.args, "key");
+        let json_val = todo::json_str(&call.args, "value");
+        let json_query = todo::json_str(&call.args, "query");
+        let args = call.args.as_str();
+        let (key, value) = if let Some(k) = json_key {
+            (k, json_val.unwrap_or_default())
+        } else if let Some((k, v)) = args.split_once('\u{1f}') {
+            (String::from(k), String::from(v))
+        } else if let Some((k, v)) = args.split_once(char::is_whitespace) {
+            (String::from(k), String::from(v.trim_start()))
+        } else {
+            (String::from(args.trim()), String::new())
+        };
+
+        match call.tool.as_str() {
+            "memory_add" | "remember" | "memory_md_append" => {
+                if key.is_empty() {
+                    return ToolOutcome::error("error: memory_add needs a key (and a value)");
+                }
+                if value.is_empty() {
+                    return ToolOutcome::error("error: memory_add needs a value");
+                }
+                let Some(path) = crate::agent::home::memory_path(agent_id, &key) else {
+                    return ToolOutcome::error(
+                        "error: invalid memory key (use [A-Za-z0-9._-], max 64 chars)",
+                    );
+                };
+                // Seed the home markers if this agent never wrote before.
+                if !store::exists(&format!("{}/memory/.keep", crate::agent::home::path(agent_id))) {
+                    crate::agent::home::ensure(agent_id, "agent");
+                }
+                let outcome = self.run_synapse(
+                    session,
+                    caller,
+                    &synapse_call(
+                        "mem_fs_write",
+                        &[("path", path.as_str()), ("text", value.as_str())],
+                    ),
+                );
+                if outcome.is_error {
+                    return outcome;
+                }
+                // Mutating under taint is refused by the router gate above, so
+                // a successful write cannot launder new untrusted content.
+                // Tag as system-trusted (durable agent state).
+                ToolOutcome::ok(
+                    format!("ok: stored '{key}' ({} bytes)", value.len()),
+                    Provenance::SystemTrusted,
+                )
+            }
+            "memory_get" | "recall" => {
+                if key.is_empty() {
+                    return ToolOutcome::error("error: memory_get needs a key");
+                }
+                // Resolve the key name against the store listing (no value
+                // read yet), then fetch the bytes through the executor.
+                let resolved = crate::agent::home::memory_resolve(agent_id, &key).map(|(k, _)| k);
+                let Some(resolved) = resolved else {
+                    // Keep the helpful miss diagnostics from the home helper.
+                    let out = crate::agent::home::run_memory_tool("memory_get", agent_id, &call.args);
+                    return if out.starts_with("error:") {
+                        ToolOutcome::error(out)
+                    } else {
+                        ToolOutcome::ok(out, Provenance::SystemTrusted)
+                    };
+                };
+                let Some(path) = crate::agent::home::memory_path(agent_id, &resolved) else {
+                    return ToolOutcome::error("error: invalid memory key");
+                };
+                let outcome = self.run_synapse(
+                    session,
+                    caller,
+                    &synapse_call("mem_fs_read", &[("path", path.as_str())]),
+                );
+                if outcome.is_error {
+                    return outcome;
+                }
+                let body = outcome
+                    .result
+                    .strip_prefix("ok:")
+                    .unwrap_or(&outcome.result)
+                    .to_string();
+                let text = if resolved == key {
+                    body
+                } else {
+                    format!("{body}\n(key: {resolved})")
+                };
+                ToolOutcome::ok(text, Provenance::SystemTrusted)
+            }
+            "memory_list" => {
+                // Path listing under `/agent/<id>/memory/` — the agent's home
+                // sandbox already confines the store view. Mutations go through
+                // `mem_fs_write` above; listing stays a pure prefix filter.
+                let keys = crate::agent::home::memory_list(agent_id);
+                let out = if keys.is_empty() {
+                    String::from("(no memories stored)")
+                } else {
+                    keys.join("\n")
+                };
+                ToolOutcome::ok(out, Provenance::SystemTrusted)
+            }
+            "memory_search" => {
+                let q = json_query.unwrap_or_else(|| {
+                    if key.is_empty() {
+                        String::new()
+                    } else if value.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{key} {value}")
+                    }
+                });
+                if q.trim().is_empty() {
+                    return ToolOutcome::error("error: memory_search needs a query");
+                }
+                let outcome = self.run_synapse(
+                    session,
+                    caller,
+                    &synapse_call("mem_fs_search", &[("query", q.as_str())]),
+                );
+                if outcome.is_error {
+                    return outcome;
+                }
+                let prefix = format!("{}/memory/", crate::agent::home::path(agent_id));
+                let body = outcome
+                    .result
+                    .strip_prefix("ok:")
+                    .unwrap_or(&outcome.result);
+                let mut hits: Vec<String> = Vec::new();
+                for line in body.lines() {
+                    let path = line.trim();
+                    if path.is_empty() {
+                        continue;
+                    }
+                    if let Some(rest) = path.strip_prefix(&prefix) {
+                        if rest.is_empty() || rest == ".keep" || rest.contains('/') {
+                            continue;
+                        }
+                        // Re-read value through the gate for the display line.
+                        let read = self.run_synapse(
+                            session,
+                            caller,
+                            &synapse_call("mem_fs_read", &[("path", path)]),
+                        );
+                        if read.is_error {
+                            continue;
+                        }
+                        let val = read
+                            .result
+                            .strip_prefix("ok:")
+                            .unwrap_or(&read.result);
+                        hits.push(format!("{rest}: {val}"));
+                    }
+                }
+                let out = if hits.is_empty() {
+                    // Fall back to the home helper if the primitive returned
+                    // nothing under our prefix (e.g. query matched keys only).
+                    let home_hits = crate::agent::home::run_memory_tool("memory_search", agent_id, &call.args);
+                    home_hits
+                } else {
+                    hits.join("\n")
+                };
+                ToolOutcome::ok(out, Provenance::SystemTrusted)
+            }
+            other => ToolOutcome::error(format!("error: unknown memory tool '{other}'")),
         }
     }
 

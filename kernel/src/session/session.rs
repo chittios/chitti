@@ -42,6 +42,7 @@ impl Session {
             audit_cursor: 0,
             origins: Vec::new(),
             trusted_origins: Vec::new(),
+            remote_planner_used: false,
         };
         // The system prompt is message 0, trusted, resident.
         s.push_message(Role::System, manifest.system_prompt.clone(), Provenance::SystemTrusted, now);
@@ -350,6 +351,7 @@ mod tests {
             audit_cursor: 0,
             origins: Vec::new(),
             trusted_origins: Vec::new(),
+            remote_planner_used: false,
         }
     }
 

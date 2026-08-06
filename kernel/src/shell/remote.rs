@@ -11,8 +11,9 @@
 //! repeated as a limitation in the paper before anyone checked the code path.
 //! What is genuinely true is narrower: the self-hosted case this exists for is
 //! conventionally plain `http://` on a LAN, so the prompt and the bearer token
-//! usually do travel in the clear, and nothing warns the human when they
-//! configure such a URL.
+//! usually do travel in the clear. Configuring such a URL now prints a warning
+//! ([`cleartext_warning`]), the session is marked ([`Session::remote_planner_used`]),
+//! and the approval dialogue names cleartext vs TLS.
 //!
 //! The remote chat runs the SAME agentic contract as the local one: the same
 //! system prompt (SOUL.md + operating rules + CORE tools + `search_tools`),
@@ -274,6 +275,9 @@ impl RemoteChat {
     pub fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> String {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
+        // Mark the session so later approval dialogues know context left the box,
+        // even after `/model local` switches the planner back.
+        session.remote_planner_used = true;
         // Mid-turn interjection queue while HTTP wait / tools run.
         super::set_chat_busy(true);
         self.refresh_system();
@@ -503,6 +507,25 @@ pub fn is_remote_active() -> bool {
     on && cfg.is_some()
 }
 
+/// True when the remote endpoint URL is plain `http://` (prompt + bearer token
+/// cross the wire in the clear). `https://` is verified TLS and returns false.
+pub fn url_is_cleartext(url: &str) -> bool {
+    let u = url.trim();
+    u.len() >= 7 && u.as_bytes()[..7].eq_ignore_ascii_case(b"http://")
+}
+
+/// Human-facing warning for configuring or approving against a cleartext
+/// remote planner. Pure — unit-tested so the modal and `/model` stay in lockstep.
+pub fn cleartext_warning(url: &str) -> Option<&'static str> {
+    if url_is_cleartext(url) {
+        Some(
+            "WARNING: plain http:// — the prompt (and any bearer key) leave this machine in the clear. Prefer https://.",
+        )
+    } else {
+        None
+    }
+}
+
 /// Hosted backend config when remote mode is on.
 pub fn active_config() -> Option<RemoteConfig> {
     let (on, cfg) = load();
@@ -636,5 +659,16 @@ mod tests {
         let slash = b"{\"mode\":\"remote\",\"url\":\"http://10.0.2.2:1234/\",\"model\":\"m\"}";
         let (_, cfg) = parse_config_json(slash).expect("parse slash");
         assert_eq!(cfg.unwrap().url, "http://10.0.2.2:1234");
+    }
+
+    /// Cleartext remote endpoints must warn; https must not.
+    #[test_case]
+    fn cleartext_http_warns_https_does_not() {
+        assert!(url_is_cleartext("http://192.168.1.20:8080"));
+        assert!(url_is_cleartext("HTTP://lan:11434"));
+        assert!(!url_is_cleartext("https://api.example.com"));
+        assert!(!url_is_cleartext("HTTPS://api.example.com/v1"));
+        assert!(cleartext_warning("http://10.0.2.2:8080").is_some());
+        assert!(cleartext_warning("https://10.0.2.2:8080").is_none());
     }
 }

@@ -268,6 +268,89 @@ pub fn shared_version_ok(version: u8) -> bool {
     (SHARED_VERSION_MIN..=SHARED_VERSION_MAX).contains(&version)
 }
 
+// ── Shared-info + common-ring layouts (Linux brcmfmac/pcie.c) ──────────────
+//
+// Once firmware posts `shared_addr`, the host reads this header to locate the
+// H2D/D2H control rings that carry ioctl pointer requests. Pure so the offsets
+// are pinned before any MMIO write.
+
+/// Byte offset of `ring_info_addr` in the shared-info header (LE u32).
+pub const SHARED_RING_INFO_OFF: usize = 0x34;
+/// Byte offset of `hto_d_mb_data_addr` (host→device mailbox).
+pub const SHARED_HTOD_MB_OFF: usize = 0x2c;
+/// Byte offset of `dto_h_mb_data_addr` (device→host mailbox).
+pub const SHARED_DTOH_MB_OFF: usize = 0x30;
+
+/// Minimum shared-info bytes we must be able to read for ring bring-up.
+pub const SHARED_INFO_MIN: usize = SHARED_RING_INFO_OFF + 4;
+
+/// Decode the ring-info TCM address from a shared-info header blob.
+pub fn shared_ring_info_addr(shared: &[u8]) -> Option<u32> {
+    if shared.len() < SHARED_INFO_MIN {
+        return None;
+    }
+    let addr = u32::from_le_bytes([
+        shared[SHARED_RING_INFO_OFF],
+        shared[SHARED_RING_INFO_OFF + 1],
+        shared[SHARED_RING_INFO_OFF + 2],
+        shared[SHARED_RING_INFO_OFF + 3],
+    ]);
+    if addr == 0 {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// Decode host→device mailbox data address.
+pub fn shared_htod_mb_addr(shared: &[u8]) -> Option<u32> {
+    if shared.len() < SHARED_DTOH_MB_OFF {
+        return None;
+    }
+    let addr = u32::from_le_bytes([
+        shared[SHARED_HTOD_MB_OFF],
+        shared[SHARED_HTOD_MB_OFF + 1],
+        shared[SHARED_HTOD_MB_OFF + 2],
+        shared[SHARED_HTOD_MB_OFF + 3],
+    ]);
+    if addr == 0 {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// A complete ioctl-pointer request: 8-byte msg header + 24-byte payload.
+pub fn pack_ioctl_request(
+    if_id: i8,
+    epoch: u8,
+    request_id: u32,
+    cmd: u32,
+    trans_id: u16,
+    input_len: u16,
+    output_len: u16,
+    host_buf: u64,
+) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&pack_msg_header(
+        MSG_TYPE_IOCTLPTR_REQ,
+        if_id,
+        0,
+        epoch,
+        request_id,
+    ));
+    out[8..].copy_from_slice(&pack_ioctl_ptr_req(
+        cmd, trans_id, input_len, output_len, host_buf,
+    ));
+    out
+}
+
+/// True when the shared-info header has enough structure to attempt ring
+/// init (version OK + non-zero ring_info pointer). Does not touch hardware.
+pub fn rings_locatable(shared_flags: u32, shared_header: &[u8]) -> bool {
+    shared_version_ok(shared_version(shared_flags)) && shared_ring_info_addr(shared_header).is_some()
+}
+
 /// Build firmware search paths for a stem (with Asahi alternate names). Pure.
 pub fn firmware_search_paths(stem: &str) -> alloc::vec::Vec<alloc::string::String> {
     use alloc::{format, string::String, vec::Vec};
@@ -537,6 +620,30 @@ mod tests {
         assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), BRCMF_C_GET_VERSION);
         assert_eq!(u16::from_le_bytes([p[4], p[5]]), 7);
         assert_eq!(u64::from_le_bytes(p[16..24].try_into().unwrap()), 0x10_0000_4000);
+    }
+
+    #[test_case]
+    fn shared_ring_info_offsets_and_ioctl_request() {
+        let mut hdr = [0u8; SHARED_INFO_MIN];
+        // flags / version word is at 0; ring_info at SHARED_RING_INFO_OFF.
+        hdr[0] = 6; // version 6
+        hdr[SHARED_RING_INFO_OFF..SHARED_RING_INFO_OFF + 4]
+            .copy_from_slice(&0x0012_3400u32.to_le_bytes());
+        hdr[SHARED_HTOD_MB_OFF..SHARED_HTOD_MB_OFF + 4]
+            .copy_from_slice(&0x0011_0000u32.to_le_bytes());
+        assert_eq!(shared_ring_info_addr(&hdr), Some(0x0012_3400));
+        assert_eq!(shared_htod_mb_addr(&hdr), Some(0x0011_0000));
+        assert!(rings_locatable(6, &hdr));
+        assert!(!rings_locatable(6, &[0u8; 8]), "too short");
+        assert!(!rings_locatable(99, &hdr), "bad version");
+
+        let req = pack_ioctl_request(0, 1, 42, BRCMF_C_SCAN, 3, 0, 256, 0x1000);
+        assert_eq!(req[0], MSG_TYPE_IOCTLPTR_REQ);
+        assert_eq!(u32::from_le_bytes([req[4], req[5], req[6], req[7]]), 42);
+        assert_eq!(
+            u32::from_le_bytes([req[8], req[9], req[10], req[11]]),
+            BRCMF_C_SCAN
+        );
     }
 
     #[test_case]

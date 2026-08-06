@@ -420,6 +420,13 @@ pub struct Session {
     /// context nobody can see any more.
     #[serde(skip)]
     pub trusted_origins: Vec<u16>,
+    /// Set when this session has used a remote (off-box) planner at least once.
+    /// Deliberately **not persisted**: a resumed session must not silently
+    /// inherit that context previously left the machine under a different
+    /// operator. The approval dialogue and `/model` status read this so a
+    /// human does not have to remember.
+    #[serde(skip)]
+    pub remote_planner_used: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -708,6 +715,7 @@ mod tests {
             audit_cursor: 91,
             origins: vec!["host:evil.example".into()],
             trusted_origins: vec![],
+            remote_planner_used: false,
         }
     }
 

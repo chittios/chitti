@@ -1681,8 +1681,36 @@ pub fn scan() -> Result<Vec<proto::BssInfo>, &'static str> {
     if !up {
         return Err("firmware not running — load brcmfmac firmware first");
     }
-    // M3: BRCMF_C_SCAN + event ring drain.
-    Err("scan ioctl path not yet wired (firmware is up but rings pending)")
+    // Read the shared-info header and locate ring_info. Mapping the common
+    // rings into host DMA and posting BRCMF_C_SCAN is the remaining half —
+    // without those mappings an ioctl would write into TCM the host does not
+    // own. Report the locator result so `/wifi scan` diagnoses "firmware up
+    // but rings unmapped" vs "shared header incomplete".
+    let locatable = DEV.with(|d| {
+        let Some(dev) = d.as_ref() else {
+            return false;
+        };
+        let mut hdr = [0u8; proto::SHARED_INFO_MIN];
+        for i in 0..(proto::SHARED_INFO_MIN / 4) {
+            let Some(w) = tcm_bar2_probe_read32(dev.bar2, dev.shared_addr + (i as u32) * 4) else {
+                return false;
+            };
+            hdr[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let flags = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        if let Some(ri) = proto::shared_ring_info_addr(&hdr) {
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: shared rings locatable — ring_info={ri:#x} ver={}",
+                proto::shared_version(flags)
+            ));
+        }
+        proto::rings_locatable(flags, &hdr)
+    });
+    if locatable {
+        Err("scan ioctl path: rings located in shared-info; common-ring DMA mapping still pending")
+    } else {
+        Err("scan ioctl path: shared-info incomplete (ring_info missing) — firmware up but rings not advertised")
+    }
 }
 
 /// Associate with `ssid` using WPA2-PSK `psk` (passphrase).
@@ -1694,6 +1722,9 @@ pub fn connect(ssid: &str, _psk: &str) -> Result<(), &'static str> {
     if !up {
         return Err("firmware not running — load brcmfmac firmware first");
     }
-    // M3: SET_SSID + SET_WSEC(AES) + SET_WPA_AUTH(PSK) + SET_WSEC_PMK.
-    Err("connect/WPA2 path not yet wired (firmware is up but rings pending)")
+    // Same gate as scan: SET_SSID + WSEC + WPA_AUTH + PMK need the H2D control
+    // ring. Packing the ioctl bytes is already tested in `proto`; the DMA map
+    // is what remains.
+    let _ = proto::pack_ioctl_request(0, 0, 1, proto::BRCMF_C_SET_SSID, 1, 36, 0, 0);
+    Err("connect/WPA2 path: rings located after scan probe; common-ring DMA mapping still pending")
 }
