@@ -32,6 +32,21 @@
 % flushed it *after* the bibliography — a 26-row table sitting in the middle of
 % the references.
 \usepackage{float}
+% Float placement. Without these, all four image figures were deferred to the end
+% of the document: a full-width screenshot plus its caption is ~67% of the text
+% block, LaTeX's default \topfraction admits 70%, and once ONE float is deferred
+% every later float queues behind it (floats are placed in order). The result was
+% Figures 2-5 stacked on pages 33-36 while their text sat on pages 11-16.
+\renewcommand{\topfraction}{0.92}      % a top float may own most of the page
+\renewcommand{\bottomfraction}{0.75}
+\renewcommand{\textfraction}{0.06}     % ...leaving little text is acceptable
+\renewcommand{\floatpagefraction}{0.7} % a float page must be reasonably full
+\setcounter{topnumber}{3}
+\setcounter{bottomnumber}{2}
+\setcounter{totalnumber}{4}
+% And a hard barrier at each section: a figure may drift within its section but
+% never past it, which is the property that actually matters for reading.
+\usepackage[section]{placeins}
 \usepackage{enumitem}
 \usepackage{hyperref}
 \hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
@@ -353,7 +368,7 @@ registry's declared order.},label={lst:wire}]
 {"name":"<registered name>","arguments":{"<k1>":<v1>,"<k2>":<v2>}}
 \end{lstlisting}
 
-\begin{figure}[t]
+\begin{figure}[tbp]
 \centering
 \begin{tikzpicture}[
   font=\footnotesize,
@@ -750,7 +765,7 @@ network relay, HTTP framing, a content server runtime --- are deterministic code
 below the boundary, so an agent that serves web pages does not implement HTTP;
 it decides what to serve while native code parses and frames.
 
-\begin{figure}[t]
+\begin{figure}[tbp]
 \centering
 \includegraphics[width=\linewidth]{figures/panes.png}
 \caption{\os{} running, captured from the guest's own framebuffer through the
@@ -902,7 +917,7 @@ The end-to-end test asserts the attribution as well as the cost: each refusal
 row must name the gate that refused it, so the same run that produces these
 numbers also demonstrates that each gate is the one stopping its own case.
 
-\begin{figure}[t]
+\begin{figure}[tbp]
 \centering
 \includegraphics[width=\linewidth]{figures/fig_cost.pdf}
 \caption{E1. \textbf{Left:} the authorization decision decomposed into its
@@ -1073,7 +1088,7 @@ than their first. Egress is the case that must not be misread --- no tool lowers
 to \code{net\_http\_post} either, yet an agent can still exfiltrate through four
 other bindings, which is exactly why those bindings carry their own checks.
 
-\begin{figure}[t]
+\begin{figure}[tbp]
 \centering
 \includegraphics[width=\linewidth]{figures/redteam_table.png}
 \caption{E2 and E4 as they actually run, screenshotted from the guest's own
@@ -1500,7 +1515,7 @@ layer answering ``\code{/http} is not available as a tool'' underneath ---
 an incidental restriction doing security work that no part of the design had
 claimed credit for, and which a table of aggregates had hidden.
 
-\begin{figure}[t]
+\begin{figure}[tbp]
 \centering
 \includegraphics[width=0.52\linewidth]{figures/fig_tradeoff.pdf}
 \caption{E4 as a position rather than a column. A defence has to be good on both

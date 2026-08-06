@@ -9,7 +9,7 @@ an agent rather than a program.
   pages / arXiv / ACL Anthology (the four entries written from working knowledge —
   CaMeL, AgentDojo, InjecAgent, Outlines — were all correct as written; page
   ranges added for LOMAC and Greshake)
-- `make` — build `main.pdf` (`make manual` if you have no `latexmk`). Verified: 37 pages, 0 errors, 0 overfull boxes, 0 undefined references with TeX Live 2026
+- `make` — build `main.pdf` (`make manual` if you have no `latexmk`). Verified: 35 pages, 0 errors, 0 overfull boxes, 0 undefined references with TeX Live 2026
 
 Intended categories: **cs.OS** (primary), cross-list **cs.CR**, **cs.AI**.
 
@@ -282,7 +282,7 @@ exactly `main.tex`, `refs.bib`, `main.bbl` and the **five referenced** figures �
 scripts, and the five unused figures sitting in `figures/`.
 
 Verified, not assumed: the tarball was extracted to a clean directory and
-compiled there with nothing else present — 37 pages, 0 errors, 0 undefined
+compiled there with nothing else present — 35 pages, 0 errors, 0 undefined
 references. That is the check that matters, because arXiv rebuilds from source
 and will not see your working directory.
 
