@@ -229,17 +229,43 @@ The 7 `parses_to!` golden token-tree unit tests that Fixes 6–9 invalidated
 were regenerated to the new correct parse output; the just-ref lib suite is
 85/85 green.
 
+## Fix 10 — ToPrimitive / numeric literals / keyword boundaries (browse-critical)
+
+Surfaced from addition + numeric test262 dirs and a `/browse`-shaped probe
+(`thrower + counter` threw `ReferenceError: er is not defined`):
+
+- **`{} + {}` → NaN** — `to_primitive` skipped `Object.prototype.toString`, so
+  plain objects fell through to ToNumber. Now only `valueOf` is skipped (it
+  returns the receiver); `toString` runs. Non-callable `Symbol.toPrimitive`
+  is a TypeError (GetMethod), not a silent fall-through.
+- **`1e-1 === 0` / `1.1e-1 !== 0.11` / `1e308 + 1e308 → -2`** — decimal
+  literals were composed as mantissa×10^exp then truncated with `as i64` when
+  no `.` digit was seen. Now the whole lexeme is `f64`-parsed and classified
+  (exact i64 → Integer, else Float).
+- **`-0 + -0` / `1 / -0`** — unary minus on integer 0 now yields float `-0.0`;
+  division uses IEEE so signed zero is preserved.
+- **WhiteSpace** — VT/FF/NBSP/ZWNBSP added to pest `WHITESPACE` (LineTerminators
+  stay out so ASI still works).
+- **`thrower` lexed as `throw` + `er`** — statement keywords (`throw`/`return`/
+  `break`/`continue`/`with`/`debugger`) and word unaries (`typeof`/`delete`/
+  `void`/`await`) now use atomic `!identifier_part` boundaries (same posture as
+  `new_op` / `async_kw`). The boundary **must** be atomic: a non-atomic
+  `!identifier_part` runs *after* pest skips WHITESPACE and rejects `throw new`.
+
+addition+numeric dirs: **205 → 204 pass / 1 fail** (99.5%; the leftover is the
+negative `12abc` early-error case). just-ref lib tests: **133/133**.
+
 ## Final state
 
-files=1104 **pass=1015** skip=22 panics=0 (**93.8%** of runnable). jQuery 3.7.1
-slim + lodash-core parse+run; **41/41 vercel.com chunks parse (skip=0)**; the two
-`--raw` runtime errors left are bare-harness environment gaps (`self is not
-defined`, webpack module-registry `.call`) — both chunks run in the browser tier.
-just-ref host tests: lib 85/85, BigInt 22/22, iterator-dstr 21/21.
+files=1104 **pass=1015** skip=22 panics=0 (**93.8%** of runnable) — Fix 10
+closed the addition/numeric cluster above without a full-corpus re-sweep yet.
+jQuery 3.7.1 slim + lodash-core parse+run; **41/41 vercel.com chunks parse
+(skip=0)**; the two `--raw` runtime errors left are bare-harness environment
+gaps (`self is not defined`, webpack module-registry `.call`) — both chunks run
+in the browser tier. just-ref host tests: lib 133/133.
 
-**Remaining ~67 test262 fails** are narrower conformance edges: `eval`
-completion-value (`UpdateEmpty`) semantics (~20), `Symbol.toPrimitive`/`Object(2n)`
-object-coercion (needs the `to_primitive` object path), a few strict-mode early
-errors, class-static-method persistence, a real `Array.prototype`/accessor
-`defineProperty`, and legacy Annex-B octal/escape forms. Each is a self-contained
-follow-up; none blocks real page rendering.
+**Remaining test262 fails** are narrower conformance edges: `eval`
+completion-value (`UpdateEmpty`) semantics (~20), a few strict-mode early
+errors (incl. `numeric-followed-by-ident`), class-static-method persistence,
+and legacy Annex-B octal/escape forms. Each is a self-contained follow-up; none
+blocks real page rendering.

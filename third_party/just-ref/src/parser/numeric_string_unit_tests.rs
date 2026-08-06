@@ -159,7 +159,7 @@ fn test_exponent_parse1() {
 fn test_exponent_parse2() {
     assert_parse(
         "1.2e2",
-        ExtendedNumberLiteralType::Std(NumberLiteralType::FloatLiteral(120_f64)),
+        ExtendedNumberLiteralType::Std(NumberLiteralType::IntegerLiteral(120)),
     )
 }
 

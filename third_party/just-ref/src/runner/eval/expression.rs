@@ -2683,6 +2683,11 @@ fn negate_number(value: &JsValue) -> ValueResult {
     }
     let num_value = to_number(value)?;
     Ok(match num_value {
+        // `i64` has no negative zero — `-0` must be a float so `1/(-0)` is -∞
+        // and `-0 + -0` stays -0 (IEEE).
+        JsValue::Number(JsNumberType::Integer(0)) => {
+            JsValue::Number(JsNumberType::Float(-0.0))
+        }
         JsValue::Number(JsNumberType::Integer(i)) => JsValue::Number(JsNumberType::Integer(-i)),
         JsValue::Number(JsNumberType::Float(f)) => JsValue::Number(JsNumberType::Float(-f)),
         JsValue::Number(JsNumberType::PositiveInfinity) => JsValue::Number(JsNumberType::NegativeInfinity),
@@ -2796,23 +2801,45 @@ fn divide_values(left: &JsValue, right: &JsValue) -> ValueResult {
     let left_num = to_number(left)?;
     let right_num = to_number(right)?;
 
-    if matches!(right_num, JsValue::Number(JsNumberType::Integer(0)))
-        || matches!(right_num, JsValue::Number(JsNumberType::Float(f)) if f == 0.0)
-    {
-        let left_f = match &left_num {
-            JsValue::Number(n) => number_to_f64(n),
-            _ => f64::NAN,
-        };
-        return Ok(if left_f.is_nan() || left_f == 0.0 {
-            JsValue::Number(JsNumberType::NaN)
-        } else if left_f > 0.0 {
-            JsValue::Number(JsNumberType::PositiveInfinity)
-        } else {
+    // IEEE division so signed zero is preserved (`1 / -0 === -∞`). The old
+    // `f == 0.0` zero-check treated -0 like +0 and always returned +∞ for a
+    // positive dividend.
+    let left_f = match &left_num {
+        JsValue::Number(n) => number_to_f64(n),
+        _ => f64::NAN,
+    };
+    let right_f = match &right_num {
+        JsValue::Number(n) => number_to_f64(n),
+        _ => f64::NAN,
+    };
+    let q = left_f / right_f;
+    Ok(if q.is_nan() {
+        JsValue::Number(JsNumberType::NaN)
+    } else if q.is_infinite() {
+        if q.is_sign_negative() {
             JsValue::Number(JsNumberType::NegativeInfinity)
-        });
-    }
-
-    apply_numeric_op(&left_num, &right_num, |a, b| a / b, |a, b| a / b)
+        } else {
+            JsValue::Number(JsNumberType::PositiveInfinity)
+        }
+    } else {
+        // Prefer Integer when both operands were integers and the quotient is
+        // an exact non-negative integer (negative zero cannot arise here).
+        if matches!(
+            (&left_num, &right_num),
+            (
+                JsValue::Number(JsNumberType::Integer(_)),
+                JsValue::Number(JsNumberType::Integer(_))
+            )
+        ) && q.fract() == 0.0
+            && !q.is_sign_negative()
+            && q >= i64::MIN as f64
+            && q <= i64::MAX as f64
+        {
+            JsValue::Number(JsNumberType::Integer(q as i64))
+        } else {
+            JsValue::Number(JsNumberType::Float(q))
+        }
+    })
 }
 
 fn modulo_values(left: &JsValue, right: &JsValue) -> ValueResult {
@@ -3499,26 +3526,35 @@ pub fn to_primitive(value: &JsValue, hint: &str, ctx: &mut EvalContext) -> Value
     if !matches!(value, JsValue::Object(_)) {
         return Ok(value.clone());
     }
-    // 1. Exotic `Symbol.toPrimitive` (keyed by its stringified form, like every
-    // other symbol-valued property in this interpreter).
+    // 1. GetMethod(input, @@toPrimitive): undefined/null → OrdinaryToPrimitive;
+    // anything non-callable → TypeError (spec). Keyed by the symbol's
+    // stringified form, like every other symbol-valued property here.
     let sym_key = value_to_property_key(&JsValue::Symbol(
         crate::runner::ds::symbol::SYMBOL_TO_PRIMITIVE.clone(),
     ));
     let exotic = get_property_with_ctx(value, &sym_key, ctx)?;
-    if value_is_callable(&exotic) {
-        let h = if hint.is_empty() { "default" } else { hint };
-        let res = call_value(
-            &exotic,
-            value.clone(),
-            alloc::vec![JsValue::String(h.to_string())],
-            ctx,
-        )?;
-        if matches!(res, JsValue::Object(_)) {
+    match &exotic {
+        JsValue::Undefined | JsValue::Null => {}
+        _ if value_is_callable(&exotic) => {
+            let h = if hint.is_empty() { "default" } else { hint };
+            let res = call_value(
+                &exotic,
+                value.clone(),
+                alloc::vec![JsValue::String(h.to_string())],
+                ctx,
+            )?;
+            if matches!(res, JsValue::Object(_)) {
+                return Err(JErrorType::TypeError(
+                    "Cannot convert object to primitive value".to_string(),
+                ));
+            }
+            return Ok(res);
+        }
+        _ => {
             return Err(JErrorType::TypeError(
-                "Cannot convert object to primitive value".to_string(),
+                "Symbol.toPrimitive is not a function".to_string(),
             ));
         }
-        return Ok(res);
     }
     // 2. Boxed primitive wrapper (`Object(prim)`, `Object(2n)`): unwrap to the
     // stored primitive. This must precede the valueOf/toString loop — the
@@ -3529,11 +3565,7 @@ pub fn to_primitive(value: &JsValue, hint: &str, ctx: &mut EvalContext) -> Value
     if let Some(p) = get_own_prop_value(value, "__primitive_value__") {
         return Ok(p);
     }
-    // 3. OrdinaryToPrimitive: valueOf/toString in hint order. Only *user-defined*
-    // overrides should short-circuit here — the generic native `valueOf`
-    // (returns `this`) and `toString` (returns "[object Object]") must fall
-    // through to the legacy path, else every plain object would stringify to
-    // "[object Object]" via the now-materialized native `toString`.
+    // 3. OrdinaryToPrimitive: valueOf/toString in hint order.
     let order: [&str; 2] = if hint == "string" {
         ["toString", "valueOf"]
     } else {
@@ -3554,12 +3586,13 @@ pub fn to_primitive(value: &JsValue, hint: &str, ctx: &mut EvalContext) -> Value
         if !value_is_callable(&method) {
             continue;
         }
-        // Skip *only* Object.prototype's generic valueOf (returns `this`) and
-        // toString (`[object Object]`) — otherwise every plain `{}` would
-        // coerce via the now-materialized natives. Number/String/Date/etc.
-        // natives and all user methods must still run.
+        // Skip Object.prototype.valueOf only — it returns the receiver (still
+        // an Object), so calling it is a no-op that would flip `tried_coercer`
+        // and turn a missing toString into a TypeError. Do **not** skip
+        // Object.prototype.toString: `({} + {})` must be string concat of
+        // "[object Object]" twice (skipping it left objects for ToNumber → NaN).
         if let Some((objname, mname)) = native_method_parts(&method) {
-            if objname == "Object" && (mname == "valueOf" || mname == "toString") {
+            if objname == "Object" && mname == "valueOf" {
                 continue;
             }
         }

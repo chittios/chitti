@@ -1631,7 +1631,50 @@ mod realworld_engine_tests {
         // not mask a boxed primitive's ToPrimitive (`Object(2n) + 1n === 3n`).
         assert_eq!(run("Object(2n) + 1n;"), "3");
         assert_eq!(run("Object(2n) + 1n === 3n;"), "true");
-        // A plain object still stringifies via the legacy path.
+        // A plain object still stringifies via ToPrimitive → toString.
         assert_eq!(run("'' + {};"), "[object Object]");
+        assert_eq!(run("({} + {});"), "[object Object][object Object]");
+        assert_eq!(run("1e-1 === 0.1;"), "true");
+        assert_eq!(run("1 / (-0 + -0) === Number.NEGATIVE_INFINITY;"), "true");
+        // GetMethod: non-callable @@toPrimitive must TypeError (not fall through).
+        assert_eq!(
+            run("try { ({[Symbol.toPrimitive]: 1}) + 0; 'no' } catch (e) { e.name }"),
+            "TypeError"
+        );
+        // Accessor-defined @@toPrimitive must run the getter (defineProperty path).
+        assert_eq!(
+            run(
+                r#"
+                var log = '';
+                var o = {};
+                Object.defineProperty(o, Symbol.toPrimitive, {
+                  get: function () { log += 'g'; return function () { return 7; }; }
+                });
+                var v = o + 1;
+                log + ':' + v;
+                "#
+            ),
+            "g:8"
+        );
+        // Getter that throws must surface that throw (not a scope ReferenceError).
+        assert_eq!(
+            run(
+                r#"
+                var hit = false;
+                var o = {};
+                Object.defineProperty(o, Symbol.toPrimitive, {
+                  get: function () {
+                    hit = true;
+                    return function () { throw new Error('boom'); };
+                  }
+                });
+                try { o + 1; 'no'; } catch (e) { (hit ? 'hit:' : 'miss:') + e.message }
+                "#
+            ),
+            "hit:boom"
+        );
+        // Keyword/identifier boundary: `thrower` is an identifier, not `throw er`.
+        assert_eq!(run("var thrower = 3; thrower + 1;"), "4");
+        assert_eq!(run("var typeofx = 9; typeofx;"), "9");
     }
 }

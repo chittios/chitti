@@ -4,7 +4,10 @@
 // Author: nirupam.biswas
 //
 
-WHITESPACE = _{ " " | "\t" }
+// ECMA-262 WhiteSpace (not LineTerminator — those stay in `s` / `line_terminator`
+// so ASI and regex-literal termination keep working). VT/FF/NBSP/ZWNBSP were
+// missing, so `eval("1\u000B+\u000B1")` and similar failed to parse.
+WHITESPACE = _{ " " | "\t" | "\u{000B}" | "\u{000C}" | "\u{00A0}" | "\u{FEFF}" }
 COMMENT = _{ comment }
 s = _{ line_terminator* }
 comment = { multi_line_comment | single_line_comment }
@@ -411,7 +414,16 @@ unary_expression__yield = {
     postfix_expression__yield
     | unary_operator ~ unary_expression__yield
 }
-unary_operator = { "delete" | "void" | "typeof" | "++" | "--" | "+" | "-" | "~" | "!" | "await" }
+// Word-operator unaries need the same identifier-part boundary (`typeofx` is
+// an identifier, not `typeof` applied to `x`).
+unary_operator = {
+    delete_op | void_op | typeof_op | await_op
+    | "++" | "--" | "+" | "-" | "~" | "!"
+}
+delete_op = @{ "delete" ~ !identifier_part }
+void_op = @{ "void" ~ !identifier_part }
+typeof_op = @{ "typeof" ~ !identifier_part }
+await_op = @{ "await" ~ !identifier_part }
 // Exponentiation `a ** b` binds tighter than `* / %` and is right-associative.
 exponentiation_expression = { unary_expression ~ (s~ "**" ~s~ exponentiation_expression)? }
 exponentiation_expression__yield = { unary_expression__yield ~ (s~ "**" ~s~ exponentiation_expression__yield)? }
@@ -874,31 +886,31 @@ for_declaration__yield = { let_or_const ~ for_binding__yield }
 for_binding = { binding_identifier | binding_pattern }
 for_binding__yield = { binding_identifier__yield | binding_pattern__yield }
 continue_statement = {
-    "continue" ~ !line_terminator ~ label_identifier ~ smart_semicolon |
-    "continue" ~ smart_semicolon
+    continue_kw ~ !line_terminator ~ label_identifier ~ smart_semicolon |
+    continue_kw ~ smart_semicolon
 }
 continue_statement__yield = {
-    "continue" ~ !line_terminator ~ label_identifier__yield ~ smart_semicolon |
-    "continue" ~ smart_semicolon
+    continue_kw ~ !line_terminator ~ label_identifier__yield ~ smart_semicolon |
+    continue_kw ~ smart_semicolon
 }
 break_statement = {
-    "break" ~ !line_terminator ~ label_identifier ~ smart_semicolon |
-    "break" ~ smart_semicolon
+    break_kw ~ !line_terminator ~ label_identifier ~ smart_semicolon |
+    break_kw ~ smart_semicolon
 }
 break_statement__yield = {
-    "break" ~ !line_terminator ~ label_identifier__yield ~ smart_semicolon |
-    "break" ~ smart_semicolon
+    break_kw ~ !line_terminator ~ label_identifier__yield ~ smart_semicolon |
+    break_kw ~ smart_semicolon
 }
 labelled_statement = { label_identifier ~s~ ":" ~s~ statement }
 labelled_statement__yield = { label_identifier__yield ~s~ ":" ~s~ statement__yield }
 labelled_statement__return = { label_identifier ~s~ ":" ~s~ statement__return }
 labelled_statement__yield_return = { label_identifier__yield ~s~ ":" ~s~ statement__yield_return }
-return_statement = { "return" ~ !line_terminator ~ expression__in ~ smart_semicolon | "return" ~ smart_semicolon }
-return_statement__yield = { "return" ~ !line_terminator ~ expression__in ~ smart_semicolon | "return" ~ smart_semicolon }
-with_statement = { "with"  ~s~ "(" ~s~ expression__in ~s~ ")" ~s~ statement }
-with_statement__yield = { "with"  ~s~ "(" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield }
-with_statement__return = { "with"  ~s~ "(" ~s~ expression__in ~s~ ")" ~s~ statement__return }
-with_statement__yield_return = { "with"  ~s~ "(" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield_return }
+return_statement = { return_kw ~ !line_terminator ~ expression__in ~ smart_semicolon | return_kw ~ smart_semicolon }
+return_statement__yield = { return_kw ~ !line_terminator ~ expression__in ~ smart_semicolon | return_kw ~ smart_semicolon }
+with_statement = { with_kw ~s~ "(" ~s~ expression__in ~s~ ")" ~s~ statement }
+with_statement__yield = { with_kw ~s~ "(" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield }
+with_statement__return = { with_kw ~s~ "(" ~s~ expression__in ~s~ ")" ~s~ statement__return }
+with_statement__yield_return = { with_kw ~s~ "(" ~s~ expression__in_yield ~s~ ")" ~s~ statement__yield_return }
 switch_statement = { "switch" ~s~ "(" ~s~ expression__in ~s~ ")" ~s~ case_block }
 switch_statement__yield = { "switch" ~s~ "(" ~s~ expression__in_yield ~s~ ")" ~s~ case_block__yield }
 switch_statement__return = { "switch" ~s~ "(" ~s~ expression__in ~s~ ")" ~s~ case_block__return }
@@ -939,8 +951,18 @@ default_clause__yield_return = { "default" ~s~ ":" ~s~ statement_list__yield_ret
 // labelled_item__yield = { statement__yield | function_declaration__yield }
 // labelled_item__return = { statement__return | function_declaration }
 // labelled_item__yield_return = { statement__yield_return | function_declaration__yield }
-throw_statement = { "throw" ~ !line_terminator ~ expression__in ~ smart_semicolon }
-throw_statement__yield = { "throw" ~ !line_terminator ~ expression__in_yield ~ smart_semicolon }
+// Keyword forms that can appear where an identifier also can: require a
+// non-identifier-part boundary so `thrower`/`returnValue` stay identifiers.
+// The `!identifier_part` check MUST be inside an atomic (`@`) token — otherwise
+// pest skips WHITESPACE first and `throw new X` fails on the `n` of `new`.
+throw_kw = @{ "throw" ~ !identifier_part }
+return_kw = @{ "return" ~ !identifier_part }
+with_kw = @{ "with" ~ !identifier_part }
+debugger_kw = @{ "debugger" ~ !identifier_part }
+break_kw = @{ "break" ~ !identifier_part }
+continue_kw = @{ "continue" ~ !identifier_part }
+throw_statement = { throw_kw ~ !line_terminator ~ expression__in ~ smart_semicolon }
+throw_statement__yield = { throw_kw ~ !line_terminator ~ expression__in_yield ~ smart_semicolon }
 try_statement = {
     "try" ~s~ block ~s~ catch ~s~ finally
     | "try" ~s~ block ~s~ catch
@@ -972,7 +994,7 @@ finally__return = { "finally" ~s~ block__return }
 finally__yield_return = { "finally" ~s~ block__yield_return }
 catch_parameter = { binding_identifier | binding_pattern }
 catch_parameter__yield = { binding_identifier__yield | binding_pattern__yield }
-debugger_statement = { "debugger" ~ smart_semicolon }
+debugger_statement = { debugger_kw ~ smart_semicolon }
 function_declaration = {
     ("async" ~ s)? ~ "function" ~s~ binding_identifier ~s~ "(" ~s~ formal_parameters ~s~ ")" ~s~ "{" ~s~ function_body ~s~ "}"
 }

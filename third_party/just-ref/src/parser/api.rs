@@ -748,9 +748,15 @@ fn build_ast_from_statement(
             (c, Semantics::new_empty())
         }
         Rule::break_statement | Rule::break_statement__yield => {
-            // Optional `label_identifier` child = `break label;`.
+            // Optional `label_identifier` child = `break label;` (skip `break_kw`).
             let label = inner_pair
                 .into_inner()
+                .filter(|p| {
+                    !matches!(
+                        p.as_rule(),
+                        Rule::break_kw | Rule::continue_kw | Rule::smart_semicolon
+                    )
+                })
                 .next()
                 .map(|p| p.as_str().trim().to_string());
             (BreakStatement { meta, label }, Semantics::new_empty())
@@ -873,7 +879,12 @@ fn build_ast_from_throw_statement(
     script: &Rc<String>,
 ) -> Result<(StatementType, Semantics), JsRuleError> {
     let meta = get_meta(&pair, script);
-    let inner_pair = pair.into_inner().next().unwrap();
+    let mut inners = pair.into_inner();
+    let mut inner_pair = inners.next().unwrap();
+    // `throw_kw` is a named atomic token (identifier-part boundary); skip it.
+    if inner_pair.as_rule() == Rule::throw_kw {
+        inner_pair = inners.next().unwrap();
+    }
     let (e, e_s) = build_ast_from_expression(inner_pair, script)?;
     Ok((
         StatementType::ThrowStatement {
@@ -893,6 +904,12 @@ fn build_ast_from_continue_statement(
     let meta = get_meta(&pair, script);
     let label = pair
         .into_inner()
+        .filter(|p| {
+            !matches!(
+                p.as_rule(),
+                Rule::continue_kw | Rule::break_kw | Rule::smart_semicolon
+            )
+        })
         .next()
         .map(|p| p.as_str().trim().to_string());
     Ok((StatementType::ContinueStatement { meta, label }, s))
@@ -1742,7 +1759,22 @@ fn build_ast_from_return_statement(
     script: &Rc<String>,
 ) -> Result<(StatementType, Semantics), JsRuleError> {
     let meta = get_meta(&pair, script);
-    let inner_pair = pair.into_inner().next().unwrap();
+    let mut inners = pair.into_inner();
+    let mut inner_pair = inners.next().unwrap();
+    if inner_pair.as_rule() == Rule::return_kw {
+        inner_pair = match inners.next() {
+            Some(p) => p,
+            None => {
+                return Ok((
+                    StatementType::ReturnStatement {
+                        meta,
+                        argument: None,
+                    },
+                    Semantics::new_empty(),
+                ));
+            }
+        };
+    }
     let (argument, s) = if inner_pair.as_rule() == Rule::expression__in {
         let (e, e_s) = build_ast_from_expression(inner_pair, script)?;
         (Some(Box::new(e)), e_s)
@@ -4247,39 +4279,32 @@ fn build_ast_str_unsigned_decimal_literal(
     pair: Pair<Rule>,
     is_negative: bool,
 ) -> Result<ExtendedNumberLiteralType, JsRuleError> {
-    let mut num: f64 = 0.0;
-    let mut is_float = false;
-    for decimal_pair in pair.into_inner() {
-        num = match decimal_pair.as_rule() {
-            Rule::str_decimal_literal_infinity => {
-                return Ok(if is_negative {
-                    ExtendedNumberLiteralType::NegativeInfinity
-                } else {
-                    ExtendedNumberLiteralType::Infinity
-                });
-            }
-            Rule::decimal_digits_integer_part => parse_decimal_integer_literal(decimal_pair),
-            Rule::decimal_digits => {
-                is_float = true;
-                num + parse_decimal_digits(decimal_pair)
-            }
-            Rule::exponent_part => num * parse_exponent_part(decimal_pair),
-            _ => {
-                return Err(get_unexpected_error(
-                    "build_ast_str_unsigned_decimal_literal",
-                    &decimal_pair,
-                ))
-            }
+    // Infinity is a dedicated token (not an f64 parse of the word).
+    for decimal_pair in pair.clone().into_inner() {
+        if decimal_pair.as_rule() == Rule::str_decimal_literal_infinity {
+            return Ok(if is_negative {
+                ExtendedNumberLiteralType::NegativeInfinity
+            } else {
+                ExtendedNumberLiteralType::Infinity
+            });
         }
     }
+    let raw = pair.as_str().replace('_', "");
+    let mut lit = classify_decimal_f64(raw.parse().unwrap_or(0.0));
     if is_negative {
-        num *= -1.0;
+        lit = match lit {
+            NumberLiteralType::IntegerLiteral(i) => {
+                if i == 0 {
+                    // `-0` from a string numeric literal must be a negative zero.
+                    NumberLiteralType::FloatLiteral(-0.0)
+                } else {
+                    NumberLiteralType::IntegerLiteral(-i)
+                }
+            }
+            NumberLiteralType::FloatLiteral(f) => NumberLiteralType::FloatLiteral(-f),
+        };
     }
-    Ok(if !is_float {
-        ExtendedNumberLiteralType::Std(NumberLiteralType::IntegerLiteral(num as i64))
-    } else {
-        ExtendedNumberLiteralType::Std(NumberLiteralType::FloatLiteral(num))
-    })
+    Ok(ExtendedNumberLiteralType::Std(lit))
 }
 
 fn get_ast_for_binary_integer_literal(pair: Pair<Rule>) -> NumberLiteralType {
@@ -4326,61 +4351,27 @@ fn get_ast_for_legacy_octal_like_integer_literal(pair: Pair<Rule>) -> NumberLite
     NumberLiteralType::IntegerLiteral(v)
 }
 
-fn parse_decimal_integer_literal(decimal_pair: Pair<Rule>) -> f64 {
-    // Strip `_` numeric separators before parsing.
-    let s = decimal_pair.as_str().replace('_', "");
-    // Literals larger than `isize` (e.g. 1e21 written out, or long digit runs)
-    // must not overflow — fall back to lossy `f64` parsing, matching JS number
-    // semantics where all numbers are doubles anyway.
-    match isize::from_str_radix(&s, 10) {
-        Ok(v) => v as f64,
-        Err(_) => s.parse::<f64>().unwrap_or(f64::INFINITY),
+/// Classify a parsed IEEE decimal into the AST's Integer vs Float form.
+/// Exact finite integers in `i64` range stay `IntegerLiteral` (so `12e2` → 1200);
+/// fractions, huge magnitudes (`1e308`), and non-finite values use `FloatLiteral`
+/// so they are not truncated by `as i64` (the bug behind `1e-1 === 0`).
+fn classify_decimal_f64(num: f64) -> NumberLiteralType {
+    if num.is_finite() {
+        let as_i = num as i64;
+        if (as_i as f64) == num {
+            return NumberLiteralType::IntegerLiteral(as_i);
+        }
     }
-}
-
-fn parse_decimal_digits(decimal_pair: Pair<Rule>) -> f64 {
-    let d = decimal_pair.as_str().replace('_', "");
-    // Long fractional digit runs overflow `isize`; parse as f64 directly.
-    let mantissa = match isize::from_str_radix(&d, 10) {
-        Ok(v) => v as f64,
-        Err(_) => d.parse::<f64>().unwrap_or(0.0),
-    };
-    mantissa / 10_f64.powf(d.len() as f64)
-}
-
-fn parse_exponent_part(decimal_pair: Pair<Rule>) -> f64 {
-    let e = decimal_pair.as_str()[1..].replace('_', "");
-    let exp = match isize::from_str_radix(&e, 10) {
-        Ok(v) => v as f64,
-        Err(_) => e.parse::<f64>().unwrap_or(0.0),
-    };
-    10_f64.powf(exp)
+    NumberLiteralType::FloatLiteral(num)
 }
 
 fn build_ast_decimal_literal(pair: Pair<Rule>) -> Result<NumberLiteralType, JsRuleError> {
-    let mut num: f64 = 0.0;
-    let mut is_float = false;
-    for decimal_pair in pair.into_inner() {
-        num = match decimal_pair.as_rule() {
-            Rule::decimal_integer_literal => parse_decimal_integer_literal(decimal_pair),
-            Rule::decimal_digits => {
-                is_float = true;
-                num + parse_decimal_digits(decimal_pair)
-            }
-            Rule::exponent_part => num * parse_exponent_part(decimal_pair),
-            _ => {
-                return Err(get_unexpected_error(
-                    "build_ast_decimal_literal",
-                    &decimal_pair,
-                ))
-            }
-        }
-    }
-    Ok(if !is_float {
-        NumberLiteralType::IntegerLiteral(num as i64)
-    } else {
-        NumberLiteralType::FloatLiteral(num)
-    })
+    // Parse the *whole* lexeme via `f64` so `1.1e-1` matches `0.11` bit-exactly.
+    // Composing mantissa × 10^exp in pieces (`1.1 * 0.1`) yields a different
+    // float than the literal grammar requires — that broke a dozen test262
+    // numeric cases and any page that compares scientific-notation constants.
+    let raw = pair.as_str().replace('_', "");
+    Ok(classify_decimal_f64(raw.parse::<f64>().unwrap_or(0.0)))
 }
 
 #[allow(dead_code)]

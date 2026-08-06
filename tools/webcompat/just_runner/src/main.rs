@@ -467,8 +467,27 @@ assert.notSameValue = function (actual, unexpected, msg) {
 };
 assert.throws = function (type, fn, msg) {
   var threw = false;
-  try { fn(); } catch (e) { threw = true; }
+  var got = null;
+  try { fn(); } catch (e) {
+    threw = true;
+    got = e;
+    // Prefer an exact constructor match when the harness can see one; fall
+    // back to name equality so `Test262Error` still works before subclasses
+    // have a solid `instanceof` chain in this engine.
+    if (type) {
+      var ok = false;
+      try { ok = e instanceof type; } catch (_) {}
+      if (!ok && e && type && e.name && type.name && e.name === type.name) ok = true;
+      if (!ok && type === TypeError && e && e.name === "TypeError") ok = true;
+      if (!ok && type === RangeError && e && e.name === "RangeError") ok = true;
+      if (!ok && type === Test262Error && e && e.name === "Test262Error") ok = true;
+      if (!ok) {
+        throw new Test262Error((msg || "") + " wrong error type: " + (e && e.name));
+      }
+    }
+  }
   if (!threw) { throw new Test262Error(msg || "expected throw"); }
+  return got;
 };
 assert._isSameValue = function (a, b) {
   if (a === b) { return a !== 0 || 1 / a === 1 / b; }
