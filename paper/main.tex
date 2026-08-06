@@ -84,7 +84,7 @@ justified by untrusted content --- Biba integrity over the live context. Every
 attempt, denials included, is audited.
 
 The model runs in-kernel with no I/O of its own, so there is no way around the
-ABI; the mechanism is 2.7k lines of a dual-architecture Rust kernel. Measured:
+ABI; the mechanism is 3.6k lines of a dual-architecture Rust kernel. Measured:
 the authorization decision costs 1.05\,$\mu$s ($2.4\times10^{-5}$ of one
 decoded token), and an injection corpus is refused 13 times out of 13 --- while
 removing provenance lets 10 through, removing attenuation all 13, and a human
@@ -709,13 +709,13 @@ omitted.
 \label{sec:impl}
 
 \os{} is a from-scratch operating system in Rust (\code{no\_std}), around
-178{,}000 lines, targeting \code{x86\_64} and \code{aarch64} from one codebase
+222{,}000 lines, targeting \code{x86\_64} and \code{aarch64} from one codebase
 with no functional divergence between them. It boots on QEMU, VirtualBox, and
 real UEFI hardware.
 
 The mechanism this paper describes --- registry, grammar, executor, capability
 table and scope ledger, path normalization, provenance, object store, audit ---
-is \textbf{2{,}671 lines excluding its own tests}, against the $\sim$178{,}000
+is \textbf{3{,}591 lines excluding its own tests}, against the $\sim$222{,}000
 above. We report the non-test figure deliberately: it is the
 code that has to be right for the argument to hold, so counting the tests
 alongside it (which would give 3{,}240) inflates the number that matters
@@ -768,7 +768,7 @@ engine that would occupy the ``Model'' slot on a model-loaded boot.}
 \paragraph{Testing posture.} Two layers, and the split reflects the
 determinism boundary itself. Pure logic --- grammar, provenance algebra,
 capability and scope arithmetic, path normalization, registry invariants --- is
-covered by 1{,}344 in-kernel unit tests that run without a model or hardware (1{,}363 are declared; the difference is aarch64-gated and does not run in the x86 suite).
+covered by 1{,}559 in-kernel unit tests that run without a model or hardware (1{,}579 are declared; the difference is aarch64-gated and does not run in the x86 suite).
 Anything that exists only on a running system is covered by an end-to-end
 harness that boots the real kernel under QEMU and drives the shell over
 serial. The gate logic is in the first category by construction, which is a
@@ -1612,14 +1612,21 @@ by the script in the artifact's \code{README} so the figure is reproducible
 rather than asserted; tests counted as \code{\#[test\_case]} attributes in the
 same files.
 
-\textbf{Result} (Table~\ref{tab:e5}). The enforcement path is 2{,}671 lines
-against $\sim$178{,}000 for the OS around it. Two things in the table are worth
+\textbf{Result} (Table~\ref{tab:e5}). The enforcement path is 3{,}591 mechanism
+lines against $\sim$222{,}000 for the OS around it. Two things in the table are worth
 more than the total.
 
-\emph{The executor and registry are 38\% of the mechanism} --- larger than the
-four gates put together. That is the part which dispatches to native
-implementations, and it is where a reviewer's attention belongs; the gates
-themselves are small enough to read in a sitting.
+\emph{The executor and registry are 29\% of the mechanism} --- still, narrowly,
+larger than the four gates put together (1{,}055 against 1{,}018). That is the
+part which dispatches to native implementations, and it is where a reviewer's
+attention belongs; the gates themselves are small enough to read in a sitting.
+
+\emph{Per-value citations are now the second-largest component}, at 417 lines
+against the four gates' 1{,}018 --- which is the shape one would predict from
+\S\ref{sec:limits}: moving provenance from the turn to the value is not a
+refinement of the taint gate but a mechanism of comparable size to all of them.
+It also carries the most tests of any component (12), because a per-value
+relation has more ways to be subtly wrong than a lattice with three points.
 
 \emph{The capability gate had no tests of its own}, which we did not know until
 this table was built. It was never untested --- it is exercised by the acceptance
@@ -1645,14 +1652,16 @@ syscall table has and an agent's tool space normally does not.
 \textbf{Component} & \textbf{Lines} & \textbf{Unit tests} \\
 \midrule
 Grammar (gate 1) & 289 & 9 \\
-Capability (gate 2) & 212 & 2 \\
+Capability (gate 2) & 213 & 2 \\
 Provenance (gate 3) & 196 & 2 \\
-Scope: path normalisation (gate 4) & 301 & 7 \\
-Executor + primitive registry & 1{,}009 & 5 \\
-Audit log & 221 & 4 \\
-Object store & 451 & 4 \\
+Scope: path normalisation (gate 4) & 320 & 7 \\
+Effect policy (what is destructive) & 191 & 5 \\
+Per-value citations + declassification & 417 & 12 \\
+Executor + primitive registry & 1{,}055 & 6 \\
+Audit log & 336 & 5 \\
+Object store & 574 & 4 \\
 \midrule
-\textbf{Total} & \textbf{2{,}671} & \textbf{33} \\
+\textbf{Total} & \textbf{3{,}591} & \textbf{52} \\
 \bottomrule
 \end{tabular}
 \caption{E5: the enforcement path, per component, excluding each file's own
@@ -2130,7 +2139,7 @@ decision. What remains, honestly, is that a fooled agent can still produce a
 fooled answer within its authority; we constrain power, not judgment.
 
 The design is running, dual-architecture, on real hardware, with the model
-inside the kernel and 2{,}671 lines of mechanism between it and every effect in
+inside the kernel and 3{,}591 lines of mechanism between it and every effect in
 the system. It costs 1.05\,$\mu$s per decision --- nothing, against a 43\,ms
 inference step --- and it refuses every attack in our corpus while the same
 corpus walks through the configurations that omit provenance or attenuation.

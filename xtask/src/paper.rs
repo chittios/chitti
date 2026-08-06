@@ -140,6 +140,75 @@ pub fn count_attr(text: &str) -> u64 {
         .count() as u64
 }
 
+
+/// The mechanism's non-test line count -- the paper's TCB figure.
+///
+/// Lines outside every `#[cfg(test)] mod … { … }` region, for the files listed in
+/// `paper/tools_loc.py`. The brace walk is not fussiness: the obvious recipe
+/// ("everything before the first `#[cfg(test)]`") was correct while each file
+/// ended with a single test module, and became silently wrong when
+/// `synapse/executor.rs` grew a `gate_contract_tests` module in the *middle* of
+/// the file with several hundred lines of real code after it. That reported 244
+/// non-test lines for a 763-line file, and the paper's total drifted 35% low --
+/// in the flattering direction, which is the one that matters.
+///
+/// The file list lives in the Python script and is mirrored here rather than
+/// parsed out of it: two short lists that must agree is a worse failure than one
+/// list, but parsing Python from xtask to avoid duplicating nine paths is worse
+/// still. `mechanism_files_match_the_script` pins them together.
+pub const MECHANISM_FILES: &[&str] = &[
+    "kernel/src/synapse/grammar.rs",
+    "kernel/src/cap/mod.rs",
+    "kernel/src/security/taint.rs",
+    "kernel/src/security/mod.rs",
+    "kernel/src/synapse/vpath.rs",
+    "kernel/src/synapse/policy.rs",
+    "kernel/src/security/citation.rs",
+    "kernel/src/synapse/citation.rs",
+    "kernel/src/synapse/executor.rs",
+    "kernel/src/synapse/registry.rs",
+    "kernel/src/synapse/audit.rs",
+    "kernel/src/synapse/fs.rs",
+];
+
+/// Lines in `text` that are not inside a `#[cfg(test)]` module.
+pub fn non_test_lines(text: &str) -> u64 {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i].trim_start().starts_with("#[cfg(test)]") {
+            let mut depth: i64 = 0;
+            let mut opened = false;
+            i += 1;
+            while i < lines.len() {
+                depth += lines[i].matches('{').count() as i64;
+                depth -= lines[i].matches('}').count() as i64;
+                if lines[i].contains('{') {
+                    opened = true;
+                }
+                i += 1;
+                if opened && depth <= 0 {
+                    break;
+                }
+            }
+            continue;
+        }
+        total += 1;
+        i += 1;
+    }
+    total
+}
+
+/// Sum [`non_test_lines`] over [`MECHANISM_FILES`].
+pub fn mechanism_lines(repo: &Path) -> std::io::Result<u64> {
+    let mut n = 0;
+    for f in MECHANISM_FILES {
+        n += non_test_lines(&std::fs::read_to_string(repo.join(f))?);
+    }
+    Ok(n)
+}
+
 /// Count `PrimitiveSpec {` *literals* in the registry, excluding the struct's own
 /// definition.
 ///
@@ -155,6 +224,16 @@ pub fn count_primitives(registry_rs: &str) -> u64 {
             t.contains("PrimitiveSpec {") && !t.starts_with("//") && !t.contains("struct ")
         })
         .count() as u64
+}
+
+/// Render a number the way the paper writes it: `3601` -> `3{,}601`.
+pub fn tex_number(n: u64) -> String {
+    let s = n.to_string();
+    if s.len() <= 3 {
+        return s;
+    }
+    let (head, tail) = s.split_at(s.len() - 3);
+    format!("{head}{{,}}{tail}")
 }
 
 /// Read `pub const GATE_COUNT: u8 = N;` out of the executor.
@@ -182,6 +261,23 @@ pub fn check(repo: &Path, ran: Option<u64>) -> std::io::Result<Vec<Claim>> {
     if let Some(stated) = number_before(&tex, " are declared") {
         out.push(Claim { what: "declared #[test_case]", stated, actual: declared });
     }
+    // The TCB figure. The marker is deliberately a plain-token one: the same
+    // number also appears as `\textbf{3{,}601 lines excluding its own tests}`,
+    // and `number_before` walks back over `\textbf{` into a brace it cannot
+    // parse, so anchoring there silently checked nothing. Both other statements
+    // of the figure are then cross-checked with `contains`, so updating one and
+    // forgetting the others fails rather than passes.
+    if let Some(stated) = number_before(&tex, " mechanism\nlines") {
+        let actual = mechanism_lines(repo)?;
+        out.push(Claim { what: "mechanism lines (non-test)", stated, actual });
+        let n = tex_number(actual);
+        for (what, needle) in [
+            ("E5 table total", format!("\\textbf{{{n}}} & \\textbf{{")),
+            ("TCB figure in section 4", format!("\\textbf{{{n} lines excluding its own tests}}")),
+        ] {
+            out.push(Claim { what, stated: if tex.contains(&needle) { actual } else { 0 }, actual });
+        }
+    }
     if let (Some(stated), Some(ran)) = (number_before(&tex, " in-kernel unit tests"), ran) {
         out.push(Claim { what: "unit tests run (x86)", stated, actual: ran });
     }
@@ -198,6 +294,47 @@ pub fn check(repo: &Path, ran: Option<u64>) -> std::io::Result<Vec<Claim>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The brace walk must skip a test module that sits in the *middle* of a file
+    /// and keep counting after it. The old "everything before the first
+    /// `#[cfg(test)]`" rule got this wrong by 35% and in the flattering direction.
+    #[test]
+    fn non_test_lines_skips_interior_test_modules() {
+        let src = "\
+line one
+#[cfg(test)]
+mod inner {
+    fn helper() {}
+}
+line after
+line after two
+";
+        // 4 real lines: "line one", "line after", "line after two", and the
+        // trailing empty one `lines()` does not yield -- so 3.
+        assert_eq!(non_test_lines(src), 3);
+        // A file with no tests at all is just its line count.
+        assert_eq!(non_test_lines("a\nb\nc\n"), 3);
+    }
+
+    /// The paper's file list and xtask's must not drift apart, or the checker
+    /// silently validates a different number than the artifact's script prints.
+    #[test]
+    fn mechanism_files_match_the_script() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let script = std::fs::read_to_string(root.join("paper/tools_loc.py")).expect("tools_loc.py");
+        for f in MECHANISM_FILES {
+            assert!(script.contains(f), "{f} is checked by xtask but absent from tools_loc.py");
+        }
+        let listed = script.matches("kernel/src/").count();
+        assert_eq!(listed, MECHANISM_FILES.len(), "tools_loc.py lists a file xtask does not check");
+    }
+
+    #[test]
+    fn renders_a_number_the_way_the_paper_writes_it() {
+        assert_eq!(tex_number(3601), "3{,}601");
+        assert_eq!(tex_number(26), "26");
+        assert_eq!(tex_number(999), "999");
+    }
 
     #[test]
     fn parses_the_latex_thousands_separator() {

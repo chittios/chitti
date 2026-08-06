@@ -228,7 +228,10 @@ def fig_blocked(path):
     a.set_yticks(ys, labels)
     a.set_xlim(0, 13.4)
     a.set_xticks([0, 3, 6, 9, 13])
-    a.set_ylim(-0.6, 2.6)
+    # Derived from the row count, not hard-coded: a fourth configuration was added
+    # to DATA and the old literal `2.6` silently clipped the Synapse row off the
+    # top of the panel — the one row the figure exists to show.
+    a.set_ylim(-0.6, len(labels) - 0.4)
     a.set_xlabel("injected attacks (n = 13)")
     a.set_title("Attacks: provenance is what stops them", loc="left", color=INK, pad=6)
     _clean(a)
