@@ -618,6 +618,39 @@ impl Screen {
             let tx = (p.ix + p.cols * p.cw).saturating_sub(tag.len() as u64 * p.cw);
             self.draw_str(tx, p.iy, &tag, self.theme.accent, p.bg);
         }
+        self.draw_scrollbar(p, self.pane_active(p));
+    }
+
+    /// Is `p` the currently focused pane (accent chrome) or idle?
+    fn pane_active(&self, p: &Pane) -> bool {
+        if core::ptr::eq(p, &self.chat) {
+            return !self.action_focused();
+        }
+        if let Some(i) = self.actions.iter().position(|a| core::ptr::eq(p, &a.pane)) {
+            return self.focus_action && i == self.focused_action;
+        }
+        false
+    }
+
+    /// A thin scrollbar at a pane's right interior edge: an accent thumb over a
+    /// dim track, shown only when there is something to scroll. Thumb height is
+    /// proportional to the visible share, position to the view offset.
+    fn draw_scrollbar(&self, p: &Pane, active: bool) {
+        let total = p.hist.len().saturating_add(p.rows as usize);
+        if p.hist.is_empty() || total <= p.rows as usize {
+            return;
+        }
+        let sb_w = 3 * self.scale.max(1);
+        let x = (p.ix + p.cols * p.cw).saturating_sub(sb_w + 1);
+        let track_h = p.rows as u64 * p.ch;
+        let min_h = (sb_w * 2).max(4);
+        let thumb_h = (track_h as usize * p.rows as usize / total).max(min_h as usize) as u64;
+        let travel = track_h.saturating_sub(thumb_h);
+        let frac = if p.hist.is_empty() { 0.0 } else { p.view as f32 / p.hist.len() as f32 };
+        let ty = p.iy + (travel as f32 * frac) as u64;
+        // Track (subtle) + thumb (accent when focused, dim otherwise).
+        self.fill_rect(x, p.iy, sb_w, track_h, self.theme.sep_dim);
+        self.fill_rect(x, ty, sb_w, thumb_h, if active { self.theme.accent } else { self.theme.title_dim });
     }
 
     /// Paint one chat-pane cell at absolute line `gi`, column `c` (selection

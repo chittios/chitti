@@ -350,6 +350,59 @@ pub fn close_action() {
     SCREEN.with(close_active_slot);
 }
 
+
+// --- pixel plumbing --------------------------------------------------
+
+/// Which action pane's close button the pointer is over (mouse hover).
+static HOVER_CLOSE: crate::mm::Locked<Option<usize>> = crate::mm::Locked::new(None);
+/// Which `(pane, tab)` the pointer is over (mouse hover).
+static HOVER_TAB: crate::mm::Locked<Option<(usize, usize)>> = crate::mm::Locked::new(None);
+
+/// Recompute the hovered close button / tab from the pointer and repaint the
+/// affected action panes' chrome when the hover set changed. Called on mouse
+/// move; returns true when something was repainted (so the shell can skip
+/// further work).
+pub fn update_hover(x: u64, y: u64) -> bool {
+    let (close, tab) = SCREEN.with(|slot| {
+        let Some(sc) = slot else { return (None, None) };
+        let mut close = None;
+        let mut tab = None;
+        for i in 0..sc.actions.len() {
+            if !sc.column_visible(i) {
+                continue;
+            }
+            let (cx, cy, cw_, ch_) = sc.close_btn_for(i);
+            if cx > 0 && x >= cx && x < cx + cw_ && y >= cy && y < cy + ch_ {
+                close = Some(i);
+            }
+            if tab_hit_in(sc, i, x, y).is_some() && !sc.actions[i].tabs.is_empty() {
+                tab = Some((i, tab_hit_in(sc, i, x, y).unwrap_or(0)));
+            }
+        }
+        (close, tab)
+    });
+    let changed = HOVER_CLOSE.with(|h| *h != close) || HOVER_TAB.with(|h| *h != tab);
+    if !changed {
+        return false;
+    }
+    HOVER_CLOSE.with(|h| *h = close);
+    HOVER_TAB.with(|h| *h = tab);
+    let panes: alloc::collections::BTreeSet<usize> =
+        [close, tab.map(|(i, _)| i)].into_iter().flatten().collect();
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            for i in panes {
+                if sc.column_visible(i) {
+                    sc.draw_tab_bar_for(i);
+                    sc.draw_close_btn_for(i);
+                }
+            }
+        }
+    });
+    true
+}
+
+
 impl Screen {
     /// Focused action slot (falls back to 0).
     fn focused_slot(&self) -> &ActionSlot {
@@ -438,14 +491,12 @@ impl Screen {
         None
     }
 
-    // --- pixel plumbing --------------------------------------------------
-
-    /// The action-pane close-button rectangle `(x, y, w, h)` — FA `xmark` at the
-    /// top-right of the action pane title. Only meaningful when the pane is open.
-    /// Geometry is shared by the renderer and the click hit-test so they cannot
-    /// disagree. Width matches the square FA cell (body line height) so the mark
-    /// isn't squeezed into a mono column.
-    pub(super) fn close_btn_for(&self, pane_i: usize) -> (u64, u64, u64, u64) {
+/// The action-pane close-button rectangle `(x, y, w, h)` — FA `xmark` at the
+/// top-right of the action pane title. Only meaningful when the pane is open.
+/// Geometry is shared by the renderer and the click hit-test so they cannot
+/// disagree. Width matches the square FA cell (body line height) so the mark
+/// isn't squeezed into a mono column.
+pub(super) fn close_btn_for(&self, pane_i: usize) -> (u64, u64, u64, u64) {
         let w = self.ch().max(self.cw() * 2);
         let Some(a) = self.actions.get(pane_i) else {
             return (0, 0, 0, 0);
@@ -494,12 +545,19 @@ impl Screen {
             return;
         }
         let (x, y, w, _) = self.close_btn_for(pane_i);
+        // Hover: fill a subtle chip so the clickable mark reads as a button.
+        let hovered = HOVER_CLOSE.with(|h| *h == Some(pane_i));
+        if hovered {
+            let chip = self.mix(a.pane.bg, self.theme.accent, 0.18);
+            self.fill_rect(x, y, w, self.ch(), chip);
+        }
         // Font Awesome xmark in a square line-height cell (see `glyph_cell`),
         // centred in the hit box; ink from the live theme accent.
         let mark = crate::icons::close_mark();
         let (iw, _) = self.glyph_cell(mark);
         let ix = x + w.saturating_sub(iw) / 2;
-        self.blit_glyph(ix, y, mark, self.theme.accent, a.pane.bg);
+        let ink = if hovered { self.lighten(self.theme.accent, 0.35) } else { self.theme.accent };
+        self.blit_glyph(ix, y, mark, ink, if hovered { self.mix(a.pane.bg, self.theme.accent, 0.18) } else { a.pane.bg });
     }
 
     /// Per-tab header layout for action column `pane_i`.
@@ -535,8 +593,11 @@ impl Screen {
                 break;
             }
             let is_active = i == a.active;
+            let hovered = HOVER_TAB.with(|h| *h == Some((pane_i, i)));
             let fg = if is_active {
                 self.theme.title_active
+            } else if hovered {
+                self.lighten(self.theme.title_dim, 0.45)
             } else {
                 self.theme.title_dim
             };
@@ -546,6 +607,10 @@ impl Screen {
             }
             let lab = tab_label(m);
             self.draw_str(lx, ty, &lab, fg, a.pane.bg);
+            // Hovered tab gets a thin accent underline (a clickable affordance).
+            if hovered && !is_active {
+                self.fill_rect(x, ty + self.ch() - 2, w, 2, self.mix(a.pane.bg, self.theme.accent, 0.5));
+            }
         }
     }
 }

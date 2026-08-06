@@ -406,6 +406,13 @@ impl Screen {
         self.shade_rect(x + s, y + h + s, w + s, s, 0.52);
         // Bottom-right corner, so the two bands meet cleanly.
         self.shade_rect(x + w, y + h, s, s, 0.28);
+        // Left side: visible in the gutter for a pane sitting right of another
+        // (the chat pane's is off-screen). Guarded so `x - 2s` cannot underflow.
+        if x >= 2 * s {
+            self.shade_rect(x - s, y + s, s, h, 0.28);
+            self.shade_rect(x - 2 * s, y + s, s, h, 0.52);
+            self.shade_rect(x - s, y + h, s, s, 0.28);
+        }
     }
 
     /// Fill `(x,y,w,h)` with the pixels beneath it darkened toward black by
@@ -427,6 +434,13 @@ impl Screen {
     pub(super) fn lighten(&self, c: Rgb, t: f32) -> Rgb {
         let d = |x: u8| (x as f32 + (255.0 - x as f32) * t) as u8;
         (d(c.0), d(c.1), d(c.2))
+    }
+
+    /// Blend `a` toward `b` by `t` (0 = `a`, 1 = `b`) — e.g. the accent-tinged
+    /// composer focus glow against the chat background.
+    pub(super) fn mix(&self, a: Rgb, b: Rgb, t: f32) -> Rgb {
+        let d = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+        (d(a.0, b.0), d(a.1, b.1), d(a.2, b.2))
     }
 
     /// Draw a `t`-thick rectangle outline (the pane border).
