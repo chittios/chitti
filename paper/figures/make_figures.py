@@ -112,8 +112,13 @@ DATA = {
     # E3: benign steps (n=11) under the full policy. `warranted` went 1 -> 2 and
     # `over_broad` 2 -> 1 when the egress label was corrected: posting a report
     # written from an ingested document is exfiltration, not a false positive.
-    "benign": {"proceeded": 8, "warranted": 2, "over_broad": 1},
-    "destructive_steps": 4,
+    # The benign suite grew from 6 tasks / 11 steps to 14 / 28; these are the
+    # current run's numbers, and they are what the E4 table's interruption column
+    # already reported (9/28) while this block still said 11. A figure and a table
+    # disagreeing about the same run is the failure this comment exists to prevent:
+    # re-run `/redteam` and copy the `utility:` line rather than editing one of them.
+    "benign": {"proceeded": 19, "warranted": 6, "over_broad": 3},
+    "destructive_steps": 12,
 }
 
 
@@ -226,13 +231,14 @@ def fig_blocked(path):
                    color=_label_on(colour), zorder=4)
             left += v
     a.set_yticks(ys, labels)
-    a.set_xlim(0, 13.4)
-    a.set_xticks([0, 3, 6, 9, 13])
+    n_attacks = max(sum(d.values()) for d in DATA["attacks"].values())
+    a.set_xlim(0, n_attacks * 1.03)
+    a.set_xticks(sorted({0, n_attacks // 4, n_attacks // 2, 3 * n_attacks // 4, n_attacks}))
     # Derived from the row count, not hard-coded: a fourth configuration was added
     # to DATA and the old literal `2.6` silently clipped the Synapse row off the
     # top of the panel — the one row the figure exists to show.
     a.set_ylim(-0.6, len(labels) - 0.4)
-    a.set_xlabel("injected attacks (n = 13)")
+    a.set_xlabel(f"injected attacks (n = {n_attacks})")
     a.set_title("Attacks: provenance is what stops them", loc="left", color=INK, pad=6)
     _clean(a)
 
@@ -254,10 +260,12 @@ def fig_blocked(path):
         left += v
     b.set_ylim(-0.6, 0.6)
     b.set_yticks([])
-    b.set_xlim(0, 11.3)
-    b.set_xticks([0, 4, 8, 11])
-    b.set_xlabel("benign steps, full policy (n = 11)")
-    b.set_title("The cost: 1 of 4 destructive\nsteps refused over-broadly", loc="left", color=INK, pad=6)
+    n_benign = sum(DATA["benign"].values())
+    b.set_xlim(0, n_benign * 1.03)
+    b.set_xticks(sorted({0, n_benign // 3, 2 * n_benign // 3, n_benign}))
+    b.set_xlabel(f"benign steps, full policy (n = {n_benign})")
+    b.set_title(f"The cost: {DATA['benign']['over_broad']} of {DATA['destructive_steps']} destructive"
+                "\nsteps refused over-broadly", loc="left", color=INK, pad=6)
     _clean(b)
 
     # One key for both panels. A hatch always means "a subset of the segment beside
@@ -296,7 +304,11 @@ def fig_tradeoff(path):
     # The sticky point is the one that moves along BOTH axes: it is the only
     # configuration a user reaches by choosing, rather than by the designer
     # removing a mechanism, so it belongs on the same plot as the ablations.
-    for label, x, y, dx, dy, ha in (("Synapse", 0.0, 27.3, 5, 6, "left"),
+    # Synapse's interruption rate is derived, not typed: it was 27.3% (3/11) when
+    # the benign suite had 11 steps and is 32.1% (9/28) now, and a hard-coded
+    # literal is how a scatter ends up disagreeing with the table beside it.
+    interrupted = 100.0 * (DATA["benign"]["warranted"] + DATA["benign"]["over_broad"]) / sum(DATA["benign"].values())
+    for label, x, y, dx, dy, ha in (("Synapse", 0.0, interrupted, 5, 6, "left"),
                                     ("+ source\ndeclassified", 46.2, 0.0, 0, 6, "center"),
                                     ("caps + scope,\nno provenance", 76.9, 0.0, 0, 20, "center"),
                                     ("ambient\nauthority", 100.0, 0.0, -1, 6, "right")):
