@@ -633,9 +633,13 @@ impl Screen {
     }
 
     /// A thin scrollbar at a pane's right interior edge: an accent thumb over a
-    /// dim track, shown only when there is something to scroll. Thumb height is
-    /// proportional to the visible share, position to the view offset.
+    /// dim track, shown **only on the focused pane** and only when there is
+    /// something to scroll. Thumb height is proportional to the visible share,
+    /// position to the view offset.
     fn draw_scrollbar(&self, p: &Pane, active: bool) {
+        if !active {
+            return;
+        }
         let total = p.hist.len().saturating_add(p.rows as usize);
         if p.hist.is_empty() || total <= p.rows as usize {
             return;

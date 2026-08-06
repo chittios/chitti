@@ -378,7 +378,7 @@ impl Screen {
         if !self.composer_active || self.action_focused() || !self.chat.has_composer {
             return None;
         }
-        let (bx, _by, bw, _bh, tx, _ty, _hy) = self.composer_geom();
+        let (_bx, _by, bw, _bh, tx, _ty, _hy) = self.composer_geom();
         let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
         let (_start, _vis, caret_col) = self.composer_visible(max_cols);
         let prompt_cols = if self.composer_prompt.is_empty() {

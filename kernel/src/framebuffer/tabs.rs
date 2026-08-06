@@ -385,10 +385,22 @@ pub fn update_hover(x: u64, y: u64) -> bool {
     if !changed {
         return false;
     }
+    // Repaint the union of the **old and new** hovered panes: clearing a hover
+    // (moving the pointer off) is itself a change that must repaint the pane
+    // the chip/label was drawn on — the old hover only, since the new is empty.
+    let old_close = HOVER_CLOSE.with(|h| *h);
+    let old_tab = HOVER_TAB.with(|h| *h);
     HOVER_CLOSE.with(|h| *h = close);
     HOVER_TAB.with(|h| *h = tab);
-    let panes: alloc::collections::BTreeSet<usize> =
-        [close, tab.map(|(i, _)| i)].into_iter().flatten().collect();
+    let panes: alloc::collections::BTreeSet<usize> = [
+        old_close,
+        close,
+        old_tab.map(|(i, _)| i),
+        tab.map(|(i, _)| i),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
             for i in panes {
