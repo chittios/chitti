@@ -31,14 +31,28 @@ pub fn interval_ms(held_ms: u64) -> u64 {
     }
 }
 
-/// Longest byte sequence a single key emits (ESC + `[5~`).
+/// Longest **escape sequence** a single key emits (ESC + `[5~`).
+///
+/// This no longer bounds what a keypress can produce. Once a layout is involved a
+/// press may emit a flushed dead key *plus* a multi-byte character, and an IME
+/// commit can be several characters — there is no honest constant for that, so
+/// [`crate::keymap`] queues bytes in a 256-byte ring instead and nothing caps a
+/// press. What is still bounded, and what this measures, is a CSI sequence.
 pub const SEQ_MAX: usize = 4;
 
-/// Hold-to-repeat state for one keyboard: the byte sequence the held key
-/// emitted on press, and when the next synthesized repeat is due.
+/// Hold-to-repeat state for one keyboard.
+///
+/// Two ways to arm it, for a reason. [`Typematic::press`] takes the *bytes* a key
+/// emitted, which is what the pre-keymap drivers had. [`Typematic::press_event`]
+/// takes the [`crate::keymap::KeyEvent`] itself, so a repeat re-runs `translate`
+/// — which is correct by construction for AltGr levels, dead keys and an IME,
+/// where the bytes a key produces depend on state that may have changed since the
+/// press. New code should use the event form; the byte form remains for callers
+/// that have no event.
 pub struct Typematic {
     seq: [u8; SEQ_MAX],
     len: u8,
+    event: Option<crate::keymap::KeyEvent>,
     pressed_ms: u64,
     due_ms: u64,
     active: bool,
@@ -46,7 +60,34 @@ pub struct Typematic {
 
 impl Typematic {
     pub const fn new() -> Typematic {
-        Typematic { seq: [0; SEQ_MAX], len: 0, pressed_ms: 0, due_ms: 0, active: false }
+        Typematic {
+            seq: [0; SEQ_MAX],
+            len: 0,
+            event: None,
+            pressed_ms: 0,
+            due_ms: 0,
+            active: false,
+        }
+    }
+
+    /// Arm repeat for a key event (a new press replaces any previously held key,
+    /// like a real keyboard's typematic).
+    pub fn press_event(&mut self, ev: crate::keymap::KeyEvent, now: u64) {
+        self.event = Some(ev);
+        self.len = 0;
+        self.pressed_ms = now;
+        self.due_ms = now + DELAY_MS;
+        self.active = true;
+    }
+
+    /// If a repeat is due at `now`, return the event to re-translate.
+    pub fn poll_event(&mut self, now: u64) -> Option<crate::keymap::KeyEvent> {
+        if !self.active || now < self.due_ms {
+            return None;
+        }
+        let ev = self.event?;
+        self.due_ms = now + interval_ms(now.saturating_sub(self.pressed_ms));
+        Some(ev)
     }
 
     /// Arm repeat for a key that just emitted `seq` (a new press replaces any
@@ -55,6 +96,7 @@ impl Typematic {
         let n = seq.len().min(SEQ_MAX);
         self.seq[..n].copy_from_slice(&seq[..n]);
         self.len = n as u8;
+        self.event = None;
         self.pressed_ms = now;
         self.due_ms = now + DELAY_MS;
         self.active = n > 0;

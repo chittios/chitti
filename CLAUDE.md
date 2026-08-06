@@ -517,10 +517,14 @@ says so rather than implying a reboot will apply it.
   resolution is a centred, letterboxed viewport that still renders **1:1** —
   glyphs are rasterised at physical pixels, nothing is scaled, text stays sharp.
   The entire translation is one function, `Screen::fb_offset`, which every
-  framebuffer write goes through (there are only four such sites — `put_pixel`,
-  the row blit, the cursor read-back, and the pane scroll's row copy; keep it that
-  way). At native both origins are 0 and it is the identity, so the default path
-  is byte-identical to before. Note `rebuilt`/`relayout` must feed `build` the
+  framebuffer write goes through (there are only **five** such sites — `put_pixel`,
+  the row blit, the cursor read-back, the pane scroll's row copy, and
+  `read_rgb32_row` (the `/screenshot` read-back, added deliberately: it is the read
+  mirror of `blit_rgb32_row`); keep it that way). NB the *physical* accessors —
+  `fill_phys` and its read mirror `read_phys_rgb32_row` — bypass it on purpose,
+  since a letterbox bar and a whole-panel capture are outside the desktop by
+  definition. At native both origins are 0 and it is the identity, so the default
+  path is byte-identical to before. Note `rebuilt`/`relayout` must feed `build` the
   **`fb_w`/`fb_h`** physical size, never `width`/`height`, or the viewport shrinks
   on every rebuild; and `pick_scale` takes the *logical* height so a smaller
   desktop gets proportionally sized text.
@@ -1096,6 +1100,87 @@ FDT claims a GICv3 but carries no readable `reg`.
     is shared by `/agents validate` and the install path, and blocks an install on
     errors. `/agents test` prints the **structured** `ToolOutcome` — kind,
     provenance, origin — never a parse of the reply text.
+- **Notifications** (`notify.rs`, `/notify`) — a bounded, coalescing, persisted
+  ring: the channel by which the OS tells the human something happened while they
+  were not looking. Three load-bearing properties. **Repeats coalesce** on a
+  `dedup_key` (a five-second job bumps a count instead of filling the ring and
+  burying what mattered). **The `source` is stamped by the kernel** from the live
+  identity and never read from the poster's arguments — an agent that could name
+  itself `kernel` has performed a transfer of authority wearing a label. And
+  **agents may post but not list**, which removes the laundering channel (post,
+  read back, untrusted content re-enters with its tag stripped) for one line of
+  policy instead of a tagging path. Surfaced as `StatusChip::Notifications` +
+  `${notifications}` — *absent* at zero unread, because `chip_text` returns `""`
+  and `ui_config::expand` swallows the following separator, so a quiet machine has
+  a byte-identical status bar — plus a dropdown and a `RightMode::Notifications`
+  action-pane tab. **No toast**, deliberately: there is no compositor layer for a
+  transient overlay, it would re-damage a rect every pulse for something nobody is
+  looking at, and it would land over the composer; `modal` already exists for the
+  rare thing that must interrupt. Ships with **one real producer** so it is not
+  decorative — `service::supervise_tick` exhausting a daemon's restart budget.
+- **Scheduled runs** (`schedule/`, `/schedule`) — a stored intent that acts later.
+  Deliberately **not five-field cron**, because the wall clock here may be fiction:
+  with no readable RTC `clock::DEFAULT_UNIX` puts the machine in January 2026 until
+  `/ntp`. So `every 5m` is measured on the **monotonic** timebase and is correct on
+  a lying clock, while `at 09:00 weekdays` / `on 1 03:00` / `in 30s` are calendar
+  and are **held rather than fired** while `clock::source()` is untrusted — held,
+  and *reported* as held by `/schedule next`, because "my schedule didn't run"
+  otherwise has three indistinguishable causes on a box you cannot debug.
+  `MIN_EVERY_SECS = 5` exists so an e2e test can watch a fire inside its budget.
+
+  **The authority model is the part to read before changing anything.** A schedule
+  is bounded by what its author could have done when it was stored, **forever** —
+  the analogue of invariant 5. So: a stored human confirmation does **not** survive
+  a change of action (`spec::reauthorise`), or an injection turns a blessed nightly
+  `/disks` into a nightly `rm -r` using the human's own approval; provenance only
+  ever joins *worse*, so editing cannot launder a tainted job; and human-vs-agent
+  authorship is **decided at the call site** (`shell::in_tool_call`) rather than
+  inferred from session taint, because a Telegram DM enters as `UserTyped` and
+  inferring would hand a DM-authored schedule typed-human authority forever. A job
+  authored while untrusted content was resident still runs — its inert calls are
+  most of a daily digest — but `blocks_destructive()` holds for its life.
+
+  **No new Synapse primitive** (the count stays 26): a schedule creates no effect
+  at creation, so gating it would be `mem_fs_write` in a costume. What it *does*
+  add is one real gate — `tools::dispatch::effect_of` classifies `schedule add` by
+  the effect of the **action being installed**, so `add … command rm -r` hits the
+  destructive check while a human is still watching. Same shape as the documented
+  `channel send` misclassification, found the same way.
+
+  **Where the work happens is the `msgchan` split, and each reason is specific.**
+  `tick()` runs on `upkeep` and only *enqueues*; the fire happens in the interactive
+  loop's drain (inference is too heavy for the poll tick, and `ChatSession::turn`
+  brings its own 1 MiB stack). `with_busy` guards the genuine
+  tick→run→`/http`→`upkeep`→tick re-entry that would spin a non-reentrant `Locked`
+  forever with interrupts off. `ReadOutcome::ChannelWake` became `Wake` because
+  without it a schedule does nothing while the prompt idles — which is most of the
+  time, and the whole situation a scheduler exists for. Fires are **at-most-once**:
+  the due time is advanced and persisted *before* the run, so a crash loses a run
+  rather than repeating an irreversible one.
+
+  An unattended run **cannot answer a modal**, so `execute_chat_tool_inner` refuses
+  an approval-requiring call, records `Outcome::NeedsApproval`, and posts a
+  `Severity::Action` notification. "The OS tried to do the thing you scheduled,
+  could not, and is asking you" is a completion of the agentic loop that neither
+  half of this could provide alone.
+- **Screenshot** (`/screenshot`, `screenshot.rs`) — capture to PNG in the store.
+  `image::png::encode_rgb8` does per-row adaptive filtering over
+  `image::deflate::zlib_compress` (fixed-Huffman LZ77), which takes a 6.2 MB 1080p
+  frame to tens of kilobytes; `zlib_stored` remains for the git object path, where
+  "the bytes are literally in there" is worth more than a smaller `.git` until
+  something has verified our output against libz. **Every encoder test round-trips
+  through our own inflater** — an encoder verified against an independently written
+  decoder in the same tree is a much stronger claim than one verified against its
+  own inverse, and it immediately caught a cheap-reject probe reading one byte past
+  the end. The capture reads through `read_phys_rgb32_row` (the read mirror of
+  `fill_phys`, with `blit_rgb32_row`'s native-XRGB fast path), **lifts the mouse
+  sprite first** (it is composited *into* a single-buffered framebuffer, so a naive
+  capture includes it and reads as an artefact in a bug report), and refuses above
+  `MAX_PIXELS` rather than failing inside a first-fit allocator. A **model-chosen**
+  capture from a non-root agent is narrowed to the surface that agent owns — the
+  gate is `in_tool_call()`, not `active_agent_id()` alone, because those are
+  different questions and conflating them refused a *human* typing `/screenshot`
+  while the chat happened to be homed to another agent.
 - **Messaging channels** (`msgchan/`) — external inbox adapters (Telegram
   live; Discord/Slack/webhooks follow the same shape): a named instance +
   backend + access policy delivering inbound DMs into the shell agent and
@@ -1844,6 +1929,122 @@ FDT claims a GICv3 but carries no readable `reg`.
   `kill` revokes a task's capability table. Every agent has
   `/agent/<id>/{SOUL.md,skills/,memory/}`; SOUL.md is prepended to its system
   prompt. The shell agent is the only default agent (boot demos removed).
+
+## STANDING RULE — one keyboard choke point; bytes are not columns
+
+**Every keyboard transport funnels through `kernel/src/keymap/`, and nothing else
+decodes a scancode.** Before it existed there were four independent decoders
+(`arch/x86_64/keyboard.rs` set-1, `arch/aarch64/pl050.rs` set-2, `xhci.rs` HID
+usages, `arch/aarch64/virtio_input.rs` evdev), each with its own modifier state,
+its own copy of the arrow→CSI table, its own caps-lock rule (two had one, two did
+not), and all four hard-coded to **US**. A driver's job now ends at *"which
+physical key was that, and which modifiers were down"*; it builds a
+`KeyEvent { usage, mods, pressed, src }` and calls `keymap::feed_event`.
+
+Four facts forced that shape, and each is a constraint on any change here:
+
+- **x86 decodes inside IRQ1.** So `feed_event` allocates nothing and only pushes a
+  4-byte `Copy` struct into a fixed ring; `translate` (which allocates — one press
+  can emit several characters) runs on the **drain** side, in `keymap::next_byte`.
+  Do not move translation into a driver.
+- **`arch::aarch64` is `cfg`'d out of the test build**, exactly like `framebuffer/`
+  but from a different `cfg`. Anything left in `pl050.rs`/`virtio_input.rs` can
+  never carry a `#[test_case]`, which is why the set-2 and evdev cross-tables live
+  in `keymap` and not in the drivers that use them.
+- **Dead keys, Compose and the IME are stateful across keystrokes**, and a machine
+  can have a USB keyboard *and* a virtio-input window at once (`console.rs` polls
+  both). Four states would mean `´` on one keyboard and `e` on the other fails to
+  compose. Caps Lock lives in `keymap::State` for the same reason.
+- **`console::read_byte() -> Option<u8>` does not change.** The event type stops at
+  the choke point; above it the OS still sees a byte stream, so the shell, editor,
+  modals, `poll_interrupt` and every e2e scenario are untouched.
+
+**HID usages are the canonical space** because a layout maps a *physical position*
+to a character, and set-1/set-2/evdev are positional too — the three cross-tables
+are ~350 bytes of pure relabelling. An ASCII-based canonical space cannot express
+"the key left of Y on an ISO board" (usage `0x64`), which is where German puts
+`<>|` and which no previous table decoded at all. **Right Alt is its own modifier
+bit**: `xhci` read `report[0] & 0x44`, the OR of both Alts, into nothing, which is
+precisely why AltGr never worked anywhere. `Ctrl+Alt` counts as AltGr too, as XKB
+does, because many keyboards have no right Alt and a macOS host eats Option.
+
+Layout data is in `keymap/layouts.rs`: a dense `US_BASE` plus per-layout **sparse
+overrides**, four levels (`Base`/`Shift`/`AltGr`/`ShiftAltGr`), `Out::None` for an
+undefined level (never a fallback to another level — that types a *wrong*
+character rather than none). Nine layouts, ~11 KB of rodata, written out rather
+than bit-packed on purpose: `c('ö')` in the wrong slot reads exactly like `c('ö')`
+in the right one, so readability is the safety property. Two tests keep a
+hand-written table honest — every layout can type all 26 letters and 10 digits,
+and no layout lists a usage twice.
+
+**`us_layout_reproduces_the_legacy_*` are the migration gate.** The four old
+decoders' tables are copied verbatim into `keymap`'s tests and every
+scancode × modifier combination is asserted to produce the same byte. Two of those
+drivers cannot be compiled by the test build at all, so this is the only place
+their behaviour is pinned; do not delete these fixtures casually.
+
+**Scancodes cannot be injected over serial**, so `/keyboard test <layout> <keys>`
+exists to make the tables assertable from a running kernel — and it calls the real
+`keymap::translate`, never a parallel path. A key is named by its **US base
+character** with modifier prefixes (`/keyboard test de altgr+q` → `@`), plus named
+keys for the ones with no character (`iso` is usage `0x64`).
+
+### Bytes, chars and columns are three different numbers
+
+`kernel/src/textfit.rs` holds the arithmetic, and the bug class it ends is worth
+naming: `String` indices are **bytes**, terminal geometry is **columns**, and for
+ASCII they are the same number — so the line editor, the composer and the modal
+wrap all used `buf.len() - cur` as a column count and `s.as_bytes().chunks(cols)`
+as a line break. The moment a non-ASCII character reaches them that is a **panic**
+(`buf.drain(cur - n..cur)` on backspace; `&line[start..start + max_cols]` in the
+composer), a caret in the wrong place, or mojibake. Use `textfit::cols`,
+`back_n_chars`, `visible_window`, `pad_trunc` and `wrap`; never subtract byte
+offsets to get a column count. `wrap` and `pad_trunc` moved out of
+`framebuffer/text.rs` for the usual reason — a test written next to them would
+never have been compiled, which is how `wrap` shipped silently *deleting* any word
+whose byte-chunk boundary fell inside a character.
+
+`char_cols` answers East-Asian width coarsely (0 for combining marks, 2 for
+Wide/Fullwidth). **The pane `Cell` grid is deliberately out of scope**: it is
+`(char, Rgb)` with one cell per character, so a wide glyph would need a lead cell
+plus a continuation marker and then `set_cell`, the scroll row copy, the selection
+maths and `glyph_cell` all change — inside the module where no test compiles. The
+visible consequence, stated so nobody reports it as a bug: typed CJK is *correct*
+in the composer (caret in the right place, backspace deletes one glyph) and renders
+**narrow** once echoed into a pane, because `font_ttf::build_ui_glyph` scales a
+non-ASCII glyph down into its cell. Cramped, not corrupt.
+
+### The IME ships what it can deliver honestly
+
+`kernel/src/ime.rs` is a pure `feed(char) -> ImeOut` machine, fed **after** the
+layout stage (so it composes over Dvorak and over AltGr output) and **before**
+`media_key` (so a composing keystroke is never eaten by a focused app).
+`consumed: false` is the regression guard: with `Mode::Off` it returns immediately
+and the caller behaves exactly as before.
+
+- **romaji → kana is complete** — hiragana and katakana, no dictionary, and every
+  glyph it can produce is inside the bundled CJK subset, so what you type renders.
+  The `nn` case is the classic trap: `nn` is ん but `nni` is んに, so the second `n`
+  **cannot be resolved until the next character arrives**. Converting it eagerly
+  turns "konnichiwa" into こんいちわ.
+- **Hangul is implemented, tested, and refused.** Jamo→syllable is arithmetic
+  (`0xAC00 + (L*21 + V)*28 + T`) plus the 2-set map and the compound merges. The
+  bundled face has **no Hangul glyphs**, so it would compose perfectly and render
+  tofu — `set_mode_by_name` refuses with that reason and `font_ttf::fallback_covers`
+  is the gate, so bundling a Hangul subset later is a one-line change with tests
+  already green.
+- **Pinyin and kanji conversion are refused, naming the missing dictionary.** A
+  pinyin engine that knows 500 words is *worse* than none: the user types a word it
+  lacks and gets silence or the wrong character, which is a mis-decode.
+
+Two escape hatches are load-bearing, because an input method with no exit is a
+trap: `/` and `~` are **absent from the romaji table** even though a real IME maps
+them, and `read_line` bypasses the IME entirely on a line starting with `/` — so
+`/keyboard ime off` is always typeable.
+
+Also: the serial console now passes **UTF-8 through** rather than dotting out every
+byte ≥ 0x80. That filter was right while the OS could not hold non-ASCII text and
+became a lie the moment it could.
 
 ## STANDING RULE — Ctrl+C interrupts every command and process
 

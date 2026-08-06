@@ -1,43 +1,17 @@
-//! Glyph rasterisation and string drawing, plus the two pure text-fitting
-//! helpers ([`wrap`], [`pad_trunc`]).
+//! Glyph rasterisation and string drawing.
+//!
+//! The two text-fitting helpers this module used to own, [`wrap`] and
+//! [`pad_trunc`], now live in [`crate::textfit`] and are re-exported here so
+//! every call site is unchanged. They moved because both counted **bytes** where
+//! they meant **columns** (`wrap` also chunked long words with
+//! `as_bytes().chunks(cols)` and `unwrap_or("")`-ed the invalid pieces, silently
+//! deleting any word whose chunk boundary fell inside a character) — and because
+//! this module is `#[cfg(not(test))]`, so a test asserting otherwise would never
+//! have been compiled.
 
 use super::*;
 
-/// Word-wrap `s` to `cols` columns (breaking long words), for modal messages.
-pub(super) fn wrap(s: &str, cols: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in s.split_whitespace() {
-        if !line.is_empty() && line.len() + 1 + word.len() > cols {
-            out.push(core::mem::take(&mut line));
-        }
-        for chunk in word.as_bytes().chunks(cols.max(1)) {
-            let w = core::str::from_utf8(chunk).unwrap_or("");
-            if line.len() + 1 + w.len() > cols && !line.is_empty() {
-                out.push(core::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(w);
-        }
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-
-pub(super) fn pad_trunc(s: &str, cols: usize) -> alloc::string::String {
-    let mut out: alloc::string::String = s.chars().take(cols).collect();
-    while out.chars().count() < cols {
-        out.push(' ');
-    }
-    out
-}
+pub(super) use crate::textfit::{pad_trunc, wrap};
 
 impl Screen {
     /// Cell size for one glyph. Font Awesome icons get a **square** cell of the

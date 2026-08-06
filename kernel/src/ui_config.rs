@@ -82,6 +82,11 @@ pub struct UiConfig {
     pub tz_offset: i32,       // seconds east of UTC (cache / fixed-offset zones)
     /// IANA zone name (`America/New_York`); empty = use fixed `tz_offset` only.
     pub tz_name: String,
+    /// Keyboard layout id (`us`, `uk`, `de`, `fr`, `es`, `it`, `se`, `dvorak`,
+    /// `colemak`) — see `keymap::layouts::LAYOUTS`.
+    pub kbd_layout: String,
+    /// Input method (`off`, `hiragana`, `katakana`) — see `crate::ime`.
+    pub ime: String,
     pub splash: bool,         // show the boot splash (logo + wordmark)
     /// Colour palette as `(name, "#rrggbb")` pairs (kept as strings so the config
     /// layer stays independent of the framebuffer, which is absent in test builds).
@@ -116,6 +121,8 @@ impl Default for UiConfig {
             status_pos: crate::panes_layout::StatusPos::default().as_str().to_string(),
             tz_offset: 0,
             tz_name: String::new(),
+            kbd_layout: "us".to_string(),
+            ime: "off".to_string(),
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             theme_name: "dark".to_string(),
@@ -143,6 +150,8 @@ impl UiConfig {
             ("status_right".to_string(), Json::Str(self.status_right.clone())),
             ("status_pos".to_string(), Json::Str(self.status_pos.clone())),
             ("tz_offset".to_string(), Json::Num(self.tz_offset as f64)),
+            ("kbd_layout".to_string(), Json::Str(self.kbd_layout.clone())),
+            ("ime".to_string(), Json::Str(self.ime.clone())),
             ("tz_name".to_string(), Json::Str(self.tz_name.clone())),
             ("splash".to_string(), Json::Bool(self.splash)),
             ("theme_name".to_string(), Json::Str(self.theme_name.clone())),
@@ -218,6 +227,27 @@ impl UiConfig {
                 .to_string(),
             tz_offset: j.get("tz_offset").and_then(|v| v.as_i64()).map(|n| n as i32).unwrap_or(d.tz_offset),
             tz_name: s("tz_name", &d.tz_name),
+            // Normalized through the layout table, so a typo falls back to `us`
+            // rather than leaving the machine with no working keyboard — the same
+            // parse-don't-trust rule `status_pos` follows.
+            kbd_layout: {
+                let want = s("kbd_layout", &d.kbd_layout);
+                if crate::keymap::layouts::LAYOUTS.iter().any(|l| l.id == want) {
+                    want
+                } else {
+                    d.kbd_layout.clone()
+                }
+            },
+            ime: {
+                let want = s("ime", &d.ime);
+                match want.as_str() {
+                    "off" | "hiragana" | "katakana" => want,
+                    // Hangul is deliberately not restorable from config: it is
+                    // gated on a font, and a machine that cannot render it must
+                    // not boot into it.
+                    _ => d.ime.clone(),
+                }
+            },
             splash: j.get("splash").and_then(|v| v.as_bool()).unwrap_or(d.splash),
             theme,
             theme_name: s("theme_name", &d.theme_name),
@@ -358,13 +388,40 @@ fn apply_appearance() {
 pub fn load_and_apply() {
     load();
     ensure_shortcuts();
+    apply_input();
     #[cfg(not(test))]
     apply_appearance();
+}
+
+/// Apply the persisted keyboard layout and input method.
+///
+/// Separate from `apply_appearance` because it is **not** `#[cfg(not(test))]`:
+/// `keymap` and `ime` are ordinary testable modules with no framebuffer
+/// dependency, so there is no reason to skip them in the test build.
+pub fn apply_input() {
+    let cfg = current();
+    if !crate::keymap::set_layout(&cfg.kbd_layout) {
+        // `from_json` normalizes, so this can only happen for a hand-edited
+        // in-memory config; report it rather than leaving a mismatch.
+        crate::ktrace::log_fmt(format_args!(
+            "ui: unknown keyboard layout '{}' — keeping {}",
+            cfg.kbd_layout,
+            crate::keymap::active_layout().id
+        ));
+    }
+    if cfg.ime != "off" {
+        // A refusal here is expected and harmless (Hangul with no font); the
+        // machine stays on `off`, which is the safe reading.
+        if let Err(e) = crate::ime::set_mode_by_name(&cfg.ime) {
+            crate::ktrace::log_fmt(format_args!("ui: ime '{}' not activated: {e}", cfg.ime));
+        }
+    }
 }
 
 /// Re-read the config from disk and re-apply the layout (`/ui reload`).
 pub fn reload_and_apply() {
     load();
+    apply_input();
     #[cfg(not(test))]
     apply_appearance();
 }
@@ -401,6 +458,22 @@ pub fn persist_tz(offset_secs: i32) {
     let mut cfg = current();
     cfg.tz_offset = offset_secs;
     cfg.tz_name.clear();
+    write_ui(&cfg);
+    store(cfg);
+}
+
+/// Persist the keyboard layout from `/keyboard set <id>`.
+pub fn persist_kbd_layout(id: &str) {
+    let mut cfg = current();
+    cfg.kbd_layout = alloc::string::String::from(id);
+    write_ui(&cfg);
+    store(cfg);
+}
+
+/// Persist the input method from `/keyboard ime <mode>`.
+pub fn persist_ime(mode: &str) {
+    let mut cfg = current();
+    cfg.ime = alloc::string::String::from(mode);
     write_ui(&cfg);
     store(cfg);
 }

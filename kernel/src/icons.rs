@@ -386,6 +386,7 @@ pub fn for_command(name: &str) -> char {
         "memory" | "skills" | "skill" | "plan" | "permissions" => fa::BOOK,
         "todos" => fa::LIST_CHECK,
         "notify" => fa::BELL,
+        "keyboard" => fa::KEYBOARD,
         "schedule" | "cron" => fa::CALENDAR,
         "model" | "infer" | "perf" | "bench" | "think" | "mode" => fa::ROBOT,
         "redteam" | "audit" => fa::SHIELD,

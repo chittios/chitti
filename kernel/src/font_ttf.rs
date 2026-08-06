@@ -59,6 +59,19 @@ pub static NOTO_FALLBACKS: &[(&str, &[u8])] = &[
 /// Canonical name of the bundled Font Awesome Free Solid face.
 pub const FA_FALLBACK_NAME: &str = "Font Awesome 7 Free Solid";
 
+/// Whether any registered fallback face (or the UI face) has a glyph for `ch`.
+///
+/// The honest answer to "can this machine render this script at all". Used to gate
+/// the Hangul input method: the bundled CJK face is a subset with no Hangul, so
+/// composing it would produce correct text that renders as tofu, and
+/// `ime::set_mode_by_name` refuses with that reason rather than appearing to work.
+pub fn fallback_covers(ch: char) -> bool {
+    if UI_FONT.with(|slot| slot.as_ref().map(|f| f.lookup_glyph_index(ch) != 0).unwrap_or(false)) {
+        return true;
+    }
+    FALLBACKS.with(|chain| chain.iter().any(|(_, f)| f.lookup_glyph_index(ch) != 0))
+}
+
 pub fn register_bundled_fallbacks() {
     // Icons before Noto so U+Fxxx never walks the huge CJK cmap first.
     const FA_NAME: &str = FA_FALLBACK_NAME;

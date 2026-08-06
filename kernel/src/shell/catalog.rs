@@ -48,6 +48,7 @@ pub const COMMAND_ALIASES: &[&str] = &[
     "notifications", // → notify
     "notif",      // → notify
     "cron",       // → schedule
+    "kbd",        // → keyboard
 ];
 
 /// Whether `name` is a known slash command or alias (for completion).
@@ -169,6 +170,7 @@ pub const ENTRIES: &[Entry] = &[
         shortcut: "",
     },
     Entry { category: "System & UI", title: "Screenshot", name: "screenshot", shortcut: "" },
+    Entry { category: "System & UI", title: "Keyboard Layout & IME", name: "keyboard", shortcut: "" },
     Entry { category: "System & UI", title: "Notifications", name: "notify", shortcut: "" },
     Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },

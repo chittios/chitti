@@ -119,10 +119,10 @@ struct VirtioInput {
     events: u64, // QSIZE * 8-byte event buffers
     last_used: u16,
     avail_idx: u16,
-    shift: bool,
-    ctrl: bool,
-    /// Super / ⌘ (Linux KEY_LEFTMETA / KEY_RIGHTMETA).
-    gui: bool,
+    /// Live modifier bits as a [`crate::keymap::Mods`] bitset. evdev delivers
+    /// *edges* (`value` 1/0), so the edge→level conversion stays here and the
+    /// shared layer takes a level.
+    mods: u8,
 }
 
 impl VirtioInput {
@@ -293,9 +293,7 @@ pub fn init() -> bool {
         events,
         last_used: 0,
         avail_idx: 0,
-        shift: false,
-        ctrl: false,
-        gui: false,
+        mods: 0,
     };
     // Offer all buffers to the device.
     // SAFETY: rings are set up above.
@@ -343,62 +341,35 @@ fn handle_event(dev: &mut VirtioInput, ev: InputEvent) {
     if ev.typ != EV_KEY {
         return;
     }
-    let pressed = ev.value != 0; // 1 = press, 2 = autorepeat, 0 = release
-    match ev.code {
-        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
-            dev.shift = pressed;
-            return;
+    // `value`: 1 = press, 2 = the **host's** autorepeat, 0 = release. The repeat
+    // is treated as a press, which is also why `Source::Evdev` reports
+    // `repeats_in_hardware` — layering our own typematic on top would double it.
+    let pressed = ev.value != 0;
+    let Some(usage) = crate::keymap::usage_from_evdev(ev.code) else {
+        return;
+    };
+    if let Some(bit) = crate::keymap::modifier_bit(usage) {
+        if pressed {
+            dev.mods |= bit;
+        } else {
+            dev.mods &= !bit;
         }
-        KEY_LEFTCTRL => {
-            dev.ctrl = pressed;
-            return;
-        }
-        KEY_LEFTMETA | KEY_RIGHTMETA => {
-            dev.gui = pressed;
-            return;
-        }
-        _ => {}
-    }
-    if ev.value == 0 {
-        return; // key release of a normal key: nothing to emit
-    }
-    // Arrow/nav keys (Linux keycodes) become the ANSI sequences a serial
-    // terminal sends, so the shell/editor decode one encoding for every input
-    // path. Ctrl+Tab / Ctrl+Shift+Tab cycle focus (`ESC [ T` / `Z`).
-    // Cmd/Super+Space opens the Agents browser (`ESC [ g`) — macOS Spotlight-style.
-    if let Some(seq) = match ev.code {
-        103 => Some(&b"[A"[..]),           // KEY_UP
-        108 => Some(&b"[B"[..]),           // KEY_DOWN
-        106 => Some(&b"[C"[..]),           // KEY_RIGHT
-        105 => Some(&b"[D"[..]),           // KEY_LEFT
-        102 => Some(&b"[H"[..]),           // KEY_HOME
-        107 => Some(&b"[F"[..]),           // KEY_END
-        104 => Some(&b"[5~"[..]),          // KEY_PAGEUP
-        109 => Some(&b"[6~"[..]),          // KEY_PAGEDOWN
-        111 => Some(&b"[3~"[..]),          // KEY_DELETE
-        15 if dev.ctrl && dev.shift => Some(&b"[Z"[..]), // Ctrl+Shift+Tab
-        15 if dev.ctrl => Some(&b"[T"[..]),               // Ctrl+Tab
-        // Agents: GUI+Space or Ctrl+Space (host macOS often steals ⌘+Space).
-        KEY_SPACE if dev.gui || dev.ctrl => Some(&b"[g"[..]),
-        _ => None,
-    } {
-        RING.with(|r| {
-            r.push(0x1b);
-            for &b in seq {
-                r.push(b);
-            }
-        });
         return;
     }
-    if let Some(ascii) = keycode_to_ascii(ev.code, dev.shift, dev.ctrl) {
-        RING.with(|r| r.push(ascii));
-    }
+    crate::keymap::feed_event(crate::keymap::KeyEvent {
+        usage,
+        mods: crate::keymap::Mods(dev.mods),
+        pressed,
+        src: crate::keymap::Source::Evdev,
+    });
 }
 
 /// The next byte from the window keyboard, if any (drains events first).
 pub fn read_byte() -> Option<u8> {
     poll();
-    RING.with(|r| r.pop())
+    // The per-driver ring is gone: translation is shared, so the bytes come out
+    // of `keymap`'s ring however many keyboards produced them.
+    crate::keymap::next_byte()
 }
 
 /// Map a Linux input keycode (US layout) to an ASCII byte. Handles letters,

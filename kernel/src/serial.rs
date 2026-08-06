@@ -108,7 +108,9 @@ pub fn write_str_raw(s: &str) {
     crate::arch::interrupts::without_interrupts(|| {
         for byte in s.bytes() {
             match byte {
-                0x20..=0x7e | b'\n' | b'\r' | b'\t' => write_byte(byte),
+                // Same rule as `Serial`'s `Write` impl: UTF-8 passes through, C0
+                // controls become dots.
+                0x20..=0x7e | 0x80..=0xff | b'\n' | b'\r' | b'\t' => write_byte(byte),
                 _ => write_byte(b'.'),
             }
         }
@@ -123,8 +125,19 @@ impl fmt::Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
             match byte {
-                0x20..=0x7e | b'\n' | b'\r' | b'\t' => write_byte(byte),
-                _ => write_byte(b'.'), // placeholder for non-ASCII bytes
+                // Printable ASCII, the three whitespace controls, and **every
+                // byte of a UTF-8 sequence**.
+                //
+                // Non-ASCII used to be replaced with `.`, which was right while
+                // the OS could not hold non-ASCII text: the console would
+                // otherwise emit whatever a stray byte happened to be. Now that
+                // the line editor, the layouts and the IME all produce real
+                // UTF-8, a host terminal — which is UTF-8 — renders it correctly,
+                // and dotting it out means the serial console cannot show text the
+                // machine is holding. `\u{1b}` (ESC) is still filtered, since the
+                // colour sequences the shell emits go through `put_byte`.
+                0x20..=0x7e | 0x80..=0xff | b'\n' | b'\r' | b'\t' => write_byte(byte),
+                _ => write_byte(b'.'), // other C0 controls
             }
         }
         // Mirror to the framebuffer text console (Phase 7), so the graphical

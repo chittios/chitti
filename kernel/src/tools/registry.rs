@@ -193,6 +193,11 @@ fn shell_commands() -> Vec<ToolDef> {
             false,
         ),
         ToolDef::shell(
+            "keyboard",
+            "Keyboard layout and input method. args: empty=status, 'list', 'set <id>' (us|uk|de|fr|es|it|se|dvorak|colemak), 'ime <off|hiragana|katakana>', 'test <layout> <keys>', 'hex <hex>', 'compose'. Reversible and local, so it needs no confirmation.",
+            false,
+        ),
+        ToolDef::shell(
             "notify",
             "Tell the human something. args: 'post <info|ok|warn|error|action> <title> [-- <body>]'. Write-only for agents: use it for something the human needs to know later, not as a reply. The source is stamped by the kernel.",
             false,

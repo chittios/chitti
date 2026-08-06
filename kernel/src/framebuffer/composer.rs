@@ -45,6 +45,28 @@ pub fn composer_begin() {
     });
 }
 
+/// Set (or clear) the IME pre-edit run shown at the caret.
+///
+/// Separate from [`composer_set`] because the pre-edit is **not** in the shell's
+/// line buffer: it is uncommitted text, so it must be visible without being text
+/// the shell would submit. Empty clears it.
+pub fn composer_set_preedit(preedit: &str) {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            if sc.composer_preedit == preedit {
+                return; // no change: do not repaint
+            }
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            sc.composer_preedit.clear();
+            sc.composer_preedit.push_str(preedit);
+            sc.caret_on = true;
+            sc.draw_composer();
+            sc.cursor_overlay();
+        }
+    });
+}
+
 /// Update the composer line + caret column (0..=len). Redraws the box in place.
 pub fn composer_set(line: &str, cursor: usize) {
     SCREEN.with(|slot| {
@@ -53,7 +75,11 @@ pub fn composer_set(line: &str, cursor: usize) {
             sc.cur_vis = false;
             sc.composer_line.clear();
             sc.composer_line.push_str(line);
-            sc.composer_cur = cursor.min(line.len());
+            // Clamped onto a character boundary rather than merely to `len`: a
+            // caller passing a mid-character offset has a bug, but a painter is
+            // the wrong place to panic about it — the screen would be left half
+            // drawn with no way to read the message.
+            sc.composer_cur = crate::textfit::clamp_boundary(line, cursor);
             sc.caret_on = true;
             sc.draw_composer();
             sc.cursor_overlay();
@@ -362,15 +388,36 @@ impl Screen {
 
     /// Visible slice of the composer line and the column of the caret within it
     /// (for long lines that scroll inside the box).
+    ///
+    /// Delegates the whole calculation to [`crate::textfit::visible_window`],
+    /// which is unit-tested — this module is `#[cfg(not(test))]`, and the previous
+    /// version sliced `&line[start..start + max_cols]` with byte offsets used as
+    /// column counts. That both **panics** on a non-boundary slice and misplaces
+    /// the caret on any non-ASCII line, so a single accented character in the
+    /// prompt could take down the compositor mid-repaint.
     fn composer_visible(&self, max_cols: usize) -> (usize, &str, usize) {
         let line = self.composer_line.as_str();
-        let cur = self.composer_cur.min(line.len());
-        if line.len() <= max_cols {
-            return (0, line, cur);
+        let (range, caret) = crate::textfit::visible_window(line, self.composer_cur, max_cols);
+        let start = range.start;
+        (start, &line[range], caret)
+    }
+
+    /// The string to draw, the caret's **byte** offset within it, and the byte
+    /// range the IME pre-edit occupies.
+    ///
+    /// Returns an owned `String` because the pre-edit is spliced in; the geometry
+    /// itself is `textfit::preedit_view`, which is unit-tested (this module is
+    /// `#[cfg(not(test))]`, so nothing here could be). With no pre-edit it is the
+    /// buffer and the range is empty, so the default path is unchanged.
+    fn composer_composed(&self) -> (String, usize, core::ops::Range<usize>) {
+        let line = self.composer_line.as_str();
+        let cur = crate::textfit::clamp_boundary(line, self.composer_cur);
+        if self.composer_preedit.is_empty() {
+            return (String::from(line), cur, cur..cur);
         }
-        let start = cur.saturating_sub(max_cols.saturating_sub(1)).min(line.len().saturating_sub(max_cols));
-        let vis = &line[start..start + max_cols.min(line.len() - start)];
-        (start, vis, cur.saturating_sub(start))
+        let (text, _cols) = crate::textfit::preedit_view(line, cur, &self.composer_preedit);
+        let caret = cur + self.composer_preedit.len();
+        (text, caret, cur..caret)
     }
 
     /// Pixel x of the caret bar inside the composer box.
@@ -380,11 +427,15 @@ impl Screen {
         }
         let (_bx, _by, bw, _bh, tx, _ty, _hy) = self.composer_geom();
         let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
-        let (_start, _vis, caret_col) = self.composer_visible(max_cols);
+        // The caret sits after the pre-edit, so the composed line is what it is
+        // measured against — otherwise the bar sits where the caret *would* be if
+        // nothing were composing, i.e. in the middle of the pre-edit run.
+        let (composed, caret_byte, _) = self.composer_composed();
+        let (_range, caret_col) = crate::textfit::visible_window(&composed, caret_byte, max_cols);
         let prompt_cols = if self.composer_prompt.is_empty() {
             2 // "> "
         } else {
-            self.composer_prompt.chars().count()
+            crate::textfit::cols(&self.composer_prompt)
         };
         Some(tx + (prompt_cols as u64 + caret_col as u64) * self.chat.cw)
     }
@@ -436,11 +487,31 @@ impl Screen {
         } else {
             &self.composer_prompt
         };
-        let prompt_cols = prompt.chars().count() as u64;
+        let prompt_cols = crate::textfit::cols(prompt) as u64;
         let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
-        let (_vis_start, vis, caret_col) = self.composer_visible(max_cols);
+        // The composed line: the buffer with any IME pre-edit spliced in at the
+        // cursor. With no pre-edit this is the buffer, so the default path is
+        // byte-identical to before.
+        let (composed, caret_byte, pre_range) = self.composer_composed();
+        let (range, caret_col) = crate::textfit::visible_window(&composed, caret_byte, max_cols);
+        let vis = &composed[range.clone()];
         let mut x = self.draw_str(tx, ty, prompt, self.theme.accent, self.theme.composer_bg);
         x = self.draw_str(x, ty, vis, self.theme.chat_fg, self.theme.composer_bg);
+        // Underline the pre-edit run in the accent colour, so uncommitted text is
+        // visibly uncommitted. This is **ink**, not a background — the theme rule
+        // forbids a raw `fill_rect` of the *background* colour, and the box itself
+        // was already painted through `paint_surface` above.
+        if !self.composer_preedit.is_empty() {
+            let lo = pre_range.start.max(range.start);
+            let hi = pre_range.end.min(range.end);
+            if lo < hi {
+                let before = crate::textfit::cols(&composed[range.start..lo]) as u64;
+                let width = crate::textfit::cols(&composed[lo..hi]) as u64;
+                let ux = tx + (prompt_cols + before) * self.chat.cw;
+                let uy = ty + self.chat.ch.saturating_sub(self.scale.max(1));
+                self.fill_rect(ux, uy, width * self.chat.cw, self.scale.max(1), self.theme.accent);
+            }
+        }
         // Clear leftover glyphs to the right of the text (shrinking line).
         let rest = (bx + bw).saturating_sub(x + 4);
         if rest > 0 {
@@ -576,11 +647,31 @@ impl Screen {
         } else {
             &self.composer_prompt
         };
-        let prompt_cols = prompt.chars().count() as u64;
+        let prompt_cols = crate::textfit::cols(prompt) as u64;
         let max_cols = ((bw.saturating_sub(16)) / self.chat.cw).saturating_sub(2) as usize;
-        let (_vis_start, vis, caret_col) = self.composer_visible(max_cols);
+        // The composed line: the buffer with any IME pre-edit spliced in at the
+        // cursor. With no pre-edit this is the buffer, so the default path is
+        // byte-identical to before.
+        let (composed, caret_byte, pre_range) = self.composer_composed();
+        let (range, caret_col) = crate::textfit::visible_window(&composed, caret_byte, max_cols);
+        let vis = &composed[range.clone()];
         let mut x = self.draw_str(tx, ty, prompt, self.theme.accent, self.theme.composer_bg);
         x = self.draw_str(x, ty, vis, self.theme.chat_fg, self.theme.composer_bg);
+        // Underline the pre-edit run in the accent colour, so uncommitted text is
+        // visibly uncommitted. This is **ink**, not a background — the theme rule
+        // forbids a raw `fill_rect` of the *background* colour, and the box itself
+        // was already painted through `paint_surface` above.
+        if !self.composer_preedit.is_empty() {
+            let lo = pre_range.start.max(range.start);
+            let hi = pre_range.end.min(range.end);
+            if lo < hi {
+                let before = crate::textfit::cols(&composed[range.start..lo]) as u64;
+                let width = crate::textfit::cols(&composed[lo..hi]) as u64;
+                let ux = tx + (prompt_cols + before) * self.chat.cw;
+                let uy = ty + self.chat.ch.saturating_sub(self.scale.max(1));
+                self.fill_rect(ux, uy, width * self.chat.cw, self.scale.max(1), self.theme.accent);
+            }
+        }
         let rest = (bx + bw).saturating_sub(x + 4);
         if rest > 0 {
             self.paint_surface(x, ty, rest, self.chat.ch, self.theme.composer_bg);

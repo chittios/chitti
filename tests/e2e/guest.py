@@ -121,6 +121,15 @@ class Guest:
         """A cursor into the output stream, so `wait_for` ignores prior text."""
         return len(self.text())
 
+    def since(self, mark):
+        """Everything the guest has printed since `mark`.
+
+        For assertions that need to look at the *whole* reply rather than wait
+        for one line — "the saved path is there AND there is no re-decode
+        warning" is two facts about one block of output, and two `wait_for`s
+        would be two timeouts."""
+        return self.text()[mark:]
+
     def saw(self, pattern, since=0):
         """True if `pattern` has already appeared after offset `since`.
 

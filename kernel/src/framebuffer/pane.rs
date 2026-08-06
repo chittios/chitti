@@ -55,8 +55,7 @@ impl Pane {
             evicted: 0,
             user_band: Vec::new(),
             tool_band: Vec::new(),
-            utf8: [0; 4],
-            utf8_len: 0,
+            utf8: crate::utf8::Utf8Decoder::new(),
         }
     }
 
@@ -155,31 +154,14 @@ impl Pane {
         }
     }
 
-    /// Feed one incoming byte through the incremental UTF-8 decoder: returns the
-    /// decoded `char` once a full sequence lands, `None` while a multi-byte
-    /// sequence is still arriving, and `U+FFFD` for an invalid byte. Uses
-    /// `core::str::from_utf8` (its `error_len() == None` = "incomplete, need
-    /// more"; `Some(_)` = "invalid").
+    /// Feed one incoming byte through the incremental UTF-8 decoder.
+    ///
+    /// The decoder itself is [`crate::utf8::Utf8Decoder`] — extracted so its
+    /// invalid-byte and incomplete-sequence branches have tests (this module is
+    /// `#[cfg(not(test))]`) and so the *input* path can share it: a keypress that
+    /// emits `é` reaches `read_line` as two bytes and must insert one character.
     fn feed_utf8(&mut self, b: u8) -> Option<char> {
-        if self.utf8_len == 0 && b < 0x80 {
-            return Some(b as char); // ASCII fast path
-        }
-        if self.utf8_len as usize >= self.utf8.len() {
-            self.utf8_len = 0; // safety: never overflow the 4-byte buffer
-        }
-        self.utf8[self.utf8_len as usize] = b;
-        self.utf8_len += 1;
-        match core::str::from_utf8(&self.utf8[..self.utf8_len as usize]) {
-            Ok(s) => {
-                self.utf8_len = 0;
-                s.chars().next()
-            }
-            Err(e) if e.error_len().is_none() => None, // incomplete — await more
-            Err(_) => {
-                self.utf8_len = 0;
-                Some('\u{FFFD}') // invalid byte(s)
-            }
-        }
+        self.utf8.feed(b)
     }
 
     /// First numeric CSI parameter (0 if absent) — enough for `ESC[nC`/`nD`/`nK`.
@@ -468,7 +450,7 @@ pub(super) fn dummy_pane() -> Pane {
         title: String::new(), show_caret: false,
         grid: Vec::new(), hist: VecDeque::new(), view: 0, sel: None, has_composer: false,
         folds: Vec::new(), evicted: 0, user_band: Vec::new(), tool_band: Vec::new(),
-        utf8: [0; 4], utf8_len: 0,
+        utf8: crate::utf8::Utf8Decoder::new(),
     }
 }
 

@@ -24,6 +24,7 @@ mod agents;
 mod browser;
 mod fs;
 mod install;
+mod keyboard;
 mod media;
 mod notify;
 mod pdf;
@@ -41,6 +42,7 @@ pub(crate) use tooljson::*;
 pub(crate) use voice::*;
 use agents::*;
 use install::*;
+use keyboard::*;
 use media::*;
 pub(crate) use notify::*;
 use pdf::*;
@@ -675,6 +677,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "screenshot" | "screencap" | "shot" => run_screenshot(arg),
         "notify" | "notifications" | "notif" => run_notify_cmd(arg),
         "schedule" | "cron" | "at" => run_schedule_cmd(arg),
+        "keyboard" | "kbd" => run_keyboard(arg),
         "touchscreen" => run_touch(arg),
         "suspend" | "sleep" => run_suspend(arg),
         // Top-level `/power` (idle + energy mode). WiFi uses `/wifi power`, not this.
@@ -6161,8 +6164,12 @@ fn cursor_shift(n: usize, right: bool) {
 /// Replace the input line (both in `buf` and on screen) with `new`, leaving the
 /// cursor at the end. `cur` is the current cursor offset within `buf`.
 fn replace_line(buf: &mut String, cur: &mut usize, new: &str) {
-    cursor_shift(buf.len() - *cur, true); // jump to end before erasing
-    erase_chars(buf.chars().count());
+    // Both of these are **column** counts. `buf.len() - *cur` (bytes) and
+    // `buf.chars().count()` (chars) happen to agree with columns only for ASCII,
+    // which is why a history entry containing CJK used to leave the old line
+    // partly on screen.
+    cursor_shift(crate::textfit::cols(&buf[*cur..]), true); // jump to end before erasing
+    erase_chars(crate::textfit::cols(buf));
     buf.clear();
     buf.push_str(new);
     *cur = buf.len();
@@ -6804,23 +6811,51 @@ fn composer_sync(buf: &str, cur: usize) {
     }
 }
 
+/// Show (or clear) the IME pre-edit run in the composer.
+///
+/// A `cfg` twin because `framebuffer` is absent from the test build — and unused
+/// arguments there, since the serial path has nowhere to draw an underline. The
+/// pre-edit is deliberately **not** echoed to serial: it is uncommitted text, and
+/// a terminal has no way to un-echo it when the composition changes.
+fn composer_set_preedit(preedit: &str) {
+    #[cfg(not(test))]
+    if composer_mode() {
+        crate::framebuffer::composer_set_preedit(preedit);
+    }
+    #[cfg(test)]
+    let _ = preedit;
+}
+
 /// Insert `c` into `buf` at the cursor, re-echoing the shifted tail on serial
 /// (and refreshing the FB composer when it is the live prompt).
+///
+/// `cur` is a **byte** offset, because that is what `String::insert` and every
+/// slice of `buf` need. So it advances by `c.len_utf8()`, not by 1: a `+= 1`
+/// after inserting a multi-byte character leaves `cur` *inside* it, and the next
+/// `buf.insert` or `&buf[*cur..]` panics. The terminal move is in **columns**
+/// (`textfit::cols`), which is a different number again for CJK.
 fn insert_at(buf: &mut String, cur: &mut usize, c: char) {
     buf.insert(*cur, c);
     emit(&buf[*cur..]); // new char + rest of line (serial; FB grid gated by emit)
-    *cur += 1;
-    cursor_shift(buf.len() - *cur, false);
+    *cur += c.len_utf8();
+    cursor_shift(crate::textfit::cols(&buf[*cur..]), false);
     composer_sync(buf, *cur);
 }
 
 /// Delete the character at `cur` (the "Delete" key), re-echoing the tail.
+///
+/// The removed character may have been two columns wide, so that many spaces are
+/// painted over its old position and the cursor moves back by the tail plus that
+/// width — not by a byte count plus one.
 fn delete_at(buf: &mut String, cur: &mut usize) {
     if *cur < buf.len() {
+        let w = buf[*cur..].chars().next().map(crate::textfit::char_cols).unwrap_or(1);
         buf.remove(*cur);
         emit(&buf[*cur..]);
-        emit(" ");
-        cursor_shift(buf.len() - *cur + 1, false);
+        for _ in 0..w {
+            emit(" ");
+        }
+        cursor_shift(crate::textfit::cols(&buf[*cur..]) + w, false);
         composer_sync(buf, *cur);
     }
 }
@@ -6966,6 +7001,10 @@ fn read_line(buf: &mut String) -> ReadOutcome {
     // Suggestion menu (slash commands + @file mentions).
     let mut sug_items: alloc::vec::Vec<suggest::Item> = alloc::vec::Vec::new();
     let mut sug_sel: usize = 0;
+    // Reassembles multi-byte input. A keypress that produces `é` arrives as two
+    // bytes and must insert **one** character; the same decoder the output side
+    // uses, so the two cannot disagree about what a byte sequence means.
+    let mut utf8 = crate::utf8::Utf8Decoder::new();
     // Prefill (e.g. from the Commands browser): echo into serial + composer so
     // the user sees `/ping ` ready to edit / send.
     if !buf.is_empty() {
@@ -7106,7 +7145,12 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                         fb_scroll_live(false);
                         for ch in pasted.chars() {
                             let c = if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch };
-                            if (' '..='~').contains(&c) {
+                            // `read_bracketed_paste` goes to real trouble to
+                            // decode the host's bytes as UTF-8 (its doc-comment
+                            // records the Latin-1 mojibake bug that motivated
+                            // it) — and this filter then threw the result away
+                            // one character at a time. Keep everything printable.
+                            if !c.is_control() {
                                 insert_at(buf, &mut cur, c);
                             }
                         }
@@ -7336,7 +7380,11 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 if let Some((text, _)) = crate::clipboard::get() {
                     for ch in text.chars() {
                         let c = if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch };
-                        if (' '..='~').contains(&c) {
+                        // Anything printable, not just ASCII. The old
+                        // `(' '..='~')` filter silently deleted every accented
+                        // and CJK character from a paste — including the ones
+                        // `clipboard::get` had just decoded correctly.
+                        if !c.is_control() {
                             insert_at(buf, &mut cur, c);
                         }
                     }
@@ -7349,31 +7397,86 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 if media_key(0x08) {
                     continue;
                 }
-                // A held Backspace streak erases 2/4/8 chars per repeat.
-                let n = accel.steps(0x08, crate::arch::now_ms()).min(cur);
-                if n > 0 {
-                    buf.drain(cur - n..cur);
-                    cur -= n;
+                // A pending IME pre-edit is erased before the line is touched:
+                // Backspace while composing means "undo that keystroke", not
+                // "delete the previous character".
+                let ime_bs = crate::ime::backspace();
+                if ime_bs.consumed {
+                    composer_set_preedit(&ime_bs.preedit);
+                    continue;
+                }
+                // A held Backspace streak erases 2/4/8 **characters** per repeat.
+                //
+                // `cur - n` was a byte subtraction with a character count, so
+                // backspacing over any multi-byte character panicked
+                // (`byte index is not a char boundary`) — reachable by typing an
+                // accent and pressing Backspace once. `back_n_chars` walks
+                // boundaries instead, and the on-screen arithmetic is in columns,
+                // which for CJK is a third number again.
+                let n = accel.steps(0x08, crate::arch::now_ms());
+                let start = crate::textfit::back_n_chars(buf, cur, n);
+                if start < cur {
+                    let erased_cols = crate::textfit::cols(&buf[start..cur]);
+                    buf.drain(start..cur);
+                    cur = start;
                     // Back up, re-echo the shifted tail, blank the freed
                     // cells, and walk the cursor back into place (serial CSI
                     // when in composer mode; dual-console otherwise).
-                    cursor_shift(n, false);
+                    cursor_shift(erased_cols, false);
                     emit(&buf[cur..]);
-                    for _ in 0..n {
+                    for _ in 0..erased_cols {
                         emit(" ");
                     }
-                    cursor_shift(buf.len() - cur + n, false);
+                    cursor_shift(crate::textfit::cols(&buf[cur..]) + erased_cols, false);
                     composer_sync(buf, cur);
                     suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
                 }
             }
-            Some(c @ 0x20..=0x7e) => {
-                // A focused image/audio tab consumes its control keys first.
-                if media_key(c) {
+            // Printable ASCII **or** any byte of a UTF-8 sequence. `0x7f` (DEL)
+            // is handled by the backspace arm above, so it cannot arrive here.
+            Some(b) if b >= 0x20 && b != 0x7f => {
+                // Mid-sequence: nothing to insert yet. Returning here rather than
+                // inserting the raw byte is the whole fix — the previous
+                // `0x20..=0x7e` arm dropped every byte >= 0x80 on the floor, so
+                // typing or pasting an accent produced nothing at all.
+                let Some(c) = utf8.feed(b) else { continue };
+
+                // **The IME sees the character before any focused app does.** A
+                // composing keystroke must never be eaten by a package-UI app or
+                // a media tab, which is why this sits above `media_key`. With the
+                // IME off, `feed` returns `consumed: false` immediately and this
+                // arm is behaviourally identical to what shipped before.
+                //
+                // …except on a **slash-command line**, where the IME is bypassed
+                // entirely. Letters legitimately become kana, so with an input
+                // method on there would otherwise be no way to type
+                // `/keyboard ime off` — the feature would be a trap with no exit.
+                // A line beginning with `/` is never Japanese prose, so this costs
+                // nothing and makes the whole command surface reachable.
+                let slash_line = buf.starts_with('/') || (buf.is_empty() && c == '/');
+                let ime_out =
+                    if slash_line { crate::ime::ImeOut::default() } else { crate::ime::feed(c) };
+                if ime_out.consumed {
+                    fb_scroll_live(false);
+                    for ch in ime_out.commit.chars() {
+                        insert_at(buf, &mut cur, ch);
+                    }
+                    composer_set_preedit(&ime_out.preedit);
+                    hist_idx = None;
+                    suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);
+                    continue;
+                }
+
+                // `media_key` takes a **typed byte** and its value space overlaps
+                // `media_nav`'s CSI finals, which is the documented trap that made
+                // capital letters scroll a PDF. So only ASCII is ever offered to
+                // it — handing it `(c as u32 & 0xff) as u8` for `ä` would be a
+                // fresh instance of exactly that bug.
+                if c.is_ascii() && media_key(c as u8) {
                     continue;
                 }
                 fb_scroll_live(false);
-                insert_at(buf, &mut cur, c as char);
+                insert_at(buf, &mut cur, c);
                 hist_idx = None;
                 // Opening `/` or `@` (or filtering further) refreshes the menu.
                 suggest_refresh(buf, cur, &mut sug_sel, &mut sug_items);

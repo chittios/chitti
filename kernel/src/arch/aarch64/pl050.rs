@@ -7,13 +7,21 @@
 //! "PS/2 keyboard drives the console" capability x86 has.
 //!
 //! Polled (like the aarch64 xHCI / virtio-input paths, no IRQ): `poll_key`
-//! drains the receive register, decodes **scan-code set 2** (what a PS/2
+//! drains the receive register and turns **scan-code set 2** (what a PS/2
 //! keyboard emits natively — the i8042 on a PC translates to set 1, but the
-//! PL050 passes set 2 through), tracks shift/caps, and returns ASCII.
+//! PL050 passes set 2 through) into HID usages, which it hands to
+//! [`crate::keymap`].
+//!
+//! It no longer decodes characters. Layout, dead keys, Compose and the arrow→CSI
+//! table are shared with the other three transports, which is also what makes the
+//! set-2 cross-table testable at all: this module is `cfg`'d out of the test build
+//! (`arch::aarch64` only exists on aarch64, and the unit suite is x86), so
+//! anything left here could never carry a `#[test_case]`.
 
+use crate::keymap::{self, KeyEvent, Mods, Source};
 use crate::mm::Locked;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // PL050 register offsets (from the KMI base).
 const KMICR: u64 = 0x00; // control
@@ -44,18 +52,14 @@ static BASE: Locked<u64> = Locked::new(0);
 pub fn keyboard_base() -> u64 {
     BASE.with(|b| *b)
 }
-static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
-static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
-/// Left/Right GUI (⌘ / Super) — set-2 E0 0x1f / E0 0x27.
-static GUI_DOWN: AtomicBool = AtomicBool::new(false);
-static CAPS_ON: AtomicBool = AtomicBool::new(false);
+/// Live modifier bits as a [`Mods`] bitset. Set 2 delivers *edges* (a break code
+/// is `0xF0 <code>`), so converting edge→level stays here and the shared layer
+/// takes a level.
+static MODS: AtomicU8 = AtomicU8::new(0);
 /// Set 2 sends a byte's *break* code as `0xF0 <code>`; this holds across polls.
 static BREAK_NEXT: AtomicBool = AtomicBool::new(false);
-/// Extended keys are prefixed `0xE0`; arrows map to ANSI sequences, others are ignored.
+/// Extended keys are prefixed `0xE0` (right Ctrl/Alt, the GUI keys, the nav block).
 static EXT_NEXT: AtomicBool = AtomicBool::new(false);
-/// Bytes still owed to the caller (arrow keys expand to a 3-byte ANSI escape,
-/// but `poll_key` returns one byte per call).
-static PENDING: Locked<alloc::vec::Vec<u8>> = Locked::new(alloc::vec::Vec::new());
 
 unsafe fn r32(a: u64) -> u32 {
     unsafe { read_volatile(a as *const u32) }
@@ -96,55 +100,20 @@ pub fn init() -> bool {
     false
 }
 
-/// Decode a scan-code-set-2 make code to ASCII, applying shift/caps. `0` means
-/// no printable character. Mirrors the x86 set-1 decoder's shift/caps rules.
-fn decode(sc: u8) -> Option<u8> {
-    let shift = SHIFT_DOWN.load(Ordering::Relaxed);
-    // Base (unshifted / shifted) character for this set-2 make code.
-    let (lo, hi): (u8, u8) = match sc {
-        0x1C => (b'a', b'A'), 0x32 => (b'b', b'B'), 0x21 => (b'c', b'C'), 0x23 => (b'd', b'D'),
-        0x24 => (b'e', b'E'), 0x2B => (b'f', b'F'), 0x34 => (b'g', b'G'), 0x33 => (b'h', b'H'),
-        0x43 => (b'i', b'I'), 0x3B => (b'j', b'J'), 0x42 => (b'k', b'K'), 0x4B => (b'l', b'L'),
-        0x3A => (b'm', b'M'), 0x31 => (b'n', b'N'), 0x44 => (b'o', b'O'), 0x4D => (b'p', b'P'),
-        0x15 => (b'q', b'Q'), 0x2D => (b'r', b'R'), 0x1B => (b's', b'S'), 0x2C => (b't', b'T'),
-        0x3C => (b'u', b'U'), 0x2A => (b'v', b'V'), 0x1D => (b'w', b'W'), 0x22 => (b'x', b'X'),
-        0x35 => (b'y', b'Y'), 0x1A => (b'z', b'Z'),
-        0x16 => (b'1', b'!'), 0x1E => (b'2', b'@'), 0x26 => (b'3', b'#'), 0x25 => (b'4', b'$'),
-        0x2E => (b'5', b'%'), 0x36 => (b'6', b'^'), 0x3D => (b'7', b'&'), 0x3E => (b'8', b'*'),
-        0x46 => (b'9', b'('), 0x45 => (b'0', b')'),
-        0x0E => (b'`', b'~'), 0x4E => (b'-', b'_'), 0x55 => (b'=', b'+'),
-        0x54 => (b'[', b'{'), 0x5B => (b']', b'}'), 0x5D => (b'\\', b'|'),
-        0x4C => (b';', b':'), 0x52 => (b'\'', b'"'),
-        0x41 => (b',', b'<'), 0x49 => (b'.', b'>'), 0x4A => (b'/', b'?'),
-        0x29 => (b' ', b' '), 0x5A => (b'\n', b'\n'), 0x66 => (0x08, 0x08), 0x0D => (b'\t', b'\t'),
-        _ => return None,
-    };
-    let base = if shift { hi } else { lo };
-    // Caps-lock flips letter case (caps + shift = lowercase, as on a PC).
-    let ch = if CAPS_ON.load(Ordering::Relaxed) && base.is_ascii_alphabetic() {
-        if base.is_ascii_lowercase() { base - 32 } else { base + 32 }
-    } else {
-        base
-    };
-    // Ctrl+letter → control code (Ctrl+C = 3 stops generation, etc.).
-    if CTRL_DOWN.load(Ordering::Relaxed) && ch.is_ascii_alphabetic() {
-        return Some(ch.to_ascii_uppercase() & 0x1f);
-    }
-    Some(ch)
+fn set_mod(bit: u8, on: bool) {
+    let cur = MODS.load(Ordering::Relaxed);
+    MODS.store(if on { cur | bit } else { cur & !bit }, Ordering::Relaxed);
 }
 
-const SC_LSHIFT: u8 = 0x12;
-const SC_RSHIFT: u8 = 0x59;
-const SC_LCTRL: u8 = 0x14;
-const SC_CAPS: u8 = 0x58;
-
-/// Poll the PL050 for the next typed character, decoding set-2 codes + tracking
-/// shift/caps across the `0xF0` (break) and `0xE0` (extended) prefixes. Consumes
-/// received bytes until it produces a character or the receive register drains.
-/// Non-blocking; `None` if no PL050 or nothing typed.
+/// Poll the PL050 and return the next translated input byte.
+///
+/// Consumes received bytes until one produces output or the receive register
+/// drains, tracking the `0xF0` (break) and `0xE0` (extended) prefixes. Everything
+/// past "which physical key was that" is [`crate::keymap`]'s job. Non-blocking;
+/// `None` if no PL050 or nothing typed.
 pub fn poll_key() -> Option<u8> {
-    // Drain any queued escape-sequence bytes first (arrow-key expansion).
-    if let Some(b) = PENDING.with(|p| if p.is_empty() { None } else { Some(p.remove(0)) }) {
+    // Anything the shared layer already translated comes out first.
+    if let Some(b) = keymap::next_byte() {
         return Some(b);
     }
     let base = BASE.with(|b| *b);
@@ -154,94 +123,35 @@ pub fn poll_key() -> Option<u8> {
     // Bounded so a stuck controller can't spin the caller forever.
     for _ in 0..16 {
         // SAFETY: `base` is the probed, enabled PL050 register block.
-        let (has, sc) = unsafe {
+        let sc = unsafe {
             if r32(base + KMISTAT) & KMISTAT_RXFULL == 0 {
                 return None;
             }
-            (true, (r32(base + KMIDATA) & 0xff) as u8)
+            (r32(base + KMIDATA) & 0xff) as u8
         };
-        if !has {
-            return None;
-        }
         match sc {
-            0xF0 => {
-                BREAK_NEXT.store(true, Ordering::Relaxed);
-            }
-            0xE0 => {
-                EXT_NEXT.store(true, Ordering::Relaxed);
-            }
+            0xF0 => BREAK_NEXT.store(true, Ordering::Relaxed),
+            0xE0 => EXT_NEXT.store(true, Ordering::Relaxed),
             _ => {
                 let breaking = BREAK_NEXT.swap(false, Ordering::Relaxed);
                 let extended = EXT_NEXT.swap(false, Ordering::Relaxed);
-                if extended {
-                    // Extended (E0-prefixed set-2) keys become the ANSI escape
-                    // sequences a serial terminal sends — one encoding for every
-                    // input path. Arrows + Home/End/PgUp/PgDn/Delete so the
-                    // shell's history nav and pane scrollback work from a PS/2
-                    // keyboard (VirtualBox-ARM presents one). Ctrl+Tab (E0 0x14)
-                    // is the pane-focus toggle. GUI (E0 0x1f / 0x27) tracks ⌘/Super.
-                    if !breaking {
-                        if sc == 0x14 {
-                            CTRL_DOWN.store(true, Ordering::Relaxed);
-                            continue;
-                        }
-                        if sc == 0x1f || sc == 0x27 {
-                            GUI_DOWN.store(true, Ordering::Relaxed);
-                            continue;
-                        }
-                        if let Some(seq) = match sc {
-                            0x75 => Some(&b"[A"[..]),  // Up
-                            0x72 => Some(&b"[B"[..]),  // Down
-                            0x74 => Some(&b"[C"[..]),  // Right
-                            0x6b => Some(&b"[D"[..]),  // Left
-                            0x6c => Some(&b"[H"[..]),  // Home
-                            0x69 => Some(&b"[F"[..]),  // End
-                            0x7d => Some(&b"[5~"[..]), // Page Up
-                            0x7a => Some(&b"[6~"[..]), // Page Down
-                            0x71 => Some(&b"[3~"[..]), // Delete
-                            _ => None,
-                        } {
-                            PENDING.with(|p| p.extend_from_slice(seq));
-                            return Some(0x1b);
-                        }
-                    } else if sc == 0x14 {
-                        CTRL_DOWN.store(false, Ordering::Relaxed); // right Ctrl release
-                    } else if sc == 0x1f || sc == 0x27 {
-                        GUI_DOWN.store(false, Ordering::Relaxed);
-                    }
-                    continue;
-                }
-                match sc {
-                    SC_LSHIFT | SC_RSHIFT => SHIFT_DOWN.store(!breaking, Ordering::Relaxed),
-                    SC_LCTRL => CTRL_DOWN.store(!breaking, Ordering::Relaxed),
-                    SC_CAPS if !breaking => {
-                        CAPS_ON.fetch_xor(true, Ordering::Relaxed);
-                    }
-                    // Ctrl+Tab / Ctrl+Shift+Tab: focus cycle (`ESC [ T` / `Z`).
-                    0x0D if !breaking && CTRL_DOWN.load(Ordering::Relaxed) => {
-                        let seq = if SHIFT_DOWN.load(Ordering::Relaxed) {
-                            &b"[Z"[..]
-                        } else {
-                            &b"[T"[..]
-                        };
-                        PENDING.with(|p| p.extend_from_slice(seq));
-                        return Some(0x1b);
-                    }
-                    // Cmd/Super+Space or Ctrl+Space: Agents browser (`ESC [ g`).
-                    // set-2 Space=0x29. Ctrl+Space is the reliable chord when a
-                    // macOS host steals ⌘+Space for Spotlight.
-                    0x29 if !breaking
-                        && (GUI_DOWN.load(Ordering::Relaxed) || CTRL_DOWN.load(Ordering::Relaxed)) =>
-                    {
-                        PENDING.with(|p| p.extend_from_slice(b"[g"));
-                        return Some(0x1b);
-                    }
-                    _ if !breaking => {
-                        if let Some(ch) = decode(sc) {
-                            return Some(ch);
+                let pressed = !breaking;
+                if let Some(usage) = keymap::usage_from_set2(sc, extended) {
+                    if let Some(bit) = keymap::modifier_bit(usage) {
+                        set_mod(bit, pressed);
+                    } else {
+                        let mods = Mods(MODS.load(Ordering::Relaxed));
+                        keymap::feed_event(KeyEvent {
+                            usage,
+                            mods,
+                            pressed,
+                            src: Source::Ps2Set2,
+                        });
+                        // The event may have produced bytes; hand back the first.
+                        if let Some(b) = keymap::next_byte() {
+                            return Some(b);
                         }
                     }
-                    _ => {}
                 }
             }
         }

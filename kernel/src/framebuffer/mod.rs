@@ -204,10 +204,9 @@ struct Pane {
     /// free. They are disjoint by construction — a line is either the human's prompt or a
     /// tool block — and [`Pane::band`] resolves user-first if that ever stops holding.
     tool_band: Vec<usize>,
-    /// Incremental UTF-8 decode buffer: the incoming byte stream is decoded one
-    /// `char` at a time (a multi-byte glyph spans several `pane_putc` calls).
-    utf8: [u8; 4],
-    utf8_len: u8,
+    /// Incremental UTF-8 decoder: the incoming byte stream is decoded one `char`
+    /// at a time (a multi-byte glyph spans several `pane_putc` calls).
+    utf8: crate::utf8::Utf8Decoder,
 }
 
 /// Minimal ANSI escape-sequence parser state for a pane's byte stream: we
@@ -251,6 +250,10 @@ pub struct Screen {
     composer_active: bool,
     composer_line: String,
     composer_cur: usize,
+    /// The IME pre-edit run, drawn underlined at the caret and **not** part of
+    /// `composer_line` — it is uncommitted text, so the shell's buffer must not
+    /// contain it.
+    composer_preedit: String,
     /// Hint bar under the composer (left / right halves).
     composer_hint_l: String,
     composer_hint_r: String,

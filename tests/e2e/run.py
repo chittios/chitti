@@ -2509,6 +2509,486 @@ def s_display(g):
         g.wait_for("display> font scale", 8, m)
 
 
+def s_screenshot(g):
+    """`/screenshot` captures the framebuffer to a PNG and re-decodes it.
+
+    The whole point of the round trip: an encoder bug that produces a
+    plausible-looking file is otherwise only found later, by a human, on another
+    machine. So the command decodes what it just wrote and this asserts the
+    dimensions came back.
+
+    NB the harness boots with a framebuffer (ramfb/GOP), so the capture path is
+    real here. On a serial-only boot the command refuses cleanly, which the
+    'no framebuffer' branch below accepts rather than failing — the scenario is
+    about the encoder, not about QEMU's display configuration."""
+    try:
+        m = g.mark()
+        g.send("/screenshot")
+        if not g.wait_for("screenshot>", 30, m):
+            return False, "/screenshot produced no output"
+        g.wait_quiet(0.5, 20)
+        out = g.since(m)
+        if "no framebuffer" in out:
+            return True, "skipped: serial-only boot, no framebuffer to capture"
+        if "saved /downloads/screenshot-" not in out:
+            return False, f"no saved line: {out[-300:]}"
+        # A re-decode warning is the failure this scenario exists to catch.
+        if "warning: re-decode" in out or "warning: re-decoded" in out:
+            return False, f"the PNG did not survive a round trip: {out[-300:]}"
+        # The file is really on the store, and non-trivially sized.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/ls /downloads")
+        if not g.wait_for("screenshot-", 10, m):
+            return False, "the capture is not in /downloads"
+
+        # A named destination, a region, and the refusals.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/screenshot region 0,0,64,48 /downloads/e2e-shot.png")
+        if not g.wait_for("64x48", 20, m):
+            return False, "a region capture did not honour its rectangle"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/screenshot region 1,2,3")
+        if not g.wait_for("region takes exactly", 10, m):
+            return False, "a malformed region was not refused"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/screenshot --nonsense")
+        if not g.wait_for("unknown flag", 10, m):
+            return False, "an unknown flag was not refused"
+        # And the result opens.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/open /downloads/e2e-shot.png")
+        if not g.wait_for("open>", 25, m):
+            return False, "the capture did not open"
+        return True, "captured, encoded, re-decoded and opened"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
+def s_notify(g):
+    """The notification queue: post, list, coalesce, read, clear — plus the pane.
+
+    The coalescing assertion is the one that matters: without it a schedule
+    running once a minute fills the ring in an hour and buries whatever the human
+    actually needed to see."""
+    try:
+        m = g.mark()
+        g.send("/notify clear")
+        g.wait_for("notify> cleared", 10, m)
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify test")
+        if not g.wait_for("notify> posted #", 10, m):
+            return False, "/notify test posted nothing"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify list")
+        if not g.wait_for("notify test", 10, m):
+            return False, "the posted notification is not in the list"
+        if not g.wait_for("1 unread", 10, m):
+            return False, "it was not counted as unread"
+
+        # A post with a severity and a body.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify post warn disk pressure -- 92% full")
+        if not g.wait_for("notify> posted #", 10, m):
+            return False, "/notify post failed"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify list")
+        # Wait for the listing before reading it: `since` is a snapshot, not a
+        # blocking read, so taking it straight after `send` races the guest.
+        if not g.wait_for("disk pressure", 10, m):
+            return False, "the posted notification is not listed"
+        g.wait_quiet(0.3, 10)
+        out_before = g.since(m)
+        if "92% full" not in out_before:
+            return False, f"the body was not stored: {out_before[-300:]}"
+        if "[warn]" not in out_before:
+            return False, f"the severity was not stored: {out_before[-300:]}"
+
+        # An unknown severity is refused rather than defaulted.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify post loud something")
+        if not g.wait_for("unknown severity", 10, m):
+            return False, "an unknown severity was not refused"
+
+        # Read, then clear.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify read all")
+        if not g.wait_for("marked 2 read", 10, m):
+            return False, "read-all did not mark both"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify list")
+        if not g.wait_for("0 unread", 10, m):
+            return False, "the unread count did not fall to zero"
+
+        # The action pane opens **without stealing keyboard focus** — the rule
+        # that made opening a view send the next typed command to the wrong pane.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify")
+        if not g.wait_for("notify>", 15, m):
+            return False, "/notify did not open"
+        g.wait_quiet(0.6, 10)
+        m = g.mark()
+        g.send("/pwd")
+        if not g.wait_for("/home/chitti", 10, m):
+            return False, "focus moved to the action pane: the next command did not run in the shell"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify clear")
+        if not g.wait_for("notify> cleared", 10, m):
+            return False, "clear failed"
+        return True, "post, list, severity, read, clear, pane (focus intact)"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
+def s_schedule(g):
+    """A scheduled `/command` fires, reports into notifications, and stops.
+
+    Uses `every 5s`, which is the **only** recurrence independent of the wall
+    clock and the only one observable inside this budget — `MIN_EVERY_SECS = 5`
+    exists precisely so this is expressible. A calendar job on a boot with no
+    trustworthy RTC is *held*, which the last block asserts is reported rather
+    than silently doing nothing."""
+    try:
+        m = g.mark()
+        g.send("/notify clear")
+        g.wait_for("notify>", 10, m)
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule add e2e every 5s command pwd")
+        if not g.wait_for("schedule> added 'e2e'", 10, m):
+            return False, "/schedule add failed"
+
+        # The authority record, which is the interesting half of this feature.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule show e2e")
+        if not g.wait_for("authority", 10, m):
+            return False, "/schedule show printed no grant"
+        g.wait_quiet(0.3, 10)
+        out = g.since(m)
+        if "author       human" not in out:
+            return False, f"a typed schedule must be recorded as human-authored: {out[-400:]}"
+        if "confirmed    true" not in out:
+            return False, "a typed schedule must be recorded as confirmed"
+
+        # Wait for a fire. The tick is 1 Hz and skips while a key was just
+        # pressed, so give it room.
+        m = g.mark()
+        fired = False
+        for _ in range(8):
+            g.send("")  # a bare Enter re-opens the prompt, which drains
+            if g.wait_for("schedule> firing 'e2e'", 8, m):
+                fired = True
+                break
+        if not fired:
+            return False, "the schedule never fired"
+
+        g.wait_quiet(0.5, 10)
+        m = g.mark()
+        g.send("/schedule show e2e")
+        if not g.wait_for("history", 10, m):
+            return False, "/schedule show printed no history"
+        g.wait_quiet(0.3, 10)
+        out = g.since(m)
+        if "runs         0" in out:
+            return False, "the run was not recorded"
+
+        # It reported into the notification queue.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify list")
+        if not g.wait_for("schedule:e2e", 10, m):
+            return False, "the run did not produce a notification"
+
+        # Pause stops it firing; remove takes it away entirely.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule pause e2e")
+        if not g.wait_for("'e2e' paused", 10, m):
+            return False, "pause failed"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule list")
+        if not g.wait_for("paused", 10, m):
+            return False, "the paused state is not shown"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule remove e2e")
+        if not g.wait_for("removed 'e2e'", 10, m):
+            return False, "remove failed"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule list")
+        if not g.wait_for("no schedules", 10, m):
+            return False, "the schedule survived removal"
+
+        # A malformed recurrence is refused with a reason, and a command that
+        # does not exist is refused at creation rather than failing forever.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule add bad every 1s command pwd")
+        if not g.wait_for("below the", 10, m):
+            return False, "an interval under the minimum was not refused"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule add bad every 30s command nosuchcommand")
+        if not g.wait_for("is not a command", 10, m):
+            return False, "a schedule naming a non-command was not refused"
+
+        # `/schedule next` answers "why is nothing running".
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/schedule next")
+        if not g.wait_for("schedule>", 10, m):
+            return False, "/schedule next said nothing"
+
+        g.send("/notify clear")
+        return True, "fired, notified, paused, removed; refusals reported"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
+def s_keyboard_layouts(g):
+    """Layouts run through the **real** translator, over serial.
+
+    Scancodes cannot be injected over serial and the harness does not drive
+    QEMU's `sendkey`, so `/keyboard test` is the only way to assert on the layout
+    tables from a running kernel — and it deliberately calls `keymap::translate`
+    rather than a parallel path, so a passing assertion here is a statement about
+    what a real keypress would do."""
+    try:
+        m = g.mark()
+        g.send("/keyboard list")
+        if not g.wait_for("layout(s)", 10, m):
+            return False, "/keyboard list failed"
+        g.wait_quiet(0.3, 10)
+        out = g.since(m)
+        for want in ("us", "de", "fr", "dvorak", "colemak"):
+            if want not in out:
+                return False, f"layout '{want}' missing from the list"
+
+        checks = [
+            # German QWERTZ: the y/z swap, an umlaut, and AltGr.
+            ("/keyboard test de y", "'z'"),
+            ("/keyboard test de z", "'y'"),
+            ("/keyboard test de shift+2", "'\"'"),
+            ("/keyboard test de altgr+q", "'@'"),
+            ("/keyboard test de altgr+e", "U+20AC"),
+            # The ISO key left of Y, which no table decoded before this work.
+            ("/keyboard test de iso", "'<'"),
+            # French AZERTY.
+            ("/keyboard test fr q", "'a'"),
+            ("/keyboard test fr a", "'q'"),
+            ("/keyboard test fr 1", "'&'"),
+            # Dvorak, and Ctrl following the layout's letter rather than US's.
+            ("/keyboard test dvorak s", "'o'"),
+            ("/keyboard test dvorak ctrl+i", "0x03"),
+            # US is unchanged.
+            ("/keyboard test us a", "'a'"),
+            ("/keyboard test us shift+a", "'A'"),
+            ("/keyboard test us ctrl+c", "0x03"),
+            # Dead keys: a hit, and a miss that types both visibly.
+            ("/keyboard test de =,e", "U+00E9"),
+            ("/keyboard test de =,q", "U+00B4"),
+            # UK.
+            ("/keyboard test uk shift+3", "U+00A3"),
+        ]
+        for cmd, want in checks:
+            g.wait_quiet(0.3, 10)
+            m = g.mark()
+            g.send(cmd)
+            if not g.wait_for(want, 10, m):
+                return False, f"'{cmd}' did not produce {want}: {g.since(m)[-200:]}"
+
+        # Switching the live layout, and refusing a typo without switching.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard set de")
+        if not g.wait_for("keyboard> layout de", 10, m):
+            return False, "/keyboard set de failed"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard set nonsense")
+        if not g.wait_for("unknown layout", 10, m):
+            return False, "an unknown layout was not refused"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard")
+        if not g.wait_for("layout de", 10, m):
+            return False, "the refused layout changed the active one"
+        # Restore, or every later scenario types German.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard set us")
+        if not g.wait_for("keyboard> layout us", 10, m):
+            return False, "could not restore the US layout"
+        return True, "9 layouts, altgr, dead keys, the ISO key, live switching"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
+def s_keyboard_unicode(g):
+    """A non-ASCII line survives typing, backspacing and submission.
+
+    This is the highest-value keyboard scenario because it pins a **live panic**:
+    backspace was `buf.drain(cur - n..cur)` with `n` a character count, so
+    erasing over any multi-byte character was a non-char-boundary panic — reachable
+    by typing an accent and pressing Backspace once. Everything before this work
+    also dropped every byte >= 0x80 on the floor, so the accent never arrived at
+    all."""
+    try:
+        # Type a mixed-width line without submitting, then backspace over the
+        # multi-byte tail, then submit.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send_raw("/keyboard echo h\u00e9llo \u65e5\u672c \u2713".encode())
+        g.wait_quiet(0.5, 10)
+        g.send_raw(b"\x7f\x7f")  # erase the check mark and the space before it
+        g.wait_quiet(0.3, 10)
+        g.send("")  # Enter
+        if not g.wait_for("keyboard> echo:", 10, m):
+            return False, "the echo command did not run (a backspace panic would hang here)"
+        g.wait_quiet(0.3, 10)
+        # **Only the reported line**, not the whole capture: the shell echoes each
+        # character as it is typed, so the erased one is still in the transcript
+        # above. What matters is what the command finally *received*.
+        echo_line = ""
+        for line in g.since(m).splitlines():
+            if "keyboard> echo:" in line:
+                echo_line = line
+        if not echo_line:
+            return False, "no echo line in the output"
+        if "h\u00e9llo \u65e5\u672c" not in echo_line:
+            return False, f"the multi-byte line did not survive: {echo_line!r}"
+        if "\u2713" in echo_line:
+            return False, f"backspace did not erase the multi-byte character: {echo_line!r}"
+        # **The three units must differ**, which is the whole reason `textfit`
+        # exists: "héllo 日本" is 8 characters, 13 bytes and 10 columns. This is the
+        # strongest assertion in the scenario — it is the guest's own measurement
+        # of what the line editor actually received, and before this work the
+        # non-ASCII bytes never arrived at all.
+        if "(8 chars, 13 bytes, 10 cols)" not in echo_line:
+            return False, f"the char/byte/column counts are wrong: {echo_line!r}"
+
+        # The shell is still alive afterwards.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/pwd")
+        if not g.wait_for("/home/chitti", 10, m):
+            return False, "the shell did not survive the multi-byte line"
+
+        # Hex entry reports a real codepoint and refuses the impossible ones.
+        for cmd, want in [
+            ("/keyboard hex 00e9", "U+00E9"),
+            ("/keyboard hex 65e5", "U+65E5"),
+            ("/keyboard hex d800", "surrogate"),
+            ("/keyboard hex 110000", "above U+10FFFF"),
+            ("/keyboard hex zzz", "not hexadecimal"),
+        ]:
+            g.wait_quiet(0.3, 10)
+            m = g.mark()
+            g.send(cmd)
+            if not g.wait_for(want, 10, m):
+                return False, f"'{cmd}' did not report {want}"
+
+        # The compose table is printable in full — a convenience surface that
+        # cannot say what it covers should not exist.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard compose")
+        if not g.wait_for("compose sequence(s)", 10, m):
+            return False, "/keyboard compose printed nothing"
+        return True, "utf-8 line, backspace over multi-byte, hex entry, compose table"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
+def s_keyboard_ime(g):
+    """romaji -> kana, and the two refusals that keep the feature honest."""
+    try:
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard ime hiragana")
+        if not g.wait_for("keyboard> ime hiragana", 15, m):
+            return False, "hiragana did not activate"
+
+        # Asserted on **codepoints**, not literal kana: `describe` prints both,
+        # and U+xxxx is ASCII, so the assertion cannot depend on how the harness
+        # or the reader's terminal renders CJK.
+        for text, want in [
+            ("ka", "U+304B"),
+            ("kya", "U+304D U+3083"),
+            ("kka", "U+3063 U+304B"),
+            ("nka", "U+3093 U+304B"),
+            ("nni", "U+3093 U+306B"),
+            ("sho", "U+3057 U+3087"),
+        ]:
+            g.wait_quiet(0.3, 10)
+            m = g.mark()
+            g.send(f"/keyboard type {text}")
+            if not g.wait_for(want, 10, m):
+                return False, f"romaji '{text}' did not produce the expected kana: {g.since(m)[-200:]}"
+
+        # Katakana shares the table.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard ime katakana")
+        if not g.wait_for("ime katakana", 10, m):
+            return False, "katakana did not activate"
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/keyboard type ka")
+        if not g.wait_for("U+30AB", 10, m):
+            return False, "katakana mode did not convert"
+
+        # The refusals must name the *reason*, not report an unknown mode.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard ime pinyin")
+        out_needed = g.wait_for("dictionary", 10, m)
+        if not out_needed:
+            return False, "pinyin was not refused with the dictionary reason"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard ime hangul")
+        if not g.wait_for("Hangul", 10, m):
+            return False, "hangul was not refused with the font reason"
+
+        # Off restores, and the shell is unaffected throughout — a slash-command
+        # line bypasses the IME entirely, which is the escape hatch.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/keyboard ime off")
+        if not g.wait_for("ime off", 10, m):
+            return False, "could not turn the IME off"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/pwd")
+        if not g.wait_for("/home/chitti", 10, m):
+            return False, "the shell did not survive the IME"
+        return True, "kana conversion, katakana, pinyin/hangul refused with reasons"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
 def s_statusbar(g):
     """Status-bar position: reports the current edge, moves to each of the four,
     rejects a typo without moving, persists to ui.json, and the shell keeps working
@@ -3128,6 +3608,12 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("display", s_display),
     ("statusbar", s_statusbar),
     ("clipboard", s_clipboard),
+    ("screenshot", s_screenshot),
+    ("notify", s_notify),
+    ("schedule", s_schedule),
+    ("keyboard_layouts", s_keyboard_layouts),
+    ("keyboard_unicode", s_keyboard_unicode),
+    ("keyboard_ime", s_keyboard_ime),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
 NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]

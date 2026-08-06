@@ -241,9 +241,9 @@ pub struct Xhci {
     done_ports: u32,
     // Small ring of decoded keyboard bytes (the shared event ring is drained by
     // `pump_events`, which routes reports; `poll_key` pops from here).
-    key_buf: [u8; 16],
-    key_head: usize,
-    key_tail: usize,
+    // NB no per-driver key ring: translated bytes come out of `keymap`'s shared
+    // ring, so a machine with a USB keyboard *and* a virtio-input window has one
+    // dead-key state and one caps-lock, not two of each.
 }
 
 /// A configured HID boot keyboard.
@@ -258,11 +258,13 @@ struct Kbd {
     int_cycle: u32,
     report_pa: u64,    // 8-byte HID boot report buffer
     report_va: usize,
-    prev: [u8; 8],     // last report, to detect newly-pressed keys
-    // USB HID boot keyboards report only press/release edges, so a held key
-    // would never repeat; synthesize accelerating typematic in software.
-    rep: crate::keyrepeat::Typematic,
-    rep_usage: u8, // the held usage the typematic is armed for (0 = none)
+    prev: [u8; 8], // last report, to detect newly-pressed and released keys
+    // NB the software typematic lives in `crate::keymap` now, not here. USB HID
+    // boot keyboards report only press/release edges so it is still needed — but
+    // arming it per driver meant only *this* transport ever got repeat, and it
+    // re-emitted the **bytes** a press produced, which is wrong once a layout is
+    // involved (AltGr, a dead key, an IME) because the bytes depend on state that
+    // may have changed. `keymap` re-runs `translate` on each repeat instead.
 }
 
 /// A configured HID pointer (USB tablet or mouse). The absolute-tablet report
@@ -719,9 +721,7 @@ impl Xhci {
                 bt: None,
                 uvc: None,
                 done_ports: 0,
-                key_buf: [0; 16],
-                key_head: 0,
-                key_tail: 0,
+
             })
         }
     }
@@ -1575,8 +1575,6 @@ impl Xhci {
             report_pa,
             report_va,
             prev: [0; 8],
-            rep: crate::keyrepeat::Typematic::new(),
-            rep_usage: 0,
         };
         unsafe { self.queue_interrupt(&mut kbd) };
         crate::ktrace::log_fmt(format_args!("xhci: HID keyboard ready (slot {}, ep {ep_addr:#x}, dci {int_dci})", c.slot));
@@ -1841,65 +1839,51 @@ impl Xhci {
                         for (i, b) in report.iter_mut().enumerate() {
                             *b = read_volatile((k.report_va + i) as *const u8);
                         }
-                        // HID boot report byte 0: L/R Ctrl 0x11, Shift 0x22,
-                        // Alt 0x44, GUI (⌘ / Super / Win) 0x88.
-                        let shift = report[0] & 0x22 != 0;
-                        let ctrl = report[0] & 0x11 != 0;
-                        let gui = report[0] & 0x88 != 0;
-                        for &usage in &report[2..8] {
-                            if usage != 0 && !k.prev[2..8].contains(&usage) {
-                                // Arrow/nav keys become the ANSI sequences a
-                                // serial terminal sends, so the shell/editor
-                                // decode one encoding for every input path.
-                                // Ctrl+Tab = focus cycle forward (`ESC [ T`);
-                                // Ctrl+Shift+Tab = reverse (`ESC [ Z`).
-                                // Cmd/Super+Space = Agents browser (`ESC [ g`)
-                                // — macOS Spotlight-style.
-                                let mut seq = [0u8; crate::keyrepeat::SEQ_MAX];
-                                let mut n = 0usize;
-                                if let Some(s) = match usage {
-                                    0x52 => Some(&b"[A"[..]),  // Up
-                                    0x51 => Some(&b"[B"[..]),  // Down
-                                    0x4f => Some(&b"[C"[..]),  // Right
-                                    0x50 => Some(&b"[D"[..]),  // Left
-                                    0x4a => Some(&b"[H"[..]),  // Home
-                                    0x4d => Some(&b"[F"[..]),  // End
-                                    0x4b => Some(&b"[5~"[..]), // PgUp
-                                    0x4e => Some(&b"[6~"[..]), // PgDn
-                                    0x4c => Some(&b"[3~"[..]), // Delete
-                                    0x2b if ctrl && shift => Some(&b"[Z"[..]), // Ctrl+Shift+Tab
-                                    0x2b if ctrl => Some(&b"[T"[..]), // Ctrl+Tab
-                                    // Agents browser (Spotlight-style). Prefer
-                                    // GUI (⌘/Super); also Ctrl+Space — macOS
-                                    // hosts often steal ⌘+Space for Spotlight
-                                    // before the guest sees it.
-                                    0x2c if gui || ctrl => Some(&b"[g"[..]),
-                                    _ => None,
-                                } {
-                                    seq[0] = 0x1b;
-                                    n = 1;
-                                    for &b in s.iter().take(seq.len() - 1) {
-                                        seq[n] = b;
-                                        n += 1;
-                                    }
-                                } else if let Some(a) = hid_to_ascii(usage, shift, ctrl) {
-                                    seq[0] = a;
-                                    n = 1;
-                                }
-                                for &b in &seq[..n] {
-                                    self.key_push(b);
-                                }
-                                // Arm software typematic for the newest press.
-                                if n > 0 {
-                                    k.rep.press(&seq[..n], crate::arch::now_ms());
-                                    k.rep_usage = usage;
-                                }
+                        // HID boot report byte 0 is a modifier **level**, not
+                        // an edge — which is why the shared layer takes a level
+                        // and the PS/2 drivers convert to one.
+                        //
+                        // Left and right Alt must be split: `0x44` is the OR of
+                        // both, and reading it as one bit is precisely why AltGr
+                        // never worked anywhere in this OS. Right Alt is `0x40`.
+                        let mut bits = 0u8;
+                        if report[0] & 0x22 != 0 {
+                            bits |= crate::keymap::Mods::SHIFT;
+                        }
+                        if report[0] & 0x11 != 0 {
+                            bits |= crate::keymap::Mods::CTRL;
+                        }
+                        if report[0] & 0x04 != 0 {
+                            bits |= crate::keymap::Mods::ALT; // left Alt / Option
+                        }
+                        if report[0] & 0x40 != 0 {
+                            bits |= crate::keymap::Mods::ALTGR; // right Alt
+                        }
+                        if report[0] & 0x88 != 0 {
+                            bits |= crate::keymap::Mods::GUI;
+                        }
+                        let mods = crate::keymap::Mods(bits);
+                        // Releases first, so a key held across two reports is not
+                        // re-pressed and the software typematic sees the edge.
+                        for &usage in &k.prev[2..8] {
+                            if usage != 0 && !report[2..8].contains(&usage) {
+                                crate::keymap::feed_event(crate::keymap::KeyEvent {
+                                    usage,
+                                    mods,
+                                    pressed: false,
+                                    src: crate::keymap::Source::UsbHid,
+                                });
                             }
                         }
-                        // The armed key was released: stop repeating it.
-                        if k.rep_usage != 0 && !report[2..8].contains(&k.rep_usage) {
-                            k.rep.release();
-                            k.rep_usage = 0;
+                        for &usage in &report[2..8] {
+                            if usage != 0 && !k.prev[2..8].contains(&usage) {
+                                crate::keymap::feed_event(crate::keymap::KeyEvent {
+                                    usage,
+                                    mods,
+                                    pressed: true,
+                                    src: crate::keymap::Source::UsbHid,
+                                });
+                            }
                         }
                         k.prev = report;
                         self.queue_interrupt(k);
@@ -2891,33 +2875,15 @@ impl Xhci {
         self.bulk_take_in_ex(out, false)
     }
 
-    fn key_push(&mut self, b: u8) {
-        let n = (self.key_head + 1) % self.key_buf.len();
-        if n != self.key_tail {
-            self.key_buf[self.key_head] = b;
-            self.key_head = n;
-        }
-    }
-
-    /// The next decoded keyboard byte, if any (drains + routes events first).
-    /// Also where held-key repeats are synthesized: USB HID reports only
-    /// press/release edges, so the armed [`crate::keyrepeat::Typematic`]
-    /// re-emits the held key's bytes at an accelerating rate.
+    /// The next translated keyboard byte, if any (drains + routes events first).
+    ///
+    /// Held-key repeat is synthesized in [`crate::keymap`], which re-runs
+    /// `translate` per repeat — correct by construction for AltGr levels, dead
+    /// keys and an IME, where the bytes a key produces are not fixed at press
+    /// time.
     pub fn poll_key(&mut self) -> Option<u8> {
         self.pump_events();
-        let rep = self.kbd.as_mut().and_then(|k| k.rep.poll(crate::arch::now_ms()));
-        if let Some((seq, n)) = rep {
-            for &b in &seq[..n] {
-                self.key_push(b);
-            }
-        }
-        if self.key_head == self.key_tail {
-            None
-        } else {
-            let b = self.key_buf[self.key_tail];
-            self.key_tail = (self.key_tail + 1) % self.key_buf.len();
-            Some(b)
-        }
+        crate::keymap::next_byte()
     }
 
     /// Drain pending pointer reports into [`crate::mouse`] (no-op without a USB
@@ -3408,68 +3374,6 @@ pub(crate) unsafe fn parse_report_layout(buf: usize, len: usize) -> Option<PtrLa
     })
 }
 
-/// Map a USB HID keyboard usage id to an ASCII byte (US layout). Handles
-/// letters, digits, common punctuation, space/enter/tab/backspace; Shift for
-/// the upper register; Ctrl+letter -> control code (Ctrl+C=3, Ctrl+D=4).
-fn hid_to_ascii(usage: u8, shift: bool, ctrl: bool) -> Option<u8> {
-    let base: u8 = match usage {
-        0x04..=0x1d => b'a' + (usage - 0x04),         // a..z
-        0x1e..=0x26 => b'1' + (usage - 0x1e),         // 1..9
-        0x27 => b'0',
-        0x28 => b'\r', // Enter
-        0x29 => 0x1b,  // Esc
-        0x2a => 0x08,  // Backspace
-        0x2b => b'\t', // Tab
-        0x2c => b' ',  // Space
-        0x2d => b'-',
-        0x2e => b'=',
-        0x2f => b'[',
-        0x30 => b']',
-        0x31 => b'\\',
-        0x33 => b';',
-        0x34 => b'\'',
-        0x35 => b'`',
-        0x36 => b',',
-        0x37 => b'.',
-        0x38 => b'/',
-        _ => return None,
-    };
-    let ch = if shift { shift_ascii(base) } else { base };
-    if ctrl && ch.is_ascii_alphabetic() {
-        Some(ch.to_ascii_uppercase() & 0x1f)
-    } else {
-        Some(ch)
-    }
-}
-
-/// The shifted form of a US-layout key.
-fn shift_ascii(c: u8) -> u8 {
-    match c {
-        b'a'..=b'z' => c.to_ascii_uppercase(),
-        b'1' => b'!',
-        b'2' => b'@',
-        b'3' => b'#',
-        b'4' => b'$',
-        b'5' => b'%',
-        b'6' => b'^',
-        b'7' => b'&',
-        b'8' => b'*',
-        b'9' => b'(',
-        b'0' => b')',
-        b'-' => b'_',
-        b'=' => b'+',
-        b'[' => b'{',
-        b']' => b'}',
-        b'\\' => b'|',
-        b';' => b':',
-        b'\'' => b'"',
-        b'`' => b'~',
-        b',' => b'<',
-        b'.' => b'>',
-        b'/' => b'?',
-        other => other,
-    }
-}
 
 
 // --- endpoint types + bulk-capable descriptor parsing ---------------------
@@ -3820,14 +3724,52 @@ mod tests {
         assert_eq!(sign_extend(1, 12), 1);
     }
 
+    /// HID usages are what this driver hands to [`crate::keymap`], so the
+    /// character mapping is tested there — including a fixture that reproduces
+    /// this driver's former `hid_to_ascii` for the whole US layout
+    /// (`keymap::tests::us_layout_reproduces_the_legacy_hid_decoder`). What is
+    /// left to check here is the one thing that is still this driver's job: that
+    /// the boot report's modifier byte is split correctly, and in particular that
+    /// **left and right Alt are separate bits**. `0x44` is the OR of both, and
+    /// reading it as one is why AltGr never worked.
     #[test_case]
-    fn hid_keyboard_ascii_mapping() {
-        assert_eq!(hid_to_ascii(0x04, false, false), Some(b'a')); // 'a'
-        assert_eq!(hid_to_ascii(0x04, true, false), Some(b'A')); // Shift+a
-        assert_eq!(hid_to_ascii(0x06, false, true), Some(3)); // Ctrl+c = 0x03
-        assert_eq!(hid_to_ascii(0x28, false, false), Some(b'\r')); // Enter
-        assert_eq!(hid_to_ascii(0x2c, false, false), Some(b' ')); // Space
-        assert_eq!(hid_to_ascii(0x00, false, false), None); // no key
+    fn boot_report_modifier_bits_split_left_and_right_alt() {
+        use crate::keymap::Mods;
+        // The same expression the report handler uses, isolated.
+        let bits = |b0: u8| -> u8 {
+            let mut bits = 0u8;
+            if b0 & 0x22 != 0 {
+                bits |= Mods::SHIFT;
+            }
+            if b0 & 0x11 != 0 {
+                bits |= Mods::CTRL;
+            }
+            if b0 & 0x04 != 0 {
+                bits |= Mods::ALT;
+            }
+            if b0 & 0x40 != 0 {
+                bits |= Mods::ALTGR;
+            }
+            if b0 & 0x88 != 0 {
+                bits |= Mods::GUI;
+            }
+            bits
+        };
+        assert_eq!(bits(0x00), 0);
+        assert_eq!(bits(0x02), Mods::SHIFT, "left shift");
+        assert_eq!(bits(0x20), Mods::SHIFT, "right shift");
+        assert_eq!(bits(0x01), Mods::CTRL);
+        assert_eq!(bits(0x10), Mods::CTRL, "right ctrl");
+        assert_eq!(bits(0x04), Mods::ALT, "LEFT Alt is a meta modifier");
+        assert_eq!(bits(0x40), Mods::ALTGR, "RIGHT Alt selects the AltGr level");
+        assert_eq!(bits(0x08), Mods::GUI);
+        assert_eq!(bits(0x80), Mods::GUI, "right GUI");
+        // The two Alts together set both, and only right Alt selects AltGr.
+        assert_eq!(bits(0x44), Mods::ALT | Mods::ALTGR);
+        assert!(Mods(bits(0x40)).altgr());
+        assert!(!Mods(bits(0x04)).altgr(), "left Alt alone must not be AltGr");
+        // Ctrl+Alt is also AltGr, for keyboards with no right Alt.
+        assert!(Mods(bits(0x05)).altgr());
     }
 
     /// Route strings pack one hub-port nibble per tier below the root hub: a

@@ -282,14 +282,20 @@ pub(super) fn run_screenshot(arg: &str) {
     // A screenshot reads whatever is on the panel, which crosses every agent
     // boundary the scope gate defends: another agent's surface, the human's
     // chat, a password modal. So a non-root agent may capture **only its own
-    // surface**. The orchestrator is the human's own shell (invariant: it holds
-    // root authority and is the trust root), so it sees the whole screen.
+    // surface**.
+    //
+    // The gate is `in_tool_call()` — "a model chose this call" — and *not*
+    // `active_agent_id()` alone. Those are different questions, and conflating
+    // them was a real bug: `active_agent_id` reports which agent the **chat is
+    // homed to**, so after `/agents switch git` a human typing `/screenshot` at
+    // the console was refused as though they were the git agent. A human at the
+    // keyboard is the trust root whatever the chat is currently talking to.
     //
     // Enforced by narrowing the extent rather than refusing, because "your own
-    // window" is what an app agent actually wants and a refusal would just be
-    // worked around with a `ui_draw` read-back.
+    // window" is what an app agent actually wants and a flat refusal would just
+    // be worked around with a `ui_draw` read-back.
     let agent = active_agent_id();
-    if agent != crate::agent::manifest::ORCHESTRATOR_ID.0 {
+    if crate::shell::in_tool_call() && agent != crate::agent::manifest::ORCHESTRATOR_ID.0 {
         let task = crate::sched::current_task_id();
         match crate::synapse::ui::surface_of_owner(task) {
             Some(id) => {

@@ -54,7 +54,9 @@ pub mod fs;
 pub mod ipc;
 pub mod highlight;
 pub mod image;
+pub mod ime;
 pub mod json;
+pub mod keymap;
 pub mod keyrepeat;
 pub mod ktrace;
 pub mod limine_protocol;
@@ -95,12 +97,14 @@ pub mod skills;
 pub mod sound;
 pub mod tools;
 pub mod ui_config;
+pub mod utf8;
 // Installable themes (colours, syntax, cursor, wallpaper, opacity) — presets
 // over ui_config; bundled + store-installed.
 pub mod theme;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 pub mod synapse;
+pub mod textfit;
 pub mod textsel;
 pub mod video;
 pub mod xhci;

@@ -26,7 +26,18 @@ enum Mode {
 struct Editor {
     path: String,
     lines: Vec<String>,
-    cx: usize, // column (byte == char, ASCII)
+    /// Cursor column, as a **byte** offset into the line.
+    ///
+    /// The editor is deliberately still ASCII-only: the insert arm below matches
+    /// `0x20..=0x7e`, so a byte >= 0x80 is dropped rather than pushed into the
+    /// `String` as a lone Latin-1 char (which would corrupt the file on save).
+    /// That means `byte == char == column` holds here, and the whole cursor
+    /// arithmetic is correct as written.
+    ///
+    /// Making it Unicode-aware is a follow-up, and the arithmetic it needs
+    /// already exists in [`crate::textfit`] (`back_n_chars`, `cols`,
+    /// `visible_window`) — the work is the call sites, not the algorithms.
+    cx: usize,
     cy: usize, // row
     /// First **visual** row shown (soft-wrap aware). Logical line `0` starts at
     /// visual row 0; a long line consumes multiple visual rows.

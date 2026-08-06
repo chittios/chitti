@@ -636,6 +636,7 @@ impl Screen {
             caret_last_ms: 0,
             composer_active: false,
             composer_line: String::new(),
+            composer_preedit: String::new(),
             composer_cur: 0,
             composer_hint_l: String::from("↑↓ history · Tab select · Ctrl+P/N pick · Ctrl+R search · Enter send · /cmds · @files"),
             composer_hint_r: String::new(),
