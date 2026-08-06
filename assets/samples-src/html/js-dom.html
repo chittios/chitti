@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JS DOM build</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    #list li { padding: 4px 0; border-bottom: 1px solid #eee; }
+    #list li.done { text-decoration: line-through; color: #888; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 0.75rem 0; }
+    input[type="text"] { flex: 1; min-width: 120px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <h1>JS DOM build</h1>
+    <p>Interactive list — <code>createElement</code>, <code>appendChild</code>, <code>classList</code>, clicks.</p>
+  </header>
+
+  <main class="card">
+    <div class="row">
+      <input type="text" id="item" value="first task" placeholder="item text">
+      <button type="button" id="add">Add</button>
+      <button type="button" id="clear">Clear</button>
+    </div>
+    <ul id="list"></ul>
+    <p class="muted" id="hint">Add items, click a row to toggle done.</p>
+  </main>
+
+  <p class="foot"><a href="index.html">← samples index</a></p>
+  <script src="js-dom.js"></script>
+</body>
+</html>

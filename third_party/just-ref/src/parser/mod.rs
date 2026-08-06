@@ -1,4 +1,4 @@
-mod api;
+pub mod api;
 pub mod ast;
 #[cfg(test)]
 mod numeric_string_unit_tests;

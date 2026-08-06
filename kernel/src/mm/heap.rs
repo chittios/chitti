@@ -250,31 +250,75 @@ unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
 /// Called from the global alloc-error path when `alloc` returned null and Rust
 /// is about to panic. Tries one last reclaim, then **OOM-kills** the current
 /// non-bootstrap task so the shell survives. Bootstrap still panics.
+/// Decimal-format `n` into `buf` without allocating — the OOM path cannot use
+/// `format!`, which is what failed to begin with.
+fn usize_to_str(mut n: usize, buf: &mut [u8; 20]) -> &str {
+    if n == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let mut i = buf.len();
+    while n > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    core::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+/// Set while [`on_alloc_error`] is running, so a failure *inside* the recovery
+/// path cannot re-enter it.
+///
+/// Recovery allocates: `reclaim::run()` and `grow()` both do. When the heap is
+/// genuinely exhausted those allocations fail too, and the handler is entered
+/// again — from inside itself, holding the allocator's own lock. It then spins
+/// on that lock forever with interrupts disabled, which is a dead machine: no
+/// output, no Ctrl+C, no scheduler. Recovery is attempted exactly once.
+static IN_OOM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub fn on_alloc_error(layout: Layout) -> ! {
     let size = layout.size();
-    crate::ktrace::log_fmt(format_args!(
-        "mm: OOM allocating {} bytes (after grow+reclaim)",
-        size
-    ));
-    // One more reclaim pass — a hook registered after the first pass may help.
-    let _ = super::reclaim::run();
-    if grow(size.max(GROW_CHUNK)) {
-        // Cannot usefully return the pointer to the original caller from here;
-        // the allocation already failed. Fall through to kill / panic.
+    let reentered = IN_OOM.swap(true, Ordering::Relaxed);
+    // Report on the **raw UART only**. The full ktrace path mirrors into the
+    // framebuffer console, which takes a non-reentrant spinlock — and an
+    // allocation can fail *inside* a critical section that already holds it
+    // (painting allocates). Logging from here then spun forever with interrupts
+    // disabled: the machine stopped dead, printing nothing, while trying to
+    // print "out of memory". A page that exhausted the heap took the whole OS
+    // with it, and the only escape was killing the VM.
+    crate::serial::write_str_raw("mm: OOM allocating ");
+    let mut buf = [0u8; 20];
+    crate::serial::write_str_raw(usize_to_str(size, &mut buf));
+    crate::serial::write_str_raw(" bytes (after grow+reclaim)\n");
+    if !reentered {
+        // One more reclaim pass — a hook registered after the first pass may
+        // help. Both of these ALLOCATE, which is why they run only on the first
+        // entry: on the second they would deadlock in the allocator we are here
+        // because of.
+        let _ = super::reclaim::run();
+        if grow(size.max(GROW_CHUNK)) {
+            // Cannot usefully return the pointer to the original caller from
+            // here; the allocation already failed. Fall through to kill / panic.
+        }
+    } else {
+        crate::serial::write_str_raw("mm: OOM while handling OOM — skipping recovery\n");
     }
     // Kill the current agent task rather than the whole OS.
     if crate::sched::initialized() {
         let cur = crate::sched::current_task_id();
         if cur != 0 {
             super::reclaim::note_oom_kill();
-            crate::ktrace::log_fmt(format_args!(
-                "mm: OOM-killing task {cur} (quota or arena exhausted)"
-            ));
+            crate::serial::write_str_raw("mm: OOM-killing task (quota or arena exhausted)\n");
             // Does not return when it succeeds (switches to another task).
+            IN_OOM.store(false, Ordering::Relaxed);
             crate::sched::fault_current_task("oom");
         }
     }
-    panic!("mm: out of memory allocating {} bytes (bootstrap / no kill path)", size);
+    // Raw serial, not `panic!`'s formatter + console: the panic path itself
+    // logs through the framebuffer, and this is exactly the moment that cannot
+    // afford another lock.
+    crate::serial::write_str_raw("mm: out of memory (bootstrap / no kill path) — halting\n");
+    panic!("mm: out of memory");
 }
 
 impl Locked<LinkedListAllocator> {

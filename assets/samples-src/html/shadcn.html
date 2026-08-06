@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>shadcn/ui gallery</title>
+  <link rel="stylesheet" href="./shadcn.css" />
+</head>
+<body class="bg-background text-foreground">
+  <div id="root">
+    <div class="flex min-h-screen items-center justify-center p-4">
+      <p class="font-mono text-sm text-muted-foreground">loading shadcn/ui bundle…</p>
+    </div>
+  </div>
+  <script src="./shadcn.js"></script>
+  <script>
+    (function () {
+      // Read the document back: every section the gallery renders gets an id,
+      // so a component that failed to mount is NAMED instead of silently
+      // missing from a screenshot.
+      var ids = ["button", "badge", "card", "input", "label", "textarea", "checkbox",
+                 "switch", "separator", "progress", "avatar", "skeleton", "alert",
+                 "tabs", "accordion", "table"];
+      var missing = [];
+      for (var i = 0; i < ids.length; i++) {
+        if (!document.getElementById("sec-" + ids[i])) { missing.push(ids[i]); }
+      }
+      var root = document.getElementById("root");
+      var h1 = root && root.querySelector && root.querySelector("h1");
+      var link = document.querySelector("link");
+      var href = link && (link.getAttribute ? link.getAttribute("href") : link.href);
+      var css = !!(href && String(href).indexOf("shadcn.css") >= 0);
+      // Count what actually reached the document. "the section frames paint but
+      // they are empty" and "the components never rendered" look identical on
+      // screen, and only these counts tell them apart.
+      var counts = "buttons=" + document.querySelectorAll("button").length +
+                   " inputs=" + document.querySelectorAll("input").length +
+                   " divs=" + document.querySelectorAll("div").length;
+      if (h1 && css && missing.length === 0) {
+        console.log("shadcn MOUNTED " + h1.textContent + " " + counts);
+      } else {
+        console.log(
+          "shadcn NOT MOUNTED h1=" + !!h1 + " css=" + css + " missing=" + missing.join(",")
+        );
+      }
+    })();
+  </script>
+</body>
+</html>

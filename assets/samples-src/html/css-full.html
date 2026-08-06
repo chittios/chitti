@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CSS full suite</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="full.css">
+</head>
+<body class="full">
+  <header class="hero">
+    <h1>CSS full suite</h1>
+    <p class="muted">Large visual checklist for <code>/browse</code> cascade features. Sheet: <code>full.css</code> (<code>@import</code> <code>theme.css</code>).</p>
+    <p class="sticky-note no-print">sticky bar · selectors · flex · grid · float · table · position · type · gradients</p>
+  </header>
+
+  <section class="card">
+    <h2>1. Selectors</h2>
+    <p class="label">child <code>&gt;</code>, <code>:nth-child</code>, <code>:first-child</code>/<code>:last-child</code>, <code>[href]</code>, <code>[type]</code>, <code>[class~=]</code>, <code>[data-role]</code></p>
+    <ul class="sel">
+      <li>first · odd · 3n+1</li>
+      <li>even</li>
+      <li>odd · 3n+1</li>
+      <li>even · last</li>
+    </ul>
+    <p>
+      <a href="index.html">link with href</a>
+      · <span class="mark other">class~=mark</span>
+      · <span class="hl" data-role="tag">data-role</span>
+      · <input type="text" value="type=text" readonly>
+      · <input type="search" value="type=search" readonly>
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>2. Generated content</h2>
+    <p class="gen">middle text between before/after markers</p>
+  </section>
+
+  <section class="card">
+    <h2>3. Flex · calc · var · @media</h2>
+    <div class="flex-row">
+      <div class="box">A · flex:1</div>
+      <div class="box grow2">B · flex:2 + gap/pad from var/calc</div>
+      <div class="box">C · stacks ≤480px</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>4. Grid (3-col + span)</h2>
+    <div class="grid3">
+      <div class="cell">1</div>
+      <div class="cell">2</div>
+      <div class="cell">3</div>
+      <div class="cell span2">span 2</div>
+      <div class="cell">6</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>5. Float · clear · ellipsis</h2>
+    <div class="float-box">float</div>
+    <p>Paragraph wraps beside the float box.</p>
+    <p class="after-float ok">cleared — sits below the float</p>
+    <p class="clip">ellipsis overflow: this line is deliberately long so it should clip with an ellipsis at the end</p>
+  </section>
+
+  <section class="card">
+    <h2>6. Table · rowspan · caption</h2>
+    <table class="demo">
+      <caption>fixed layout table</caption>
+      <tr><th>A</th><th>B</th><th>C</th></tr>
+      <tr>
+        <td class="span" rowspan="2">rowspan 2</td>
+        <td>r1c2</td>
+        <td>r1c3</td>
+      </tr>
+      <tr>
+        <td>r2c2</td>
+        <td>r2c3</td>
+      </tr>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>7. Position · z-index · opacity</h2>
+    <div class="rel">
+      <span class="abs">absolute</span>
+      relative container
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>8. Typography</h2>
+    <div class="type-sample">
+      <span class="upper">upper</span> ·
+      <span class="lower">LOWER</span> ·
+      <span class="cap">title case words</span> ·
+      <em>italic</em> · <strong>strong accent</strong>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>9. Lists</h2>
+    <ul class="plain">
+      <li>plain / border-left</li>
+      <li>second item</li>
+    </ul>
+    <ol class="roman">
+      <li>roman one</li>
+      <li>roman two</li>
+    </ol>
+  </section>
+
+  <section class="card">
+    <h2>10. Display · centering</h2>
+    <div class="hidden-box">should not paint</div>
+    <div class="block-center">margin: 0 auto</div>
+    <span class="pill">pill</span>
+    <span class="tilt">tilt + cursor</span>
+  </section>
+
+  <section class="card">
+    <h2>11. Gradients</h2>
+    <div class="grad">linear-gradient accent band</div>
+    <p></p>
+    <div class="stripes">striped background-size pattern</div>
+  </section>
+
+  <section class="card">
+    <h2>12. Forms · nested cascade</h2>
+    <fieldset class="demo">
+      <legend>fieldset</legend>
+      <label class="chk"><input type="checkbox" checked> checked</label>
+      <label class="chk"><input type="checkbox"> unchecked</label>
+    </fieldset>
+    <div class="nest">
+      <div class="inner">
+        <p>outer</p>
+        <p class="deep">deep nested accent</p>
+      </div>
+    </div>
+  </section>
+
+  <p class="foot"><a href="index.html">← samples index</a> · <a href="css-suite.html">css-suite</a></p>
+</body>
+</html>

@@ -1097,6 +1097,177 @@ def s_browse(g):
     return ok, "rendered harness HTML (title E2E Browser)" if ok else "browse did not report title"
 
 
+def s_browse_runaway(g):
+    """A page whose script never returns must not take the machine with it.
+
+    The in-kernel JS engine is a tree-walking interpreter with no yield points,
+    so `/browse` on a heavy real-world site ran the shell thread into a script
+    that never came back: the clock kept ticking and nothing else could ever
+    happen. Two escapes exist and both are asserted here — Ctrl+C, and a
+    wall-clock budget for when nobody is watching.
+    """
+    # 1. Ctrl+C reaches the script, promptly.
+    m = g.mark()
+    g.send(f"/browse http://{HOST}:{PLAIN_PORT}/runaway.html")
+    if not g.wait_for("Runaway", 40, m):
+        return False, "runaway page did not load"
+    t0 = time.time()
+    g.send_raw(b"\x03")
+    if not g.wait_for("script stopped", 30, m):
+        return False, "Ctrl+C did not stop the runaway script"
+    dt = time.time() - t0
+
+    # 2. …and the shell is alive afterwards, which is the whole point.
+    m2 = g.mark()
+    g.send("/pwd")
+    if not g.wait_for("/home/chitti", 15, m2):
+        return False, "the shell did not survive the runaway page"
+
+    # 3. The page still rendered — the document is not lost with the script.
+    #    Page content is painted, not printed, so the evidence is the browser's
+    #    own layout counts (`runs=` text runs) for a paint of this URL.
+    out = g.text()[m:]
+    laid_out = [
+        ln for ln in out.splitlines() if "runaway.html" in ln and "runs=" in ln
+    ]
+    def runs_of(line):
+        try:
+            return int(line.split("runs=", 1)[1].split()[0])
+        except (IndexError, ValueError):
+            return 0
+    if not any(runs_of(ln) > 0 for ln in laid_out):
+        return False, "the page was not rendered without its script"
+    return True, f"runaway script interrupted in {dt:.1f}s; shell and page survived"
+
+
+def s_browse_samples(g):
+    """`/browse file:///samples/html/…` — local HTML/CSS/JS suites.
+
+    Skips when the kernel was built without `CHITTI_SAMPLE_FILES`. Asserts the
+    self-checking JS suites log `ALL PASS` markers and CSS pages load.
+    """
+    m = g.mark()
+    g.send("/ls /samples/html")
+    if not g.wait_for("ls> /samples/html", 15, m):
+        out = g.text()[m:]
+        if "no such file or directory" in out:
+            return None, "skipped (kernel built without CHITTI_SAMPLE_FILES)"
+        return False, "/ls /samples/html failed"
+    if not g.wait_for("js-suite.html", 12, m):
+        return False, "/samples/html missing js-suite.html"
+
+    def browse_js_pass(path, title, marker):
+        mm = g.mark()
+        g.send(f"/browse /samples/html/{path}")
+        if not g.wait_for(f"ok:title={title}", 40, mm):
+            return False, f"{path} did not load (ok:title={title})"
+        if not g.wait_for(marker, 15, mm):
+            out = g.text()[mm:]
+            prefix = marker.split()[0]
+            fail = f"{prefix} FAIL" if f"{prefix} FAIL" in out else "no ALL PASS marker"
+            return False, f"{path} assertions failed ({fail})"
+        return True, None
+
+    for path, title, marker in (
+        ("js-suite.html", "JS suite", "js-suite ALL PASS"),
+        ("js-full.html", "JS full suite", "js-full ALL PASS"),
+        ("js-fetch.html", "JS fetch suite", "js-fetch ALL PASS"),
+        ("js-iframe.html", "JS iframe / postMessage suite", "js-iframe ALL PASS"),
+        # The real Vite/React 18 production bundle. `ALL PASS` is logged from
+        # inside the mounted component, so it is proof the bundle *ran*; the
+        # `<h1>` check below is proof it reached the DOM.
+        ("react-tw.html", "React + Tailwind", "react-tw ALL PASS"),
+    ):
+        ok, err = browse_js_pass(path, title, marker)
+        if not ok:
+            return False, err
+
+    # …and the bundle's output really landed in the document: the trailing
+    # inline script reads `#root` back and reports the mounted <h1>.
+    m = g.mark()
+    g.send("/browse /samples/html/react-tw.html")
+    if not g.wait_for("ok:title=React + Tailwind", 40, m):
+        return False, "react-tw did not reload"
+    if not g.wait_for("react-tw MOUNTED React + Tailwind", 15, m):
+        out = g.text()[m:]
+        why = "react-tw NOT MOUNTED" if "react-tw NOT MOUNTED" in out else "no MOUNTED marker"
+        return False, f"React did not mount into the DOM ({why})"
+
+    # The shadcn/ui gallery: real Radix-backed components. `IMPORTS OK` proves
+    # the bundle executed, a `SECTION FAIL` line names any component whose
+    # render threw, and `MOUNTED` proves every section reached the document.
+    m = g.mark()
+    g.send("/browse /samples/html/shadcn.html")
+    # The gallery is a 226 KiB bundle of real component code on a tree-walking
+    # interpreter — it is the heaviest page in the corpus, so it gets the
+    # longest budget of any scenario here.
+    if not g.wait_for("ok:title=shadcn/ui gallery", 240, m):
+        return False, "shadcn gallery did not load"
+    if not g.wait_for("shadcn IMPORTS OK", 60, m):
+        return False, "shadcn bundle did not execute (no IMPORTS OK)"
+    out = g.text()[m:]
+    if "shadcn SECTION FAIL" in out:
+        fails = [
+            ln.split("shadcn SECTION FAIL", 1)[1].strip()
+            for ln in out.splitlines()
+            if "shadcn SECTION FAIL" in ln
+        ]
+        names = sorted({f.split(":", 1)[0].strip() for f in fails})
+        # Carry one whole message: the component name says *which*, the message
+        # says *why*, and the why is what a fix needs.
+        why = fails[0][:180] if fails else ""
+        return False, f"shadcn components failed to render: {','.join(names)} — {why}"
+    # Not just "a section frame exists" — the components inside it must have
+    # produced real elements. An empty frame is the failure that looks like
+    # success on screen.
+    if not g.wait_for("shadcn MOUNTED", 60, m):
+        out = g.text()[m:]
+        why = "shadcn NOT MOUNTED" if "shadcn NOT MOUNTED" in out else "no MOUNTED marker"
+        return False, f"shadcn gallery did not mount ({why})"
+    out = g.text()[m:]
+    mounted = next((ln for ln in out.splitlines() if "shadcn MOUNTED" in ln), "")
+    # The components must reach LAYOUT, not just the DOM. A commit that stops
+    # part-way down the tree leaves every section frame drawn and empty — the
+    # page looks rendered and is not, and the DOM counts above cannot see it.
+    stats = [ln for ln in out.splitlines() if "rects=" in ln and "ctrls=" in ln]
+    if not stats:
+        return False, "no browser layout stats for the shadcn gallery"
+    stat = stats[-1]
+
+    def count(line, key):
+        try:
+            return int(line.split(key, 1)[1].split()[0])
+        except (IndexError, ValueError):
+            return -1
+
+    ctrls = count(stat, "ctrls=")
+    runs = count(stat, "runs=")
+    if ctrls < 10 or runs < 100:
+        return False, (
+            f"shadcn gallery laid out only part of its tree (ctrls={ctrls}, runs={runs}) "
+            "— section frames would paint empty"
+        )
+    for want, least in (("buttons=", 10), ("inputs=", 1)):
+        got = mounted.split(want, 1)[1].split()[0] if want in mounted else "0"
+        if not got.isdigit() or int(got) < least:
+            return False, f"shadcn sections are empty ({want}{got}, expected >= {least})"
+
+    m = g.mark()
+    g.send("/browse /samples/html/css-suite.html")
+    if not g.wait_for("ok:title=CSS suite", 40, m):
+        return False, "css-suite did not load"
+    if "file:///samples/html/css-suite.html" not in g.text()[m:]:
+        if not g.wait_for("file:///samples/html/css-suite.html", 5, m):
+            return False, "css-suite URL not file:///"
+
+    m = g.mark()
+    g.send("/browse /samples/html/css-full.html")
+    if not g.wait_for("ok:title=CSS full suite", 40, m):
+        return False, "css-full did not load"
+
+    return True, "JS suites ALL PASS, React 18 + shadcn/ui gallery mounted, css-suite/css-full loaded"
+
+
 def s_http_post(g):
     m = g.mark()
     g.send(f'/http -X POST -H "X-Test: yes" -d payload-9182 http://{HOST}:{PLAIN_PORT}/echo')
@@ -1752,7 +1923,7 @@ def s_samples(g):
     out = g.text()[m:]
     if "no such file or directory" in out:
         return None, "skipped (kernel built without CHITTI_SAMPLE_FILES)"
-    for cat in ("images/", "videos/", "audios/", "misc/"):
+    for cat in ("images/", "videos/", "audios/", "misc/", "html/"):
         if cat not in out:
             return False, f"/samples is missing the {cat} category"
 
@@ -2959,7 +3130,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("clipboard", s_clipboard),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

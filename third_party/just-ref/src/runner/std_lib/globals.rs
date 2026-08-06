@@ -332,6 +332,8 @@ impl PluginResolver for GlobalsResolver {
             n if is_global_fn(n) => {
                 let f = make_object(vec![]);
                 set_own_prop(&f, "__builtin_name__", JsValue::String(n.to_string()), false);
+                // Real engines report these as typeof "function".
+                set_own_prop(&f, "__host_fn__", JsValue::Boolean(true), false);
                 f
             }
             _ => JsValue::Undefined,
@@ -340,13 +342,48 @@ impl PluginResolver for GlobalsResolver {
 
     fn call_method(
         &self,
-        _object_name: &str,
-        _method_name: &str,
+        object_name: &str,
+        method_name: &str,
         _ctx: &mut EvalContext,
         _this: JsValue,
-        _args: Vec<JsValue>,
+        args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
-        None
+        if object_name != "Symbol" {
+            return None;
+        }
+        match method_name {
+            // Global symbol registry. Same key → same symbol (description identity).
+            // Prefix keeps these distinct from `Symbol("key")` under description Eq.
+            "for" => {
+                let key = match args.get(0) {
+                    Some(JsValue::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => String::from("undefined"),
+                };
+                Some(Ok(JsValue::Symbol(SymbolData::new(alloc::format!(
+                    "Symbol.for({key})"
+                )))))
+            }
+            "keyFor" => match args.get(0) {
+                Some(JsValue::Symbol(s)) => {
+                    let d = s.description();
+                    if let Some(key) = d
+                        .strip_prefix("Symbol.for(")
+                        .and_then(|r| r.strip_suffix(')'))
+                    {
+                        Some(Ok(JsValue::String(key.to_string())))
+                    } else {
+                        Some(Ok(JsValue::Undefined))
+                    }
+                }
+                _ => Some(Ok(JsValue::Undefined)),
+            },
+            _ => None,
+        }
+    }
+
+    fn has_method(&self, object_name: &str, method_name: &str) -> bool {
+        object_name == "Symbol" && matches!(method_name, "for" | "keyFor")
     }
 
     fn call_constructor(
@@ -426,12 +463,17 @@ impl PluginResolver for GlobalsResolver {
                 return Some(to_bigint(&a0));
             }
             "Symbol" => {
+                // Every `Symbol(desc)` call is a distinct value, even when
+                // descriptions match — contrast `Symbol.for`, which is keyed.
                 let desc = match &a0 {
                     JsValue::Undefined => String::new(),
                     JsValue::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                JsValue::Symbol(SymbolData::new(desc))
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                let n = NEXT.fetch_add(1, Ordering::Relaxed);
+                JsValue::Symbol(SymbolData::new(alloc::format!("Symbol({desc})#{n}")))
             }
             _ => JsValue::Undefined,
         };

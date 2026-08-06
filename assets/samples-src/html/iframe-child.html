@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>iframe child</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 12px; background: #fff3e8; color: #2a2a2a; }
+    #msg { font-weight: 600; color: #cc785c; }
+  </style>
+</head>
+<body>
+  <p>iframe child</p>
+  <p id="msg">waiting</p>
+  <script>
+    (function () {
+      var msg = document.getElementById("msg");
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage("child-hello", "*");
+          if (msg) msg.textContent = "posted to parent";
+        } else if (msg) {
+          msg.textContent = "no parent";
+        }
+      } catch (e) {
+        if (msg) msg.textContent = "err " + e;
+      }
+      window.addEventListener("message", function (ev) {
+        if (msg) msg.textContent = "got: " + (ev && ev.data != null ? ev.data : "?");
+        try {
+          if (window.parent) window.parent.postMessage("child-ack:" + (ev && ev.data), "*");
+        } catch (e2) {}
+      });
+    })();
+  </script>
+</body>
+</html>

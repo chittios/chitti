@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JS full suite</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    #results { font-family: ui-monospace, monospace; font-size: 0.85rem; line-height: 1.4; }
+    #results .pass { color: #2e7d32; }
+    #results .fail { color: #c62828; }
+    #results .sum { margin-top: 0.75rem; font-weight: 600; }
+    #playground { position: absolute; left: -9999px; top: 0; width: 1px; height: 1px; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <h1>JS full suite</h1>
+    <p>Large self-check: DOM, storage, canvas, Promise/JSON/Math, events, encodeURI.</p>
+  </header>
+  <main class="card">
+    <div id="results">running…</div>
+  </main>
+  <div id="playground" aria-hidden="true">
+    <div id="box" data-k="v" class="a b">seed</div>
+    <span class="x">1</span>
+    <span class="x">2</span>
+    <span class="x">3</span>
+    <canvas id="c" width="32" height="24"></canvas>
+    <a id="link" href="index.html">home</a>
+    <input id="inp" type="text" name="q" value="hi" placeholder="type">
+    <ul id="list"><li class="item">a</li><li class="item">b</li></ul>
+  </div>
+  <p class="foot"><a href="index.html">← samples index</a></p>
+  <script src="harness.js"></script>
+  <script src="js-full.js"></script>
+</body>
+</html>

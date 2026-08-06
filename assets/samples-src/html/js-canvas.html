@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JS canvas</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    canvas {
+      display: block;
+      margin: 0.5rem 0;
+      background: #1a1a1a;
+      border-radius: 8px;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 0.75rem; }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <h1>JS canvas</h1>
+    <p><code>getContext('2d')</code> fill / stroke under <code>file:///</code>.</p>
+  </header>
+
+  <main class="card">
+    <canvas id="c" width="320" height="180"></canvas>
+    <div class="row">
+      <button type="button" id="paint">Paint</button>
+      <button type="button" id="clear">Clear</button>
+    </div>
+    <p class="foot" id="status">ready</p>
+  </main>
+
+  <p class="foot"><a href="index.html">← samples index</a></p>
+  <script src="js-canvas.js"></script>
+</body>
+</html>

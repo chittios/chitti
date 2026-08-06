@@ -1625,7 +1625,7 @@ mod sample_file_tests {
         let mut seen: Vec<String> = Vec::new();
         for s in SAMPLE_FILES {
             assert!(
-                matches!(s.category, "images" | "videos" | "audios" | "misc" | "js"),
+                matches!(s.category, "images" | "videos" | "audios" | "misc" | "js" | "html"),
                 "{}: unknown category {:?}",
                 s.name,
                 s.category
@@ -1662,7 +1662,7 @@ mod sample_file_tests {
         // that fall through to the editor, plus `.js` for `/js` (and `/open` → editor).
         const OPENABLE: &[&str] = &[
             "png", "jpg", "jpeg", "wav", "mp3", "aac", "mp4", "mov", "mkv", "webm", "pdf", "txt",
-            "json", "csv", "html", "md", "js",
+            "json", "csv", "html", "md", "js", "css",
         ];
         for s in SAMPLE_FILES {
             let ext = s.name.rsplit('.').next().unwrap_or_default();
@@ -2227,6 +2227,28 @@ fn require_gguf_for_run(model: Model, no_model: bool) -> Result<Option<PathBuf>,
 ///
 /// The distributable `image -arch aarch64` still puts the model on the ESP for
 /// real hardware; this `run --uefi` path optimises for QEMU correctness.
+/// `CHITTI_GDB=1` opens QEMU's gdbstub on :1234 so a debugger can break into a
+/// *hung* guest and get a backtrace. That is the only way to answer "which
+/// native loop is the kernel stuck in": a spin inside native code never reaches
+/// the cooperative UI pump, so nothing inside the guest can report it — not the
+/// script budget, not Ctrl+C, not ktrace. `CHITTI_GDB=wait` also halts at reset
+/// so breakpoints can be set before boot.
+///
+/// Usage: `CHITTI_GDB=1 cargo xtask run -arch aarch64`, then
+/// `lldb kernel/target/aarch64-chitti/release/chitti-kernel -o "gdb-remote 1234"`
+/// and `process interrupt` + `bt`.
+fn gdbstub_args(qemu: &mut Command) {
+    match std::env::var("CHITTI_GDB").as_deref() {
+        Ok("wait") => {
+            qemu.args(["-gdb", "tcp::1234", "-S"]);
+        }
+        Ok(v) if !v.is_empty() => {
+            qemu.args(["-gdb", "tcp::1234"]);
+        }
+        _ => {}
+    }
+}
+
 fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no_model: bool) -> Result<(), String> {
     let elf = build_kernel_aarch64(true, model.features())?;
     assert_identity_kernel(&elf)?;
@@ -2234,6 +2256,7 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
     let mut qemu = Command::new("qemu-system-aarch64");
     qemu.args(["-M", "virt", "-smp", &smp_count(), "-m", model.qemu_mem()]);
     qemu.args(accel_args("aarch64"));
+    gdbstub_args(&mut qemu);
     for a in aavmf_pflash_args()? {
         qemu.arg(a);
     }
@@ -2315,6 +2338,7 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     // Ctrl-A C for the monitor).
     qemu.args(["-M", "virt", "-smp", &smp_count(), "-m", model.qemu_mem()]);
     qemu.args(accel_args("aarch64"));
+    gdbstub_args(&mut qemu);
     for a in gpu_device_args("aarch64", false) {
         qemu.arg(a);
     }
@@ -3719,6 +3743,246 @@ const SAMPLE_FILES: &[SampleFile] = &[
         name: "json.js",
         url: "",
         note: "JSON.stringify / JSON.parse round-trip (in-tree, ChittiOS)",
+        openable: true,
+    },
+    // HTML — pages for `/browse file:///samples/html/…` (authored in-tree;
+    // relative CSS/JS resolve as file:/// subresources from the store).
+    SampleFile {
+        category: "html",
+        name: "index.html",
+        url: "",
+        note: "browse landing page linking CSS/JS sample suites (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "hello.html",
+        url: "",
+        note: "minimal HTML + inline script smoke test for /browse file:/// (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "css-demo.html",
+        url: "",
+        note: "flex/grid/@media/calc/var/::before CSS demo for /browse (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "css-suite.html",
+        url: "",
+        note: "CSS checklist: selectors, float/clear, tables, position, @import (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "css-full.html",
+        url: "",
+        note: "large CSS visual suite (full.css @import theme) for /browse (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "css-hn.html",
+        url: "",
+        note: "HN-like table + link colour cascade for /browse (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-demo.html",
+        url: "",
+        note: "page that loads relative styles.css + app.js over file:/// (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-suite.html",
+        url: "",
+        note: "self-checking DOM/storage/canvas/events suite for /browse (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-full.html",
+        url: "",
+        note: "large self-checking DOM/Promise/Math/storage/canvas suite (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-fetch.html",
+        url: "",
+        note: "self-checking fetch over file:///samples JSON (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-iframe.html",
+        url: "",
+        note: "iframe src/srcdoc + postMessage self-delivery suite (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "iframe-child.html",
+        url: "",
+        note: "iframe child page for postMessage samples (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-dom.html",
+        url: "",
+        note: "interactive DOM list demo (createElement/classList/clicks) (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-canvas.html",
+        url: "",
+        note: "canvas 2D paint/clear demo for /browse (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "styles.css",
+        url: "",
+        note: "shared stylesheet for /samples/html (relative link target; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "theme.css",
+        url: "",
+        note: "@import target for suite.css (ok/bad colours; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "suite.css",
+        url: "",
+        note: "css-suite stylesheet with @import theme.css (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "full.css",
+        url: "",
+        note: "css-full stylesheet with @import theme.css (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "fetch-data.json",
+        url: "",
+        note: "JSON fixture for js-fetch suite (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "app.js",
+        url: "",
+        note: "shared page script for /samples/html index + js-demo (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "harness.js",
+        url: "",
+        note: "shared PASS/FAIL harness for large JS suites (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-suite.js",
+        url: "",
+        note: "self-checking assertions for js-suite.html (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-full.js",
+        url: "",
+        note: "assertions for js-full.html (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-fetch.js",
+        url: "",
+        note: "assertions for js-fetch.html (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-iframe.js",
+        url: "",
+        note: "assertions for js-iframe.html (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "react-tw.html",
+        url: "",
+        note: "Vite React+Tailwind sample page (built from tools/react-tw; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "react-tw.js",
+        url: "",
+        note: "React 18 IIFE bundle for react-tw.html (npm build artifact; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "react-tw.css",
+        url: "",
+        note: "Tailwind CSS build for react-tw.html (npm build artifact; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "shadcn.html",
+        url: "",
+        note: "shadcn/ui component gallery (built from tools/react-shadcn; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "shadcn.js",
+        url: "",
+        note: "React 18 + shadcn/ui IIFE bundle for shadcn.html (npm build artifact; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "shadcn.css",
+        url: "",
+        note: "Tailwind CSS build for shadcn.html (npm build artifact; in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-dom.js",
+        url: "",
+        note: "interactive list script for js-dom.html (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "js-canvas.js",
+        url: "",
+        note: "canvas paint script for js-canvas.html (in-tree, ChittiOS)",
+        openable: true,
+    },
+    SampleFile {
+        category: "html",
+        name: "README.md",
+        url: "",
+        note: "how to /browse the html samples (in-tree, ChittiOS)",
         openable: true,
     },
 ];

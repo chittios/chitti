@@ -49,7 +49,7 @@ pub enum Kind {
 /// small hand-list: every entry here must actually take a path (the catalogue
 /// is the source of truth for *names*, this is about *argument shape*).
 pub const PATH_COMMANDS: &[&str] = &[
-    "ls", "cat", "open", "mkdir", "rm", "cp", "mv", "touch", "glob", "grep",
+    "ls", "cat", "open", "browse", "mkdir", "rm", "cp", "mv", "touch", "glob", "grep",
 ];
 
 /// Active completion context: kind, the typed prefix (without `/` or `@`),

@@ -1,0 +1,278 @@
+/* Large CSS checklist for /browse — visual + cascade coverage. */
+@import url("theme.css");
+
+:root {
+  --gap: 10px;
+  --accent: #cc785c;
+  --ink: #2a2a2a;
+  --muted: #666;
+  --card: #fff;
+  --line: #ddd;
+  --pad: calc(6px + 6px);
+  --radius: 8px;
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  --nested: var(--accent, #f00);
+}
+
+body.full {
+  color: var(--ink);
+  line-height: 1.45;
+}
+
+.full h2 {
+  color: var(--nested);
+  margin: 1.4rem 0 0.55rem;
+  font-size: 1.15rem;
+  letter-spacing: 0.02em;
+}
+
+.full .card {
+  margin-bottom: 1rem;
+  box-shadow: var(--shadow);
+}
+
+.full .label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+/* --- Selectors --- */
+.full .sel > li { list-style: square; }
+.full .sel li:nth-child(odd) { background: #fff3e8; }
+.full .sel li:nth-child(even) { background: #f0f0f0; }
+.full .sel li:nth-child(3n+1) {
+  border-left: 3px solid var(--accent);
+  padding-left: 6px;
+}
+.full .sel li:first-child { font-weight: 600; }
+.full .sel li:last-child { border-bottom: 1px dashed var(--line); }
+.full a[href] { text-decoration: underline; color: var(--accent); }
+.full a[href]:hover { opacity: 0.85; }
+.full input[type="text"],
+.full input[type="search"] {
+  border: 1px solid var(--accent);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+.full span[class~="mark"] { background: #ffe0d0; padding: 0 4px; }
+.full .hl[data-role="tag"] { outline: 1px dashed var(--accent); padding: 0 3px; }
+
+/* --- Generated content --- */
+.full .gen::before { content: "[before] "; color: var(--accent); }
+.full .gen::after { content: " [after]"; color: #888; }
+
+/* --- Flex / calc / media --- */
+.full .flex-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  width: calc(100% - 16px);
+  align-items: stretch;
+}
+.full .flex-row .box {
+  flex: 1;
+  min-width: 90px;
+  padding: var(--pad);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.full .flex-row .box.grow2 { flex: 2; }
+@media (max-width: 480px) {
+  .full .flex-row { display: block; }
+  .full .flex-row .box { margin-bottom: 8px; }
+}
+
+/* --- Grid --- */
+.full .grid3 {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: var(--gap);
+}
+.full .grid3 .cell {
+  padding: 10px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  text-align: center;
+}
+.full .grid3 .span2 { grid-column: span 2; }
+
+/* --- Float / clear / overflow --- */
+.full .float-box {
+  float: left;
+  width: 72px;
+  height: 48px;
+  margin: 0 12px 8px 0;
+  background: var(--accent);
+  color: #fff;
+  text-align: center;
+  line-height: 48px;
+  border-radius: 4px;
+}
+.full .after-float { clear: both; padding-top: 4px; }
+.full .clip {
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+/* --- Table --- */
+.full table.demo {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  margin-top: 0.5rem;
+}
+.full table.demo th,
+.full table.demo td {
+  border: 1px solid #ccc;
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: middle;
+}
+.full table.demo th { background: #eee; }
+.full table.demo td.span { background: #fff3e8; }
+.full table.demo caption {
+  caption-side: bottom;
+  font-size: 0.8rem;
+  color: var(--muted);
+  padding-top: 4px;
+}
+
+/* --- Position / z-index / opacity --- */
+.full .rel {
+  position: relative;
+  height: 64px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  padding: 8px;
+}
+.full .abs {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  background: var(--accent);
+  color: #fff;
+  padding: 2px 8px;
+  border-radius: 4px;
+  z-index: 2;
+  opacity: 0.95;
+}
+.full .sticky-note {
+  position: sticky;
+  top: 0;
+  background: #fff8f3;
+  border-bottom: 1px solid #f0d0c0;
+  padding: 4px 8px;
+  font-size: 0.85rem;
+}
+
+/* --- Typography --- */
+.full .type-sample {
+  font-size: 1rem;
+  line-height: 1.6;
+  letter-spacing: 0.01em;
+}
+.full .type-sample .upper { text-transform: uppercase; }
+.full .type-sample .lower { text-transform: lowercase; }
+.full .type-sample .cap { text-transform: capitalize; }
+.full .type-sample em { font-style: italic; }
+.full .type-sample strong { font-weight: 700; color: var(--accent); }
+
+/* --- Lists --- */
+.full ul.plain {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.4rem 0;
+}
+.full ul.plain li {
+  padding: 4px 0 4px 12px;
+  border-left: 2px solid var(--accent);
+  margin-bottom: 4px;
+}
+.full ol.roman { list-style-type: lower-roman; }
+
+/* --- Visibility / display --- */
+.full .hidden-box { display: none; }
+.full .invisible { visibility: hidden; height: 0; overflow: hidden; }
+.full .block-center {
+  display: block;
+  width: 160px;
+  margin: 0.5rem auto;
+  padding: 8px;
+  text-align: center;
+  background: #fff3e8;
+  border-radius: var(--radius);
+}
+
+/* --- Gradients / backgrounds --- */
+.full .grad {
+  padding: 12px;
+  border-radius: var(--radius);
+  color: #fff;
+  background: linear-gradient(90deg, #cc785c, #8b5a4a);
+  text-align: center;
+  font-weight: 600;
+}
+.full .stripes {
+  padding: 10px;
+  border-radius: var(--radius);
+  background: linear-gradient(135deg, #fff3e8 25%, #ffe0d0 25%, #ffe0d0 50%, #fff3e8 50%, #fff3e8 75%, #ffe0d0 75%);
+  background-size: 16px 16px;
+  border: 1px solid var(--line);
+}
+
+/* --- Transform / cursor --- */
+.full .tilt {
+  display: inline-block;
+  padding: 8px 14px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  transform: rotate(-2deg);
+  cursor: pointer;
+  box-shadow: var(--shadow);
+}
+.full .pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.8rem;
+}
+
+/* --- Forms chrome --- */
+.full fieldset.demo {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+.full fieldset.demo legend {
+  color: var(--accent);
+  padding: 0 6px;
+  font-weight: 600;
+}
+.full label.chk {
+  display: block;
+  margin: 4px 0;
+  cursor: pointer;
+}
+
+/* --- Nested cascade --- */
+.full .nest .inner .deep {
+  color: var(--accent);
+  font-weight: 600;
+}
+.full .nest > .inner > p { margin: 0.25rem 0; }
+
+/* --- Media print hide (smoke) --- */
+@media print {
+  .full .no-print { display: none; }
+}

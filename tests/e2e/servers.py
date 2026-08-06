@@ -171,6 +171,22 @@ def _handle(conn):
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
                 b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
             )
+        elif path == "/runaway.html":
+            # A page whose script never returns. The in-kernel JS engine is a
+            # tree-walker with no yield points of its own, so this used to run
+            # the shell thread until the machine was rebooted; the browser now
+            # bounds it (and Ctrl+C reaches it) and renders the page without it.
+            body = (
+                b"<!DOCTYPE html><html><head><title>Runaway</title></head>"
+                b"<body><h1>Runaway script</h1>"
+                b"<p id=\"m\">static content</p>"
+                b"<script>var n=0; while(true){ n=n+1; }</script>"
+                b"</body></html>"
+            )
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+            )
         elif path == "/mcp":
             # A minimal MCP server (JSON-RPC 2.0 over Streamable HTTP): supports
             # initialize / notifications/initialized / tools/list / tools/call,

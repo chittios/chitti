@@ -45,9 +45,26 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* Boot stack grows down from __stack_top (2 MiB). */
+    /* Boot stack, growing down from __stack_top.
+     *
+     * `__stack_guard` is a 64 KiB region reserved BELOW the stack and never
+     * mapped writable. Without it the stack's bottom was `__bss_end` exactly:
+     * an overflow walked straight into `.bss`, silently rewriting kernel
+     * statics (a corrupted ktrace sequence counter was the visible symptom),
+     * and the next exception then re-entered the vector on a ruined stack and
+     * looped there forever — a dead machine, no output, no Ctrl+C. With the
+     * guard the overflow faults at a known address instead, and
+     * `aarch64_sync_exception` can say "kernel stack overflow" and stop.
+     *
+     * 8 MiB of stack: the deepest real consumer measured is the PEG parser on
+     * a minified page (~440 nested rules with multi-KiB frames), which came
+     * within reach of 2 MiB. */
+    . = ALIGN(4096);
+    __stack_guard_bottom = .;
+    . += 0x10000;
+    __stack_guard_top = .;
     . = ALIGN(16);
-    . += 0x200000;
+    . += 0x800000;
     __stack_top = .;
 
     /* Effective image size for the arm64 `Image` header: the whole span the

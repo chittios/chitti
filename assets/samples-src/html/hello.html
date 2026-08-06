@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hello /browse</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; background: #f5f0e8; color: #2a2a2a; }
+    h1 { color: #cc785c; }
+    #out { margin-top: 1rem; padding: 0.75rem; background: #fff; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Hello from file:///</h1>
+  <p>If you can read this, the store path resolved and HTML layout ran.</p>
+  <div id="out">script pending…</div>
+  <p><a href="index.html">← samples index</a></p>
+  <script>
+    var el = document.getElementById("out");
+    if (el) {
+      el.textContent = "JS ran: title=" + document.title;
+      console.log("hello.html script ok");
+    }
+  </script>
+</body>
+</html>

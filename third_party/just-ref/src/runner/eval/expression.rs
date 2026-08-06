@@ -411,7 +411,28 @@ pub fn is_array(v: &JsValue) -> bool {
 }
 
 /// Read an array's `length`.
+/// Most elements any single array operation will materialize.
+///
+/// A JS `length` is attacker-controlled (`Array.prototype.filter.call({length:
+/// 4294967295}, f)` is one expression), and every array generic turns it
+/// straight into `Vec::with_capacity(n)` plus an n-iteration loop. At 2^32 that
+/// is a ~137 GB allocation and four billion property lookups in **native**
+/// code, where the interpreter's tick never runs — so the OS stops responding
+/// entirely: no UI, no Ctrl+C, no script budget. A browser tab may hang itself
+/// on that; a kernel may not. 16 Mi elements is far past any real DOM
+/// collection and still bounded work — and the walk below ticks, so even that
+/// much is interruptible.
+pub const MAX_ARRAY_ELEMENTS: usize = 1 << 20;
+
+/// The `length` an array/array-like reports, clamped to [`MAX_ARRAY_ELEMENTS`].
+/// Callers that materialize elements use this; see the constant for why.
 pub fn array_len(v: &JsValue) -> usize {
+    array_len_raw(v).min(MAX_ARRAY_ELEMENTS)
+}
+
+/// The `length` exactly as reported, unclamped — for reads that do not
+/// materialize (`arr.length`).
+pub fn array_len_raw(v: &JsValue) -> usize {
     if let JsValue::Object(o) = v {
         let b = o.borrow();
         if let Some(PropertyDescriptor::Data(d)) = b
@@ -433,11 +454,16 @@ pub fn array_len(v: &JsValue) -> usize {
 /// Read every element of an array (0..length) into a Vec.
 pub fn array_elements(v: &JsValue) -> Vec<JsValue> {
     let n = array_len(v);
-    let mut out = Vec::with_capacity(n);
+    // `with_capacity` on a clamped length, and a tick in the walk: this is the
+    // one place a single JS expression turns into an unbounded native loop.
+    let mut out = Vec::with_capacity(n.min(4096));
     if let JsValue::Object(o) = v {
         let b = o.borrow();
         let base = b.as_js_object().get_object_base();
         for i in 0..n {
+            if crate::runner::host::host_tick() {
+                break; // host asked to stop (Ctrl+C / script budget)
+            }
             let val = match base.properties.get(&PropertyKey::Str(i.to_string())) {
                 Some(PropertyDescriptor::Data(d)) => d.value.clone(),
                 _ => JsValue::Undefined,
@@ -1136,40 +1162,45 @@ pub fn call_value(
     match callee {
         JsValue::Object(obj) => {
             let obj_ref = obj.borrow();
+            // Builtin / host function sentinels (`setTimeout`, `String`, …) —
+            // try the registry first even when marked callable for `typeof`.
+            let builtin = {
+                let base = obj_ref.as_js_object().get_object_base();
+                match base.properties.get(&PropertyKey::Str("__builtin_name__".to_string())) {
+                    Some(PropertyDescriptor::Data(d)) => match &d.value {
+                        JsValue::String(name) => Some(name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            if let Some(name) = builtin {
+                drop(obj_ref);
+                let sg = ctx.super_global.clone();
+                let result =
+                    sg.borrow()
+                        .call_constructor(&name, ctx, this_value.clone(), args.clone());
+                drop(sg);
+                if let Some(r) = result {
+                    return r;
+                }
+                // Fall through: user may have shadowed a builtin name with a
+                // real function object that also carries the marker.
+                let obj_ref = obj.borrow();
+                if obj_ref.is_callable() {
+                    drop(obj_ref);
+                    return call_function_object(obj, this_value, args, ctx);
+                }
+                return Err(JErrorType::TypeError(format!(
+                    "{} is not a function",
+                    callee
+                )));
+            }
             if obj_ref.is_callable() {
                 drop(obj_ref);
-                // For now, we'll call through our execution context stack
-                // This is a simplified implementation that doesn't fully support
-                // user-defined functions yet, but will work for native functions
-                // stored in NativeFunctionObject
                 call_function_object(obj, this_value, args, ctx)
             } else {
-                // ChittiOS: a builtin sentinel (String/Number/Boolean/Array/…)
-                // called directly as a function — route to its registry
-                // constructor (`String(42)`, `Number("7")`, `Array(1,2)`).
-                let builtin = {
-                    let base = obj_ref.as_js_object().get_object_base();
-                    match base.properties.get(&PropertyKey::Str("__builtin_name__".to_string())) {
-                        Some(PropertyDescriptor::Data(d)) => match &d.value {
-                            JsValue::String(name) => Some(name.clone()),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
-                };
                 drop(obj_ref);
-                if let Some(name) = builtin {
-                    let sg = ctx.super_global.clone();
-                    // Pass through `this` so `super()` / `Error.call(this, …)`
-                    // stamp the instance rather than allocating a free object.
-                    let result =
-                        sg.borrow()
-                            .call_constructor(&name, ctx, this_value, args);
-                    drop(sg);
-                    if let Some(r) = result {
-                        return r;
-                    }
-                }
                 Err(JErrorType::TypeError(format!(
                     "{} is not a function",
                     callee
@@ -1193,6 +1224,13 @@ pub fn call_function_object(
     // Cooperative yield: pump the host UI / honor Ctrl+C between calls so a
     // heavy script can't freeze the (cooperatively-scheduled) kernel thread.
     if crate::runner::host::host_tick() {
+        return Err(crate::runner::host::interrupt_error());
+    }
+    // A native builtin that was interrupted mid-loop cannot return an error
+    // (the regex matcher returns `Option`), so it raises a flag; surface it at
+    // the next call boundary as the real interrupt rather than letting the
+    // script continue on a truncated result.
+    if crate::runner::std_lib::regexp::take_interrupt() {
         return Err(crate::runner::host::interrupt_error());
     }
     // Call-depth guard: the interpreter recurses on the host (kernel) stack, so
@@ -1251,15 +1289,7 @@ fn call_function_object_inner(
             ctx.var_env = func_scope;
 
             // Bind parameters to arguments
-            for (i, param) in params.iter().enumerate() {
-                if let crate::parser::ast::PatternType::PatternWhichCanBeExpression(
-                    ExpressionPatternType::Identifier(id)
-                ) = param {
-                    let arg_value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
-                    ctx.create_binding(&id.name, false)?;
-                    ctx.initialize_binding(&id.name, arg_value)?;
-                }
-            }
+            bind_parameters(&params[..], &args, ctx)?;
 
             // Execute each statement in the function body
             use super::statement::execute_statement;
@@ -1689,15 +1719,7 @@ fn call_function_with_body(
     ctx.global_this = Some(this_value);
 
     // Bind parameters to arguments
-    for (i, param) in params.iter().enumerate() {
-        if let PatternType::PatternWhichCanBeExpression(
-            ExpressionPatternType::Identifier(id)
-        ) = param {
-            let arg_value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
-            ctx.create_binding(&id.name, false)?;
-            ctx.initialize_binding(&id.name, arg_value)?;
-        }
-    }
+    bind_parameters(&params[..], &args[..], ctx)?;
 
     // Hoist `var` declarations to the top of the function scope.
     super::statement::hoist_var_declarations(&body.body, ctx);
@@ -2920,10 +2942,37 @@ fn compare_operand_f64(v: &JsValue) -> Option<f64> {
     }
 }
 
+/// Order two strings the way JS does: by UTF-16 code unit.
+///
+/// Rust's own `str` ordering is by code *point*, which disagrees for a
+/// supplementary character (U+10000+, whose surrogates are 0xD800..0xDBFF)
+/// compared against U+E000..U+FFFF. ASCII — every real comparison a page makes
+/// — takes the byte fast path.
+fn code_unit_cmp(a: &str, b: &str) -> core::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        return a.as_bytes().cmp(b.as_bytes());
+    }
+    a.encode_utf16().cmp(b.encode_utf16())
+}
+
 fn compare_values<F>(left: &JsValue, right: &JsValue, cmp: F) -> ValueResult
 where
     F: Fn(f64, f64) -> bool,
 {
+    // Abstract Relational Comparison: when *both* operands are Strings they are
+    // ordered by UTF-16 code unit, NOT through ToNumber — which would make both
+    // sides NaN and answer `false` for every string pair. React's production
+    // bundle guards every DOM access with `typeof document < "u"`, so a numeric
+    // `"object" < "u"` reports the document as absent on a page that has one.
+    if let (JsValue::String(a), JsValue::String(b)) = (left, right) {
+        let result = match code_unit_cmp(a, b) {
+            core::cmp::Ordering::Less => cmp(-1.0, 0.0),
+            core::cmp::Ordering::Greater => cmp(1.0, 0.0),
+            core::cmp::Ordering::Equal => cmp(0.0, 0.0),
+        };
+        return Ok(JsValue::Boolean(result));
+    }
+
     // A BigInt operand compares mathematically against the other side (Number,
     // String, or BigInt) without the ToNumber TypeError.
     if matches!(left, JsValue::BigInt(_)) || matches!(right, JsValue::BigInt(_)) {
@@ -2977,6 +3026,9 @@ pub fn strict_equality(left: &JsValue, right: &JsValue) -> bool {
         // false (handled by the fall-through `_ => false`).
         (JsValue::BigInt(a), JsValue::BigInt(b)) => a == b,
         (JsValue::Object(a), JsValue::Object(b)) => alloc::rc::Rc::ptr_eq(a, b),
+        // Symbols compare by description identity (well-knowns + Symbol.for
+        // registry keys share a description; Symbol()/new_empty get unique ones).
+        (JsValue::Symbol(a), JsValue::Symbol(b)) => a == b,
         _ => false,
     }
 }
@@ -3294,15 +3346,7 @@ impl SimpleFunctionObject {
         }
 
         // Bind parameters to arguments
-        for (i, param) in params.iter().enumerate() {
-            if let PatternType::PatternWhichCanBeExpression(
-                ExpressionPatternType::Identifier(id)
-            ) = param {
-                let arg_value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
-                ctx.create_binding(&id.name, false)?;
-                ctx.initialize_binding(&id.name, arg_value)?;
-            }
-        }
+        bind_parameters(&params[..], &args[..], ctx)?;
 
         // ChittiOS: the `arguments` object — an array-like of the actual call
         // arguments, exposed in every *non-arrow* function (arrows inherit it
@@ -3489,7 +3533,13 @@ pub fn value_is_callable(v: &JsValue) -> bool {
             }
             // A native-method value (`[].slice`, `Object.prototype.toString`) is
             // an ordinary object tagged callable — dispatched by `call_value`.
-            get_own_prop_value(v, "__native_method__").is_some()
+            if get_own_prop_value(v, "__native_method__").is_some() {
+                return true;
+            }
+            // Host/builtin function sentinels (`setTimeout`, `fetch`, `Symbol`)
+            // carry `__builtin_name__` *and* `__host_fn__` so `typeof` is
+            // `"function"` without treating `document`/`window` as callables.
+            get_own_prop_value(v, "__host_fn__").is_some()
         }
         _ => false,
     }
@@ -3820,6 +3870,7 @@ fn is_static_method(type_name: &str, method: &str) -> bool {
             method,
             "isInteger" | "isFinite" | "isNaN" | "isSafeInteger" | "parseFloat" | "parseInt"
         ),
+        "Symbol" => matches!(method, "for" | "keyFor"),
         _ => false,
     }
 }
@@ -4077,6 +4128,46 @@ pub fn make_bound_function(target: JsValue, this: JsValue, partial: Vec<JsValue>
     set_own_prop(&f, "__bound_this__", this, false);
     set_own_prop(&f, "__bound_args__", make_array(partial), false);
     f
+}
+
+/// Bind a call's arguments to a function's formal parameters.
+///
+/// A parameter list is the full pattern grammar, not a list of names: an object
+/// or array pattern (`function ({label, ok})`), a default (`a = 1`) and a rest
+/// (`...args`) are all legal there. Binding only the plain identifiers left
+/// every other form *silently unbound*, so the first read of one raised
+/// `ReferenceError: label is not defined` from inside a function that was
+/// called correctly — which is how a React component written as
+/// `function Check({ label, ok })` failed with the parameter's name and no hint
+/// that the parameter was the problem. `bind_pattern` already implements the
+/// grammar for `var`/`let`, so parameters go through it rather than a second
+/// copy that can drift.
+pub(crate) fn bind_parameters(
+    params: &[PatternType],
+    args: &[JsValue],
+    ctx: &mut EvalContext,
+) -> Result<(), JErrorType> {
+    for (i, param) in params.iter().enumerate() {
+        match param {
+            // Fast path: the overwhelmingly common plain `function (a, b)`.
+            PatternType::PatternWhichCanBeExpression(ExpressionPatternType::Identifier(id)) => {
+                let arg_value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
+                ctx.create_binding(&id.name, false)?;
+                ctx.initialize_binding(&id.name, arg_value)?;
+            }
+            // `...rest` takes every remaining argument, so it is the one form
+            // whose value is not `args[i]`.
+            PatternType::RestElement { argument, .. } => {
+                let rest: alloc::vec::Vec<JsValue> = args.iter().skip(i).cloned().collect();
+                super::statement::bind_pattern(argument, make_array(rest), ctx, false, false)?;
+            }
+            other => {
+                let arg_value = args.get(i).cloned().unwrap_or(JsValue::Undefined);
+                super::statement::bind_pattern(other, arg_value, ctx, false, false)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `length` of a function: the number of leading formal parameters that are

@@ -1,0 +1,19 @@
+[package]
+name = "chitti-csslayout"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host harness: mounts the kernel's own CSS + layout modules (`#[path]`) and
+# lays a page out natively, in milliseconds. Same pattern as tools/h264diff,
+# tools/pngbench and tools/cortexdiff — the point is that there is ONE engine,
+# so a fix here is a fix in the kernel and cannot drift.
+
+[dependencies]
+htmlparser = { version = "0.2", default-features = false }
+
+[[bin]]
+name = "chitti-csslayout"
+path = "src/main.rs"
+
+[workspace]

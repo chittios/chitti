@@ -153,6 +153,8 @@ pub struct ImageBox {
     pub src_h: usize,
     /// `object-fit` for scaling the source into the `w`×`h` box.
     pub object_fit: css::ObjectFit,
+    /// `object-position` keywords (e.g. `right bottom`); empty = center.
+    pub object_position: String,
 }
 
 /// Form control kind (Ladybird `HTMLInputElement` type subset).
@@ -399,6 +401,9 @@ pub fn layout_document_ex(
     vh: i32,
     interactive: &[usize],
 ) -> Layout {
+    // `vh`/`vw` lengths resolve against this — recorded before any style is
+    // computed, since a length is parsed lazily per declaration.
+    css::set_viewport(vw, vh);
     let mut runs = Vec::new();
     let mut links = Vec::new();
     let mut rects = Vec::new();
@@ -603,8 +608,41 @@ fn push_chain<'a>(
 ) -> Vec<css::ElemRef<'a>> {
     let mut v = Vec::with_capacity(chain.len() + 1);
     v.extend_from_slice(chain);
-    v.push((tag, id, class));
+    v.push(css::ElemRef::basic(tag, id, class));
     v
+}
+
+/// Advance past floats that `clear` requires, then zero the matching exclusion.
+fn apply_clear(cur: &mut Cursor, clear: css::ClearMode) {
+    match clear {
+        css::ClearMode::None => {}
+        css::ClearMode::Left => {
+            if cur.float_l_w > 0 {
+                cur.y = cur.y.max(cur.float_l_bottom);
+            }
+            cur.float_l_w = 0;
+            cur.float_l_bottom = 0;
+            cur.x = cur.margin_x;
+        }
+        css::ClearMode::Right => {
+            if cur.float_r_w > 0 {
+                cur.y = cur.y.max(cur.float_r_bottom);
+            }
+            cur.float_r_w = 0;
+            cur.float_r_bottom = 0;
+        }
+        css::ClearMode::Both => {
+            let bottom = cur.float_l_bottom.max(cur.float_r_bottom);
+            if cur.float_l_w > 0 || cur.float_r_w > 0 {
+                cur.y = cur.y.max(bottom);
+            }
+            cur.float_l_w = 0;
+            cur.float_l_bottom = 0;
+            cur.float_r_w = 0;
+            cur.float_r_bottom = 0;
+            cur.x = cur.margin_x;
+        }
+    }
 }
 
 fn walk<'a>(
@@ -676,15 +714,15 @@ fn walk<'a>(
             if in_head {
                 return;
             }
-            let mut st = css::compute_ex(
-                sheet,
+            let el_ref = css::ElemRef {
                 tag,
-                id.as_deref(),
-                class.as_deref(),
-                style_attr.as_deref(),
-                parent_st,
-                chain,
-            );
+                id: id.as_deref(),
+                class: class.as_deref(),
+                nth: 1,
+                href: href.as_deref(),
+                input_type: input_type.as_deref(),
+            };
+            let mut st = css::compute_el(sheet, el_ref, style_attr.as_deref(), parent_st, chain);
             // Presentational attrs (bgcolor / width%) — also applied in
             // `layout_cell_isolated` for table cells (they skip this path).
             let _ = (bgcolor_attr, width_pct, width_attr); // used via node
@@ -695,6 +733,14 @@ fn walk<'a>(
             // Ancestor chain for this element's children (self appended).
             let child_chain = push_chain(chain, tag, id.as_deref(), class.as_deref());
             let child_chain = child_chain.as_slice();
+            // `clear` — move below floats before placing this block/float.
+            apply_clear(cur, st.clear);
+            // Generated content ::before
+            if let Some(pst) =
+                css::compute_pseudo(sheet, el_ref, &st, chain, css::PseudoElement::Before)
+            {
+                emit_text(&pst.content, cur, runs, links, link, &pst);
+            }
             if tag == "body" {
                 if let Some(bg) = st.background {
                     *page_bg = bg;
@@ -705,7 +751,7 @@ fn walk<'a>(
 
             // Flex / Grid formatting context — children become independently
             // measured fragments, then translated into place (not block-stacked).
-            if matches!(st.display, DisplayMode::Flex | DisplayMode::Grid)
+            if matches!(st.display, DisplayMode::Flex | DisplayMode::InlineFlex | DisplayMode::Grid)
                 && n.children
                     .iter()
                     .any(|c| matches!(c.kind, NodeKind::Element { .. }))
@@ -735,14 +781,17 @@ fn walk<'a>(
                     line_h,
                     chain,
                 );
+                if let Some(pst) =
+                    css::compute_pseudo(sheet, el_ref, &st, chain, css::PseudoElement::After)
+                {
+                    emit_text(&pst.content, cur, runs, links, link, &pst);
+                }
                 return;
             }
 
-            // CSS `float: left|right` (parsed but never applied). The floated
-            // box is laid out as an isolated fragment and placed at the left or
-            // right edge; a left float lets following inline content flow to its
-            // right. A single-pass approximation — no multi-line wrap-around or
-            // `clear` — but handles image/callout floats and simple sidebars.
+            // CSS `float: left|right`. The floated box is laid out as an
+            // isolated fragment and placed at the left or right edge; a left
+            // float lets following inline content flow to its right.
             if matches!(st.float_mode, css::FloatMode::Left | css::FloatMode::Right)
                 && !matches!(tag, "br" | "hr")
             {
@@ -792,6 +841,11 @@ fn walk<'a>(
                 translate_frag(mark, fx - x0, fy - y0, runs, links, rects, images, controls, frames, aux);
                 cur.line_h = cur.line_h.max(fh);
                 cur.content_bottom = cur.content_bottom.max(fy + fh);
+                if let Some(pst) =
+                    css::compute_pseudo(sheet, el_ref, &st, chain, css::PseudoElement::After)
+                {
+                    emit_text(&pst.content, cur, runs, links, link, &pst);
+                }
                 return;
             }
 
@@ -1010,6 +1064,7 @@ fn walk<'a>(
                         src_w: 0,
                         src_h: 0,
                         object_fit: st.object_fit,
+                        object_position: st.object_position.clone(),
                     });
                     cur.y += ih + st.margin_bottom.max(0);
                     cur.x = cur.margin_x;
@@ -1280,6 +1335,18 @@ fn walk<'a>(
                     // Mark where this block's inline content begins, so a
                     // non-`Left` `text-align` can be applied to just these items.
                     let (r0, l0, i0, c0) = (runs.len(), links.len(), images.len(), controls.len());
+                    // Where this block's own decoration must be INSERTED. A
+                    // block's background can only be pushed once its children
+                    // have been laid out (that is what fixes its height), but
+                    // the painter draws rects in list order — so pushing it
+                    // last painted the parent over every child background. A
+                    // white Tailwind card erased the badges and rules inside
+                    // it. Everything this block paints goes in at `rect0`,
+                    // behind its children.
+                    let rect0 = rects.len();
+                    // Fragment mark for shrink-to-fit width (see below).
+                    let inline_mark =
+                        mark_frag(runs, links, rects, images, controls, frames, aux);
                     // Full fragment mark for any `transform` (translate/scale/
                     // rotate), applied to the whole box after layout.
                     let has_xform = {
@@ -1322,36 +1389,70 @@ fn walk<'a>(
                         block_h = block_h.min(to_box_h(mxh)).max(1);
                     }
                     cur.y = block_y0 + block_h;
+                    // Shrink-to-fit for an INLINE-LEVEL box with no explicit
+                    // width. `display: inline-flex` / `inline-block` size to
+                    // their content, not to the line — and a shadcn button or
+                    // badge is `inline-flex` with a text child, which has no
+                    // element children and so never reaches the flex container
+                    // path at all. Without this every one of them painted as a
+                    // full-width bar.
+                    let mut box_w = box_w;
+                    if st.width.is_none() && st.display == DisplayMode::InlineFlex {
+                        let (cx0, _, cx1, _) =
+                            frag_bbox(inline_mark, runs, links, rects, images, controls, frames, aux);
+                        let natural = (cx1 - cx0).max(0) + h_extra;
+                        if natural > 0 {
+                            box_w = natural.min(box_w).max(1);
+                        }
+                    }
                     // `box-shadow`: a soft offset rectangle behind the box
                     // (single hard rect, colour faded toward the page by blur —
                     // no real gaussian blur). Drawn before the background.
+                    let mut deco = 0usize; // decoration rects inserted at `rect0`
                     if let Some((sdx, sdy, blur, scol)) = parse_box_shadow(&st.box_shadow) {
                         // The painter box-blurs this rect when `blur > 0` (real
                         // gaussian-ish falloff); the solid box is the shadow's
                         // spread footprint at the shadow offset.
-                        rects.push(RectBox {
-                            x: block_x0 + sdx,
-                            y: block_y0 + sdy,
-                            w: box_w.max(1),
-                            h: block_h.max(1),
-                            color: scol,
-                            radius: st.border_radius.max(0),
-                            blur: blur.clamp(0, 40),
-                        });
+                        rects.insert(
+                            rect0,
+                            RectBox {
+                                x: block_x0 + sdx,
+                                y: block_y0 + sdy,
+                                w: box_w.max(1),
+                                h: block_h.max(1),
+                                color: scol,
+                                radius: st.border_radius.max(0),
+                                blur: blur.clamp(0, 40),
+                            },
+                        );
+                        deco += 1;
                     }
                     if let Some(bg) = st.background {
-                        rects.push(RectBox {
-                            x: block_x0,
-                            y: block_y0,
-                            w: box_w,
-                            h: block_h,
-                            color: fade(bg, st.opacity),
-                            radius: st.border_radius.max(0),
-                            blur: 0,
-                        });
+                        rects.insert(
+                            rect0 + deco,
+                            RectBox {
+                                x: block_x0,
+                                y: block_y0,
+                                w: box_w,
+                                h: block_h,
+                                color: fade(bg, st.opacity),
+                                radius: st.border_radius.max(0),
+                                blur: 0,
+                            },
+                        );
+                        deco += 1;
                     }
                     aux.push_bg_box(&st, block_x0, block_y0, box_w, block_h);
-                    push_box_borders(rects, block_x0, block_y0, box_w, block_h, &st);
+                    {
+                        // Borders go in front of this block's own background but
+                        // still behind its children.
+                        let mut edges = Vec::new();
+                        push_box_borders(&mut edges, block_x0, block_y0, box_w, block_h, &st);
+                        for e in edges {
+                            rects.insert(rect0 + deco, e);
+                            deco += 1;
+                        }
+                    }
                     aux.push_elem_box(n.elem_idx, block_x0, block_y0, box_w, block_h);
                     // Honor `text-align` for this block's own **inline** content.
                     // Gated on the alignment differing from the parent's, so a
@@ -1469,12 +1570,16 @@ fn walk<'a>(
                         st_i.bold = true;
                     }
                     cur.line_h = line_h.max(cur.line_h);
+                    let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+                    cur.x += st_i.padding_left.max(0) + st_i.border_left_width.max(0);
                     for c in &n.children {
                         walk(
                             c, sheet, &st_i, cur, runs, links, rects, images, controls, frames,
                             aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                         );
                     }
+                    cur.x += st_i.padding_right.max(0) + st_i.border_right_width.max(0);
+                    paint_inline_box(mark, &st_i, runs, rects);
                 }
                 "ul" | "ol" | "body" | "html" => {
                     cur.line_h = line_h;
@@ -1490,12 +1595,17 @@ fn walk<'a>(
                     match dkind {
                         DisplayKind::Inline | DisplayKind::InlineBlock => {
                             cur.line_h = line_h.max(cur.line_h);
+                            let mark =
+                                mark_frag(runs, links, rects, images, controls, frames, aux);
+                            cur.x += st.padding_left.max(0) + st.border_left_width.max(0);
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
                                     frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
                                 );
                             }
+                            cur.x += st.padding_right.max(0) + st.border_right_width.max(0);
+                            paint_inline_box(mark, &st, runs, rects);
                         }
                         DisplayKind::ListItem => {
                             block_before(cur, st.margin_top);
@@ -1527,11 +1637,103 @@ fn walk<'a>(
                     }
                 }
             }
+            // Generated content ::after (after children / tag-specific layout).
+            // `st` may have been moved into tag arms — recompute lightly for colour/font.
+            if let Some(pst) = css::compute_pseudo(
+                sheet,
+                el_ref,
+                parent_st,
+                chain,
+                css::PseudoElement::After,
+            ) {
+                emit_text(&pst.content, cur, runs, links, link, &pst);
+            }
+        }
+    }
+}
+/// Paint the background + border of an **inline** element behind the runs its
+/// children produced.
+///
+/// A block box gets its background from the block path; an inline one had none
+/// at all, so `<span class="rounded-full border bg-emerald-50 px-2">loaded</span>`
+/// — a badge, the single most common shadcn/Tailwind inline component —
+/// rendered as bare text. One box per line, the way a browser fragments an
+/// inline box that wraps.
+///
+/// Vertical padding deliberately expands only the painted box: per CSS, an
+/// inline box's vertical padding does not grow the line, it overflows it.
+/// Horizontal padding *does* advance the cursor, and that is done by the
+/// caller before/after walking the children.
+fn paint_inline_box(
+    start: FragMark,
+    st: &ComputedStyle,
+    runs: &[TextRun],
+    rects: &mut Vec<RectBox>,
+) {
+    let visible_border = (st.border_top_style.is_visible() && st.border_top_width > 0)
+        || (st.border_bottom_style.is_visible() && st.border_bottom_width > 0)
+        || (st.border_left_style.is_visible() && st.border_left_width > 0)
+        || (st.border_right_style.is_visible() && st.border_right_width > 0);
+    if st.background.is_none() && !visible_border {
+        return;
+    }
+    // Group this element's runs into line boxes by their y.
+    let mut lines: Vec<(i32, i32, i32, i32)> = Vec::new(); // (y, h, x0, x1)
+    for r in &runs[start.runs..] {
+        let w = (crate::font_ttf::measure(&r.text, r.font_size.max(8) as f32) + 0.5) as i32;
+        let h = (crate::font_ttf::line_height(r.font_size.max(8) as f32) + 0.5) as i32;
+        match lines.iter_mut().find(|l| l.0 == r.y) {
+            Some(l) => {
+                l.1 = l.1.max(h);
+                l.2 = l.2.min(r.x);
+                l.3 = l.3.max(r.x + w);
+            }
+            None => lines.push((r.y, h.max(1), r.x, r.x + w)),
+        }
+    }
+    let (pl, pr) = (st.padding_left.max(0), st.padding_right.max(0));
+    let (pt, pb) = (st.padding_top.max(0), st.padding_bottom.max(0));
+    let bl = if st.border_left_style.is_visible() { st.border_left_width.max(0) } else { 0 };
+    let br = if st.border_right_style.is_visible() { st.border_right_width.max(0) } else { 0 };
+    let bt = if st.border_top_style.is_visible() { st.border_top_width.max(0) } else { 0 };
+    let bb = if st.border_bottom_style.is_visible() { st.border_bottom_width.max(0) } else { 0 };
+    // Insert at the fragment's start so the box lands *behind* anything the
+    // children drew (a nested badge, an inline image background).
+    let mut at = start.rects;
+    for (y, h, x0, x1) in lines {
+        let x = x0 - pl - bl;
+        let w = (x1 - x0) + pl + pr + bl + br;
+        let by = y - pt - bt;
+        let bh = h + pt + pb + bt + bb;
+        if w <= 0 || bh <= 0 {
+            continue;
+        }
+        if let Some(bg) = st.background {
+            rects.insert(
+                at,
+                RectBox {
+                    x,
+                    y: by,
+                    w,
+                    h: bh,
+                    color: fade(bg, st.opacity),
+                    radius: st.border_radius.max(0),
+                    blur: 0,
+                },
+            );
+            at += 1;
+        }
+        if visible_border {
+            let mut edges = Vec::new();
+            push_box_borders(&mut edges, x, by, w, bh, st);
+            for e in edges {
+                rects.insert(at, e);
+                at += 1;
+            }
         }
     }
 }
 
-/// Indices marking the start of a fragment in each geometry buffer.
 #[derive(Clone, Copy)]
 struct FragMark {
     runs: usize,
@@ -1810,10 +2012,11 @@ fn apply_presentational(n: &Node, st: &mut ComputedStyle, avail_w: i32) {
     }
 }
 
-/// One cell in a table row, with its HTML `colspan` (minimum 1).
+/// One cell in a table row, with its HTML `colspan`/`rowspan` (minimum 1).
 struct TableCellRef<'a> {
     node: &'a Node,
     colspan: u32,
+    rowspan: u32,
 }
 
 fn cell_colspan(n: &Node) -> u32 {
@@ -1822,6 +2025,16 @@ fn cell_colspan(n: &Node) -> u32 {
             colspan_attr: Some(c),
             ..
         } => (*c).max(1),
+        _ => 1,
+    }
+}
+
+fn cell_rowspan(n: &Node) -> u32 {
+    match &n.kind {
+        NodeKind::Element {
+            rowspan_attr: Some(r),
+            ..
+        } => (*r).max(1),
         _ => 1,
     }
 }
@@ -1844,6 +2057,7 @@ fn collect_table_rows<'a>(n: &'a Node, rows: &mut Vec<Vec<TableCellRef<'a>>>) {
                         .map(|c| TableCellRef {
                             node: c,
                             colspan: cell_colspan(c),
+                            rowspan: cell_rowspan(c),
                         })
                         .collect();
                     rows.push(cells);
@@ -2015,13 +2229,37 @@ fn layout_table<'a>(
     if rows.is_empty() {
         return;
     }
-    // Column count = max over rows of the sum of colspans (not the cell count).
-    let ncols = rows
-        .iter()
-        .map(|r| r.iter().map(|c| c.colspan as usize).sum::<usize>())
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    // Column count: walk rows skipping slots covered by rowspans from above.
+    let mut pending = alloc::vec![0u32; 64]; // rows remaining that cover column c
+    let mut ncols = 1usize;
+    for row in &rows {
+        for p in pending.iter_mut() {
+            if *p > 0 {
+                *p -= 1;
+            }
+        }
+        let mut ci = 0usize;
+        for cell in row {
+            while ci < 64 && pending[ci] > 0 {
+                ci += 1;
+            }
+            let cs = (cell.colspan as usize).max(1);
+            let rs = (cell.rowspan as usize).max(1);
+            for c in 0..cs {
+                if ci + c < 64 {
+                    pending[ci + c] = (rs as u32).saturating_sub(1);
+                }
+            }
+            ci += cs;
+            ncols = ncols.max(ci);
+        }
+        for (c, p) in pending.iter().enumerate() {
+            if *p > 0 {
+                ncols = ncols.max(c + 1);
+            }
+        }
+    }
+    let ncols = ncols.max(1).min(64);
     block_before(cur, table_st.margin_top.max(2));
     // Presentational `width="85%"` (HN `#hnmain`) / CSS width shrinks the
     // table; `<center>` (inherited `text-align:center`) or `margin:auto` centers it.
@@ -2044,8 +2282,19 @@ fn layout_table<'a>(
 
     // 1. Per-column min/max-content widths (honoring an explicit cell `width`).
     // Spanning cells contribute evenly across their columns for measurement.
+    // `table-layout: fixed` → equal columns (or first-row explicit widths).
+    let fixed_layout = table_st.table_layout == "fixed";
     let mut col_min = alloc::vec![0i32; ncols];
     let mut col_max = alloc::vec![0i32; ncols];
+    if fixed_layout {
+        let equal = (container_w - spacing * (ncols as i32 + 1))
+            .max(1)
+            / ncols as i32;
+        for i in 0..ncols {
+            col_min[i] = equal.max(1);
+            col_max[i] = equal.max(1);
+        }
+    } else {
     for row in &rows {
         let mut ci = 0usize;
         for cell in row {
@@ -2077,6 +2326,7 @@ fn layout_table<'a>(
             ci += span;
         }
     }
+    } // end auto layout measure
 
     // 2. Distribute the available width across columns.
     let gutters = spacing * (ncols as i32 + 1);
@@ -2156,12 +2406,22 @@ fn layout_table<'a>(
         None
     };
     let mut row_y = cur.y + spacing;
+    let mut pending = alloc::vec![0u32; ncols]; // rowspan cover remaining
     for row in &rows {
-        let mut placed: Vec<(FragMark, FragMark, usize, u32, ComputedStyle)> = Vec::new();
+        for p in pending.iter_mut() {
+            if *p > 0 {
+                *p -= 1;
+            }
+        }
+        let mut placed: Vec<(FragMark, FragMark, usize, u32, u32, ComputedStyle)> = Vec::new();
         let mut row_h = line_h;
         let mut ci = 0usize;
         for cell in row {
+            while ci < ncols && pending[ci] > 0 {
+                ci += 1;
+            }
             let span = (cell.colspan as usize).max(1).min(ncols.saturating_sub(ci).max(1));
+            let rspan = cell.rowspan.max(1);
             if ci >= ncols {
                 break;
             }
@@ -2181,13 +2441,20 @@ fn layout_table<'a>(
                 true, // final place: apply cell text-align / align=
             );
             let end = mark_frag(runs, links, rects, images, controls, frames, aux);
-            row_h = row_h.max(h);
-            placed.push((mark, end, ci, span as u32, cst));
+            if rspan <= 1 {
+                row_h = row_h.max(h);
+            } else {
+                row_h = row_h.max(h / rspan as i32).max(line_h);
+            }
+            for k in 0..span {
+                if ci + k < ncols {
+                    pending[ci + k] = rspan.saturating_sub(1);
+                }
+            }
+            placed.push((mark, end, ci, span as u32, rspan, cst));
             ci += span;
         }
-        // Now that the row height is known, position each cell fragment (only
-        // its own `[mark, end)` range — a bounded translate) + its box.
-        for (mark, end, ci, span, cst) in &placed {
+        for (mark, end, ci, span, rspan, cst) in &placed {
             let mut span_w = 0i32;
             for k in 0..(*span as usize) {
                 if *ci + k < ncols {
@@ -2198,22 +2465,26 @@ fn layout_table<'a>(
                 }
             }
             span_w = span_w.max(1);
+            let cell_h = if *rspan <= 1 {
+                row_h
+            } else {
+                row_h + (*rspan as i32 - 1) * (line_h + spacing)
+            };
             translate_frag_range(
                 *mark, *end, col_x[*ci], row_y, runs, links, rects, images, controls, frames, aux,
             );
-            // Cell background/border box spans all columns covered by colspan.
             if let Some(bg) = cst.background {
                 rects.push(RectBox {
                     x: col_x[*ci],
                     y: row_y,
                     w: span_w,
-                    h: row_h,
+                    h: cell_h,
                     color: fade(bg, cst.opacity),
                     radius: cst.border_radius.max(0),
                     blur: 0,
                 });
             }
-            push_box_borders(rects, col_x[*ci], row_y, span_w, row_h, cst);
+            push_box_borders(rects, col_x[*ci], row_y, span_w, cell_h, cst);
         }
         row_y += row_h + spacing;
     }
@@ -2264,11 +2535,12 @@ fn layout_flex_grid_container<'a>(
     cur.y += st.padding_top;
     let box_x = cur.margin_x + st.margin_left;
     let box_y = cur.y;
-    let container_w = st
-        .width
-        .or(st.max_width)
-        .unwrap_or_else(|| (cur.max_w - st.margin_left - st.margin_right).max(1))
-        .max(1);
+    // The space the container may use. An inline-level flex container is
+    // shrink-to-fit: this is its *upper bound*, and the real width comes from
+    // the items once they have been measured (see `shrink_to_fit` below).
+    let avail_w = (cur.max_w - st.margin_left - st.margin_right).max(1);
+    let container_w = st.width.or(st.max_width).unwrap_or(avail_w).max(1);
+    let shrink_to_fit = st.display == DisplayMode::InlineFlex && st.width.is_none();
 
     let children: Vec<&Node> = n
         .children
@@ -2288,7 +2560,7 @@ fn layout_flex_grid_container<'a>(
             let cols = st.grid_columns.max(1);
             flex::grid_col_width(container_w, cols, gap)
         }
-        DisplayMode::Flex if st.flex_direction == FlexDirection::Row => {
+        d if d.is_flex() && st.flex_direction == FlexDirection::Row => {
             let gaps = gap * (n_items as i32 - 1).max(0);
             ((container_w - gaps) / n_items as i32).max(24)
         }
@@ -2355,9 +2627,13 @@ fn layout_flex_grid_container<'a>(
         let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
         // Isolated cursor at origin so fragment coords start near (0,0).
         // Auto-size: use natural max_w; for row flex wrap prefer content width.
-        let measure_w = if st.display == DisplayMode::Flex
+        // An inline-level flex container sizes to its content, so its items
+        // must be measured at their NATURAL width — the same roomy measure a
+        // wrapping row uses — never at an equal share of the line.
+        let measure_w = if st.display.is_flex()
             && st.flex_direction == FlexDirection::Row
-            && st.flex_wrap != flex::FlexWrap::NoWrap
+            && (st.flex_wrap != flex::FlexWrap::NoWrap
+                || st.display == DisplayMode::InlineFlex)
         {
             // Prefer natural width: roomy measure, then clamp to container.
             container_w
@@ -2407,9 +2683,10 @@ fn layout_flex_grid_container<'a>(
         }
         if let Some(ew) = cst.width {
             w = ew.clamp(1, container_w.max(1));
-        } else if st.display == DisplayMode::Flex
+        } else if st.display.is_flex()
             && st.flex_direction == FlexDirection::Row
-            && st.flex_wrap != flex::FlexWrap::NoWrap
+            && (st.flex_wrap != flex::FlexWrap::NoWrap
+                || st.display == DisplayMode::InlineFlex)
         {
             // Natural content width for wrapping.
             w = w.min(container_w).max(16);
@@ -2441,11 +2718,25 @@ fn layout_flex_grid_container<'a>(
     let mut visual: Vec<usize> = (0..items.len()).collect();
     visual.sort_by_key(|&i| (items[i].order, i));
 
+    // Shrink-to-fit: a `display: inline-flex` box is exactly as wide as its
+    // items plus the gaps between them (plus its own padding), bounded by the
+    // line. Without this every shadcn button and badge — all `inline-flex` —
+    // became a full-width bar.
+    let container_w = if shrink_to_fit {
+        let sum: i32 = items.iter().map(|it| it.w.max(0)).sum();
+        let gaps = gap * (items.len() as i32 - 1).max(0);
+        (sum + gaps + st.padding_left.max(0) + st.padding_right.max(0))
+            .max(1)
+            .min(avail_w)
+    } else {
+        container_w
+    };
+
     let mut content_h = line_h;
     let mut content_w = container_w;
 
     match st.display {
-        DisplayMode::Flex => {
+        d if d.is_flex() => {
             // Arrays in visual (`order`-sorted) sequence; a placement's index
             // maps back through `visual` to the real item's fragment.
             let widths: Vec<i32> = visual.iter().map(|&i| items[i].w).collect();
@@ -2946,8 +3237,23 @@ fn parse_box_shadow(s: &str) -> Option<(i32, i32, i32, u32)> {
     if s.is_empty() || s.eq_ignore_ascii_case("none") {
         return None;
     }
-    // Whitespace tokens, keeping `(...)` groups intact; stop at a top-level comma.
-    let mut toks: Vec<String> = Vec::new();
+    // `box-shadow` is a comma-separated LIST, and the first entry is very often
+    // a placeholder: Tailwind emits
+    // `var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)`
+    // on every shadowed element. Stopping at the first comma took `0 0 #0000` —
+    // a *transparent* shadow — and painted the card solid black. So each entry
+    // is parsed and the first one with a real colour wins.
+    for entry in split_top_level_commas(s) {
+        if let Some(shadow) = parse_one_shadow(&entry) {
+            return Some(shadow);
+        }
+    }
+    None
+}
+
+/// Split on commas that are not inside `(...)`.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
     for ch in s.chars() {
@@ -2960,21 +3266,21 @@ fn parse_box_shadow(s: &str) -> Option<(i32, i32, i32, u32)> {
                 depth -= 1;
                 cur.push(ch);
             }
-            ',' if depth == 0 => break,
-            c if c.is_whitespace() && depth == 0 => {
-                if !cur.is_empty() {
-                    toks.push(core::mem::take(&mut cur));
-                }
-            }
+            ',' if depth <= 0 => out.push(core::mem::take(&mut cur)),
             c => cur.push(c),
         }
     }
-    if !cur.is_empty() {
-        toks.push(cur);
-    }
+    out.push(cur);
+    out
+}
+
+/// One `[inset] <dx> <dy> [blur] [spread] [color]` entry. `None` when it has no
+/// visible colour (`parse_color` answers `None` for a transparent one), which
+/// is what makes a placeholder entry skippable.
+fn parse_one_shadow(entry: &str) -> Option<(i32, i32, i32, u32)> {
     let mut lens: Vec<i32> = Vec::new();
     let mut color = None;
-    for t in &toks {
+    for t in css::value_tokens(entry) {
         if t.eq_ignore_ascii_case("inset") {
             continue;
         }
@@ -2984,11 +3290,12 @@ fn parse_box_shadow(s: &str) -> Option<(i32, i32, i32, u32)> {
             color = Some(c);
         }
     }
+    let color = color?;
     Some((
         lens.first().copied().unwrap_or(0),
         lens.get(1).copied().unwrap_or(0),
         lens.get(2).copied().unwrap_or(0).max(0),
-        color.unwrap_or(0x000000),
+        color,
     ))
 }
 
@@ -3977,6 +4284,209 @@ mod tests {
     }
 
     #[test_case]
+    fn a_shadcn_shaped_section_paints_its_components() {
+        // The gallery's real shape: `:root` HSL custom properties, a bordered
+        // card frame, and shadcn buttons inside a wrapping flex row. The
+        // failure this pins is a section frame that paints while everything
+        // inside it is invisible.
+        //
+        // NB a `<button>` is a **form control**, not a box — its colours land on
+        // `FormControl.bg/fg` and the painter draws it. Looking for a rect here
+        // finds nothing even when the button is perfectly laid out.
+        let doc = html::parse(
+            r#"<html><head><style>
+                :root{--card: 0 0% 100%; --primary: 222.2 47.4% 11.2%;
+                      --primary-foreground: 210 40% 98%; --border: 214.3 31.8% 91.4%}
+                *{border-color:#e5e7eb}
+                .frame{border-width:1px;border-style:solid;border-color:hsl(var(--border));
+                       border-radius:0.5rem;background-color:hsl(var(--card));padding:1rem}
+                .row{display:flex;flex-wrap:wrap;align-items:center;gap:0.5rem}
+                .btn{display:inline-flex;align-items:center;border-radius:0.375rem;
+                     height:2.25rem;padding-left:1rem;padding-right:1rem;
+                     background-color:hsl(var(--primary));color:hsl(var(--primary-foreground))}
+                .badge{display:inline-flex;border-radius:9999px;padding:2px 10px;
+                       background-color:hsl(var(--primary))}
+            </style></head><body>
+                <section><h2>Button</h2><div class="frame">
+                  <div class="row">
+                    <button class="btn">Default</button><button class="btn">Secondary</button>
+                    <span class="badge">New</span>
+                  </div>
+                </div></section>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+
+        let (fi, frame) = lay
+            .rects
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.color == 0xffffff && r.w > 200)
+            .expect("card frame background — hsl(var(--card))");
+        assert_eq!(frame.radius, 8, "border-radius: 0.5rem");
+
+        // Both buttons are controls, carrying the HSL palette colours.
+        assert_eq!(lay.controls.len(), 2, "two buttons: {:?}", lay.controls);
+        for c in &lay.controls {
+            assert_eq!(c.bg, Some(0x0f172a), "hsl(var(--primary)) on the control");
+            assert!(c.fg.map(|f| f > 0xe0e0e0).unwrap_or(false), "near-white label");
+            assert!(c.w < 200, "shrink-to-fit, not the whole row: {}", c.w);
+            assert!(
+                c.x >= frame.x && c.x + c.w <= frame.x + frame.w,
+                "inside the frame"
+            );
+        }
+        assert!(
+            lay.controls[1].x >= lay.controls[0].x + lay.controls[0].w,
+            "the two buttons sit side by side, not stacked"
+        );
+
+        // The inline badge is a real box, and it paints AFTER the frame.
+        let (bi, badge) = lay
+            .rects
+            .iter()
+            .enumerate()
+            .find(|(i, r)| *i != fi && r.color == 0x0f172a)
+            .expect("badge background");
+        assert!(fi < bi, "the frame paints behind what is inside it");
+        assert!(badge.w < 100, "the badge hugs its label: {}", badge.w);
+        assert!(badge.radius > 0, "rounded-full reaches the inline box");
+    }
+
+    #[test_case]
+    fn box_shadow_skips_transparent_placeholder_entries() {
+        // Tailwind puts the real shadow LAST:
+        // `var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)`.
+        // Stopping at the first comma took `0 0 #0000` and painted the card
+        // solid black.
+        let tw = "0 0 #0000,0 0 #0000,0 10px 15px -3px rgb(0 0 0 / 0.1)";
+        let (dx, dy, blur, color) = parse_box_shadow(tw).expect("real shadow");
+        assert_eq!((dx, dy), (0, 10));
+        assert_eq!(blur, 15);
+        assert!(color > 0xd0d0d0, "10% black blends light, got {color:06x}");
+        // A shadow list that is entirely transparent has nothing to paint.
+        assert_eq!(parse_box_shadow("0 0 #0000,0 0 #0000"), None);
+    }
+
+    #[test_case]
+    fn an_inline_element_paints_its_background_and_border() {
+        // `<span class="rounded-full border bg-emerald-50 px-2">loaded</span>` —
+        // a badge, the commonest inline component in Tailwind/shadcn — used to
+        // render as bare text because only block boxes painted a background.
+        let doc = html::parse(
+            r#"<html><head><style>
+                .pill{background-color:#ecfdf5;border:1px solid #6ee7b7;border-radius:9999px;padding:2px 8px}
+            </style></head><body><div>x <span class="pill">loaded</span> y</div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let bg = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xecfdf5)
+            .expect("inline background painted");
+        assert!(bg.radius > 0, "border-radius reaches the inline box");
+        // Horizontal padding widens the box AND advances the line, so the text
+        // after it is not overlapped.
+        let run_after = lay.runs.iter().find(|r| r.text.contains('y')).expect("y");
+        assert!(
+            run_after.x >= bg.x + bg.w,
+            "text after the pill starts past it ({} vs {})",
+            run_after.x,
+            bg.x + bg.w
+        );
+        assert!(
+            lay.rects.iter().any(|r| r.color == 0x6ee7b7),
+            "inline border edges painted"
+        );
+    }
+
+    #[test_case]
+    fn a_block_background_paints_behind_its_children() {
+        // Rects paint in list order, and a block's background can only be
+        // pushed once its children have fixed its height — so pushing it last
+        // painted the parent OVER every child. A white card erased the badges
+        // inside it.
+        let doc = html::parse(
+            r#"<html><head><style>
+                .card{background-color:#ffffff}
+                .pill{background-color:#ecfdf5}
+            </style></head><body>
+                <div class="card"><div class="pill">inside</div></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let card = lay.rects.iter().position(|r| r.color == 0xffffff).expect("card");
+        let pill = lay.rects.iter().position(|r| r.color == 0xecfdf5).expect("pill");
+        assert!(card < pill, "card bg (#{card}) must paint before pill (#{pill})");
+    }
+
+    #[test_case]
+    fn inline_flex_shrinks_to_its_content() {
+        // A shadcn button is `<button class="inline-flex …">Label</button>`:
+        // an inline-level flex box whose only child is text. It has no element
+        // children, so it never reaches the flex container path — and as a
+        // plain block it filled the whole line.
+        let doc = html::parse(
+            r#"<html><head><style>
+                .btn{display:inline-flex;background-color:#0f172a;padding:4px 12px}
+                .blk{display:block;background-color:#0284c7}
+            </style></head><body>
+                <div class="btn">Go</div><div class="blk">Go</div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let btn = lay.rects.iter().find(|r| r.color == 0x0f172a).expect("inline-flex box");
+        let blk = lay.rects.iter().find(|r| r.color == 0x0284c7).expect("block box");
+        assert!(
+            btn.w < blk.w / 2,
+            "inline-flex shrinks to content ({}) while a block fills the line ({})",
+            btn.w,
+            blk.w
+        );
+        assert!(btn.w > 24, "…but still holds its label + padding: {}", btn.w);
+    }
+
+    #[test_case]
+    fn a_tailwind_card_gets_its_width_padding_and_colours() {
+        // The whole chain in one page: rem lengths, a functional colour, a
+        // shadow list, and a centred max-width card.
+        let doc = html::parse(
+            r#"<html><head><style>
+                .wrap{display:flex;justify-content:center;padding:1rem}
+                .card{width:100%;max-width:28rem;padding:1.5rem;border-radius:0.75rem;
+                      background-color:rgb(255 255 255 / 1);
+                      border:1px solid rgb(226 232 240 / 1);
+                      box-shadow:0 0 #0000,0 0 #0000,0 10px 15px -3px rgb(0 0 0 / 0.1)}
+            </style></head><body>
+                <div class="wrap"><div class="card"><h1>React + Tailwind</h1></div></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let card = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xffffff && r.w > 100)
+            .expect("card background");
+        assert_eq!(card.w, 448, "max-width: 28rem");
+        assert_eq!(card.radius, 12, "border-radius: 0.75rem");
+        assert!(
+            lay.rects.iter().any(|r| r.blur > 0),
+            "the real (third) shadow entry is painted"
+        );
+        assert!(
+            !lay.rects.iter().any(|r| r.color == 0x000000 && r.w >= card.w),
+            "no opaque black box from the `0 0 #0000` placeholders"
+        );
+        let h1 = lay.runs.iter().find(|r| r.text.contains("React")).expect("h1");
+        assert!(h1.x >= card.x + 24, "padding: 1.5rem insets the content");
+    }
+
+    #[test_case]
     fn parse_box_shadow_extracts_offsets_and_color() {
         assert_eq!(parse_box_shadow("none"), None);
         assert_eq!(parse_box_shadow(""), None);
@@ -4017,6 +4527,79 @@ mod tests {
         let side = lay.runs.iter().find(|r| r.text == "side").expect("side");
         // Right-floated content sits in the right half of the viewport.
         assert!(side.x > DEFAULT_W / 2, "float:right at x={} (vw={})", side.x, DEFAULT_W);
+    }
+
+    #[test_case]
+    fn clear_both_drops_below_float() {
+        let doc = html::parse(
+            r#"<html><body>
+                <div style="float:left;width:80px">side</div>
+                <div style="clear:both">below</div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let side = lay.runs.iter().find(|r| r.text == "side").expect("side");
+        let below = lay.runs.iter().find(|r| r.text == "below").expect("below");
+        assert!(
+            below.y >= side.y + 8,
+            "clear:both must sit below the float (below.y={}, side.y={})",
+            below.y,
+            side.y
+        );
+    }
+
+    #[test_case]
+    fn before_pseudo_emits_generated_content() {
+        let doc = html::parse(
+            r#"<html><head><style>p::before{content:"» "}</style></head>
+               <body><p>hello</p></body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let joined: String = lay.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            joined.contains('»') && joined.contains("hello"),
+            "expected ::before quote in runs, got {joined:?}"
+        );
+    }
+
+    #[test_case]
+    fn hn_like_link_and_modern_css_fixture() {
+        // HN-shaped: a:link colour + simple table.
+        let hn = html::parse(
+            r#"<html><head><style>
+                a:link{color:#000000;text-decoration:none}
+                .title{font-size:14px}
+            </style></head><body>
+                <table><tr><td class="title"><a href="x">Story</a></td></tr></table>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&hn.stylesheets, DEFAULT_W);
+        let lay = layout_document(&hn.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let story = lay.runs.iter().find(|r| r.text.contains("Story")).expect("Story");
+        assert_eq!(story.color, 0x000000, "a:link should be black");
+
+        // Modern: flex + media + calc + var + ::before.
+        let modern = html::parse(
+            r#"<html><head><style>
+                :root{--accent:#cc785c}
+                .row{display:flex;gap:8px;width:calc(100% - 20px)}
+                .badge::before{content:"> "}
+                @media (max-width: 100px){ .row{display:block} }
+            </style></head><body>
+                <div class="row"><span class="badge" style="color:var(--accent)">ok</span></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&modern.stylesheets, DEFAULT_W);
+        let lay = layout_document(&modern.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let joined: String = lay.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            joined.contains('>') && joined.contains("ok"),
+            "expected ::before + ok in runs, got {joined:?}"
+        );
+        let ok = lay.runs.iter().find(|r| r.text.contains("ok")).expect("ok");
+        assert_eq!(ok.color, 0xcc785c, "var(--accent) on colour");
     }
 
     #[test_case]

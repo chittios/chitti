@@ -7,6 +7,17 @@ description = "Host test262 runner powered by the vendored just-engine (applegre
 [workspace]
 members = []
 
+# The SAME vendored pest the kernel builds — otherwise this harness measures a
+# different parser than the one that runs in the OS, which is the one thing a
+# host harness must never do.
+[patch.crates-io]
+pest = { path = "../../../third_party/pest" }
+pest_derive = { path = "../../../third_party/pest_derive" }
+pest_generator = { path = "../../../third_party/pest_generator" }
+pest_meta = { path = "../../../third_party/pest_meta" }
+pest_consume = { path = "../../../third_party/pest_consume" }
+pest_consume_macros = { path = "../../../third_party/pest_consume_macros" }
+
 [dependencies]
 just-engine = { path = "../../../third_party/just-ref" }
 

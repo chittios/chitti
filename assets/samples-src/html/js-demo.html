@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JS + CSS subresources</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <h1>External CSS &amp; JS</h1>
+    <p>Relative <code>href</code>/<code>src</code> against a <code>file:///</code> document.</p>
+  </header>
+  <main class="card">
+    <p>Counter: <strong id="count">0</strong></p>
+    <button id="btn" type="button">Increment</button>
+    <p id="msg" class="foot">waiting for app.js…</p>
+  </main>
+  <p class="foot"><a href="index.html">← samples index</a></p>
+  <script src="app.js"></script>
+</body>
+</html>

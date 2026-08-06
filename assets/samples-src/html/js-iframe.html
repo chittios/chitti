@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JS iframe / postMessage suite</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    #results { font-family: ui-monospace, monospace; font-size: 0.85rem; line-height: 1.4; }
+    #results .pass { color: #2e7d32; }
+    #results .fail { color: #c62828; }
+    #results .sum { margin-top: 0.75rem; font-weight: 600; }
+    iframe {
+      width: 100%;
+      max-width: 420px;
+      height: 120px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      background: #fff;
+      margin-top: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <h1>JS iframe / postMessage</h1>
+    <p>Self-check: iframe <code>src</code> / <code>srcdoc</code>, same-window <code>postMessage</code>, parent outbound. Marker: <code>js-iframe ALL PASS</code>.</p>
+  </header>
+  <main class="card">
+    <div id="results">running…</div>
+    <h2 style="font-size:1rem;color:#cc785c;margin:1rem 0 0.35rem">iframe src</h2>
+    <iframe id="child" src="iframe-child.html" title="child"></iframe>
+    <h2 style="font-size:1rem;color:#cc785c;margin:1rem 0 0.35rem">iframe srcdoc</h2>
+    <iframe id="inline" title="srcdoc" srcdoc="<html><body style='font:14px sans-serif;margin:8px'><p id=m>srcdoc child</p><script>try{parent.postMessage('srcdoc-hi','*')}catch(e){}</script></body></html>"></iframe>
+  </main>
+  <p class="foot"><a href="index.html">← samples index</a> · <a href="iframe-child.html">iframe-child.html</a></p>
+  <script src="harness.js"></script>
+  <script src="js-iframe.js"></script>
+</body>
+</html>

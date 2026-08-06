@@ -78,6 +78,19 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     let far: u64;
     // SAFETY: reading FAR_EL1 is always valid at EL1.
     unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack)) };
+    // A fault inside the guard region below the boot stack is a **kernel stack
+    // overflow**, and it must be said in those words: the alternative is what
+    // this used to do — walk past the stack into `.bss`, corrupt statics, and
+    // hang in this vector with no output at all. Reported on raw serial because
+    // the stack we are on is the broken one and the console takes a lock.
+    if in_stack_guard(far) {
+        crate::serial::write_str_raw(
+            "aarch64 FATAL: kernel stack overflow (faulted in the stack guard) -- halting\n",
+        );
+        loop {
+            super::hlt();
+        }
+    }
     crate::ktrace::log_fmt(format_args!(
         "aarch64 sync exception: ESR_EL1={:#x} ELR_EL1={:#x} FAR_EL1={:#x}",
         esr, elr, far
@@ -93,6 +106,24 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     loop {
         super::hlt();
     }
+}
+
+/// True when `addr` lies in the reserved region just below the boot stack
+/// (`kernel/linker-aarch64.ld`). Nothing is ever placed there, so an access is
+/// only ever the stack having grown through its own bottom.
+fn in_stack_guard(addr: u64) -> bool {
+    unsafe extern "C" {
+        static __stack_guard_bottom: u8;
+        static __stack_guard_top: u8;
+    }
+    // SAFETY: taking the addresses of linker-provided symbols; never read.
+    let (lo, hi) = unsafe {
+        (
+            &raw const __stack_guard_bottom as u64,
+            &raw const __stack_guard_top as u64,
+        )
+    };
+    addr >= lo && addr < hi
 }
 
 /// Fatal-exception handler for the SError / unexpected vectors: log the

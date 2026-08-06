@@ -735,10 +735,64 @@ fn build_ast_from_function_body(
     ))
 }
 
+/// Deepest nesting the AST builder will follow before refusing.
+///
+/// The builder is recursive descent, so nesting in the *source* becomes
+/// recursion on the **kernel task stack** — 256 KiB, with frames this large.
+/// Real minified code reaches depths hand-written code never does: a chain of
+/// 320 `else if`s is one nested `IfStatement` per link, and www.google.com's
+/// search page ships exactly that. Overflowing the stack does not raise a Rust
+/// error, it takes a synchronous exception whose handler faults again — the
+/// machine stops with no output and no Ctrl+C, which is what a page must never
+/// be able to do. 256 is far deeper than any legible source and shallow enough
+/// to survive with room to spare.
+const MAX_AST_DEPTH: u32 = 256;
+
+/// Current builder depth. The parse runs on one task, so a plain counter is
+/// enough; [`DepthGuard`] restores it on every exit path including `?`.
+static AST_DEPTH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+struct DepthGuard;
+
+impl DepthGuard {
+    /// Enter one level, or `Err` past [`MAX_AST_DEPTH`].
+    fn enter(pair: &Pair<Rule>, script: &Rc<String>) -> Result<Self, JsRuleError> {
+        let d = AST_DEPTH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        AST_DEPTH_MAX.fetch_max(d + 1, core::sync::atomic::Ordering::Relaxed);
+        if d >= MAX_AST_DEPTH {
+            AST_DEPTH.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            return Err(get_validation_error(
+                alloc::format!("expression or statement nested deeper than {MAX_AST_DEPTH}"),
+                AstBuilderValidationErrorType::SyntaxError,
+                pair,
+                script,
+            ));
+        }
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        AST_DEPTH.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Deepest nesting any parse has reached — reported by the host harness so the
+/// limit above can be set from measurements rather than a guess.
+pub static AST_DEPTH_MAX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Reset the depth counter — a parse that bailed out mid-way (any `Err`) unwinds
+/// its guards, but a *panic*-free abort elsewhere could leave it non-zero.
+pub fn reset_ast_depth() {
+    AST_DEPTH.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn build_ast_from_statement(
     pair: Pair<Rule>,
     script: &Rc<String>,
 ) -> Result<(StatementType, Semantics), JsRuleError> {
+    let _depth = DepthGuard::enter(&pair, script)?;
     let inner_pair = pair.into_inner().next().unwrap();
     let meta = get_meta(&inner_pair, script);
     Ok(match inner_pair.as_rule() {
@@ -1521,7 +1575,7 @@ fn build_ast_from_binding_property(
     } else if inner_pair.as_rule() == Rule::property_name
         || inner_pair.as_rule() == Rule::property_name__yield
     {
-        let (key, _key_s) = build_ast_from_property_name(inner_pair, script)?;
+        let (key, _key_s, key_computed) = build_ast_from_property_name(inner_pair, script)?;
         let (value, value_s) =
             build_ast_from_lexical_binding_or_variable_declaration_or_binding_element(
                 inner_iter.next().unwrap(),
@@ -1538,7 +1592,7 @@ fn build_ast_from_binding_property(
         };
         // s.merge(value_s); bound_names is read only from value_s (binding_element)
         Ok((
-            AssignmentPropertyData::new_with_any_expression_key(meta, key, value_exp, false),
+            AssignmentPropertyData::new_with_any_expression_key(meta, key, key_computed, value_exp, false),
             value_s,
         ))
     } else {
@@ -1549,10 +1603,20 @@ fn build_ast_from_binding_property(
     }
 }
 
+/// Build an object/class property *name*.
+///
+/// The third element of the result is whether the source wrote a **computed**
+/// key (`[expr]`). It has to be reported: deciding "computed" from the shape of
+/// the key expression — as `new_with_any_expression_key` used to — reads
+/// `{ [node]: v }` as the *literal* key `"node"`, because a computed key whose
+/// expression happens to be a bare identifier is indistinguishable from a
+/// static one after parsing. Radix builds every one of its primitives that way
+/// (`NODES.reduce((p, node) => ({ ...p, [node]: … }), {})`), so `Primitive.div`
+/// came out `undefined` and React refused the element with `got: undefined`.
 fn build_ast_from_property_name(
     pair: Pair<Rule>,
     script: &Rc<String>,
-) -> Result<(ExpressionType, Semantics), JsRuleError> {
+) -> Result<(ExpressionType, Semantics, bool), JsRuleError> {
     let inner_pair = pair.into_inner().next().unwrap();
     Ok(if inner_pair.as_rule() == Rule::literal_property_name {
         let pn_pair = inner_pair.into_inner().next().unwrap();
@@ -1582,11 +1646,14 @@ fn build_ast_from_property_name(
                 ));
             },
             s,
+            false,
         )
     } else if inner_pair.as_rule() == Rule::computed_property_name
         || inner_pair.as_rule() == Rule::computed_property_name__yield
     {
-        build_ast_from_assignment_expression(inner_pair.into_inner().next().unwrap(), script)?
+        let (e, s) =
+            build_ast_from_assignment_expression(inner_pair.into_inner().next().unwrap(), script)?;
+        return Ok((e, s, true));
     } else {
         return Err(get_unexpected_error(
             "build_ast_from_property_name:2",
@@ -2021,6 +2088,7 @@ fn build_ast_from_assignment_expression(
     pair: Pair<Rule>,
     script: &Rc<String>,
 ) -> Result<(ExpressionType, Semantics), JsRuleError> {
+    let _depth = DepthGuard::enter(&pair, script)?;
     let meta = get_meta(&pair, script);
     let mut inner_pair_iter = pair.into_inner().peekable();
     let inner_pair = inner_pair_iter.next().unwrap();
@@ -2242,6 +2310,7 @@ fn convert_lhs_expression_to_pattern_for_assignment_operation(
                     properties.push(AssignmentPropertyData::new_with_any_expression_key(
                         p.meta,
                         *p.key,
+                        p.computed,
                         convert_lhs_expression_to_pattern_for_assignment_operation(
                             *p.value,
                             None,
@@ -4504,6 +4573,7 @@ fn build_ast_from_property_definition(
             PropertyData::new_with_any_expression_key(
                 meta.clone(),
                 ExpressionType::ThisExpression { meta },
+                false,
                 Box::new(a),
                 PropertyKind::Spread,
                 false,
@@ -4511,13 +4581,14 @@ fn build_ast_from_property_definition(
             )
         }
         Rule::property_name | Rule::property_name__yield => {
-            let (p, p_s) = build_ast_from_property_name(inner_pair, script)?;
+            let (p, p_s, p_computed) = build_ast_from_property_name(inner_pair, script)?;
             let (a, a_s) =
                 build_ast_from_assignment_expression(inner_pair_iter.next().unwrap(), script)?;
             s.merge(p_s).merge(a_s);
             PropertyData::new_with_any_expression_key(
                 meta,
                 p,
+                p_computed,
                 Box::new(a),
                 PropertyKind::Init,
                 false,
@@ -4578,7 +4649,7 @@ fn build_ast_from_method_definition(
     let inner_pair = inner_iter.next().unwrap();
     let m = match inner_pair.as_rule() {
         Rule::property_name | Rule::property_name__yield => {
-            let (p, p_s) = build_ast_from_property_name(inner_pair, script)?;
+            let (p, p_s, p_computed) = build_ast_from_property_name(inner_pair, script)?;
             let (fp, fp_s) = build_ast_from_formal_parameters(inner_iter.next().unwrap(), script)?;
             let (fb, fb_s) = build_ast_from_function_body(inner_iter.next().unwrap(), script)?;
             validate_bound_names_have_no_duplicates_and_also_not_present_in_var_declared_names_or_lexically_declared_names(&fp_s.bound_names,&vec![],&fb_s.lexically_declared_names)?;
@@ -4587,6 +4658,7 @@ fn build_ast_from_method_definition(
             PropertyData::new_with_any_expression_key(
                 meta,
                 p,
+                p_computed,
                 Box::new(ExpressionType::FunctionOrGeneratorExpression(
                     FunctionData {
                         meta: meta2,
@@ -4604,7 +4676,7 @@ fn build_ast_from_method_definition(
         }
         Rule::generator_method | Rule::generator_method__yield => {
             let mut inner_inner_iter = inner_pair.into_inner();
-            let (p, p_s) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
+            let (p, p_s, p_computed) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
             let (fp, fp_s) =
                 build_ast_from_formal_parameters(inner_inner_iter.next().unwrap(), script)?;
             let (fb, fb_s) =
@@ -4622,6 +4694,7 @@ fn build_ast_from_method_definition(
             PropertyData::new_with_any_expression_key(
                 meta,
                 p,
+                p_computed,
                 Box::new(ExpressionType::FunctionOrGeneratorExpression(
                     FunctionData {
                         meta: meta2,
@@ -4640,7 +4713,7 @@ fn build_ast_from_method_definition(
         Rule::async_method => {
             // async_kw ~ property_name ~ "(" params ")" "{" body "}"
             let mut inner_inner_iter = inner_pair.into_inner().filter(|p| p.as_rule() != Rule::async_kw);
-            let (p, p_s) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
+            let (p, p_s, p_computed) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
             let (fp, fp_s) =
                 build_ast_from_formal_parameters(inner_inner_iter.next().unwrap(), script)?;
             let (fb, fb_s) =
@@ -4651,6 +4724,7 @@ fn build_ast_from_method_definition(
             PropertyData::new_with_any_expression_key(
                 meta,
                 p,
+                p_computed,
                 Box::new(ExpressionType::FunctionOrGeneratorExpression(
                     FunctionData {
                         meta: meta2,
@@ -4669,7 +4743,7 @@ fn build_ast_from_method_definition(
         Rule::async_generator_method => {
             // async_kw ~ "*" ~ property_name ~ "(" params ")" "{" gen_body "}"
             let mut inner_inner_iter = inner_pair.into_inner().filter(|p| p.as_rule() != Rule::async_kw);
-            let (p, p_s) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
+            let (p, p_s, p_computed) = build_ast_from_property_name(inner_inner_iter.next().unwrap(), script)?;
             let (fp, fp_s) =
                 build_ast_from_formal_parameters(inner_inner_iter.next().unwrap(), script)?;
             let (fb, fb_s) =
@@ -4680,6 +4754,7 @@ fn build_ast_from_method_definition(
             PropertyData::new_with_any_expression_key(
                 meta,
                 p,
+                p_computed,
                 Box::new(ExpressionType::FunctionOrGeneratorExpression(
                     FunctionData {
                         meta: meta2,
@@ -4696,13 +4771,14 @@ fn build_ast_from_method_definition(
             )
         }
         Rule::getter => {
-            let (p, p_s) = build_ast_from_property_name(inner_iter.next().unwrap(), script)?;
+            let (p, p_s, p_computed) = build_ast_from_property_name(inner_iter.next().unwrap(), script)?;
             let (fb, fb_s) = build_ast_from_function_body(inner_iter.next().unwrap(), script)?;
             s.merge(p_s).merge(fb_s);
             let meta2 = meta.clone();
             PropertyData::new_with_any_expression_key(
                 meta,
                 p,
+                p_computed,
                 Box::new(ExpressionType::FunctionOrGeneratorExpression(
                     FunctionData {
                         meta: meta2,
@@ -4719,7 +4795,7 @@ fn build_ast_from_method_definition(
             )
         }
         Rule::setter => {
-            let (p, p_s) = build_ast_from_property_name(inner_iter.next().unwrap(), script)?;
+            let (p, p_s, p_computed) = build_ast_from_property_name(inner_iter.next().unwrap(), script)?;
             // Setters use property_set_parameter_list which is a single formal_parameter (silent rule)
             let (fp, fp_s) = build_ast_from_single_formal_parameter(inner_iter.next().unwrap(), script)?;
             let (fb, fb_s) = build_ast_from_function_body(inner_iter.next().unwrap(), script)?;
@@ -4729,6 +4805,7 @@ fn build_ast_from_method_definition(
             PropertyData::new_with_any_expression_key(
                 meta,
                 p,
+                p_computed,
                 Box::new(ExpressionType::FunctionOrGeneratorExpression(
                     FunctionData {
                         meta: meta2,
@@ -4985,17 +5062,12 @@ fn build_ast_from_class_element(
         let name_inner = name_pair.into_inner().next().unwrap();
         let (key, computed) = match name_inner.as_rule() {
             Rule::property_name | Rule::property_name__yield => {
-                let (k, k_s) = build_ast_from_property_name(name_inner.clone(), script)?;
+                // The builder reports `computed` itself now — this site used to
+                // re-derive it by re-walking the pair, which was the only place
+                // that got it right.
+                let (k, k_s, computed) =
+                    build_ast_from_property_name(name_inner.clone(), script)?;
                 s.merge(k_s);
-                // computed when it was a `[expr]` form
-                let computed = name_inner
-                    .into_inner()
-                    .next()
-                    .map(|p| {
-                        p.as_rule() == Rule::computed_property_name
-                            || p.as_rule() == Rule::computed_property_name__yield
-                    })
-                    .unwrap_or(false);
                 (Box::new(k), computed)
             }
             Rule::private_name => {

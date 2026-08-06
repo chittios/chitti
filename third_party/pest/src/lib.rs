@@ -89,7 +89,7 @@ pub mod error;
 pub mod iterators;
 mod macros;
 mod parser;
-mod parser_state;
+pub mod parser_state;
 mod position;
 // ChittiOS patch: prec_climber's HashMap swapped to BTreeMap so it builds no_std.
 pub mod prec_climber;

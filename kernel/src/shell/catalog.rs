@@ -135,7 +135,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Network", title: "HTTP Client", name: "http", shortcut: "" },
     Entry {
         category: "Network",
-        title: "Browse URL (render HTML)",
+        title: "Browse URL / file:///samples/html/…",
         name: "browse",
         shortcut: "",
     },

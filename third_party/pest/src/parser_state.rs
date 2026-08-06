@@ -55,6 +55,45 @@ pub enum MatchDir {
 /// The complete state of a [`Parser`].
 ///
 /// [`Parser`]: trait.Parser.html
+
+/// Deepest grammar-rule nesting the parser will follow.
+///
+/// Sized from the kernel's 2 MiB boot stack and measured frames: real bundles
+/// peak well under this (see `AST_DEPTH_MAX` in the JS parser for the companion
+/// figure), while the pathological input that overflowed reached it in one
+/// script. Set generously — the point is to fail before the hardware does, not
+/// to be strict.
+pub const MAX_RULE_DEPTH: usize = 1500;
+
+/// Current rule depth. Parsing is single-threaded here, so a plain counter is
+/// enough; [`DepthGuard`] restores it on every exit path.
+pub static RULE_DEPTH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Deepest nesting any parse has reached — so the limit above can be set from
+/// measurements rather than a guess.
+pub static RULE_DEPTH_MAX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Option<Self> {
+        let d = RULE_DEPTH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        RULE_DEPTH_MAX.fetch_max(d + 1, core::sync::atomic::Ordering::Relaxed);
+        if d >= MAX_RULE_DEPTH {
+            RULE_DEPTH.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        Some(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        RULE_DEPTH.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 pub struct ParserState<'i, R: RuleType> {
     position: Position<'i>,
@@ -198,6 +237,20 @@ impl<'i, R: RuleType> ParserState<'i, R> {
     where
         F: FnOnce(Box<Self>) -> ParseResult<Box<Self>>,
     {
+        // ChittiOS: bound the PEG's recursion.
+        //
+        // Every nested grammar rule is a Rust stack frame, and the input is a
+        // web page's JavaScript — attacker-controlled, and minified code nests
+        // far deeper than anything hand-written. On a kernel task stack, running
+        // out does not unwind: the stack pointer walks off the bottom into
+        // `.bss`, silently corrupting statics, and the next exception re-enters
+        // the vector on that ruined stack and loops there forever. The machine
+        // stops with no output and no Ctrl+C. A refused parse is a page that
+        // does not run; an overflow is an OS that does not run.
+        let _guard = match DepthGuard::enter() {
+            Some(g) => g,
+            None => return Err(self),
+        };
         let actual_pos = self.position.pos();
         let index = self.queue.len();
 

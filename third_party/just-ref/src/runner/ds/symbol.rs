@@ -37,6 +37,11 @@ impl SymbolData {
         SymbolData { description }
     }
 
+    /// The symbol's description string (used by `Symbol.keyFor` / `String(sym)`).
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
     pub fn new_empty() -> Self {
         // Anonymous symbol: a process-unique description string.
         #[cfg(feature = "std")]

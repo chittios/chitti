@@ -1,0 +1,33 @@
+/* Shared styles for /samples/html (file:/// relative links). */
+:root { --accent: #cc785c; --ink: #2a2a2a; --paper: #f5f0e8; }
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+}
+.hero {
+  padding: 1.25rem 1.5rem;
+  background: linear-gradient(#f5f0e8, #e8e0d4);
+  border-bottom: 1px solid #ddd;
+}
+.hero h1 { margin: 0 0 0.35rem; color: var(--accent); }
+.card {
+  margin: 1rem 1.5rem;
+  padding: 1rem 1.25rem;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+}
+.card ul { margin: 0.5rem 0 0; padding-left: 1.25rem; }
+a { color: var(--accent); }
+code { font-size: 0.9em; }
+.foot { margin: 1rem 1.5rem; color: #666; font-size: 0.9rem; }
+button {
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+}

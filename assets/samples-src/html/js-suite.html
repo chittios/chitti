@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JS suite</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    #results { font-family: ui-monospace, monospace; font-size: 0.9rem; line-height: 1.45; }
+    #results .pass { color: #2e7d32; }
+    #results .fail { color: #c62828; }
+    #results .sum { margin-top: 0.75rem; font-weight: 600; }
+    /* Keep fixtures in-DOM (getElementById) but off-layout. */
+    #playground { position: absolute; left: -9999px; top: 0; width: 1px; height: 1px; overflow: hidden; }
+    .live { margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid #eee; }
+    #live-out { margin-left: 0.5rem; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <h1>JS suite</h1>
+    <p>Self-checking DOM / storage / canvas / events tests under <code>file:///</code>.</p>
+  </header>
+
+  <main class="card">
+    <div id="results">running…</div>
+
+    <div class="live">
+      <button type="button" id="live-btn">Click me</button>
+      <span id="live-out">0</span>
+      <span class="muted"> — addEventListener smoke</span>
+    </div>
+  </main>
+
+  <!-- Fixtures the suite script probes (kept in normal flow, not display:none). -->
+  <div id="playground" aria-hidden="true">
+    <div id="box" data-k="v" class="a">seed</div>
+    <span class="x">1</span>
+    <span class="x">2</span>
+    <canvas id="c" width="20" height="20"></canvas>
+    <a id="link" href="index.html">home</a>
+  </div>
+
+  <p class="foot"><a href="index.html">← samples index</a></p>
+  <script src="js-suite.js"></script>
+</body>
+</html>

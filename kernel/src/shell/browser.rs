@@ -13,6 +13,12 @@ use super::*;
 pub(super) const BROWSER_SURFACE: u32 = u32::MAX - 2;
 pub(super) const BROWSER_BODY_MAX: usize = 1 << 20; // 1 MiB
 
+/// Read a `file:///` URL from the Synapse store / mounted volumes.
+fn read_file_url(url: &str) -> Option<alloc::vec::Vec<u8>> {
+    let path = crate::browser::url::file_path(url)?;
+    read_mounted(&path).or_else(|| crate::synapse::fs::read(&path))
+}
+
 /// Browser layout/paint viewport width — the action pane's actual pixel width
 /// so the page is rendered 1:1 into the pane (no upscaling → crisp text).
 /// Falls back to a sane default before the pane exists.
@@ -221,6 +227,7 @@ pub(crate) fn run_browser_tool(name: &str, args_json: &str) -> alloc::string::St
     match name {
         "browser_open" | "browser_navigate" => {
             let url = json_str(args_json, "url").unwrap_or_default();
+            let url = crate::browser::url::normalize_browse_arg(&url);
             browser_load(&url, name == "browser_navigate" || name == "browser_open")
         }
         "browser_back" => browser_back(),
@@ -331,7 +338,7 @@ pub(super) fn browser_mirror_js_log() {
 pub(super) fn browser_dispatch_nav(base: &str) -> Option<alloc::string::String> {
     let nav = crate::browser::js_just::page_with_dom(|d| d.navigate.take()).flatten()?;
     let abs = crate::browser::url::resolve(base, &nav).unwrap_or(nav);
-    if !crate::browser::url::is_http_url(&abs) {
+    if !crate::browser::url::is_browse_url(&abs) {
         return None;
     }
     Some(browser_load(&abs, true))
@@ -357,7 +364,7 @@ pub(super) fn browser_load_fonts(css: &str, base_url: &str) {
             continue; // first src per family wins
         }
         let abs = crate::browser::url::resolve(base_url, &f.url).unwrap_or_else(|| f.url.clone());
-        if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+        if !crate::browser::url::is_browse_url(&abs) {
             continue;
         }
         if !urls.contains(&abs) {
@@ -368,13 +375,29 @@ pub(super) fn browser_load_fonts(css: &str, base_url: &str) {
     if urls.is_empty() {
         return;
     }
-    let fetched = crate::browser::worker::fetch_subresources_cooperative(
-        &urls,
-        crate::browser::loader::Destination::Font,
-        1 << 20,
-    );
+    let http_urls: alloc::vec::Vec<_> = urls
+        .iter()
+        .filter(|u| crate::browser::url::is_http_url(u))
+        .cloned()
+        .collect();
+    let fetched = if http_urls.is_empty() {
+        alloc::collections::BTreeMap::new()
+    } else {
+        crate::browser::worker::fetch_subresources_cooperative(
+            &http_urls,
+            crate::browser::loader::Destination::Font,
+            1 << 20,
+        )
+    };
     for (family, abs) in wanted {
-        let Some(bytes) = fetched.get(&abs) else {
+        let owned;
+        let bytes = if crate::browser::url::is_file_url(&abs) {
+            owned = read_file_url(&abs);
+            owned.as_deref()
+        } else {
+            fetched.get(&abs).map(|v| v.as_slice())
+        };
+        let Some(bytes) = bytes else {
             crate::serial_println!("browser> font: '{}' not fetched ({})", family, abs);
             continue;
         };
@@ -409,20 +432,33 @@ pub(super) fn browser_fetch_bg_images(
     let mut urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
     for u in crate::browser::css::scan_css_urls(css) {
         let abs = crate::browser::url::resolve(base_url, &u).unwrap_or(u);
-        if (abs.starts_with("http://") || abs.starts_with("https://")) && !urls.contains(&abs) {
+        if crate::browser::url::is_browse_url(&abs) && !urls.contains(&abs) {
             urls.push(abs);
         }
     }
     if urls.is_empty() {
         return out;
     }
-    let (loaded, assets) = crate::browser::worker::fetch_images_cooperative(&urls);
+    let http_urls: alloc::vec::Vec<_> = urls
+        .iter()
+        .filter(|u| crate::browser::url::is_http_url(u))
+        .cloned()
+        .collect();
+    let (loaded, assets) = if http_urls.is_empty() {
+        (alloc::vec::Vec::new(), crate::browser::cache::AssetStore::new())
+    } else {
+        crate::browser::worker::fetch_images_cooperative(&http_urls)
+    };
     for u in &urls {
-        let body: Option<alloc::vec::Vec<u8>> = loaded
-            .iter()
-            .find(|r| &r.url == u)
-            .map(|r| r.body.clone())
-            .or_else(|| assets.get(u).map(|(_, b)| b.to_vec()));
+        let body: Option<alloc::vec::Vec<u8>> = if crate::browser::url::is_file_url(u) {
+            read_file_url(u)
+        } else {
+            loaded
+                .iter()
+                .find(|r| &r.url == u)
+                .map(|r| r.body.clone())
+                .or_else(|| assets.get(u).map(|(_, b)| b.to_vec()))
+        };
         let Some(bytes) = body else { continue };
         // SVG-aware decode (iana.org's icons are SVG); 0 hints → intrinsic size.
         let Some(img) = crate::browser::decode_image_or_svg(&bytes, 0, 0) else {
@@ -498,9 +534,7 @@ pub(super) fn browser_module_graph(
 ) {
     for spec in imports {
         let abs = crate::browser::url::resolve(base_url, &spec).unwrap_or(spec);
-        if !(abs.starts_with("http://") || abs.starts_with("https://"))
-            || visited.contains(&abs)
-        {
+        if !crate::browser::url::is_browse_url(&abs) || visited.contains(&abs) {
             continue;
         }
         visited.insert(abs.clone());
@@ -508,16 +542,28 @@ pub(super) fn browser_module_graph(
             crate::serial_println!("browser> js: skipped {} (import depth cap)", abs);
             continue;
         }
-        let fetched = crate::browser::worker::fetch_subresources_cooperative(
-            core::slice::from_ref(&abs),
-            crate::browser::loader::Destination::Script,
-            512 * 1024,
-        );
-        let Some(bytes) = fetched.get(&abs) else {
-            crate::serial_println!("browser> js: skipped {} (not fetched)", abs);
-            continue;
+        let src = if crate::browser::url::is_file_url(&abs) {
+            match read_file_url(&abs) {
+                Some(b) => alloc::string::String::from_utf8_lossy(&b).into_owned(),
+                None => {
+                    crate::serial_println!("browser> js: skipped {} (not fetched)", abs);
+                    continue;
+                }
+            }
+        } else {
+            let fetched = crate::browser::worker::fetch_subresources_cooperative(
+                core::slice::from_ref(&abs),
+                crate::browser::loader::Destination::Script,
+                512 * 1024,
+            );
+            match fetched.get(&abs) {
+                Some(bytes) => alloc::string::String::from_utf8_lossy(bytes).into_owned(),
+                None => {
+                    crate::serial_println!("browser> js: skipped {} (not fetched)", abs);
+                    continue;
+                }
+            }
         };
-        let src = alloc::string::String::from_utf8_lossy(bytes).into_owned();
         let (sub_stripped, sub_imports) = crate::browser::css::strip_module_syntax(&src);
         browser_module_graph(sub_stripped, sub_imports, &abs, depth - 1, visited, out);
     }
@@ -530,7 +576,10 @@ pub(super) fn browser_module_graph(
 /// calls it from its hot loops (see `just_engine::runner::host`).
 pub(super) fn browser_js_tick() -> bool {
     upkeep();
-    poll_interrupt()
+    // Ctrl+C is the human's answer; the budget is the one for when nobody is
+    // watching. Both abort with the same uncatchable interrupt, and
+    // `js_just::abort_reason` tells them apart for the log.
+    poll_interrupt() || crate::browser::js_just::script_budget_expired()
 }
 
 /// The `host[:port]` of an `http(s)://` URL, or `None`.
@@ -571,18 +620,62 @@ pub(super) fn browser_prefetch_dns<'a>(hrefs: impl Iterator<Item = &'a str>, bas
     }
 }
 
+
+/// Trace one phase of a page load: its name and how long it took.
+///
+/// "`/browse` never came back" is otherwise a bisect through a long function;
+/// with this, the last line printed IS the phase that hung.
+fn browser_phase(name: &str, since_ms: u64) -> u64 {
+    let now = crate::arch::now_ms();
+    crate::ktrace::log_fmt(format_args!(
+        "browser:phase {name} {} ms",
+        now.saturating_sub(since_ms)
+    ));
+    now
+}
+
+/// How many `<meta http-equiv="refresh">` hops one navigation may follow.
+/// A meta refresh carries no HTTP status, so nothing else bounds a chain of
+/// them; three is past every real "you are being redirected" interstitial.
+const META_REFRESH_MAX_HOPS: u32 = 3;
+
+/// Longest refresh delay treated as a redirect rather than as content the
+/// reader is meant to see first.
+const META_REFRESH_MAX_DELAY_S: u32 = 1;
+
 pub(super) fn browser_load_method(
     url: &str,
     method: &str,
     body: &[u8],
     push_hist: bool,
 ) -> alloc::string::String {
-    let url = url.trim();
+    browser_load_method_hops(url, method, body, push_hist, 0)
+}
+
+/// A meta-refresh hop re-enters the loader; `meta_hops` is what stops a chain.
+fn browser_load_hops(url: &str, push_hist: bool, meta_hops: u32) -> alloc::string::String {
+    browser_load_method_hops(url, "GET", &[], push_hist, meta_hops)
+}
+
+fn browser_load_method_hops(
+    url: &str,
+    method: &str,
+    body: &[u8],
+    push_hist: bool,
+    meta_hops: u32,
+) -> alloc::string::String {
+    let url = crate::browser::url::normalize_browse_arg(url.trim());
     if url.is_empty() {
         return alloc::string::String::from("error: missing url");
     }
-    if !crate::browser::url::is_http_url(url) {
-        return alloc::string::String::from("error: url must be http:// or https://");
+    if !crate::browser::url::is_browse_url(&url) {
+        return alloc::string::String::from(
+            "error: url must be http://, https://, or file:///",
+        );
+    }
+    let is_file = crate::browser::url::is_file_url(&url);
+    if is_file && method.eq_ignore_ascii_case("POST") {
+        return alloc::string::String::from("error: file:// only supports GET");
     }
     // Keep the UI alive + Ctrl+C responsive while page scripts run.
     just_engine::runner::host::set_tick_hook(Some(browser_js_tick));
@@ -597,26 +690,59 @@ pub(super) fn browser_load_method(
     });
     browser_begin_load();
     browser_set_progress(5);
+    let t_phase = crate::arch::now_ms();
 
     // Progressive render (stage 1/5): paint a loading screen immediately so the
     // browser tab opens right away instead of a blank pane while the document +
     // subresources fetch.
     {
         let loading =
-            crate::browser::layout::layout_reader("Loading\u{2026}", url, browser_vw(), browser_vh());
-        browser_paint_stage(&loading, "Loading\u{2026}", url, 8);
+            crate::browser::layout::layout_reader("Loading\u{2026}", &url, browser_vw(), browser_vh());
+        browser_paint_stage(&loading, "Loading\u{2026}", &url, 8);
     }
 
-    let doc_res = if method.eq_ignore_ascii_case("POST") {
+    let doc_res = if is_file {
+        match read_file_url(&url) {
+            Some(bytes) => {
+                let ctype = if url.ends_with(".css") {
+                    "text/css"
+                } else if url.ends_with(".js") {
+                    "application/javascript"
+                } else if url.ends_with(".svg") {
+                    "image/svg+xml"
+                } else {
+                    "text/html; charset=utf-8"
+                };
+                crate::browser::loader::LoadedResource {
+                    url: url.clone(),
+                    status: 200,
+                    content_type: alloc::string::String::from(ctype),
+                    headers: alloc::vec::Vec::new(),
+                    body: bytes,
+                    from_cache: false,
+                    redirects: 0,
+                    destination: crate::browser::loader::Destination::Document,
+                    cors_opaque: false,
+                }
+            }
+            None => {
+                browser_clear_progress();
+                return alloc::format!(
+                    "error: file not found: {}",
+                    crate::browser::url::file_path(&url).unwrap_or_else(|| url.clone())
+                );
+            }
+        }
+    } else if method.eq_ignore_ascii_case("POST") {
         match crate::net::http::request(
             "POST",
-            url,
+            &url,
             &[("Content-Type", "application/x-www-form-urlencoded")],
             body,
             60_000,
         ) {
             Ok(r) => crate::browser::loader::LoadedResource {
-                url: url.to_string(),
+                url: url.clone(),
                 status: r.status,
                 content_type: r
                     .get("content-type")
@@ -635,7 +761,7 @@ pub(super) fn browser_load_method(
             }
         }
     } else {
-        match crate::browser::loader::load_document(url, false) {
+        match crate::browser::loader::load_document(&url, false) {
             Ok(r) => r,
             Err(e) => {
                 browser_clear_progress();
@@ -688,7 +814,7 @@ pub(super) fn browser_load_method(
     // stylesheets / fonts / background images (the layout parse comes later,
     // via the session path).
     let pre = crate::browser::html::parse(&body_html);
-    let is_http = |u: &str| u.starts_with("http://") || u.starts_with("https://");
+    let is_fetchable = |u: &str| crate::browser::url::is_browse_url(u);
 
     // DNS prefetch: resolve the cross-origin hosts of this page's scripts +
     // stylesheets up front so their fetches (below) skip the DNS round trip.
@@ -709,7 +835,7 @@ pub(super) fn browser_load_method(
         if let Some(src) = &t.src {
             let abs =
                 crate::browser::url::resolve(&final_url, src).unwrap_or_else(|| src.clone());
-            if is_http(&abs) && !script_urls.contains(&abs) {
+            if is_fetchable(&abs) && !script_urls.contains(&abs) {
                 script_urls.push(abs);
             }
         }
@@ -718,12 +844,29 @@ pub(super) fn browser_load_method(
         alloc::string::String,
         alloc::string::String,
     > = alloc::collections::BTreeMap::new();
-    for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
-        &script_urls,
-        crate::browser::loader::Destination::Script,
-        512 * 1024,
-    ) {
-        script_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
+    let http_scripts: alloc::vec::Vec<_> = script_urls
+        .iter()
+        .filter(|u| crate::browser::url::is_http_url(u))
+        .cloned()
+        .collect();
+    if !http_scripts.is_empty() {
+        for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
+            &http_scripts,
+            crate::browser::loader::Destination::Script,
+            512 * 1024,
+        ) {
+            script_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
+        }
+    }
+    for u in &script_urls {
+        if crate::browser::url::is_file_url(u) && !script_bodies.contains_key(u) {
+            if let Some(body) = read_file_url(u) {
+                script_bodies.insert(
+                    u.clone(),
+                    alloc::string::String::from_utf8_lossy(&body).into_owned(),
+                );
+            }
+        }
     }
     browser_set_progress(32);
 
@@ -734,7 +877,7 @@ pub(super) fn browser_load_method(
         if let crate::browser::html::StyleSrc::External(href) = s {
             let abs =
                 crate::browser::url::resolve(&final_url, href).unwrap_or_else(|| href.clone());
-            if is_http(&abs) && !css_urls.contains(&abs) {
+            if is_fetchable(&abs) && !css_urls.contains(&abs) {
                 css_urls.push(abs);
             }
         }
@@ -743,12 +886,29 @@ pub(super) fn browser_load_method(
         alloc::string::String,
         alloc::string::String,
     > = alloc::collections::BTreeMap::new();
-    for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
-        &css_urls,
-        crate::browser::loader::Destination::Style,
-        256 * 1024,
-    ) {
-        css_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
+    let http_css: alloc::vec::Vec<_> = css_urls
+        .iter()
+        .filter(|u| crate::browser::url::is_http_url(u))
+        .cloned()
+        .collect();
+    if !http_css.is_empty() {
+        for (u, body) in crate::browser::worker::fetch_subresources_cooperative(
+            &http_css,
+            crate::browser::loader::Destination::Style,
+            256 * 1024,
+        ) {
+            css_bodies.insert(u, alloc::string::String::from_utf8_lossy(&body).into_owned());
+        }
+    }
+    for u in &css_urls {
+        if crate::browser::url::is_file_url(u) && !css_bodies.contains_key(u) {
+            if let Some(body) = read_file_url(u) {
+                css_bodies.insert(
+                    u.clone(),
+                    alloc::string::String::from_utf8_lossy(&body).into_owned(),
+                );
+            }
+        }
     }
     let mut import_wants: alloc::vec::Vec<(
         alloc::string::String,
@@ -760,7 +920,7 @@ pub(super) fn browser_load_method(
             crate::browser::css::scan_imports(body)
                 .iter()
                 .filter_map(|i| crate::browser::url::resolve(sheet_url, i))
-                .filter(|u| is_http(u))
+                .filter(|u| is_fetchable(u))
                 .collect();
         for u in &imps {
             if !import_urls.contains(u) && !css_bodies.contains_key(u) {
@@ -772,11 +932,27 @@ pub(super) fn browser_load_method(
         }
     }
     if !import_urls.is_empty() {
-        let fetched_imports = crate::browser::worker::fetch_subresources_cooperative(
-            &import_urls,
-            crate::browser::loader::Destination::Style,
-            256 * 1024,
-        );
+        let http_imports: alloc::vec::Vec<_> = import_urls
+            .iter()
+            .filter(|u| crate::browser::url::is_http_url(u))
+            .cloned()
+            .collect();
+        let mut fetched_imports = if http_imports.is_empty() {
+            alloc::collections::BTreeMap::new()
+        } else {
+            crate::browser::worker::fetch_subresources_cooperative(
+                &http_imports,
+                crate::browser::loader::Destination::Style,
+                256 * 1024,
+            )
+        };
+        for u in &import_urls {
+            if crate::browser::url::is_file_url(u) && !fetched_imports.contains_key(u) {
+                if let Some(body) = read_file_url(u) {
+                    fetched_imports.insert(u.clone(), body);
+                }
+            }
+        }
         for (sheet_url, imps) in import_wants {
             let mut prefix = alloc::string::String::new();
             for u in &imps {
@@ -794,6 +970,7 @@ pub(super) fn browser_load_method(
         }
     }
     browser_set_progress(40);
+    let t_phase = browser_phase("css", t_phase);
 
     // (c) Web fonts + (d) CSS background images, from inline + external CSS.
     let mut all_css = pre.stylesheets.clone();
@@ -802,8 +979,10 @@ pub(super) fn browser_load_method(
         all_css.push_str(body);
     }
     browser_load_fonts(&all_css, &final_url);
+    let t_phase = browser_phase("fonts", t_phase);
     let bg_pixels = browser_fetch_bg_images(&all_css, &final_url);
     browser_set_progress(50);
+    let t_phase = browser_phase("bg-images", t_phase);
 
     // Progressive render (stage 3/5): CSS paint — re-lay out with the fetched
     // external stylesheets applied (still no scripts), so the page is styled
@@ -823,10 +1002,12 @@ pub(super) fn browser_load_method(
         };
         browser_paint_stage(&css_lay, &t, &final_url, 52);
     }
+    let t_phase = browser_phase("css-layout+paint", t_phase);
 
     // --- Boot the persistent page JS context (scripts run ONCE per
     // navigation; repaints re-read the DOM instead of re-running them).
     let (exec_list, _skipped) = browser_script_list(&pre, &final_url, &script_bodies);
+    let t_phase = browser_phase("script-list", t_phase);
     let _parsed = crate::browser::js_just::page_boot(
         &pre,
         &final_url,
@@ -834,6 +1015,7 @@ pub(super) fn browser_load_method(
         browser_vh(),
         &exec_list,
     );
+    let t_phase = browser_phase("page-boot", t_phase);
     browser_mirror_js_log();
     browser_set_progress(55);
 
@@ -841,14 +1023,40 @@ pub(super) fn browser_load_method(
     if let Some(nav) =
         crate::browser::js_just::page_with_dom(|d| d.navigate.take()).flatten()
     {
-        if crate::browser::url::is_http_url(&nav) && nav != final_url {
+        if crate::browser::url::is_browse_url(&nav) && nav != final_url {
             browser_clear_progress();
             return browser_load(&nav, push_hist);
         }
         if let Some(abs) = crate::browser::url::resolve(&final_url, &nav) {
-            if abs != final_url {
+            if crate::browser::url::is_browse_url(&abs) && abs != final_url {
                 browser_clear_progress();
                 return browser_load(&abs, push_hist);
+            }
+        }
+    }
+
+    // `<meta http-equiv="refresh">` — the only redirect a page can express in
+    // markup, and the one google.com/search hands a browser it does not want to
+    // serve. Taken AFTER scripts, so a page that navigates itself with
+    // `location.href` wins (that is the order a real browser ends up in), and
+    // bounded by `META_REFRESH_MAX_HOPS` because a chain of them is otherwise a
+    // navigation loop with no HTTP status to count.
+    //
+    // Only an *immediate* refresh is followed. A long delay is a page telling
+    // the reader "you have time to read this first"; honouring it here would
+    // yank the page away with no timer and no way to stop it.
+    if meta_hops < META_REFRESH_MAX_HOPS {
+        if let Some((delay, href)) = crate::browser::html::meta_refresh(&body_html) {
+            if delay <= META_REFRESH_MAX_DELAY_S {
+                let target = crate::browser::url::resolve(&final_url, &href)
+                    .unwrap_or_else(|| href.clone());
+                if crate::browser::url::is_browse_url(&target) && target != final_url {
+                    crate::ktrace::log_fmt(format_args!(
+                        "browser: meta refresh ({delay}s) -> {target}"
+                    ));
+                    browser_clear_progress();
+                    return browser_load_hops(&target, push_hist, meta_hops + 1);
+                }
             }
         }
     }
@@ -861,6 +1069,7 @@ pub(super) fn browser_load_method(
         };
         crate::browser::layout_session(&body_html, browser_vw(), browser_vh(), &final_url, &assets)
     };
+    let t_phase = browser_phase("session-layout", t_phase);
     browser_mirror_js_lines(&js_lines);
 
     // Progressive render (stage 4/5): scripts paint — the live page DOM after
@@ -882,13 +1091,21 @@ pub(super) fn browser_load_method(
         }
         let abs =
             crate::browser::url::resolve(&final_url, &im.src).unwrap_or_else(|| im.src.clone());
-        if abs.starts_with("http://") || abs.starts_with("https://") {
+        if crate::browser::url::is_browse_url(&abs) {
             img_urls.push(abs);
         }
     }
     let n_total = img_urls.len().max(1);
-    let (loaded_imgs, page_assets) =
-        crate::browser::worker::fetch_images_cooperative(&img_urls);
+    let http_imgs: alloc::vec::Vec<_> = img_urls
+        .iter()
+        .filter(|u| crate::browser::url::is_http_url(u))
+        .cloned()
+        .collect();
+    let (loaded_imgs, page_assets) = if http_imgs.is_empty() {
+        (alloc::vec::Vec::new(), crate::browser::cache::AssetStore::new())
+    } else {
+        crate::browser::worker::fetch_images_cooperative(&http_imgs)
+    };
     browser_set_progress(40 + (50 * loaded_imgs.len() / n_total) as u8);
     let n_imgs = loaded_imgs.len();
     let mut by_url: alloc::collections::BTreeMap<
@@ -901,6 +1118,13 @@ pub(super) fn browser_load_method(
     for u in page_assets.urls() {
         if let Some((_, body)) = page_assets.get(&u) {
             by_url.entry(u).or_insert_with(|| body.to_vec());
+        }
+    }
+    for u in &img_urls {
+        if crate::browser::url::is_file_url(u) && !by_url.contains_key(u) {
+            if let Some(body) = read_file_url(u) {
+                by_url.insert(u.clone(), body);
+            }
         }
     }
     for im in lay.images.iter_mut() {
@@ -937,7 +1161,15 @@ pub(super) fn browser_load_method(
                 }
                 let abs = crate::browser::url::resolve(&final_url, &fr.src)
                     .unwrap_or_else(|| fr.src.clone());
-                if !(abs.starts_with("http://") || abs.starts_with("https://")) {
+                if crate::browser::url::is_file_url(&abs) {
+                    if let Some(bytes) = read_file_url(&abs) {
+                        let nested =
+                            alloc::string::String::from_utf8_lossy(&bytes).into_owned();
+                        crate::browser::fill_frame_slot(fr, &nested, &abs);
+                    }
+                    continue;
+                }
+                if !crate::browser::url::is_http_url(&abs) {
                     continue;
                 }
                 let req =
@@ -965,14 +1197,19 @@ pub(super) fn browser_load_method(
                 }
                 let abs = crate::browser::url::resolve(&final_url, &fr.src)
                     .unwrap_or_else(|| fr.src.clone());
-                // http(s) via loader, or store/mount path via existing readers
-                let bytes = if abs.starts_with("http://") || abs.starts_with("https://") {
+                // http(s) via loader, file:/// or store/mount path via readers
+                let bytes = if crate::browser::url::is_http_url(&abs) {
                     let req = crate::browser::loader::LoadRequest::get(&abs)
                         .with_source(&final_url)
                         .with_timeout(60_000);
                     match crate::browser::loader::load(&req) {
                         Ok(res) if res.status < 400 => res.body,
                         _ => continue,
+                    }
+                } else if crate::browser::url::is_file_url(&abs) {
+                    match read_file_url(&abs) {
+                        Some(b) => b,
+                        None => continue,
                     }
                 } else {
                     match read_mounted(&abs).or_else(|| crate::synapse::fs::read(&abs)) {
@@ -1221,13 +1458,24 @@ pub(super) fn browser_present(pixels: &[u32], title: &str, url: &str, scroll_y: 
             browser_vh(),
             focused,
         );
+        // The box counts are the difference between "the page did not render"
+        // and "the page rendered and nothing is visible" — two failures that
+        // look identical on screen and have nothing in common.
+        let (n_rects, n_runs, n_ctrl) = BROWSER_LAYOUT.with(|s| {
+            s.as_ref()
+                .map(|l| (l.rects.len(), l.runs.len(), l.controls.len()))
+                .unwrap_or((0, 0, 0))
+        });
         crate::serial_println!(
-            "browser> {} — {}  scroll {}/{}  runs_px={}",
+            "browser> {} — {}  scroll {}/{}  runs_px={} rects={} runs={} ctrls={}",
             title,
             url,
             scroll_y,
             (content_h - browser_vh()).max(0),
-            pixels.iter().filter(|&&p| p != 0 && p != 0xf5f0e8).count()
+            pixels.iter().filter(|&&p| p != 0 && p != 0xf5f0e8).count(),
+            n_rects,
+            n_runs,
+            n_ctrl
         );
     }
     #[cfg(test)]
@@ -1500,7 +1748,7 @@ pub(super) fn browser_click(x: i32, y: i32) -> alloc::string::String {
 /// Fetch (or open local path) video and start the full video player tab.
 #[cfg(not(feature = "server"))]
 pub(super) fn browser_play_video_url(abs: &str, page_url: &str) -> alloc::string::String {
-    let bytes = if abs.starts_with("http://") || abs.starts_with("https://") {
+    let bytes = if crate::browser::url::is_http_url(abs) {
         let req = crate::browser::loader::LoadRequest::get(abs)
             .with_source(page_url)
             .with_timeout(120_000);
@@ -1511,6 +1759,13 @@ pub(super) fn browser_play_video_url(abs: &str, page_url: &str) -> alloc::string
             }
             Err(e) => {
                 return alloc::format!("error: video load: {e}");
+            }
+        }
+    } else if crate::browser::url::is_file_url(abs) {
+        match read_file_url(abs) {
+            Some(b) => b,
+            None => {
+                return alloc::format!("error: video not found: {abs}");
             }
         }
     } else {

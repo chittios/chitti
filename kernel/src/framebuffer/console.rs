@@ -218,7 +218,15 @@ pub fn blink(now_ms: u64) {
 /// Render `s` into the **logs** pane. Called by `ktrace`, so the trace stream
 /// scrolls independently of the chat conversation.
 pub fn log_print(s: &str) {
-    SCREEN.with(|slot| {
+    // `try_with`, never `with`: a log line must not be able to stop the
+    // machine. `SCREEN` is a non-reentrant spinlock, and anything that logs
+    // from *inside* a critical section that already holds it — the panic path,
+    // the allocation-failure handler, a driver called from a painter — would
+    // spin forever with interrupts disabled. That is not a lost log line, it is
+    // a dead OS with no output at all. When the screen is busy the line still
+    // reaches serial (the caller wrote it there first); only the on-screen
+    // mirror is dropped.
+    SCREEN.try_with(|slot| {
         if let Some(sc) = slot {
             // Write into whichever action column currently shows ktrace.
             let Some((pi, _)) = sc.find_mode(RightMode::Ktrace) else {

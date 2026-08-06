@@ -1,0 +1,99 @@
+/* External sheet for css-suite.html — @import is fetched from linked CSS. */
+@import url("theme.css");
+
+:root {
+  --gap: 8px;
+  --accent: #cc785c;
+  --pad: calc(4px + 8px);
+  --nested: var(--accent, #f00);
+}
+
+h2 { color: var(--nested); margin: 1.25rem 0 0.5rem; font-size: 1.1rem; }
+section.card { margin-bottom: 1rem; }
+.label { font-size: 0.8rem; color: #666; margin-bottom: 0.35rem; }
+
+/* Selectors: child, nth-child, attribute */
+.sel > li { list-style: square; }
+.sel li:nth-child(odd) { background: #fff3e8; }
+.sel li:nth-child(even) { background: #f0f0f0; }
+.sel li:nth-child(3n+1) { border-left: 3px solid var(--accent); padding-left: 6px; }
+a[href] { text-decoration: underline; }
+input[type="text"] { border: 1px solid var(--accent); padding: 4px 8px; border-radius: 4px; }
+span[class~="mark"] { background: #ffe0d0; padding: 0 4px; }
+
+/* Generated content */
+.gen::before { content: "[before] "; color: var(--accent); }
+.gen::after { content: " [after]"; color: #888; }
+
+/* Flex + calc + media */
+.flex-row {
+  display: flex; flex-wrap: wrap; gap: var(--gap);
+  width: calc(100% - 16px);
+}
+.flex-row .box {
+  flex: 1; min-width: 80px;
+  padding: var(--pad);
+  background: #fff; border: 1px solid #ddd; border-radius: 6px;
+}
+@media (max-width: 480px) {
+  .flex-row { display: block; }
+  .flex-row .box { margin-bottom: 8px; }
+}
+
+/* Grid */
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gap);
+}
+.grid2 .cell {
+  padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 6px;
+}
+
+/* Float + clear */
+.float-box {
+  float: left; width: 72px; height: 48px;
+  margin: 0 12px 8px 0;
+  background: var(--accent); color: #fff;
+  text-align: center; line-height: 48px; border-radius: 4px;
+}
+.after-float { clear: both; padding-top: 4px; }
+
+/* Table + rowspan + fixed layout */
+table.demo {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  margin-top: 0.5rem;
+}
+table.demo th, table.demo td {
+  border: 1px solid #ccc;
+  padding: 6px 8px;
+  text-align: left;
+}
+table.demo th { background: #eee; }
+table.demo td.span { background: #fff3e8; vertical-align: middle; }
+
+/* Position */
+.rel {
+  position: relative;
+  height: 56px;
+  background: #eee;
+  border-radius: 6px;
+  margin-top: 0.5rem;
+}
+.abs {
+  position: absolute;
+  right: 8px; top: 8px;
+  padding: 4px 8px;
+  background: var(--accent); color: #fff;
+  border-radius: 4px; font-size: 0.85rem;
+}
+
+/* Nested custom properties */
+.nested-var {
+  --local: var(--pad);
+  padding: var(--local);
+  border: 2px dashed var(--accent);
+  border-radius: 6px;
+}

@@ -124,7 +124,7 @@ pub fn layout_html_ex(
         navigate: dom.navigate.clone(),
         scroll_y: dom.scroll_to,
     };
-    let sheet = css::Stylesheet::parse(&doc.stylesheets);
+    let sheet = css::Stylesheet::parse_with_viewport(&doc.stylesheets, vw);
     let mut lay = layout::layout_document(&doc.root, &sheet, vw, vh);
     // Apply canvas 2d pixels drawn during script execution.
     js::apply_canvases_to_layout(&dom, &mut lay);
@@ -228,7 +228,7 @@ pub fn layout_session(
         js::stamp_elem_indices(&mut doc.root);
     }
 
-    let sheet = css::Stylesheet::parse(&css_all);
+    let sheet = css::Stylesheet::parse_with_viewport(&css_all, vw);
     let mut lay = layout::layout_document_ex(&doc.root, &sheet, vw, vh, &interactive);
 
     // Fill background-image pixels by absolute URL (raw src as fallback).
@@ -283,7 +283,7 @@ pub fn layout_static(
         }
     }
     js::stamp_elem_indices(&mut doc.root);
-    let sheet = css::Stylesheet::parse(&css_all);
+    let sheet = css::Stylesheet::parse_with_viewport(&css_all, vw);
     let mut lay = layout::layout_document(&doc.root, &sheet, vw, vh);
     finish_layout(&doc, &mut lay, vw, vh);
     (doc, lay)

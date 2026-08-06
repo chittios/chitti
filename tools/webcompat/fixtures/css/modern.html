@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+:root { --accent: #cc785c; --pad: 12px; }
+body { margin: 0; font-family: system-ui, sans-serif; }
+.hero {
+  display: flex; flex-wrap: wrap; gap: 16px;
+  width: calc(100% - 40px);
+  margin: 0 auto; padding: var(--pad);
+  background: linear-gradient(#f5f0e8, #e8e0d4);
+}
+@media (max-width: 480px) {
+  .hero { display: block; }
+}
+.card {
+  flex: 1; min-width: 120px;
+  border: 1px solid #ddd; border-radius: 8px; padding: 12px;
+}
+.card::before { content: "> "; color: var(--accent); }
+.card h2 { margin: 0 0 8px; color: var(--accent); }
+.grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  width: calc(100% - 40px); margin: 16px auto;
+}
+</style></head>
+<body>
+<div class="hero">
+  <div class="card"><h2>Flex</h2><p>calc + var + ::before</p></div>
+  <div class="card"><h2>Media</h2><p>@media (max-width)</p></div>
+</div>
+<div class="grid"><div class="card"><h2>Grid</h2><p>two tracks</p></div>
+                 <div class="card"><h2>More</h2><p>ok</p></div></div>
+</body></html>

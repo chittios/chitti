@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ChittiOS /samples/html</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <h1>Browse samples</h1>
+    <p>Local pages for <code>/browse file:///samples/html/…</code></p>
+  </header>
+  <nav class="card">
+    <h2 style="margin:0 0 0.5rem;font-size:1rem;color:#cc785c">Basics</h2>
+    <ul>
+      <li><a href="hello.html">hello.html</a> — minimal DOM + inline script</li>
+      <li><a href="js-demo.html">js-demo.html</a> — external CSS + JS (relative <code>file://</code>)</li>
+    </ul>
+    <h2 style="margin:1rem 0 0.5rem;font-size:1rem;color:#cc785c">CSS</h2>
+    <ul>
+      <li><a href="css-demo.html">css-demo.html</a> — flex, grid, <code>@media</code>, <code>calc</code>, <code>var</code>, <code>::before</code></li>
+      <li><a href="css-suite.html">css-suite.html</a> — selectors, float/clear, tables, position, <code>@import</code></li>
+      <li><a href="css-full.html">css-full.html</a> — large visual checklist (<code>full.css</code>)</li>
+      <li><a href="css-hn.html">css-hn.html</a> — HN-like table + link colours</li>
+    </ul>
+    <h2 style="margin:1rem 0 0.5rem;font-size:1rem;color:#cc785c">JavaScript</h2>
+    <ul>
+      <li><a href="js-suite.html">js-suite.html</a> — self-checking DOM / storage / canvas / events</li>
+      <li><a href="js-full.html">js-full.html</a> — large DOM / Promise / Math / storage / canvas suite</li>
+      <li><a href="js-fetch.html">js-fetch.html</a> — <code>fetch</code> over <code>file:///samples/…</code></li>
+      <li><a href="js-iframe.html">js-iframe.html</a> — iframe + <code>postMessage</code></li>
+      <li><a href="react-tw.html">react-tw.html</a> — Vite + React 18 + Tailwind 3 (<code>tools/react-tw</code> dist)</li>
+      <li><a href="shadcn.html">shadcn.html</a> — shadcn/ui gallery: 16 components on React 18 + Tailwind 3 (<code>tools/react-shadcn</code> dist)</li>
+      <li><a href="js-dom.html">js-dom.html</a> — interactive list (<code>createElement</code>, clicks)</li>
+      <li><a href="js-canvas.html">js-canvas.html</a> — canvas 2D paint / clear</li>
+    </ul>
+  </nav>
+  <p class="foot" id="status">index loaded</p>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -25,6 +25,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::vec;
+use core::sync::atomic::Ordering;
 use crate::runner::ds::error::JErrorType;
 use crate::runner::ds::object::JsObject;
 use crate::runner::ds::object_property::{PropertyDescriptor, PropertyDescriptorData, PropertyKey};
@@ -522,6 +523,22 @@ impl<'a> M<'a> {
     /// Match `node` then continue matching via the continuation `k`. Returns the
     /// end index on success.
     fn m(&mut self, node: &Node, pos: usize, k: &dyn Fn(&mut M, usize) -> Option<usize>) -> Option<usize> {
+        // The backtracking matcher itself: one pattern can explore
+        // exponentially many paths from a single start position, so the tick
+        // belongs here too, not only in the scan that calls it.
+        //
+        // It cannot return an error (the signature is `Option`), so it raises a
+        // flag and unwinds; the public entry points turn that into the real
+        // interrupt. Returning a bare `None` would be worse than the hang it
+        // fixes: the regex would quietly report "no match" for a match that
+        // exists.
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            return None;
+        }
+        if crate::runner::host::host_tick() {
+            INTERRUPTED.store(true, Ordering::Relaxed);
+            return None;
+        }
         match node {
             Node::Char(c) => {
                 if pos < self.text.len() && self.ceq(self.text[pos], *c) {
@@ -682,6 +699,17 @@ fn search(pattern: &str, flags: Flags, text: &[char], from: usize) -> Option<Mat
         && matches!(&node, Node::Seq(v) if v.first().map_or(false, |n| matches!(n, Node::Start)));
     let mut start = from;
     loop {
+        // A regex scan is native code driven by page input, and a
+        // catastrophically-backtracking pattern has no other bound. Without a
+        // tick here the interpreter's hook never runs, so the kernel stops
+        // answering Ctrl+C and the script budget for as long as the match takes.
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            return None;
+        }
+        if crate::runner::host::host_tick() {
+            INTERRUPTED.store(true, Ordering::Relaxed);
+            return None;
+        }
         if start > text.len() {
             return None;
         }
@@ -1474,6 +1502,10 @@ pub fn string_replace_regexp(text: &str, re: &JsValue, replacement: &str) -> Str
     let mut out = String::new();
     let mut from = 0usize;
     loop {
+        if INTERRUPTED.load(Ordering::Relaxed) || crate::runner::host::host_tick() {
+            INTERRUPTED.store(true, Ordering::Relaxed);
+            break;
+        }
         match search(&src, flags, &chars, from) {
             Some(mr) => {
                 out.extend(chars[from..mr.start].iter());
@@ -1548,6 +1580,16 @@ pub fn string_split_regexp(text: &str, re: &JsValue) -> Vec<JsValue> {
     }
     out.push(JsValue::String(span_str(&chars, last, chars.len())));
     out
+}
+
+/// Raised when the host asked to stop *inside* the matcher, which cannot
+/// return an error. Public entry points call [`take_interrupt`] and turn it
+/// into the interpreter's uncatchable interrupt.
+static INTERRUPTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// True (once) if the matcher was interrupted; clears the flag.
+pub fn take_interrupt() -> bool {
+    INTERRUPTED.swap(false, Ordering::Relaxed)
 }
 
 /// `str.search(re)` — index of first match or -1.

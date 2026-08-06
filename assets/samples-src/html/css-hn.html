@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CSS HN-like</title>
+  <style>
+    body {
+      background: #f6f6ef;
+      margin: 0;
+      font-family: Verdana, Geneva, sans-serif;
+      font-size: 10pt;
+    }
+    a:link { color: #000000; text-decoration: none; }
+    a:visited { color: #828282; }
+    .rank { color: #828282; text-align: right; }
+    .title { font-size: 10pt; }
+    .subtext { font-size: 7pt; color: #828282; }
+    .subtext a:link { color: #828282; }
+    #hnmain { background: #f6f6ef; width: 85%; margin: 12px auto; }
+    .foot { margin: 1rem auto; width: 85%; font-size: 9pt; }
+    .foot a { color: #cc785c; text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <table id="hnmain" bgcolor="#f6f6ef">
+    <tr>
+      <td class="rank">1.</td>
+      <td class="title"><a href="https://example.com">Show HN: ChittiOS CSS</a></td>
+    </tr>
+    <tr>
+      <td colspan="2"></td>
+      <td class="subtext">42 points by alice | <a href="item?id=1">12 comments</a></td>
+    </tr>
+    <tr>
+      <td class="rank">2.</td>
+      <td class="title"><a href="css-suite.html">CSS suite (local)</a></td>
+    </tr>
+    <tr>
+      <td colspan="2"></td>
+      <td class="subtext">table colours · link styles · compact type</td>
+    </tr>
+  </table>
+  <p class="foot"><a href="index.html">← samples index</a></p>
+</body>
+</html>

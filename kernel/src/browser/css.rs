@@ -1,20 +1,21 @@
 //! **CSS engine (subset)** — pure no_std stylesheet parse + cascade.
 //!
 //! Structure follows Ladybird LibCSS / StyleComputer (selector match →
-//! cascade → computed). Full
-//! [MDN CSS](https://developer.mozilla.org/en-US/docs/Web/CSS) is not in
-//! scope; we expand properties behind the same APIs.
+//! cascade → computed). Full MDN CSS is not in scope; we expand properties
+//! behind the same APIs.
 //!
-//! Supported:
-//! - Rules: `tag`, `.class`, `#id`, `*` (simple; optional `tag.class` / `tag#id`)
-//! - Declarations: `color`, `background`/`background-color`, `font-size`,
-//!   `margin`/`margin-*`, `padding`/`padding-*`, `display`, `font-weight`,
-//!   `text-align`, `width`/`height`/`max-width`, `opacity`, `line-height`,
-//!   `border`/`border-color` (stored as background-ish chrome for boxes)
-//! - Inline `style="…"` (highest priority after `!important` author rules)
+//! Supported (honest, tested):
+//! - Selectors: tag / `.class` / `#id` / `*` / compounds; descendant + child
+//!   (`>`); `:link`/`:any-link`; `:nth-child(odd|even|An+B)`; attribute
+//!   `[href]`, `[type=…]`, `[class~=…]`; `::before` / `::after` (generated
+//!   content in layout)
+//! - `@media` width queries (`min-width` / `max-width` / `screen` / `all`);
+//!   `@import` + `@layer` cascade layers; `!important`
+//! - `var(--name)` / nested fallback; `calc()` on lengths (px/em/%)
+//! - Flex / grid / float / absolute; popular paint props (see REPORT.md)
 //!
-//! Not supported: @media, full flex/grid, calc(), variables, pseudo-elements,
-//! combinators beyond a single simple selector, full cascade layers.
+//! Not in scope: timed animations/transitions, `:hover` restyle, sticky
+//! compositing, full Grid Level 2, complete css3test.com.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -423,8 +424,21 @@ pub enum DisplayMode {
     Block,
     Inline,
     Flex,
+    /// `display: inline-flex` — a flex container that is **inline-level**, so
+    /// it shrink-wraps its content instead of filling the line. Every shadcn
+    /// button and badge is one; treating it as block-level flex made each of
+    /// them a full-width bar.
+    InlineFlex,
     Grid,
     None,
+}
+
+impl DisplayMode {
+    /// Both flex flavours lay their children out identically — only the
+    /// container's own sizing differs.
+    pub fn is_flex(self) -> bool {
+        matches!(self, DisplayMode::Flex | DisplayMode::InlineFlex)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -640,30 +654,93 @@ fn canonicalize_prop(name: &str) -> String {
     }
 }
 
-/// Resolve simple `var(--name)` / `var(--name, fallback)` against custom props.
+/// Resolve `var(--name)` / `var(--name, fallback)` against custom props.
+/// Nested fallbacks (`var(--a, var(--b, red))`) resolve recursively; a cycle
+/// (seen set) yields an empty string rather than looping forever.
 fn resolve_var(value: &str, props: &alloc::collections::BTreeMap<String, String>) -> String {
+    resolve_var_depth(value, props, 0, &mut alloc::collections::BTreeSet::new())
+}
+
+fn resolve_var_depth(
+    value: &str,
+    props: &alloc::collections::BTreeMap<String, String>,
+    depth: u8,
+    seen: &mut alloc::collections::BTreeSet<String>,
+) -> String {
+    if depth > 8 {
+        return String::new();
+    }
     let v = value.trim();
-    if let Some(rest) = v.strip_prefix("var(") {
-        let inner = rest.trim_end_matches(')').trim();
-        let (name, fallback) = if let Some((a, b)) = inner.split_once(',') {
+    // Resolve the outermost `var(...)` if the whole value is one, else scan
+    // for an embedded `var(` (common in `calc(var(--x) + 10px)`).
+    if let Some(start) = v.find("var(") {
+        let after = &v[start + 4..];
+        let mut depth_p = 1i32;
+        let mut end = None;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth_p += 1,
+                ')' => {
+                    depth_p -= 1;
+                    if depth_p == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            return v.to_string();
+        };
+        let inner = after[..end].trim();
+        let (name, fallback) = if let Some((a, b)) = split_var_args(inner) {
             (a.trim(), Some(b.trim()))
         } else {
             (inner, None)
         };
-        let key = name.trim_start_matches('-'); // allow --foo or foo
         let key = if name.starts_with("--") {
             name.to_string()
         } else {
-            format!("--{key}")
+            format!("--{name}")
         };
-        if let Some(val) = props.get(&key).or_else(|| props.get(name)) {
-            return val.clone();
+        if !seen.insert(key.clone()) {
+            return String::new(); // cycle
         }
-        if let Some(fb) = fallback {
-            return fb.to_string();
+        let resolved = if let Some(val) = props.get(&key).or_else(|| props.get(name)) {
+            resolve_var_depth(val, props, depth + 1, seen)
+        } else if let Some(fb) = fallback {
+            resolve_var_depth(fb, props, depth + 1, seen)
+        } else {
+            String::new()
+        };
+        seen.remove(&key);
+        let mut out = String::with_capacity(v.len());
+        out.push_str(&v[..start]);
+        out.push_str(&resolved);
+        out.push_str(&after[end + 1..]);
+        // Another var may remain.
+        if out.contains("var(") {
+            return resolve_var_depth(&out, props, depth + 1, seen);
+        }
+        return out;
+    }
+    v.to_string()
+}
+
+/// Split `var()` args on the first top-level comma (fallback may contain commas
+/// inside nested `var(...)`).
+fn split_var_args(inner: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => return Some((&inner[..i], &inner[i + 1..])),
+            _ => {}
         }
     }
-    value.to_string()
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -674,60 +751,194 @@ struct Decl {
 }
 
 /// A **compound selector** — one sequence of simple selectors with no
-/// combinator (`a.gb_1a`, `.gb_9a.gb_K`, `div#x`, `*`, `p`). `tag == None`
-/// means "any tag" for this position; all `classes` must be present.
+/// combinator (`a.gb_1a`, `.gb_9a.gb_K`, `div#x`, `*`, `p`, `[href]`,
+/// `:nth-child(odd)`). `tag == None` means "any tag" for this position; all
+/// `classes` must be present.
 #[derive(Clone, Debug, Default)]
 struct Compound {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    /// Attribute predicates (`[href]`, `[type=submit]`, `[class~=foo]`).
+    attrs: Vec<AttrSel>,
+    /// `:nth-child(…)` — `None` means no structural check.
+    nth_child: Option<NthFormula>,
+    /// `::before` / `::after` (pseudo-element; matching is on the owning element,
+    /// and layout emits generated content from rules tagged with this).
+    pseudo_el: PseudoElement,
+}
+
+/// Combinator between two compounds in a complex selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Combinator {
+    /// Descendant (` `).
+    Descendant,
+    /// Child (`>`).
+    Child,
+    /// Next-sibling (`+`) — approximated as descendant for v1 match depth,
+    /// but stored so child can be exact.
+    Adjacent,
+    /// Subsequent-sibling (`~`) — same approximation as Adjacent.
+    Sibling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PseudoElement {
+    #[default]
+    None,
+    Before,
+    After,
+}
+
+#[derive(Clone, Debug)]
+struct AttrSel {
+    name: String,
+    /// `None` = presence `[href]`; `Some` = exact `[type=…]` or space-list
+    /// `[class~=…]` depending on `op`.
+    value: Option<String>,
+    op: AttrOp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttrOp {
+    Present,
+    Exact,
+    Includes, // ~=
+}
+
+/// CSS `:nth-child(An+B)` / odd / even.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NthFormula {
+    a: i32,
+    b: i32,
+}
+
+impl NthFormula {
+    fn matches(self, index_1based: u32) -> bool {
+        let n = index_1based as i32;
+        if self.a == 0 {
+            return n == self.b;
+        }
+        let rem = n - self.b;
+        if rem % self.a != 0 {
+            return false;
+        }
+        let k = rem / self.a;
+        k >= 0
+    }
 }
 
 impl Compound {
-    fn matches(&self, tag: &str, id: Option<&str>, class: Option<&str>) -> bool {
+    fn matches_el(&self, el: &ElemRef<'_>) -> bool {
         if let Some(t) = &self.tag {
-            if !t.eq_ignore_ascii_case(tag) {
+            if !t.eq_ignore_ascii_case(el.tag) {
                 return false;
             }
         }
         if let Some(i) = &self.id {
-            if id != Some(i.as_str()) {
+            if el.id != Some(i.as_str()) {
                 return false;
             }
         }
         if !self.classes.is_empty() {
-            let cs = class.unwrap_or("");
+            let cs = el.class.unwrap_or("");
             for c in &self.classes {
                 if !cs.split_whitespace().any(|x| x == c) {
                     return false;
                 }
             }
         }
+        for a in &self.attrs {
+            if !attr_matches(a, el) {
+                return false;
+            }
+        }
+        if let Some(nth) = self.nth_child {
+            if !nth.matches(el.nth.max(1)) {
+                return false;
+            }
+        }
         true
     }
-    /// (id, class, type) specificity contribution of this compound.
+    /// (id, class+attr+pseudo-class, type) specificity contribution.
     fn spec(&self) -> (u32, u32, u32) {
+        let classy = self.classes.len() as u32
+            + self.attrs.len() as u32
+            + self.nth_child.is_some() as u32;
         (
             self.id.is_some() as u32,
-            self.classes.len() as u32,
+            classy,
             self.tag.is_some() as u32,
         )
     }
 }
 
-/// One (tag, id, class) triple in an element's ancestor chain, ordered
-/// **outermost → innermost** (root first, parent last) — used for
-/// descendant-combinator matching.
-pub type ElemRef<'a> = (&'a str, Option<&'a str>, Option<&'a str>);
+fn attr_matches(a: &AttrSel, el: &ElemRef<'_>) -> bool {
+    let name = a.name.as_str();
+    let got = if name.eq_ignore_ascii_case("href") {
+        el.href
+    } else if name.eq_ignore_ascii_case("type") {
+        el.input_type
+    } else if name.eq_ignore_ascii_case("class") {
+        el.class
+    } else if name.eq_ignore_ascii_case("id") {
+        el.id
+    } else {
+        None
+    };
+    match a.op {
+        AttrOp::Present => got.is_some(),
+        AttrOp::Exact => got == a.value.as_deref(),
+        AttrOp::Includes => {
+            let Some(want) = a.value.as_deref() else {
+                return false;
+            };
+            got.map(|g| g.split_whitespace().any(|t| t == want))
+                .unwrap_or(false)
+        }
+    }
+}
+
+/// One element in an ancestor / subject chain for selector matching, ordered
+/// **outermost → innermost** (root first, parent last).
+#[derive(Clone, Copy, Debug)]
+pub struct ElemRef<'a> {
+    pub tag: &'a str,
+    pub id: Option<&'a str>,
+    pub class: Option<&'a str>,
+    /// 1-based index among element siblings (for `:nth-child`).
+    pub nth: u32,
+    pub href: Option<&'a str>,
+    pub input_type: Option<&'a str>,
+}
+
+impl<'a> ElemRef<'a> {
+    pub fn basic(tag: &'a str, id: Option<&'a str>, class: Option<&'a str>) -> Self {
+        Self {
+            tag,
+            id,
+            class,
+            nth: 1,
+            href: None,
+            input_type: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AncestorHop {
+    compound: Compound,
+    /// Combinator **from this hop to the next** (toward the key). The last hop
+    /// uses its combinator to reach the key compound.
+    combinator: Combinator,
+}
 
 #[derive(Clone, Debug)]
 struct Rule {
     /// Rightmost compound — must match the element itself.
     key: Compound,
-    /// Ancestor compounds (left of the key), outermost → innermost. Each must
-    /// match some ancestor, preserving order (descendant combinator; `>`/`+`/`~`
-    /// are approximated as descendant).
-    ancestors: Vec<Compound>,
+    /// Ancestor hops (left of the key), outermost → innermost.
+    ancestors: Vec<AncestorHop>,
     decls: Vec<Decl>,
     /// Specificity: (id, class, type)
     spec: (u8, u8, u8),
@@ -738,7 +949,8 @@ struct Rule {
 }
 
 /// Parsed stylesheet (LibCSS-inspired: rules sorted by cascade order).
-/// Supports CSS **cascade layers** (`@layer name, …` / `@layer name { … }`).
+/// Supports CSS **cascade layers** (`@layer name, …` / `@layer name { … }`)
+/// and viewport-filtered `@media` (min/max-width).
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
     rules: Vec<Rule>,
@@ -747,11 +959,23 @@ pub struct Stylesheet {
     next_layer: u32,
     /// Current layer when parsing nested `@layer name { }`.
     parse_layer: Option<u32>,
+    /// Layout viewport width (px) used to evaluate `@media (min/max-width)`.
+    /// `0` means “unknown” — width queries are treated as matching (fail-open
+    /// for sheets parsed without a viewport, e.g. unit tests of cascade alone).
+    viewport_w: i32,
 }
 
 impl Stylesheet {
     pub fn parse(css: &str) -> Self {
-        let mut sheet = Stylesheet::default();
+        Self::parse_with_viewport(css, 0)
+    }
+
+    /// Parse with a known layout viewport so `@media (max-width: …)` etc. filter.
+    pub fn parse_with_viewport(css: &str, viewport_w: i32) -> Self {
+        let mut sheet = Stylesheet {
+            viewport_w,
+            ..Stylesheet::default()
+        };
         sheet.append(css);
         sheet
     }
@@ -897,6 +1121,33 @@ impl Stylesheet {
                 // Nested layer names: @layer framework.layout { } → dotted name
                 // (already handled by @layer name { } with full name string)
 
+                // @media … { … } — evaluate width queries against viewport_w.
+                if at_header.starts_with("@media") && i < bytes.len() && bytes[i] == b'{' {
+                    let query = at_header["@media".len()..].trim();
+                    i += 1;
+                    let body_start = i;
+                    let mut depth = 1i32;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == b'{' {
+                            depth += 1;
+                        } else if bytes[i] == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    let body = core::str::from_utf8(&bytes[body_start..i]).unwrap_or("");
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    if media_matches(query, self.viewport_w) {
+                        self.append_block(body, layer);
+                    }
+                    continue;
+                }
+
                 // Other @-rules: skip
                 if i < bytes.len() && bytes[i] == b';' {
                     i += 1;
@@ -972,7 +1223,7 @@ impl Stylesheet {
         id: Option<&str>,
         class: Option<&str>,
     ) -> Vec<(String, String, bool)> {
-        self.matching_decls_ex(tag, id, class, &[])
+        self.matching_decls_for(ElemRef::basic(tag, id, class), &[], PseudoElement::None)
     }
 
     /// Match rules for an element given its ancestor chain (outermost→innermost),
@@ -986,10 +1237,26 @@ impl Stylesheet {
         class: Option<&str>,
         chain: &[ElemRef],
     ) -> Vec<(String, String, bool)> {
+        self.matching_decls_for(ElemRef::basic(tag, id, class), chain, PseudoElement::None)
+    }
+
+    /// Full matcher: subject `el`, ancestor `chain`, and optional pseudo-element
+    /// filter (`None` = element rules only; `Before`/`After` = generated-content
+    /// rules for that pseudo).
+    pub fn matching_decls_for(
+        &self,
+        el: ElemRef<'_>,
+        chain: &[ElemRef],
+        pseudo: PseudoElement,
+    ) -> Vec<(String, String, bool)> {
         let mut matched: Vec<&Rule> = self
             .rules
             .iter()
-            .filter(|r| r.key.matches(tag, id, class) && ancestors_match(&r.ancestors, chain))
+            .filter(|r| {
+                r.key.pseudo_el == pseudo
+                    && r.key.matches_el(&el)
+                    && ancestors_match(&r.ancestors, chain)
+            })
             .collect();
         matched.sort_by(|a, b| {
             // Unlayered (None) sorts after layered → higher priority.
@@ -1011,10 +1278,10 @@ impl Stylesheet {
 
 /// Specificity of a complex selector = sum over the key + ancestor compounds
 /// of (ids, classes, types), saturated into `(u8, u8, u8)`.
-fn specificity(key: &Compound, ancestors: &[Compound]) -> (u8, u8, u8) {
+fn specificity(key: &Compound, ancestors: &[AncestorHop]) -> (u8, u8, u8) {
     let (mut a, mut b, mut c) = key.spec();
     for anc in ancestors {
-        let (x, y, z) = anc.spec();
+        let (x, y, z) = anc.compound.spec();
         a += x;
         b += y;
         c += z;
@@ -1022,161 +1289,362 @@ fn specificity(key: &Compound, ancestors: &[Compound]) -> (u8, u8, u8) {
     (a.min(255) as u8, b.min(255) as u8, c.min(255) as u8)
 }
 
-/// Strip simple dynamic pseudo-classes from a compound selector.
-///
-/// - `:link` / `:any-link` → keep the base (HN titles need
-///   `a:link { color:#000; text-decoration:none }` — previously dropped because
-///   of the colon). We treat every link as unvisited.
-/// - `:visited` → drop the rule (no visit history; if kept it would override
-///   `:link` via source order and paint every HN title grey).
-/// - `:hover` / `:active` / `:focus*` / `:target` → drop (state dependent).
-/// - Pseudo-elements (`::before`, …) and functional pseudos → drop.
-/// - Attribute selectors (`[…]`) → drop.
-fn strip_compound_pseudos(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'[' {
-            return None;
-        }
-        if bytes[i] == b':' {
-            let mut j = i + 1;
-            let double = j < bytes.len() && bytes[j] == b':';
-            if double {
-                j += 1;
-            }
-            let start = j;
-            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
-                j += 1;
-            }
-            let name = s[start..j].to_ascii_lowercase();
-            if j < bytes.len() && bytes[j] == b'(' {
-                return None; // :nth-child(…), :not(…), …
-            }
-            if double
-                || matches!(
-                    name.as_str(),
-                    "before"
-                        | "after"
-                        | "first-line"
-                        | "first-letter"
-                        | "marker"
-                        | "selection"
-                        | "placeholder"
-                        | "backdrop"
-                )
-            {
-                return None;
-            }
-            match name.as_str() {
-                // Unvisited approximation — honor as the base compound.
-                "link" | "any-link" => {
-                    i = j;
-                    continue;
-                }
-                // No history store: drop so `:link` colors win (HN titles).
-                "visited" => return None,
-                "hover" | "active" | "focus" | "focus-visible" | "focus-within" | "target" => {
-                    return None;
-                }
-                _ => return None,
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    if out.is_empty() {
-        None
-    } else {
-        String::from_utf8(out).ok()
-    }
-}
-
-/// Parse one compound selector (`a.gb_1a`, `.gb_9a.gb_K`, `div#x`, `*`, `p`,
-/// `a:link`). State-dependent / structural pseudos that we can't honor make
-/// the whole selector unsupported (`None`).
+/// Parse one compound selector. Keeps `:link`, `:nth-child`, attrs, and
+/// `::before`/`::after`; drops state-dependent `:hover`/`:visited`/etc.
 fn parse_compound(s: &str) -> Option<Compound> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    let s = strip_compound_pseudos(s)?;
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if s == "*" {
-        return Some(Compound::default());
-    }
     let mut c = Compound::default();
     let bytes = s.as_bytes();
     let mut i = 0;
-    // Leading type (tag) selector, if any.
-    while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+    // Leading type / `*`.
+    if i < bytes.len() && bytes[i] == b'*' {
         i += 1;
-    }
-    if i > 0 {
-        let t = &s[..i];
-        if !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-            return None;
-        }
-        c.tag = Some(t.to_ascii_lowercase());
-    }
-    // `.class` / `#id` tokens.
-    while i < bytes.len() {
-        let marker = bytes[i];
-        i += 1;
+    } else {
         let start = i;
-        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'#' {
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+        {
             i += 1;
         }
-        let name = &s[start..i];
-        if name.is_empty() {
-            return None;
+        if i > start {
+            c.tag = Some(s[start..i].to_ascii_lowercase());
         }
-        match marker {
-            b'.' => c.classes.push(name.to_string()),
-            b'#' => c.id = Some(name.to_string()),
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                c.classes.push(s[start..i].to_string());
+            }
+            b'#' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                c.id = Some(s[start..i].to_string());
+            }
+            b'[' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                let inner = s[start..i].trim();
+                if i < bytes.len() {
+                    i += 1;
+                }
+                let attr = parse_attr_sel(inner)?;
+                c.attrs.push(attr);
+            }
+            b':' => {
+                i += 1;
+                let double = i < bytes.len() && bytes[i] == b':';
+                if double {
+                    i += 1;
+                }
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
+                {
+                    i += 1;
+                }
+                let name = s[start..i].to_ascii_lowercase();
+                let mut arg = None;
+                if i < bytes.len() && bytes[i] == b'(' {
+                    i += 1;
+                    let a0 = i;
+                    let mut depth = 1i32;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == b'(' {
+                            depth += 1;
+                        } else if bytes[i] == b')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    arg = Some(s[a0..i].trim().to_string());
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                if double
+                    || matches!(name.as_str(), "before" | "after" | "first-line" | "first-letter")
+                {
+                    match name.as_str() {
+                        "before" => c.pseudo_el = PseudoElement::Before,
+                        "after" => c.pseudo_el = PseudoElement::After,
+                        _ => return None,
+                    }
+                    continue;
+                }
+                match name.as_str() {
+                    "link" | "any-link" => {} // keep base
+                    "root" => {
+                        // `:root` ≈ document element (`html`).
+                        if c.tag.is_none() {
+                            c.tag = Some(String::from("html"));
+                        }
+                    }
+                    "visited" | "hover" | "active" | "focus" | "focus-visible"
+                    | "focus-within" | "target" => return None,
+                    "nth-child" => {
+                        c.nth_child = Some(parse_nth(arg.as_deref()?)?);
+                    }
+                    "first-child" => {
+                        c.nth_child = Some(NthFormula { a: 0, b: 1 });
+                    }
+                    "last-child" => {
+                        // Approximate as odd huge — layout doesn't pass last index.
+                        // Drop rather than wrong-match.
+                        return None;
+                    }
+                    _ => return None,
+                }
+            }
             _ => return None,
+        }
+    }
+    // A bare `*` or empty after stripping is ok as universal.
+    if c.tag.is_none()
+        && c.id.is_none()
+        && c.classes.is_empty()
+        && c.attrs.is_empty()
+        && c.nth_child.is_none()
+        && c.pseudo_el == PseudoElement::None
+        && !s.trim().starts_with('*')
+        && s != "*"
+    {
+        // e.g. completely empty after parse failure path
+        if s != "*" && !s.starts_with(|ch: char| ch == '.' || ch == '#' || ch == '[' || ch == ':') {
+            // Had a tag that we already set, or invalid.
         }
     }
     Some(c)
 }
 
-/// Parse a complex selector into (key compound, ancestor compounds
-/// outermost→innermost). Combinators `>`/`+`/`~` are approximated as
-/// descendant. Returns `None` if any compound is unsupported.
-fn parse_complex(s: &str) -> Option<(Compound, Vec<Compound>)> {
-    // Split on descendant/child/sibling combinators (whitespace or > + ~).
-    let mut parts: Vec<Compound> = Vec::new();
-    for tok in s.split(|c: char| c == ' ' || c == '>' || c == '+' || c == '~') {
-        let tok = tok.trim();
+fn parse_attr_sel(inner: &str) -> Option<AttrSel> {
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return None;
+    }
+    if let Some((name, rest)) = inner.split_once("~=") {
+        let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+        return Some(AttrSel {
+            name: name.trim().to_ascii_lowercase(),
+            value: Some(val.to_string()),
+            op: AttrOp::Includes,
+        });
+    }
+    if let Some((name, rest)) = inner.split_once('=') {
+        let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+        return Some(AttrSel {
+            name: name.trim().to_ascii_lowercase(),
+            value: Some(val.to_string()),
+            op: AttrOp::Exact,
+        });
+    }
+    Some(AttrSel {
+        name: inner.to_ascii_lowercase(),
+        value: None,
+        op: AttrOp::Present,
+    })
+}
+
+fn parse_nth(s: &str) -> Option<NthFormula> {
+    let s = s.trim().to_ascii_lowercase();
+    if s == "odd" {
+        return Some(NthFormula { a: 2, b: 1 });
+    }
+    if s == "even" {
+        return Some(NthFormula { a: 2, b: 0 });
+    }
+    // An+B / n+B / -n+B / B
+    let s = s.replace(' ', "");
+    if let Some(n_pos) = s.find('n') {
+        let a_str = &s[..n_pos];
+        let a = if a_str.is_empty() || a_str == "+" {
+            1
+        } else if a_str == "-" {
+            -1
+        } else {
+            a_str.parse().ok()?
+        };
+        let b_str = &s[n_pos + 1..];
+        let b = if b_str.is_empty() {
+            0
+        } else {
+            b_str.parse().ok()?
+        };
+        Some(NthFormula { a, b })
+    } else {
+        let b: i32 = s.parse().ok()?;
+        Some(NthFormula { a: 0, b })
+    }
+}
+
+/// Parse a complex selector into (key, ancestor hops outermost→innermost).
+fn parse_complex(s: &str) -> Option<(Compound, Vec<AncestorHop>)> {
+    // Tokenize into compounds + combinators.
+    let bytes = s.as_bytes();
+    let mut compounds: Vec<Compound> = Vec::new();
+    let mut combs: Vec<Combinator> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Combinator at start of a hop (after first compound).
+        if !compounds.is_empty() {
+            let comb = match bytes[i] {
+                b'>' => {
+                    i += 1;
+                    Combinator::Child
+                }
+                b'+' => {
+                    i += 1;
+                    Combinator::Adjacent
+                }
+                b'~' => {
+                    i += 1;
+                    Combinator::Sibling
+                }
+                _ => Combinator::Descendant,
+            };
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            combs.push(comb);
+        }
+        let start = i;
+        // Compound runs until whitespace or combinator (not inside [] or ()).
+        let mut depth_b = 0i32;
+        let mut depth_p = 0i32;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'[' {
+                depth_b += 1;
+            } else if c == b']' {
+                depth_b -= 1;
+            } else if c == b'(' {
+                depth_p += 1;
+            } else if c == b')' {
+                depth_p -= 1;
+            } else if depth_b == 0 && depth_p == 0 {
+                if c.is_ascii_whitespace() || c == b'>' || c == b'+' || c == b'~' {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let tok = s[start..i].trim();
         if tok.is_empty() {
             continue;
         }
-        parts.push(parse_compound(tok)?);
+        compounds.push(parse_compound(tok)?);
     }
-    let key = parts.pop()?;
-    Some((key, parts))
+    if compounds.is_empty() {
+        return None;
+    }
+    let key = compounds.pop()?;
+    // combs.len() should be compounds.len() (remaining).
+    let mut ancestors = Vec::new();
+    for (idx, compound) in compounds.into_iter().enumerate() {
+        let combinator = combs.get(idx).copied().unwrap_or(Combinator::Descendant);
+        ancestors.push(AncestorHop {
+            compound,
+            combinator,
+        });
+    }
+    Some((key, ancestors))
 }
 
-/// True if `ancestors` (the selector's ancestor compounds, outermost→innermost)
-/// match a subsequence of `chain` (the element's ancestor chain, same order).
-fn ancestors_match(ancestors: &[Compound], chain: &[ElemRef]) -> bool {
+/// Match ancestor hops against the element's ancestor chain.
+/// Child (`>`) requires the hop to match the immediate next ancestor slot;
+/// descendant allows skipping.
+fn ancestors_match(ancestors: &[AncestorHop], chain: &[ElemRef]) -> bool {
     if ancestors.is_empty() {
         return true;
     }
-    let mut ai = 0;
-    for &(tag, id, class) in chain {
-        if ancestors[ai].matches(tag, id, class) {
-            ai += 1;
-            if ai == ancestors.len() {
-                return true;
+    // Walk from outermost hop against chain from the start.
+    // For each hop, find a matching element; Child means the *next* chain
+    // entry after the previous match must be that element (no skip).
+    let mut ci = 0usize; // next chain index to consider
+    for (hi, hop) in ancestors.iter().enumerate() {
+        let comb_into_this = if hi == 0 {
+            Combinator::Descendant // first hop: anywhere
+        } else {
+            ancestors[hi - 1].combinator
+        };
+        match comb_into_this {
+            Combinator::Child => {
+                if ci >= chain.len() || !hop.compound.matches_el(&chain[ci]) {
+                    return false;
+                }
+                ci += 1;
+            }
+            Combinator::Descendant | Combinator::Adjacent | Combinator::Sibling => {
+                // Adjacent/Sibling approximated as descendant (plan: exact child first).
+                let mut found = false;
+                while ci < chain.len() {
+                    if hop.compound.matches_el(&chain[ci]) {
+                        ci += 1;
+                        found = true;
+                        break;
+                    }
+                    ci += 1;
+                }
+                if !found {
+                    return false;
+                }
             }
         }
     }
-    false
+    // Last hop's combinator constrains the subject relative to the last
+    // matched ancestor — subject is not in `chain`; layout's `chain` is
+    // ancestors only. Child means the subject must be a direct child, which
+    // is always true for the chain we pass (parent is last in chain). So for
+    // `div > p`, ancestors=[div] with Child into key: after matching div at
+    // end of chain, Child is satisfied because subject is walked as child.
+    if let Some(last) = ancestors.last() {
+        if last.combinator == Combinator::Child {
+            // Require the matched ancestor to be the immediate parent =
+            // last entry in chain.
+            // After the loop, `ci` is one past the match for the last hop.
+            if ci == 0 || ci != chain.len() {
+                // If we matched something before the parent, child fails.
+                // Successful child walk leaves ci == chain.len() when the
+                // parent is the last hop match.
+                if ci != chain.len() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn parse_decls(block: &str) -> Vec<Decl> {
@@ -1208,7 +1676,51 @@ fn parse_decls(block: &str) -> Vec<Decl> {
     out
 }
 
+/// Split a declaration value into whitespace-separated tokens, keeping
+/// `(...)` groups whole.
+///
+/// A plain `split_whitespace` shreds every functional value: `rgb(255, 255,
+/// 255)` becomes three tokens, none of which is a colour, so a shorthand that
+/// scans tokens for a colour silently found none. Every Tailwind background,
+/// border and text colour is written that way — `rgb(248 250 252 /
+/// var(--tw-bg-opacity, 1))` — so a Tailwind page rendered with no backgrounds
+/// at all while `#ffffff` in the same position worked.
+pub fn value_tokens(v: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    for (i, c) in v.char_indices() {
+        match c {
+            '(' => {
+                depth += 1;
+                start.get_or_insert(i);
+            }
+            ')' => {
+                depth -= 1;
+                start.get_or_insert(i);
+            }
+            c if c.is_whitespace() && depth <= 0 => {
+                if let Some(s) = start.take() {
+                    out.push(&v[s..i]);
+                }
+            }
+            _ => {
+                start.get_or_insert(i);
+            }
+        }
+    }
+    if let Some(s) = start {
+        out.push(&v[s..]);
+    }
+    out
+}
+
 /// Parse a color: `#rgb`, `#rrggbb`, `rgb(r,g,b)`, named basics.
+///
+/// A fully transparent colour is `None`, the same answer as the `transparent`
+/// keyword — a caller asking "is there a colour to paint here?" must not be
+/// told "black". Tailwind's shadow chain is literally `0 0 #0000`, and reading
+/// that as opaque black painted a solid black rectangle over every card.
 pub fn parse_color(s: &str) -> Option<u32> {
     let s = s.trim().to_ascii_lowercase();
     if s == "transparent" {
@@ -1243,18 +1755,37 @@ pub fn parse_color(s: &str) -> Option<u32> {
             return Some((r << 20) | (r << 16) | (g << 12) | (g << 8) | (b << 4) | b);
         }
         if hex.len() == 4 {
-            // #RGBA → RGB only
+            // #RGBA — alpha 0 is transparent (`#0000`), else blend toward the
+            // page the way the rgba() path does.
             let r = u32::from_str_radix(&hex[0..1], 16).ok()?;
             let g = u32::from_str_radix(&hex[1..2], 16).ok()?;
             let b = u32::from_str_radix(&hex[2..3], 16).ok()?;
-            return Some((r << 20) | (r << 16) | (g << 12) | (g << 8) | (b << 4) | b);
+            let a = u32::from_str_radix(&hex[3..4], 16).ok()?;
+            if a == 0 {
+                return None;
+            }
+            let af = a as f32 / 15.0;
+            let ch = |c: u32| -> u32 {
+                let c8 = (c << 4) | c;
+                ((c8 as f32 * af + 255.0 * (1.0 - af)) as u32).min(255)
+            };
+            return Some((ch(r) << 16) | (ch(g) << 8) | ch(b));
         }
         if hex.len() == 6 {
             return u32::from_str_radix(hex, 16).ok();
         }
         if hex.len() == 8 {
-            // #RRGGBBAA → RGB
-            return u32::from_str_radix(&hex[0..6], 16).ok();
+            // #RRGGBBAA — same rule as #RGBA.
+            let rgb = u32::from_str_radix(&hex[0..6], 16).ok()?;
+            let a = u32::from_str_radix(&hex[6..8], 16).ok()?;
+            if a == 0 {
+                return None;
+            }
+            let af = a as f32 / 255.0;
+            let ch = |c: u32| -> u32 { ((c as f32 * af + 255.0 * (1.0 - af)) as u32).min(255) };
+            return Some(
+                (ch((rgb >> 16) & 0xff) << 16) | (ch((rgb >> 8) & 0xff) << 8) | ch(rgb & 0xff),
+            );
         }
     }
     // `rgb(r,g,b)` and `rgba(r,g,b,a)` (also space/slash-separated). Alpha is
@@ -1289,10 +1820,82 @@ pub fn parse_color(s: &str) -> Option<u32> {
             None => 1.0,
         }
         .clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return None; // fully transparent — nothing to paint
+        }
         let mix = |c: u32| -> u32 { ((c as f32 * a + 255.0 * (1.0 - a)) as u32).min(255) };
         return Some((mix(r) << 16) | (mix(g) << 8) | mix(b));
     }
+    // `hsl(H S% L%)` / `hsl(H, S%, L%)` / `hsla(…)`, with the same `/ alpha`
+    // form. This is not an exotic corner: shadcn/ui defines its ENTIRE palette
+    // as HSL triples in custom properties (`--background: 0 0% 100%`) and every
+    // component reads `hsl(var(--background))`, so without it a shadcn page has
+    // no colour at all — no card, no button fill, no border.
+    let hsl_inner = s
+        .strip_prefix("hsla(")
+        .or_else(|| s.strip_prefix("hsl("))
+        .and_then(|x| x.strip_suffix(')'));
+    if let Some(inner) = hsl_inner {
+        let norm = inner.replace('/', " ").replace(',', " ");
+        let mut parts = norm.split_whitespace();
+        // Hue is an angle: bare number or `deg`; `turn`/`rad`/`grad` are rarer
+        // but cheap to accept.
+        let h_tok = parts.next()?;
+        let h: f32 = if let Some(n) = h_tok.strip_suffix("deg") {
+            n.parse().ok()?
+        } else if let Some(n) = h_tok.strip_suffix("turn") {
+            n.parse::<f32>().ok()? * 360.0
+        } else if let Some(n) = h_tok.strip_suffix("grad") {
+            n.parse::<f32>().ok()? * 0.9
+        } else if let Some(n) = h_tok.strip_suffix("rad") {
+            n.parse::<f32>().ok()? * 180.0 / core::f32::consts::PI
+        } else {
+            h_tok.parse().ok()?
+        };
+        let pct = |t: &str| -> Option<f32> {
+            t.strip_suffix('%').unwrap_or(t).trim().parse::<f32>().ok().map(|v| v / 100.0)
+        };
+        let sat = pct(parts.next()?)?.clamp(0.0, 1.0);
+        let lit = pct(parts.next()?)?.clamp(0.0, 1.0);
+        let a = match parts.next() {
+            Some(t) => {
+                if let Some(p) = t.strip_suffix('%') {
+                    p.trim().parse::<f32>().map(|v| v / 100.0).unwrap_or(1.0)
+                } else {
+                    t.trim().parse::<f32>().unwrap_or(1.0)
+                }
+            }
+            None => 1.0,
+        }
+        .clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return None;
+        }
+        let (r, g, b) = hsl_to_rgb(h, sat, lit);
+        let mix = |c: f32| -> u32 { ((c * 255.0 * a + 255.0 * (1.0 - a)) as u32).min(255) };
+        return Some((mix(r) << 16) | (mix(g) << 8) | mix(b));
+    }
     None
+}
+
+/// HSL → RGB (each channel 0.0..=1.0), per CSS Color 4.
+fn hsl_to_rgb(h_deg: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    // `%` on a negative hue keeps the sign in Rust, so add a turn back.
+    let h = ((h_deg % 360.0) + 360.0) % 360.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h6 = h / 60.0;
+    // `abs(h6 mod 2 - 1)` — no `f32::rem_euclid` in core for no_std here.
+    let x = c * (1.0 - ((h6 % 2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h6 as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (r + m, g + m, b + m)
 }
 
 /// First color stop of a `linear-gradient(...)` / `radial-gradient(...)`, used
@@ -1387,18 +1990,266 @@ pub fn parse_grid_tracks(value: &str) -> Vec<GridTrack> {
 }
 
 pub fn parse_px(s: &str) -> Option<i32> {
-    let s = s.trim().to_ascii_lowercase();
-    if let Some(n) = s.strip_suffix("px") {
-        return n.trim().parse().ok();
+    parse_px_rel(s, None)
+}
+
+/// The CSS root font size `rem` is relative to.
+///
+/// 16px — the browser default every design system's scale is calibrated
+/// against, including Tailwind's and shadcn's. It is deliberately NOT the
+/// console's own 14px body size: `text-sm` (`0.875rem`) is meant to come out at
+/// 14px, and it only does if the root is 16.
+pub const REM_PX: f32 = 16.0;
+
+/// Viewport the current layout is for, in CSS px — what `vh`/`vw`/`vmin`/`vmax`
+/// resolve against. Set by `layout::layout_document` on entry; the fallback is
+/// a plausible desktop so a unit test calling `parse_px` directly still gets a
+/// number rather than dropping the declaration.
+///
+/// SAFETY (`Sync`): `mm::Locked` is unconditionally `Sync`, and layout runs
+/// only on the single-threaded shell task and is not reentrant.
+static VIEWPORT: crate::mm::Locked<(i32, i32)> = crate::mm::Locked::new((1024, 768));
+
+/// Record the viewport for viewport-relative units. Called once per layout.
+pub fn set_viewport(w: i32, h: i32) {
+    if w > 0 && h > 0 {
+        VIEWPORT.with(|v| *v = (w, h));
     }
-    if let Some(n) = s.strip_suffix("em") {
-        let f: i32 = n.trim().parse().ok()?;
-        return Some(f * 14);
+}
+
+fn viewport() -> (i32, i32) {
+    VIEWPORT.with(|v| *v)
+}
+
+/// Parse a CSS length to px. When `cb_w` is `Some(w)`, percentages (and
+/// `calc(…%…)`) resolve against the containing-block width `w`. Without a CB,
+/// bare `%` and `%`-bearing calcs return `None` (layout call sites that have
+/// `max_w` should pass it).
+pub fn parse_px_rel(s: &str, cb_w: Option<i32>) -> Option<i32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
     }
+    let low = s.to_ascii_lowercase();
+    if let Some(inner) = low.strip_prefix("calc(").and_then(|r| r.strip_suffix(')')) {
+        return eval_calc(inner.trim(), cb_w);
+    }
+    parse_length_term(&low, cb_w)
+}
+
+fn parse_length_term(s: &str, cb_w: Option<i32>) -> Option<i32> {
+    let s = s.trim();
     if s == "0" {
         return Some(0);
     }
-    s.parse().ok()
+    if let Some(n) = s.strip_suffix("px") {
+        return n.trim().parse::<f32>().ok().map(f32_to_i32);
+    }
+    // `rem` MUST be tested before `em` — `"28rem"` ends in "em", so the em arm
+    // took it, failed to parse the leftover "28r", and answered `None`. Every
+    // Tailwind size is in rem (`max-w-md` is `28rem`, `p-6` is `1.5rem`), so a
+    // Tailwind page laid out with no widths, no padding and no type scale while
+    // each individual declaration looked perfectly well-formed.
+    if let Some(n) = s.strip_suffix("rem") {
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f * REM_PX));
+    }
+    if let Some(n) = s.strip_suffix("em") {
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f * 14.0));
+    }
+    // Viewport units, against the viewport the current layout is for.
+    if let Some(n) = s.strip_suffix("vmin") {
+        let (vw, vh) = viewport();
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f / 100.0 * vw.min(vh) as f32));
+    }
+    if let Some(n) = s.strip_suffix("vmax") {
+        let (vw, vh) = viewport();
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f / 100.0 * vw.max(vh) as f32));
+    }
+    if let Some(n) = s.strip_suffix("vh") {
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f / 100.0 * viewport().1 as f32));
+    }
+    if let Some(n) = s.strip_suffix("vw") {
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f / 100.0 * viewport().0 as f32));
+    }
+    if let Some(n) = s.strip_suffix("pt") {
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f * 96.0 / 72.0));
+    }
+    // `ch`/`ex` are font metrics; approximate against the default face rather
+    // than dropping the declaration.
+    if let Some(n) = s.strip_suffix("ch") {
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f * 8.0));
+    }
+    if let Some(n) = s.strip_suffix("ex") {
+        let f: f32 = n.trim().parse().ok()?;
+        return Some(f32_to_i32(f * 7.0));
+    }
+    if let Some(n) = s.strip_suffix('%') {
+        let pct: f32 = n.trim().parse().ok()?;
+        let w = cb_w?;
+        return Some(f32_to_i32((pct / 100.0) * w as f32));
+    }
+    s.parse::<f32>().ok().map(f32_to_i32)
+}
+
+fn f32_to_i32(v: f32) -> i32 {
+    // no_std: avoid `f32::round` (needs Float trait). Truncate toward nearest.
+    if v >= 0.0 {
+        (v + 0.5) as i32
+    } else {
+        (v - 0.5) as i32
+    }
+}
+
+/// Evaluate a simple `calc()` expression: terms of `Npx|Nem|N%` joined by
+/// `+` / `-` (no `*`/`/` nesting for v1). Whitespace around operators required
+/// by CSS (`calc(100% - 20px)`).
+fn eval_calc(inner: &str, cb_w: Option<i32>) -> Option<i32> {
+    // Tokenize into signed terms by scanning for top-level + / - that follow
+    // a completed term (not the unary sign of the first term).
+    let bytes = inner.as_bytes();
+    let mut terms: Vec<(bool, &str)> = Vec::new(); // (negative, term)
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut neg_first = false;
+    // Optional leading sign.
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        neg_first = bytes[i] == b'-';
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        start = i;
+    }
+    while i < bytes.len() {
+        let c = bytes[i];
+        if (c == b'+' || c == b'-') && i > start {
+            // Operator only if flanked by whitespace (CSS calc grammar) OR
+            // previous char ended a unit — accept either.
+            let prev_ws = bytes[i - 1].is_ascii_whitespace();
+            let next_ws = i + 1 < bytes.len() && bytes[i + 1].is_ascii_whitespace();
+            if prev_ws || next_ws {
+                let term = inner[start..i].trim();
+                if !term.is_empty() {
+                    terms.push((neg_first, term));
+                }
+                neg_first = c == b'-';
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let term = inner[start..].trim();
+    if !term.is_empty() {
+        terms.push((neg_first, term));
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    let mut sum = 0i32;
+    for (neg, t) in terms {
+        let v = parse_length_term(t, cb_w)?;
+        sum = if neg { sum - v } else { sum + v };
+    }
+    Some(sum)
+}
+
+/// Evaluate an `@media` query list against a layout viewport width.
+///
+/// - `print` / `speech` alone → false (drop print-only sheets).
+/// - `screen` / `all` / empty → true.
+/// - `(min-width: Npx)` / `(max-width: Npx)` — when `viewport_w == 0` (unknown),
+///   fail-open (keep rules); otherwise compare.
+/// - Unknown features → fail-open (keep) for screen/all contexts.
+pub fn media_matches(query: &str, viewport_w: i32) -> bool {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    // Comma = OR of media queries.
+    for part in q.split(',') {
+        if media_query_one(part.trim(), viewport_w) {
+            return true;
+        }
+    }
+    false
+}
+
+fn media_query_one(q: &str, viewport_w: i32) -> bool {
+    let q = q.trim();
+    if q.is_empty() {
+        return true;
+    }
+    // Extract media type (token before first `(` or `and`).
+    let type_end = q.find('(').unwrap_or(q.len());
+    let type_part = q[..type_end].replace(" and ", " ").replace("and ", " ");
+    let ty = type_part.split_whitespace().next().unwrap_or("all");
+    if matches!(
+        ty,
+        "print" | "speech" | "tty" | "tv" | "projection" | "handheld" | "braille" | "embossed" | "aural"
+    ) {
+        return false;
+    }
+    // Evaluate every `(feature: value)` — AND.
+    let b = q.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'(' {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && b[j] != b')' {
+                j += 1;
+            }
+            let feat = q[start..j.min(q.len())].trim();
+            if !media_feature(feat, viewport_w) {
+                return false;
+            }
+            i = if j < b.len() { j + 1 } else { b.len() };
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+fn media_feature(feat: &str, viewport_w: i32) -> bool {
+    let feat = feat.trim();
+    let (name, value) = if let Some((a, b)) = feat.split_once(':') {
+        (a.trim(), b.trim())
+    } else {
+        // boolean features like `(color)` — fail-open
+        return true;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "min-width" | "max-width" | "width" => {
+            if viewport_w == 0 {
+                return true; // unknown viewport — fail-open
+            }
+            let Some(px) = parse_px(value).or_else(|| value.parse().ok()) else {
+                return true;
+            };
+            match name.as_str() {
+                "min-width" => viewport_w >= px,
+                "max-width" => viewport_w <= px,
+                "width" => viewport_w == px,
+                _ => true,
+            }
+        }
+        _ => true, // unknown feature — fail-open
+    }
 }
 
 /// Apply a list of decls onto a base style (later / important wins).
@@ -1431,7 +2282,7 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         }
         "background" | "background-color" => {
             // `background: #fff url(...)` — take first color-like token.
-            for tok in value.split_whitespace() {
+            for tok in value_tokens(value) {
                 if let Some(c) = parse_color(tok) {
                     st.background = Some(c);
                     break;
@@ -1533,7 +2384,8 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             st.display_none = v == "none";
             st.display = match v.as_str() {
                 "none" => DisplayMode::None,
-                "flex" | "inline-flex" => DisplayMode::Flex,
+                "flex" => DisplayMode::Flex,
+                "inline-flex" => DisplayMode::InlineFlex,
                 "grid" | "inline-grid" => DisplayMode::Grid,
                 "inline" | "inline-block" => DisplayMode::Inline,
                 _ => DisplayMode::Block,
@@ -1642,7 +2494,7 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             }
         }
         "border-color" => {
-            for tok in value.split_whitespace() {
+            for tok in value_tokens(value) {
                 if let Some(c) = parse_color(tok) {
                     st.border_color = Some(c);
                     st.border_top_color = Some(c);
@@ -1654,7 +2506,7 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             }
         }
         "outline-color" => {
-            for tok in value.split_whitespace() {
+            for tok in value_tokens(value) {
                 if let Some(c) = parse_color(tok) {
                     st.outline_color = Some(c);
                     break;
@@ -1942,7 +2794,7 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         }
         "outline" => {
             // `outline: <width> <style> <color>` shorthand (any order).
-            for tok in value.split_whitespace() {
+            for tok in value_tokens(value) {
                 if let Some(px) = parse_px(tok) {
                     st.outline_width = px.max(0);
                 } else if let Some(c) = parse_color(tok) {
@@ -2018,7 +2870,7 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             let mut c: Option<u32> = None;
             let mut style: Option<BorderStyle> = None;
             let mut had_style_kw = false;
-            for tok in value.split_whitespace() {
+            for tok in value_tokens(value) {
                 let low = tok.to_ascii_lowercase();
                 if let Some(px) = parse_px(tok) {
                     w = Some(px);
@@ -2427,6 +3279,18 @@ pub fn compute_ex(
     parent: &ComputedStyle,
     chain: &[ElemRef],
 ) -> ComputedStyle {
+    compute_el(sheet, ElemRef::basic(tag, id, class), inline, parent, chain)
+}
+
+/// Compute style for a fully-described subject element (`nth`, `href`, …).
+pub fn compute_el(
+    sheet: &Stylesheet,
+    el: ElemRef<'_>,
+    inline: Option<&str>,
+    parent: &ComputedStyle,
+    chain: &[ElemRef],
+) -> ComputedStyle {
+    let tag = el.tag;
     let mut st = ComputedStyle::default();
     // Inherited properties from parent.
     st.color = parent.color;
@@ -2501,7 +3365,7 @@ pub fn compute_ex(
         }
         _ => {}
     }
-    let mut decls = sheet.matching_decls_ex(tag, id, class, chain);
+    let mut decls = sheet.matching_decls_for(el, chain, PseudoElement::None);
     if let Some(inl) = inline {
         for d in parse_decls(inl) {
             // Inline style ≈ specificity (1,0,0,0) — applied after author rules
@@ -2516,6 +3380,35 @@ pub fn compute_ex(
         apply_filter_colors(&mut st);
     }
     st
+}
+
+/// Resolve `::before` / `::after` generated-content style for an element.
+pub fn compute_pseudo(
+    sheet: &Stylesheet,
+    el: ElemRef<'_>,
+    parent: &ComputedStyle,
+    chain: &[ElemRef],
+    pseudo: PseudoElement,
+) -> Option<ComputedStyle> {
+    if pseudo == PseudoElement::None {
+        return None;
+    }
+    let decls = sheet.matching_decls_for(el, chain, pseudo);
+    if decls.is_empty() {
+        return None;
+    }
+    let mut st = parent.clone();
+    // Generated content does not inherit display:none from quirks — start
+    // from inherited colour/font, clear layout-affecting props lightly.
+    st.content = String::new();
+    apply_decls(&mut st, &decls);
+    if st.content.is_empty()
+        || st.content.eq_ignore_ascii_case("none")
+        || st.content.eq_ignore_ascii_case("normal")
+    {
+        return None;
+    }
+    Some(st)
 }
 
 /// Apply the colour-affecting parts of `filter` (grayscale/invert/brightness/
@@ -2958,6 +3851,94 @@ mod tests {
     }
 
     #[test_case]
+    fn functional_colors_survive_shorthand_tokenizing() {
+        // Every Tailwind colour is `rgb(R G B / var(--x, 1))`, and every shadcn
+        // colour is `hsl(var(--y))`. Splitting a value on whitespace shredded
+        // both into non-colours, so a whole design system rendered with no
+        // backgrounds while `#ffffff` in the same slot worked.
+        assert_eq!(value_tokens("rgb(255, 255, 255)"), alloc::vec!["rgb(255, 255, 255)"]);
+        assert_eq!(
+            value_tokens("1px solid rgb(0 0 0 / .5)"),
+            alloc::vec!["1px", "solid", "rgb(0 0 0 / .5)"]
+        );
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "background-color", "rgb(255, 255, 255)");
+        assert_eq!(st.background, Some(0xffffff));
+        apply_one(&mut st, "background-color", "rgb(248 250 252 / 1)");
+        assert_eq!(st.background, Some(0xf8fafc));
+        // The var() form as Tailwind actually writes it.
+        st.custom_props.insert(String::from("--tw-bg-opacity"), String::from("1"));
+        apply_one(&mut st, "background-color", "rgb(2 132 199 / var(--tw-bg-opacity, 1))");
+        assert_eq!(st.background, Some(0x0284c7));
+        // A border shorthand carrying a functional colour.
+        let mut b = ComputedStyle::default();
+        apply_one(&mut b, "border", "1px solid rgb(226 232 240 / 1)");
+        assert_eq!(b.border_color, Some(0xe2e8f0));
+        assert_eq!(b.border_top_width, 1);
+    }
+
+    #[test_case]
+    fn hsl_colors_parse() {
+        // shadcn/ui defines its entire palette as HSL triples in custom
+        // properties and reads them back as `hsl(var(--name))`.
+        assert_eq!(parse_color("hsl(0 0% 100%)"), Some(0xffffff));
+        assert_eq!(parse_color("hsl(0 0% 0%)"), Some(0x000000));
+        assert_eq!(parse_color("hsl(222.2 47.4% 11.2%)"), Some(0x0f172a));
+        assert_eq!(parse_color("hsl(210, 40%, 96.1%)"), Some(0xf1f5f9));
+        assert_eq!(parse_color("hsl(120deg 100% 50%)"), Some(0x00ff00));
+        // Alpha blends toward the page; fully transparent is "no colour".
+        assert!(parse_color("hsla(0 100% 50% / 0.5)").is_some());
+        assert_eq!(parse_color("hsla(0 100% 50% / 0)"), None);
+        let mut st = ComputedStyle::default();
+        st.custom_props.insert(String::from("--card"), String::from("0 0% 100%"));
+        apply_one(&mut st, "background-color", "hsl(var(--card))");
+        assert_eq!(st.background, Some(0xffffff));
+    }
+
+    #[test_case]
+    fn a_fully_transparent_color_is_none_not_black() {
+        // Tailwind's shadow chain is `0 0 #0000`. Read as opaque black it
+        // painted a solid rectangle over every card.
+        assert_eq!(parse_color("#0000"), None);
+        assert_eq!(parse_color("#00000000"), None);
+        assert_eq!(parse_color("rgba(0,0,0,0)"), None);
+        assert_eq!(parse_color("transparent"), None);
+        // A partly transparent one still resolves.
+        assert!(parse_color("#0008").is_some());
+        assert_eq!(parse_color("#000f"), Some(0x000000));
+    }
+
+    #[test_case]
+    fn rem_is_not_em_and_viewport_units_resolve() {
+        // `"28rem"` ends in "em", so the em arm consumed it and failed on the
+        // leftover "28r" — every Tailwind size (all rem) was dropped.
+        assert_eq!(parse_px("28rem"), Some(448)); // max-w-md
+        assert_eq!(parse_px("1.5rem"), Some(24)); // p-6
+        assert_eq!(parse_px("0.875rem"), Some(14)); // text-sm
+        assert_eq!(parse_px("2em"), Some(28)); // em is unchanged
+        assert_eq!(parse_px("16px"), Some(16));
+        set_viewport(800, 600);
+        assert_eq!(parse_px("100vh"), Some(600));
+        assert_eq!(parse_px("50vw"), Some(400));
+        assert_eq!(parse_px("100vmin"), Some(600));
+        assert_eq!(parse_px("100vmax"), Some(800));
+    }
+
+    #[test_case]
+    fn inline_flex_is_its_own_display_mode() {
+        // It lays children out like flex but sizes like an inline box; folding
+        // it into `flex` made every shadcn button a full-width bar.
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "display", "inline-flex");
+        assert_eq!(st.display, DisplayMode::InlineFlex);
+        assert!(st.display.is_flex());
+        let mut f = ComputedStyle::default();
+        apply_one(&mut f, "display", "flex");
+        assert_eq!(f.display, DisplayMode::Flex);
+        assert!(f.display.is_flex());
+    }
+
+    #[test_case]
     fn rgba_and_percent_radius() {
         // rgba() now parses (Google uses it for borders/shadows); alpha blends
         // toward white so a subtle border isn't rendered solid black.
@@ -3243,14 +4224,17 @@ mod tests {
 
         // Ancestor <div class="gb_Na gb_9a"> present (has gb_Na, lacks gb_K):
         // only the bright-blue rule matches.
-        let chain: &[ElemRef] = &[("body", None, None), ("div", None, Some("gb_Na gb_9a"))];
+        let chain: &[ElemRef] = &[
+            ElemRef::basic("body", None, None),
+            ElemRef::basic("div", None, Some("gb_Na gb_9a")),
+        ];
         let signin = compute_ex(&sheet, "a", None, Some("gb_1a"), None, &parent, chain);
         assert_eq!(signin.background, Some(0x0b57d0), "gb_Na ancestor → bright blue");
         assert_eq!(signin.color, 0xffffff);
         assert_eq!(signin.border_radius, 100);
 
         // With gb_K present too, the pale rule (later, equal-ish specificity) wins.
-        let chain2: &[ElemRef] = &[("div", None, Some("gb_9a gb_K"))];
+        let chain2: &[ElemRef] = &[ElemRef::basic("div", None, Some("gb_9a gb_K"))];
         let pale = compute_ex(&sheet, "a", None, Some("gb_1a"), None, &parent, chain2);
         assert_eq!(pale.background, Some(0xc2e7ff), "gb_9a.gb_K ancestor → pale");
     }
@@ -3260,19 +4244,98 @@ mod tests {
         // A multi-class compound counts each class; descendant compounds add up.
         assert!(parse_compound(".a.b.c").is_some());
         let (key, anc) = parse_complex("div.card a.link").unwrap();
-        assert!(key.matches("a", None, Some("link")));
-        assert!(!key.matches("a", None, Some("other")));
+        assert!(key.matches_el(&ElemRef::basic("a", None, Some("link"))));
+        assert!(!key.matches_el(&ElemRef::basic("a", None, Some("other"))));
         assert_eq!(anc.len(), 1);
-        assert!(anc[0].matches("div", None, Some("card foo")));
+        assert!(anc[0]
+            .compound
+            .matches_el(&ElemRef::basic("div", None, Some("card foo"))));
         // State-dependent pseudos drop the rule (not applied unconditionally).
         assert!(parse_complex("a:hover").is_none());
         // `:link` / `:visited` strip to the base compound — HN needs this.
         let (k, _) = parse_complex("a:link").expect("a:link");
-        assert!(k.matches("a", None, None));
+        assert!(k.matches_el(&ElemRef::basic("a", None, None)));
         let (k, a) = parse_complex(".subtext a:link").expect(".subtext a:link");
-        assert!(k.matches("a", None, None));
+        assert!(k.matches_el(&ElemRef::basic("a", None, None)));
         assert_eq!(a.len(), 1);
-        assert!(a[0].matches("span", None, Some("subtext")));
+        assert!(a[0]
+            .compound
+            .matches_el(&ElemRef::basic("span", None, Some("subtext"))));
+    }
+
+    #[test_case]
+    fn media_calc_var_and_selectors() {
+        assert!(media_matches("screen", 800));
+        assert!(!media_matches("print", 800));
+        assert!(media_matches("(min-width: 600px)", 800));
+        assert!(!media_matches("(min-width: 600px)", 400));
+        assert!(media_matches("(max-width: 700px)", 600));
+        assert!(!media_matches("(max-width: 700px)", 800));
+        // Unknown viewport fail-open.
+        assert!(media_matches("(max-width: 100px)", 0));
+
+        let sheet = Stylesheet::parse_with_viewport(
+            r#"
+            @media (max-width: 500px) { .m { color: #ff0000; } }
+            @media (min-width: 501px) { .m { color: #00ff00; } }
+            "#,
+            800,
+        );
+        let st = compute(&sheet, "div", None, Some("m"), None, &ComputedStyle::default());
+        assert_eq!(st.color, 0x00ff00, "wide viewport picks min-width rule");
+
+        assert_eq!(parse_px("calc(10px + 2em)"), Some(10 + 2 * 14));
+        assert_eq!(parse_px_rel("calc(100% - 20px)", Some(200)), Some(180));
+        assert_eq!(parse_px_rel("50%", Some(100)), Some(50));
+        assert!(parse_px_rel("50%", None).is_none());
+
+        let mut props = alloc::collections::BTreeMap::new();
+        props.insert(String::from("--a"), String::from("var(--b, #112233)"));
+        props.insert(String::from("--b"), String::from("#abcdef"));
+        assert_eq!(resolve_var("var(--a)", &props), "#abcdef");
+        // Cycle → empty.
+        props.insert(String::from("--c"), String::from("var(--c)"));
+        assert_eq!(resolve_var("var(--c)", &props), "");
+
+        let (k, a) = parse_complex("ul > li:nth-child(odd)").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].combinator, Combinator::Child);
+        let mut el = ElemRef::basic("li", None, None);
+        el.nth = 1;
+        assert!(k.matches_el(&el));
+        el.nth = 2;
+        assert!(!k.matches_el(&el));
+
+        let (k, _) = parse_complex("a[href]").unwrap();
+        let mut el = ElemRef::basic("a", None, None);
+        assert!(!k.matches_el(&el));
+        el.href = Some("https://x");
+        assert!(k.matches_el(&el));
+
+        let (k, _) = parse_complex("p::before").unwrap();
+        assert_eq!(k.pseudo_el, PseudoElement::Before);
+
+        // Child combinator does not match a nested grandchild-only chain.
+        let sheet = Stylesheet::parse("div > p { color: #010101; } div p { color: #020202; }");
+        let parent = ComputedStyle::default();
+        let deep = &[
+            ElemRef::basic("div", None, None),
+            ElemRef::basic("section", None, None),
+        ];
+        let st = compute_ex(&sheet, "p", None, None, None, &parent, deep);
+        // `div > p` fails (parent is section); `div p` matches.
+        assert_eq!(st.color, 0x020202);
+        let direct = &[ElemRef::basic("div", None, None)];
+        let st = compute_ex(&sheet, "p", None, None, None, &parent, direct);
+        // Child rule is later? Actually both match; source order: child first then descendant.
+        // Equal-ish: descendant is second so wins if both match... child has same type spec.
+        // div>p and div p — child rule first, descendant second → descendant wins when both match.
+        // So for direct child we still get #020202. To test child uniquely:
+        let sheet2 = Stylesheet::parse("div > span { color: #030303; }");
+        let st = compute_ex(&sheet2, "span", None, None, None, &parent, direct);
+        assert_eq!(st.color, 0x030303);
+        let st = compute_ex(&sheet2, "span", None, None, None, &parent, deep);
+        assert_ne!(st.color, 0x030303);
     }
 
     #[test_case]

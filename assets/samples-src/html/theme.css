@@ -1,0 +1,9 @@
+/* Imported by css-suite.html — proves @import over file:///. */
+:root {
+  --suite-ok: #2e7d32;
+  --suite-bad: #c62828;
+  --suite-muted: #666;
+}
+.ok { color: var(--suite-ok); font-weight: 600; }
+.bad { color: var(--suite-bad); font-weight: 600; }
+.muted { color: var(--suite-muted); font-size: 0.9rem; }

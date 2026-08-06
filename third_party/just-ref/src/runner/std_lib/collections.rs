@@ -43,6 +43,28 @@ pub fn register(registry: &mut BuiltInRegistry) {
         .add_method("forEach", set_for_each)
         .add_method("values", set_values);
     registry.register_object(set);
+
+    // `WeakMap`/`WeakSet` back the private state of nearly every component
+    // library (Radix keeps per-node context in one), and a bundle that merely
+    // *constructs* one at module scope dies with `WeakMap is not defined`
+    // before rendering anything. They are implemented as their strong
+    // counterparts: without a garbage collector there is nothing weak to
+    // model, and holding a key alive is the safe direction — the observable
+    // behaviour of get/set/has/delete is identical for a page that is running.
+    let weak_map = BuiltInObject::new("WeakMap")
+        .with_constructor(map_constructor)
+        .add_method("set", map_set)
+        .add_method("get", map_get)
+        .add_method("has", map_has)
+        .add_method("delete", map_delete);
+    registry.register_object(weak_map);
+
+    let weak_set = BuiltInObject::new("WeakSet")
+        .with_constructor(set_constructor)
+        .add_method("add", set_add)
+        .add_method("has", set_has)
+        .add_method("delete", set_delete);
+    registry.register_object(weak_set);
 }
 
 fn js_same(a: &JsValue, b: &JsValue) -> bool {

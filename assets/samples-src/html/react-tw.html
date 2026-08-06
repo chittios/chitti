@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>React + Tailwind</title>
+  <link rel="stylesheet" href="./react-tw.css" />
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased">
+  <div id="root">
+    <div class="flex min-h-screen items-center justify-center p-4">
+      <p class="font-mono text-sm text-slate-500">loading React bundle…</p>
+    </div>
+  </div>
+  <script src="./react-tw.js"></script>
+  <script>
+    (function () {
+      // Read the DOM back after the bundle ran. `ALL PASS` above is logged from
+      // inside the component, so it proves the bundle *executed*; this proves it
+      // reached the document — the two failed independently while React was
+      // being brought up here.
+      var root = document.getElementById("root");
+      var h1 = root && root.querySelector && root.querySelector("h1");
+      // Prefer a plain tag selector — attribute *= may be missing in-engine.
+      var link = document.querySelector("link");
+      var href = link && (link.getAttribute ? link.getAttribute("href") : link.href);
+      var css = !!(href && String(href).indexOf("react-tw.css") >= 0);
+      if (h1 && css) {
+        console.log("react-tw MOUNTED " + h1.textContent);
+      } else {
+        console.log("react-tw NOT MOUNTED h1=" + !!h1 + " css=" + css);
+      }
+    })();
+  </script>
+</body>
+</html>

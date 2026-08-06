@@ -78,7 +78,20 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
             continue;
         }
         if let Some(ref px) = im.pixels {
-            blit_image_fit(&mut buf, w, h, im.x, y0, im.w, im.h, px, im.src_w, im.src_h, im.object_fit);
+            blit_image_fit(
+                &mut buf,
+                w,
+                h,
+                im.x,
+                y0,
+                im.w,
+                im.h,
+                px,
+                im.src_w,
+                im.src_h,
+                im.object_fit,
+                &im.object_position,
+            );
         } else {
             fill_rect(&mut buf, w, h, im.x, y0, im.w, im.h, 0xe0e0e0);
             for dx in 0..im.w {
@@ -635,11 +648,11 @@ fn blit_image_crop(
 }
 
 /// Blit an image into a `box_w`×`box_h` box honoring `object-fit`
-/// (fill/contain/cover/none/scale-down) — integer math, centered.
+/// (fill/contain/cover/none/scale-down) and `object-position` keywords.
 #[allow(clippy::too_many_arguments)]
 fn blit_image_fit(
     buf: &mut [u32], bw: usize, bh: usize, bx: i32, by: i32, box_w: i32, box_h: i32,
-    src: &[u32], sw: usize, sh: usize, fit: super::css::ObjectFit,
+    src: &[u32], sw: usize, sh: usize, fit: super::css::ObjectFit, object_pos: &str,
 ) {
     use super::css::ObjectFit::*;
     if sw == 0 || sh == 0 || box_w <= 0 || box_h <= 0 {
@@ -647,6 +660,7 @@ fn blit_image_fit(
     }
     let (siw, sih) = (sw as i64, sh as i64);
     let (bwi, bhi) = (box_w as i64, box_h as i64);
+    let (pos_x, pos_y) = parse_object_position(object_pos);
     match fit {
         Fill => blit_image(buf, bw, bh, bx, by, box_w, box_h, src, sw, sh),
         Contain | ScaleDown => {
@@ -660,31 +674,82 @@ fn blit_image_fit(
                 dw = sw as i32;
                 dh = sh as i32;
             }
-            let ox = bx + (box_w - dw) / 2;
-            let oy = by + (box_h - dh) / 2;
+            let ox = bx + align_pos(box_w - dw, pos_x);
+            let oy = by + align_pos(box_h - dh, pos_y);
             blit_image(buf, bw, bh, ox, oy, dw.max(1), dh.max(1), src, sw, sh);
         }
         Cover => {
-            // Fill the box, cropping the overflow (centered).
-            let (cw, ch, sx0, sy0) = if siw * bhi > sih * bwi {
+            // Fill the box, cropping the overflow per object-position.
+            let (cw, ch, max_sx, max_sy) = if siw * bhi > sih * bwi {
                 let cw = (sih * bwi / bhi) as usize;
-                (cw.min(sw), sh, (sw - cw.min(sw)) / 2, 0)
+                let cw = cw.min(sw);
+                (cw, sh, sw.saturating_sub(cw), 0usize)
             } else {
                 let ch = (siw * bhi / bwi) as usize;
-                (sw, ch.min(sh), 0, (sh - ch.min(sh)) / 2)
+                let ch = ch.min(sh);
+                (sw, ch, 0usize, sh.saturating_sub(ch))
             };
+            let sx0 = align_pos(max_sx as i32, pos_x) as usize;
+            let sy0 = align_pos(max_sy as i32, pos_y) as usize;
             blit_image_crop(buf, bw, bh, bx, by, box_w, box_h, src, sw, sh, sx0, sy0, cw, ch);
         }
         None => {
-            // Natural size, centered, cropped to the box.
+            // Natural size, positioned, cropped to the box.
             let dw = (sw as i32).min(box_w);
             let dh = (sh as i32).min(box_h);
-            let sx0 = (sw.saturating_sub(dw as usize)) / 2;
-            let sy0 = (sh.saturating_sub(dh as usize)) / 2;
-            let ox = bx + (box_w - dw) / 2;
-            let oy = by + (box_h - dh) / 2;
+            let sx0 = align_pos(sw as i32 - dw, pos_x) as usize;
+            let sy0 = align_pos(sh as i32 - dh, pos_y) as usize;
+            let ox = bx + align_pos(box_w - dw, pos_x);
+            let oy = by + align_pos(box_h - dh, pos_y);
             blit_image_crop(buf, bw, bh, ox, oy, dw, dh, src, sw, sh, sx0, sy0, dw as usize, dh as usize);
         }
+    }
+}
+
+/// `0.0` = start, `0.5` = center, `1.0` = end.
+fn parse_object_position(s: &str) -> (f32, f32) {
+    let mut x = 0.5f32;
+    let mut y = 0.5f32;
+    let low = s.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return (x, y);
+    }
+    for tok in low.split_whitespace() {
+        match tok {
+            "left" => x = 0.0,
+            "right" => x = 1.0,
+            "center" => { /* keep axis ambiguous — both if alone */ }
+            "top" => y = 0.0,
+            "bottom" => y = 1.0,
+            t if t.ends_with('%') => {
+                if let Ok(p) = t.trim_end_matches('%').parse::<f32>() {
+                    // First percentage → x, second → y (CSS object-position).
+                    if (x - 0.5).abs() < f32::EPSILON && !low.contains("left") && !low.contains("right") {
+                        x = (p / 100.0).clamp(0.0, 1.0);
+                    } else {
+                        y = (p / 100.0).clamp(0.0, 1.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Lone `center` leaves both at 0.5 — fine.
+    if low == "center" {
+        return (0.5, 0.5);
+    }
+    (x, y)
+}
+
+fn align_pos(free: i32, pos: f32) -> i32 {
+    if free <= 0 {
+        return 0;
+    }
+    let v = (free as f32) * pos;
+    if v >= 0.0 {
+        (v + 0.5) as i32
+    } else {
+        (v - 0.5) as i32
     }
 }
 

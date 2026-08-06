@@ -166,6 +166,7 @@ fn display_value(v: &JsValue) -> String {
 // determinism/taint boundary is unchanged.
 // ============================================================================
 
+use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec;
 use core::cell::RefCell;
@@ -209,11 +210,217 @@ fn truthy(v: &JsValue) -> bool {
     }
 }
 
+/// One wrapper object per element index, for the lifetime of the page.
+///
+/// A DOM node in JS has *identity*: `document.getElementById("x") ===
+/// document.getElementById("x")`, and a property assigned to a node is still
+/// there on the next lookup. Minting a fresh wrapper per access breaks both —
+/// and React relies on both, storing each fiber on its own node
+/// (`node[internalInstanceKey] = fiber`) and reading it back to route every
+/// event. Cleared by [`page_close`] / a fresh script run, so a navigation
+/// cannot leak the previous page's objects.
+///
+/// SAFETY (`Sync`): `mm::Locked` is unconditionally `Sync`; the page JS world
+/// is only ever touched from the single-threaded shell task, and `.with()`
+/// serializes access.
+static ELEM_WRAPPERS: crate::mm::Locked<Option<BTreeMap<usize, JsValue>>> =
+    crate::mm::Locked::new(None);
+
+/// True when `anc` is `node` or one of its ancestors.
+///
+/// Inserting a node **under its own descendant** makes the parent/children
+/// graph cyclic, and the DOM refuses it (`HierarchyRequestError`) for a reason:
+/// every tree walk after that runs forever. In this kernel that is not an
+/// exception a page catches, it is the machine stopping — a cycle spins inside
+/// native code, where the interpreter's tick never runs, so neither Ctrl+C nor
+/// the script budget can reach it. The walk is bounded by the element count as
+/// well, so a graph that is *already* cyclic cannot hang this check too.
+fn is_ancestor_or_self(elements: &[super::js::ElemRef], anc: usize, node: usize) -> bool {
+    let mut cur = Some(node);
+    let mut steps = 0usize;
+    while let Some(i) = cur {
+        if i == anc {
+            return true;
+        }
+        steps += 1;
+        if steps > elements.len() {
+            return true; // already cyclic — refuse rather than walk it again
+        }
+        cur = elements.get(i).and_then(|e| e.parent);
+    }
+    false
+}
+
+/// Longest a single page-log line may be.
+///
+/// A page's error text is page-controlled, and the engine's errors embed the
+/// *source that failed* — a `SyntaxError` from `eval()` on a minified script
+/// carries the whole 61 KiB of it. Unbounded, one bad `eval` floods the ktrace
+/// pane and the serial log with the page's own JavaScript, which drowns every
+/// other line and costs real time to write out. Long enough to keep the message
+/// and the position that matter, short enough that a page cannot use the log as
+/// an output device.
+const MAX_LOG_LINE: usize = 240;
+
+/// One page-log line, bounded. Truncation is marked so a clipped message is
+/// never mistaken for the whole one.
+fn log_line(prefix: &str, body: &str) -> String {
+    let mut out = String::from(prefix);
+    if body.chars().count() <= MAX_LOG_LINE {
+        out.push_str(body);
+        return out;
+    }
+    out.extend(body.chars().take(MAX_LOG_LINE));
+    out.push_str(" … (truncated)");
+    out
+}
+
 fn elem_wrapper(i: usize) -> JsValue {
-    let w = make_object(vec![]);
-    set_own_prop(&w, "__builtin_name__", s("Element"), false);
-    set_own_prop(&w, "__native_node__", num(i as i64), false);
-    w
+    ELEM_WRAPPERS.with(|slot| {
+        let map = slot.get_or_insert_with(BTreeMap::new);
+        if let Some(w) = map.get(&i) {
+            return w.clone();
+        }
+        let w = make_object(vec![]);
+        set_own_prop(&w, "__builtin_name__", s("Element"), false);
+        set_own_prop(&w, "__native_node__", num(i as i64), false);
+        map.insert(i, w.clone());
+        w
+    })
+}
+
+/// The DOM interface name for a tag — what `node.constructor.name` reports in a
+/// browser. Only the tags whose interface a page is likely to test for are
+/// named; everything else is a plain `HTMLElement`, which is what an unknown
+/// element really is.
+fn interface_for_tag(tag: &str) -> &'static str {
+    match tag {
+        "#text" => "Text",
+        "#comment" => "Comment",
+        "input" => "HTMLInputElement",
+        "textarea" => "HTMLTextAreaElement",
+        "select" => "HTMLSelectElement",
+        "option" => "HTMLOptionElement",
+        "button" => "HTMLButtonElement",
+        "form" => "HTMLFormElement",
+        "a" => "HTMLAnchorElement",
+        "img" => "HTMLImageElement",
+        "canvas" => "HTMLCanvasElement",
+        "iframe" => "HTMLIFrameElement",
+        "link" => "HTMLLinkElement",
+        "style" => "HTMLStyleElement",
+        "script" => "HTMLScriptElement",
+        "div" => "HTMLDivElement",
+        "span" => "HTMLSpanElement",
+        "body" => "HTMLBodyElement",
+        "html" => "HTMLHtmlElement",
+        _ => "HTMLElement",
+    }
+}
+
+/// Wall-clock deadline for the JS currently running, in `arch::now_ms` units.
+/// `0` = no budget (nothing is running).
+///
+/// SAFETY (`Sync`): `mm::Locked` is unconditionally `Sync`; page JS runs only on
+/// the single-threaded shell task.
+static SCRIPT_DEADLINE_MS: crate::mm::Locked<u64> = crate::mm::Locked::new(0);
+
+/// Longest a page's scripts may run before the engine is asked to stop.
+///
+/// The tree-walking interpreter has no other bound: a page whose scripts do not
+/// terminate — or merely take longer than a person will wait, which for a 2 MB
+/// bundle of framework chunks is the same thing — used to run until the machine
+/// was rebooted. Ctrl+C already worked through the same tick hook; this is the
+/// answer for the case where nobody is watching. Generous on purpose: the
+/// heaviest page in the corpus (16 shadcn/ui components on React 18) executes in
+/// a few seconds, so this only fires on a page that was never going to finish.
+pub const SCRIPT_BUDGET_MS: u64 = 60_000;
+
+/// Start the clock for a JS entry point (page load, or one event dispatch).
+/// Every entry re-arms it, so a page that took its whole budget at load still
+/// responds to a later click.
+pub fn arm_script_budget() {
+    SCRIPT_DEADLINE_MS.with(|d| *d = crate::arch::now_ms().saturating_add(SCRIPT_BUDGET_MS));
+}
+
+/// Stop the clock — nothing is running, so a later tick must not abort.
+pub fn disarm_script_budget() {
+    SCRIPT_DEADLINE_MS.with(|d| *d = 0);
+}
+
+/// True once the running JS has outlived [`SCRIPT_BUDGET_MS`]. Consulted by the
+/// host tick hook (`shell::browser::browser_js_tick`).
+pub fn script_budget_expired() -> bool {
+    let deadline = SCRIPT_DEADLINE_MS.with(|d| *d);
+    deadline != 0 && crate::arch::now_ms() >= deadline
+}
+
+/// Pump the UI and answer Ctrl+C / the budget between two scripts — the points
+/// where the *parser* can yield. `Some(reason)` means stop.
+///
+/// The granularity is one script: the parser itself has no tick, so a single
+/// very large chunk is parsed without a yield. A real site's bundle is dozens
+/// of chunks, which is what makes per-script checking enough in practice —
+/// `ui.shadcn.com` is 50 scripts over 2 MB, and the budget stops it mid-list.
+fn interrupted_between_scripts() -> Option<String> {
+    #[cfg(not(test))]
+    {
+        crate::shell::upkeep();
+        if crate::shell::poll_interrupt() {
+            return Some(String::from("script parsing stopped (Ctrl+C)"));
+        }
+    }
+    if script_budget_expired() {
+        return Some(alloc::format!(
+            "script parsing stopped after {}s — the page is rendered without its scripts",
+            SCRIPT_BUDGET_MS / 1000
+        ));
+    }
+    None
+}
+
+/// Describe why the engine stopped, for the page log. An interrupt is either
+/// the human (Ctrl+C) or the budget, and the two want different words.
+fn abort_reason(e: &JErrorType) -> Option<String> {
+    if !just_engine::runner::host::is_interrupt(e) {
+        return None;
+    }
+    Some(if script_budget_expired() {
+        alloc::format!(
+            "script stopped after {}s — this page's scripts did not finish; the page is rendered without them",
+            SCRIPT_BUDGET_MS / 1000
+        )
+    } else {
+        String::from("script stopped (Ctrl+C)")
+    })
+}
+
+/// Drop every cached element wrapper (navigation / page close). The wrappers
+/// hold page-script values (React fibers, handler closures), so they must not
+/// outlive the page context that owns the environments those close over.
+fn reset_elem_wrappers() {
+    ELEM_WRAPPERS.with(|slot| *slot = None);
+}
+
+/// `dir` = +1 next sibling, -1 previous. Uses the parent's `children` list.
+fn sibling_of(elements: &[super::js::ElemRef], i: usize, dir: i32) -> JsValue {
+    let Some(e) = elements.get(i) else {
+        return JsValue::Null;
+    };
+    let Some(p) = e.parent else {
+        return JsValue::Null;
+    };
+    let Some(parent) = elements.get(p) else {
+        return JsValue::Null;
+    };
+    let Some(pos) = parent.children.iter().position(|&c| c == i) else {
+        return JsValue::Null;
+    };
+    let next = pos as i32 + dir;
+    if next < 0 || next as usize >= parent.children.len() {
+        return JsValue::Null;
+    }
+    elem_wrapper(parent.children[next as usize])
 }
 fn style_wrapper(i: usize) -> JsValue {
     let w = make_object(vec![]);
@@ -252,6 +459,11 @@ fn is_bare_global(name: &str) -> bool {
             | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
             | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask"
             | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
+            // Component libraries read a node's resolved style before they
+            // animate or measure it (Radix's Presence checks `animationName`),
+            // and an undefined global is a hard ReferenceError that takes the
+            // whole component down.
+            | "getComputedStyle"
             // Bare event-target methods at global scope == `window.X(…)`.
             | "addEventListener" | "removeEventListener" | "dispatchEvent"
     )
@@ -367,12 +579,62 @@ fn matches_selector(e: &super::js::ElemRef, sel: &str) -> bool {
     }
 }
 
+/// Descendants of `root` matching `sel` (document order). Does not match `root`
+/// itself — same as `Element.prototype.querySelector(All)`.
+fn query_descendants(dom: &super::js::JsDom, root: usize, sel: &str, all: bool) -> Vec<usize> {
+    let mut out = Vec::new();
+    // Every DOM walk in here is **bounded by the element count**, and visits
+    // each node at most once. A tree walk that trusts `children` runs forever
+    // the moment the graph has a cycle — and it runs forever in *native* code,
+    // where the interpreter's tick never fires, so neither Ctrl+C nor the
+    // script budget can end it. That is not a slow page, it is the machine
+    // stopping. Insertion refuses to build a cycle (`is_ancestor_or_self`);
+    // this is the second line of defence for one arriving any other way.
+    fn walk(
+        dom: &super::js::JsDom,
+        idx: usize,
+        sel: &str,
+        all: bool,
+        out: &mut Vec<usize>,
+        budget: &mut usize,
+    ) {
+        if *budget == 0 {
+            return;
+        }
+        let Some(e) = dom.elements.get(idx) else {
+            return;
+        };
+        for &c in &e.children {
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
+            if matches_selector(&dom.elements[c], sel) {
+                out.push(c);
+                if !all {
+                    return;
+                }
+            }
+            walk(dom, c, sel, all, out, budget);
+            if !all && !out.is_empty() {
+                return;
+            }
+        }
+    }
+    let mut budget = dom.elements.len();
+    walk(dom, root, sel, all, &mut out, &mut budget);
+    out
+}
+
 // ============================================================================
 // DomProps: live property backing (NativeProps).
 // ============================================================================
 
 struct DomProps {
     dom: Rc<RefCell<JsDom>>,
+    /// Stable `document` wrapper — React's listen path does
+    /// `e.ownerDocument[_reactListening…]` and needs identity, not a fresh object.
+    document: JsValue,
 }
 
 impl DomProps {
@@ -386,7 +648,15 @@ impl DomProps {
             "className" => s(e.class.as_deref().unwrap_or("")),
             "tagName" | "nodeName" => s(&e.tag.to_uppercase()),
             "childElementCount" => num(e.children.len() as i64),
-            "nodeType" => num(1),
+            "nodeType" => {
+                // TEXT_NODE=3, COMMENT=8, ELEMENT=1 — React's host config
+                // branches on these (createTextNode results must be 3).
+                num(match e.tag.as_str() {
+                    "#text" => 3,
+                    "#comment" => 8,
+                    _ => 1,
+                })
+            },
             "checked" => JsValue::Boolean(e.checked),
             "disabled" => JsValue::Boolean(e.disabled),
             "hidden" => JsValue::Boolean(e.hidden),
@@ -409,8 +679,35 @@ impl DomProps {
             "lastChild" | "lastElementChild" => {
                 e.children.last().map(|&c| elem_wrapper(c)).unwrap_or(JsValue::Null)
             }
+            "nextSibling" | "nextElementSibling" => {
+                sibling_of(&dom.elements, i, 1)
+            }
+            "previousSibling" | "previousElementSibling" => {
+                sibling_of(&dom.elements, i, -1)
+            }
             "parentNode" | "parentElement" => {
                 e.parent.map(elem_wrapper).unwrap_or(JsValue::Null)
+            }
+            // ReactDOM `listenToAllSupportedEvents` stamps `_reactListening*` on
+            // the container and then on `ownerDocument`. Missing this threw
+            // `Cannot read property '_reactListening' of undefined`.
+            "ownerDocument" => self.document.clone(),
+            // Every DOM node has a constructor — its interface — and ReactDOM's
+            // input value-tracking reads
+            // `Object.getOwnPropertyDescriptor(node.constructor.prototype, "value")`
+            // for *every* `<input>`/`<textarea>` it commits. With no
+            // `constructor` that is `undefined.prototype`, a TypeError thrown
+            // mid-commit, and every form control on the page failed to render
+            // while non-form components were fine. The prototype is deliberately
+            // empty: React then finds no accessor to wrap and takes its plain
+            // tracking path, which is the correct behaviour here since these
+            // wrappers have no native value accessors to intercept.
+            "constructor" => {
+                let iface = interface_for_tag(&e.tag);
+                let c = make_object(vec![]);
+                set_own_prop(&c, "name", s(iface), false);
+                set_own_prop(&c, "prototype", make_object(vec![]), false);
+                c
             }
             _ => return None, // not a property → let the call path route methods
         })
@@ -420,7 +717,19 @@ impl DomProps {
         let mut dom = self.dom.borrow_mut();
         let Some(e) = dom.elements.get_mut(i) else { return false };
         match prop {
-            "innerText" | "textContent" | "innerHTML" => e.text = as_str(&value),
+            // Real DOM: assigning textContent/innerHTML replaces all children.
+            // React's createRoot commit does `container.textContent = ""` to
+            // clear; without detaching children the placeholder stays forever.
+            "innerText" | "textContent" | "innerHTML" => {
+                let text = as_str(&value);
+                let kids = core::mem::take(&mut e.children);
+                e.text = text;
+                for c in kids {
+                    if let Some(ch) = dom.elements.get_mut(c) {
+                        ch.parent = None;
+                    }
+                }
+            }
             "value" => e.value = as_str(&value),
             "id" => e.id = Some(as_str(&value)),
             "className" => e.class = Some(as_str(&value)),
@@ -463,6 +772,8 @@ impl DomProps {
             "title" => s(&dom.title),
             "cookie" => s(""),
             "readyState" => s("complete"),
+            // DOCUMENT_NODE — React's isValidContainer / listen path checks this.
+            "nodeType" => num(9),
             "body" => dom.elements.iter().position(|e| e.tag == "body").map(elem_wrapper).unwrap_or(JsValue::Null),
             "head" => dom.elements.iter().position(|e| e.tag == "head").map(elem_wrapper).unwrap_or(JsValue::Null),
             "documentElement" => dom.elements.iter().position(|e| e.tag == "html").map(elem_wrapper).unwrap_or(JsValue::Null),
@@ -611,13 +922,14 @@ fn global_wrapper(name: &str, node: i64) -> JsValue {
 
 impl DomResolver {
     fn new(dom: Rc<RefCell<JsDom>>) -> Self {
-        Self::with_listeners(dom, Rc::new(RefCell::new(Vec::new())))
+        let document = global_wrapper("document", DOC_NODE);
+        Self::with_listeners(dom, Rc::new(RefCell::new(Vec::new())), document)
     }
 
     /// Build a resolver sharing an externally-owned listener registry (the
     /// persistent-page path, so the dispatcher can invoke stored callbacks).
-    fn with_listeners(dom: Rc<RefCell<JsDom>>, listeners: ListenerReg) -> Self {
-        let document = global_wrapper("document", DOC_NODE);
+    /// `document` must be the same wrapper [`DomProps`] returns as `ownerDocument`.
+    fn with_listeners(dom: Rc<RefCell<JsDom>>, listeners: ListenerReg, document: JsValue) -> Self {
         let window = global_wrapper("window", WIN_NODE);
         let location = global_wrapper("location", LOC_NODE);
         let storage = make_object(vec![]);
@@ -633,6 +945,7 @@ impl DomResolver {
         set_own_prop(&web_assembly, "__builtin_name__", s("WebAssembly"), false);
         let fetch_fn = make_object(vec![]);
         set_own_prop(&fetch_fn, "__builtin_name__", s("fetch"), false);
+        set_own_prop(&fetch_fn, "__host_fn__", JsValue::Boolean(true), false);
         set_own_prop(&window, "document", document.clone(), true);
         set_own_prop(&window, "location", location.clone(), true);
         set_own_prop(&window, "parent", parent.clone(), true);
@@ -658,6 +971,16 @@ impl DomResolver {
             "DOMTokenList", "CSSStyleDeclaration", "ShadowRoot", "DOMParser",
             "XMLHttpRequest", "HTMLInputElement", "HTMLDivElement",
             "HTMLSpanElement", "HTMLAnchorElement", "HTMLStyleElement",
+            // ReactDOM's commit phase saves the selection first, and that walk
+            // is `while (node instanceof window.HTMLIFrameElement)`. An
+            // undefined right-hand side is a TypeError, not a `false` — so the
+            // whole commit threw and a React app rendered but never mounted.
+            // The rest are the interfaces the same family of `instanceof`
+            // checks reach for.
+            "HTMLIFrameElement", "HTMLTextAreaElement", "HTMLSelectElement",
+            "HTMLButtonElement", "HTMLFormElement", "HTMLImageElement",
+            "HTMLScriptElement", "HTMLLinkElement", "HTMLCanvasElement",
+            "HTMLBodyElement", "HTMLHtmlElement", "SVGElement",
         ] {
             let ctor = make_object(vec![]);
             set_own_prop(&ctor, "prototype", make_object(vec![]), false);
@@ -701,6 +1024,28 @@ impl DomResolver {
         });
     }
 
+    /// Same-window `postMessage` → `message` listeners (HTML MessageEvent).
+    /// Queued outbound messages stay for parent/iframe routing; self delivery
+    /// is synchronous so `addEventListener` + `postMessage` in one script works.
+    fn deliver_message_event(&self, ctx: &mut EvalContext, data: &str, origin: &str) {
+        let eobj = make_object(vec![]);
+        set_own_prop(&eobj, "__builtin_name__", s("MessageEvent"), false);
+        set_own_prop(&eobj, "type", s("message"), true);
+        set_own_prop(&eobj, "data", s(data), true);
+        set_own_prop(&eobj, "origin", s(origin), true);
+        set_own_prop(&eobj, "source", self.window.clone(), true);
+        let cbs: Vec<JsValue> = self
+            .listeners
+            .borrow()
+            .iter()
+            .filter(|l| l.target == WIN_NODE && l.type_ == "message")
+            .map(|l| l.cb.clone())
+            .collect();
+        for cb in cbs {
+            let _ = call_value(&cb, self.window.clone(), vec![eobj.clone()], ctx);
+        }
+    }
+
     /// Parse a `fetch(url, opts)` call: (method, absolute url, body).
     fn fetch_args(&self, args: &[JsValue]) -> (String, String, String) {
         let url = as_str(args.get(0).unwrap_or(&JsValue::Undefined));
@@ -718,7 +1063,7 @@ impl DomResolver {
             }
         }
         let base = self.dom.borrow().location_href.clone();
-        let abs = if super::url::is_http_url(&url) {
+        let abs = if super::url::is_http_url(&url) || super::url::is_file_url(&url) {
             url.clone()
         } else {
             super::url::resolve(&base, &url).unwrap_or(url)
@@ -772,6 +1117,7 @@ impl PluginResolver for DomResolver {
             "postMessage" => {
                 let f = make_object(vec![]);
                 set_own_prop(&f, "__builtin_name__", s("postMessage"), false);
+                set_own_prop(&f, "__host_fn__", JsValue::Boolean(true), false);
                 f
             }
             "navigator" => {
@@ -807,8 +1153,13 @@ impl PluginResolver for DomResolver {
                 p
             }
             n if is_bare_global(n) => {
+                // `__host_fn__` makes `typeof setTimeout === "function"` so
+                // libraries (React's scheduler) keep the real timer path
+                // instead of storing `null` and later throwing
+                // `null is not a function`.
                 let f = make_object(vec![]);
                 set_own_prop(&f, "__builtin_name__", s(n), false);
+                set_own_prop(&f, "__host_fn__", JsValue::Boolean(true), false);
                 f
             }
             // Bare global read → the matching `window` property (window is the
@@ -854,6 +1205,21 @@ impl PluginResolver for DomResolver {
                     num(0)
                 }
                 "clearTimeout" | "clearInterval" | "cancelAnimationFrame" => JsValue::Undefined,
+                // The element's own style object: it answers every property
+                // read and `getPropertyValue`, with "" for anything unset.
+                // That is the honest answer here — the cascade lives in the
+                // layout engine, not in the JS DOM, so a *computed* value is
+                // not something this layer can produce. Callers treat "" the
+                // way they treat a missing style (Radix's `animationName ||
+                // "none"`), which is the safe direction.
+                "getComputedStyle" => match self.node_of(&a0) {
+                    Some(i) => style_wrapper(i),
+                    None => {
+                        let o = make_object(vec![]);
+                        set_own_prop(&o, "__builtin_name__", s("Style"), false);
+                        o
+                    }
+                },
                 "encodeURIComponent" => s(&percent_encode(&as_str(&a0), "-_.!~*'()")),
                 "encodeURI" => s(&percent_encode(&as_str(&a0), "-_.!~*'();,/?:@&=+$#")),
                 "decodeURIComponent" | "decodeURI" => s(&percent_decode(&as_str(&a0))),
@@ -874,11 +1240,12 @@ impl PluginResolver for DomResolver {
             let target_origin = as_str(args.get(1).unwrap_or(&JsValue::Undefined));
             let origin = self.dom.borrow().location_href.clone();
             self.dom.borrow_mut().outbound_messages.push(super::js::Message {
-                data,
-                origin,
+                data: data.clone(),
+                origin: origin.clone(),
                 target_origin,
                 target: "self".to_string(),
             });
+            self.deliver_message_event(ctx, &data, &origin);
             return Some(Ok(JsValue::Undefined));
         }
         None
@@ -888,7 +1255,7 @@ impl PluginResolver for DomResolver {
         &self,
         object_name: &str,
         method_name: &str,
-        _ctx: &mut EvalContext,
+        ctx: &mut EvalContext,
         this: JsValue,
         args: Vec<JsValue>,
     ) -> Option<Result<JsValue, JErrorType>> {
@@ -934,6 +1301,16 @@ impl PluginResolver for DomResolver {
                 dom.elements.push(empty_elem(&tag));
                 elem_wrapper(dom.elements.len() - 1)
             }
+            // `createElementNS(ns, tag)` — the namespace argument comes FIRST.
+            // React uses it for every SVG node, so an icon inside a component
+            // (shadcn's accordion chevron, every lucide glyph) took the whole
+            // component down with "createElementNS is not a function".
+            ("document", "createElementNS") => {
+                let tag = as_str(&a1);
+                let mut dom = self.dom.borrow_mut();
+                dom.elements.push(empty_elem(&tag));
+                elem_wrapper(dom.elements.len() - 1)
+            }
             ("document", "createTextNode") => {
                 let mut dom = self.dom.borrow_mut();
                 let mut e = empty_elem("#text");
@@ -941,12 +1318,46 @@ impl PluginResolver for DomResolver {
                 dom.elements.push(e);
                 elem_wrapper(dom.elements.len() - 1)
             }
-            ("Element", "appendChild") | ("Element", "insertBefore") => {
+            ("Element", "appendChild") => {
                 if let (Some(p), Some(c)) = (self.node_of(&this), self.node_of(&a0)) {
                     let mut dom = self.dom.borrow_mut();
-                    if p < dom.elements.len() && c < dom.elements.len() && p != c {
+                    if p < dom.elements.len()
+                        && c < dom.elements.len()
+                        && p != c
+                        && !is_ancestor_or_self(&dom.elements, c, p)
+                    {
+                        if let Some(old_p) = dom.elements[c].parent {
+                            if old_p < dom.elements.len() {
+                                dom.elements[old_p].children.retain(|&x| x != c);
+                            }
+                        }
                         dom.elements[p].children.retain(|&x| x != c);
                         dom.elements[p].children.push(c);
+                        dom.elements[c].parent = Some(p);
+                    }
+                }
+                a0
+            }
+            ("Element", "insertBefore") => {
+                // insertBefore(new, ref): ref=null → append. React uses this heavily.
+                if let (Some(p), Some(c)) = (self.node_of(&this), self.node_of(&a0)) {
+                    let ref_i = self.node_of(&a1);
+                    let mut dom = self.dom.borrow_mut();
+                    if p < dom.elements.len()
+                        && c < dom.elements.len()
+                        && p != c
+                        && !is_ancestor_or_self(&dom.elements, c, p)
+                    {
+                        if let Some(old_p) = dom.elements[c].parent {
+                            if old_p < dom.elements.len() {
+                                dom.elements[old_p].children.retain(|&x| x != c);
+                            }
+                        }
+                        dom.elements[p].children.retain(|&x| x != c);
+                        let at = ref_i
+                            .and_then(|r| dom.elements[p].children.iter().position(|&x| x == r))
+                            .unwrap_or(dom.elements[p].children.len());
+                        dom.elements[p].children.insert(at, c);
                         dom.elements[c].parent = Some(p);
                     }
                 }
@@ -1000,7 +1411,20 @@ impl PluginResolver for DomResolver {
                         return Some(Ok(match k.as_str() {
                             "id" => e.id.as_deref().map(s).unwrap_or(JsValue::Null),
                             "class" => e.class.as_deref().map(s).unwrap_or(JsValue::Null),
-                            _ => e.attrs.get(&k).map(|v| s(v)).unwrap_or(JsValue::Null),
+                            "href" if !e.href.is_empty() => s(&e.href),
+                            "src" if !e.src.is_empty() => s(&e.src),
+                            "type" if !e.type_attr.is_empty() => s(&e.type_attr),
+                            "name" if !e.name_attr.is_empty() => s(&e.name_attr),
+                            "placeholder" if !e.placeholder.is_empty() => s(&e.placeholder),
+                            _ => e
+                                .attrs
+                                .get(&k)
+                                .or_else(|| {
+                                    k.strip_prefix("data-")
+                                        .and_then(|rest| e.dataset.get(rest))
+                                })
+                                .map(|v| s(v))
+                                .unwrap_or(JsValue::Null),
                         }));
                     }
                 }
@@ -1013,7 +1437,15 @@ impl PluginResolver for DomResolver {
                     dom.elements.get(i).map_or(false, |e| match k.as_str() {
                         "id" => e.id.is_some(),
                         "class" => e.class.is_some(),
-                        _ => e.attrs.contains_key(&k),
+                        "href" => !e.href.is_empty() || e.attrs.contains_key("href"),
+                        "src" => !e.src.is_empty() || e.attrs.contains_key("src"),
+                        _ => {
+                            e.attrs.contains_key(&k)
+                                || k
+                                    .strip_prefix("data-")
+                                    .map(|rest| e.dataset.contains_key(rest))
+                                    .unwrap_or(false)
+                        }
                     })
                 });
                 JsValue::Boolean(has)
@@ -1090,6 +1522,86 @@ impl PluginResolver for DomResolver {
                     }
                 }
                 JsValue::Boolean(found)
+            }
+            ("Element", "querySelector") => {
+                let sel = as_str(&a0);
+                match self.node_of(&this) {
+                    Some(root) => {
+                        let hit = {
+                            let dom = self.dom.borrow();
+                            query_descendants(&dom, root, &sel, false)
+                        };
+                        hit.first().copied().map(elem_wrapper).unwrap_or(JsValue::Null)
+                    }
+                    None => JsValue::Null,
+                }
+            }
+            ("Element", "querySelectorAll") => {
+                let sel = as_str(&a0);
+                let idxs = match self.node_of(&this) {
+                    Some(root) => {
+                        let dom = self.dom.borrow();
+                        query_descendants(&dom, root, &sel, true)
+                    }
+                    None => Vec::new(),
+                };
+                make_array(idxs.into_iter().map(elem_wrapper).collect())
+            }
+            // `closest` walks self-then-ancestors for the first match, and
+            // `matches` tests one node. Radix uses `closest("form")` on every
+            // checkbox/switch to find its owning form, so their absence took
+            // out exactly the form controls and nothing else.
+            ("Element", "closest") | ("Element", "matches") => {
+                let sel = as_str(&a0);
+                let only_self = method_name == "matches";
+                match self.node_of(&this) {
+                    Some(start) => {
+                        let dom = self.dom.borrow();
+                        let mut cur = Some(start);
+                        let mut found = JsValue::Null;
+                        let mut budget = dom.elements.len();
+                        while let Some(i) = cur {
+                            if budget == 0 {
+                                break; // cyclic parent chain — refuse to walk it
+                            }
+                            budget -= 1;
+                            let Some(e) = dom.elements.get(i) else { break };
+                            if matches_selector(e, &sel) {
+                                found = if only_self {
+                                    JsValue::Boolean(true)
+                                } else {
+                                    elem_wrapper(i)
+                                };
+                                break;
+                            }
+                            if only_self {
+                                break;
+                            }
+                            cur = e.parent;
+                        }
+                        if only_self && !matches!(found, JsValue::Boolean(true)) {
+                            JsValue::Boolean(false)
+                        } else {
+                            found
+                        }
+                    }
+                    None => {
+                        if only_self {
+                            JsValue::Boolean(false)
+                        } else {
+                            JsValue::Null
+                        }
+                    }
+                }
+            }
+            // A DOM wrapper is a host object, so it does not inherit
+            // `Object.prototype`. ReactDOM's input tracking calls
+            // `node.hasOwnProperty("value")` on every form control it commits,
+            // and "not a function" there took out every input, textarea,
+            // checkbox and switch on the page. The honest answer is whether the
+            // wrapper itself carries the property (React's own expandos do).
+            ("Element", "hasOwnProperty") => {
+                JsValue::Boolean(get_own_prop_value(&this, &as_str(&a0)).is_some())
             }
             ("Element", "focus") | ("Element", "blur") | ("Element", "click")
             | ("Element", "scrollIntoView") => JsValue::Undefined,
@@ -1241,16 +1753,23 @@ impl PluginResolver for DomResolver {
 
             // --- postMessage (window/self/parent/top) ---
             ("window" | "parent" | "self" | "top", "postMessage") => {
-                let target = if object_name == "parent" || object_name == "top" { "parent" } else { "self" };
+                let target = if object_name == "parent" || object_name == "top" {
+                    "parent"
+                } else {
+                    "self"
+                };
                 let data = as_str(&a0);
                 let target_origin = as_str(&a1);
                 let origin = self.dom.borrow().location_href.clone();
                 self.dom.borrow_mut().outbound_messages.push(super::js::Message {
-                    data,
-                    origin,
+                    data: data.clone(),
+                    origin: origin.clone(),
                     target_origin,
                     target: target.to_string(),
                 });
+                if target == "self" {
+                    self.deliver_message_event(ctx, &data, &origin);
+                }
                 JsValue::Undefined
             }
 
@@ -1273,6 +1792,42 @@ impl PluginResolver for DomResolver {
         Some(Ok(res))
     }
 
+    fn has_method(&self, object_name: &str, method_name: &str) -> bool {
+        matches!(
+            (object_name, method_name),
+            ("document", "getElementById")
+                | ("document", "querySelector")
+                | ("document", "querySelectorAll")
+                | ("document", "createElement")
+                | ("document", "createElementNS")
+                | ("document", "createTextNode")
+                | ("document", "addEventListener")
+                | ("document", "removeEventListener")
+                | ("Element", "appendChild")
+                | ("Element", "insertBefore")
+                | ("Element", "removeChild")
+                | ("Element", "remove")
+                | ("Element", "setAttribute")
+                | ("Element", "getAttribute")
+                | ("Element", "hasAttribute")
+                | ("Element", "removeAttribute")
+                | ("Element", "addEventListener")
+                | ("Element", "removeEventListener")
+                | ("Element", "cloneNode")
+                | ("Element", "contains")
+                | ("Element", "getContext")
+                | ("Element", "querySelector")
+                | ("Element", "querySelectorAll")
+                | ("Element", "closest")
+                | ("Element", "matches")
+                | ("Element", "hasOwnProperty")
+                | ("Element", "focus")
+                | ("Element", "blur")
+                | ("Element", "click")
+                | ("performance", "now")
+        )
+    }
+
     fn name(&self) -> &str {
         "chitti_dom"
     }
@@ -1290,6 +1845,8 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
         }
     }
     let _ = drain_console_log();
+    // Wrappers belong to one run: an index means a different node next time.
+    reset_elem_wrappers();
 
     let placeholder = JsDom::from_document(&super::html::parse(""));
     let taken = core::mem::replace(dom, placeholder);
@@ -1297,21 +1854,35 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
 
     let mut ctx = EvalContext::new();
     ctx.install_core_builtins(BuiltInRegistry::with_core());
-    ctx.native_props = Some(Rc::new(DomProps { dom: shared.clone() }));
-    ctx.add_resolver(alloc::boxed::Box::new(DomResolver::new(shared.clone())));
+    let document = global_wrapper("document", DOC_NODE);
+    ctx.native_props = Some(Rc::new(DomProps {
+        dom: shared.clone(),
+        document: document.clone(),
+    }));
+    ctx.add_resolver(alloc::boxed::Box::new(DomResolver::with_listeners(
+        shared.clone(),
+        Rc::new(RefCell::new(Vec::new())),
+        document,
+    )));
 
     let mut errors: alloc::vec::Vec<String> = alloc::vec::Vec::new();
-    for ast in &asts {
+    arm_script_budget();
+    'scripts: for ast in &asts {
         just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
         for stmt in &ast.body {
             if let Err(e) = execute_statement(stmt, &mut ctx) {
+                if let Some(why) = abort_reason(&e) {
+                    errors.push(why);
+                    break 'scripts;
+                }
                 // Surface the runtime error (it lands in dom.log → serial) —
                 // silently swallowing it made page-script failures invisible.
-                errors.push(alloc::format!("Uncaught {}", e.to_string()));
+                errors.push(log_line("Uncaught ", &e.to_string()));
                 break;
             }
         }
     }
+    disarm_script_budget();
     drop(ctx); // releases the resolver + native_props Rc clones of `shared`
 
     match Rc::try_unwrap(shared) {
@@ -1322,6 +1893,9 @@ pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
         dom.log.push(line);
     }
     dom.log.append(&mut errors);
+    // This path drops its ASTs on return, and a cached wrapper can hold a
+    // closure that points into them — so the cache must not outlive the run.
+    reset_elem_wrappers();
     true
 }
 
@@ -1398,14 +1972,36 @@ pub fn page_boot(
 
     let mut ctx = EvalContext::new();
     ctx.install_core_builtins(BuiltInRegistry::with_core());
-    ctx.native_props = Some(Rc::new(DomProps { dom: shared.clone() }));
+    let document = global_wrapper("document", DOC_NODE);
+    ctx.native_props = Some(Rc::new(DomProps {
+        dom: shared.clone(),
+        document: document.clone(),
+    }));
     ctx.add_resolver(alloc::boxed::Box::new(DomResolver::with_listeners(
         shared.clone(),
         listeners.clone(),
+        document,
     )));
 
+    // Parsing is the other half of the script phase and it has no tick of its
+    // own — the interpreter's hook only fires from *evaluation* loops. A real
+    // site's bundle is dozens of chunks and megabytes of source, so the UI is
+    // pumped and the budget checked between scripts; otherwise a page could
+    // freeze the shell before a single statement ran.
+    arm_script_budget();
+    let t_parse0 = crate::arch::now_ms();
+    let (allocs0, scans0) = crate::mm::heap::alloc_stats();
+    let src_bytes: usize = scripts.iter().map(|s| s.len()).sum();
     let mut asts = Vec::with_capacity(scripts.len());
-    for src in scripts {
+    for (i, src) in scripts.iter().enumerate() {
+        if let Some(why) = interrupted_between_scripts() {
+            shared.borrow_mut().log.push(alloc::format!(
+                "{why} ({} of {} script(s) parsed)",
+                i,
+                scripts.len()
+            ));
+            break;
+        }
         match JsParser::parse_to_ast_from_str(src) {
             Ok(ast) => asts.push(ast),
             Err(e) => {
@@ -1414,24 +2010,71 @@ pub fn page_boot(
                 shared
                     .borrow_mut()
                     .log
-                    .push(alloc::format!("Uncaught SyntaxError: {}", msg));
+                    .push(log_line("Uncaught SyntaxError: ", &msg));
             }
         }
     }
     let parsed = asts.len();
+    let parse_ms = crate::arch::now_ms().saturating_sub(t_parse0);
+    let t_run0 = crate::arch::now_ms();
 
-    for ast in &asts {
+    // The scripts are about to run with no yield points of their own; the host
+    // tick hook keeps the UI alive and answers Ctrl+C, and the budget armed
+    // above bounds the whole phase (parse included).
+    'scripts: for (si, ast) in asts.iter().enumerate() {
+        // Per-script, because "the page hung" has to name a script: the last
+        // `begin` line printed IS the one that never returned.
+        let t_script = crate::arch::now_ms();
+        crate::ktrace::log_fmt(format_args!(
+            "browser:js run begin {}/{} ({} B)",
+            si + 1,
+            asts.len(),
+            scripts.get(si).map(|s| s.len()).unwrap_or(0)
+        ));
         just_engine::runner::eval::statement::hoist_var_declarations(&ast.body, &mut ctx);
         for stmt in &ast.body {
             if let Err(e) = execute_statement(stmt, &mut ctx) {
+                // An interrupt (Ctrl+C or the budget) stops the PAGE, not just
+                // this script: the remaining ones are part of the same bundle
+                // and would each hit the same wall.
+                if let Some(why) = abort_reason(&e) {
+                    shared.borrow_mut().log.push(why);
+                    break 'scripts;
+                }
                 shared
                     .borrow_mut()
                     .log
-                    .push(alloc::format!("Uncaught {}", e.to_string()));
+                    .push(log_line("Uncaught ", &e.to_string()));
                 break;
             }
         }
+        crate::ktrace::log_fmt(format_args!(
+            "browser:js run end {}/{} in {} ms",
+            si + 1,
+            asts.len(),
+            crate::arch::now_ms().saturating_sub(t_script)
+        ));
     }
+    disarm_script_budget();
+    // "the page is slow" has several possible answers and they are fixed in
+    // different places — report the split rather than leaving it to guesswork.
+    let run_ms = crate::arch::now_ms().saturating_sub(t_run0);
+    // `allocs`/`scan` price the heap: the allocator is a first-fit free list, so
+    // scan steps per allocation grow with how full and fragmented it is. A
+    // parse rate that collapses on a bigger page shows up here as scan steps
+    // per alloc, not as anything in the parser.
+    let (allocs1, scans1) = crate::mm::heap::alloc_stats();
+    let allocs = allocs1.saturating_sub(allocs0);
+    let scans = scans1.saturating_sub(scans0);
+    crate::ktrace::log_fmt(format_args!(
+        "browser:js {} script(s), {} KiB: parse {} ms, run {} ms, {} allocs, {} scan/alloc",
+        scripts.len(),
+        src_bytes / 1024,
+        parse_ms,
+        run_ms,
+        allocs,
+        scans / allocs.max(1)
+    ));
     for line in drain_console_log() {
         shared.borrow_mut().log.push(line);
     }
@@ -1451,6 +2094,7 @@ pub fn page_active() -> bool {
 /// [`JsPage`] guarantees closures die before the ASTs they point into.
 pub fn page_close() {
     JS_PAGE.with(|slot| *slot = None);
+    reset_elem_wrappers();
 }
 
 /// Run `f` against the live page DOM (commit/layout/effects reads and writes).
@@ -1488,6 +2132,10 @@ pub fn page_interactive_elems() -> alloc::vec::Vec<usize> {
 /// document → window). Returns one `default_prevented` flag per event.
 pub fn page_dispatch(events: &[PageEvent]) -> alloc::vec::Vec<bool> {
     let _ = drain_console_log();
+    // A handler is JS too, and a click into an infinite loop is just as fatal
+    // as a script that never returns. Re-armed per dispatch so a page that
+    // spent its whole load budget still answers the next click.
+    arm_script_budget();
     let out = JS_PAGE.with(|slot| {
         let Some(page) = slot.as_mut() else {
             return events.iter().map(|_| false).collect::<alloc::vec::Vec<bool>>();
@@ -1498,6 +2146,7 @@ pub fn page_dispatch(events: &[PageEvent]) -> alloc::vec::Vec<bool> {
         }
         prevented
     });
+    disarm_script_budget();
     // Console output produced by handlers lands in the page log.
     let lines = drain_console_log();
     if !lines.is_empty() {
@@ -1603,7 +2252,7 @@ fn invoke_listeners(page: &mut JsPage, target: i64, type_: &str, eobj: &JsValue,
             page.shared
                 .borrow_mut()
                 .log
-                .push(alloc::format!("Uncaught {}", e.to_string()));
+                .push(log_line("Uncaught ", &e.to_string()));
         }
     }
 }
@@ -1627,7 +2276,10 @@ fn run_on_attr(page: &mut JsPage, target: usize, type_: &str, eobj: &JsValue) {
             page.shared
                 .borrow_mut()
                 .log
-                .push(alloc::format!("Uncaught SyntaxError (on{}): {}", type_, msg));
+                .push(log_line(
+                    &alloc::format!("Uncaught SyntaxError (on{type_}): "),
+                    &msg,
+                ));
             return;
         }
     };
@@ -1647,7 +2299,7 @@ fn run_on_attr(page: &mut JsPage, target: usize, type_: &str, eobj: &JsValue) {
             page.shared
                 .borrow_mut()
                 .log
-                .push(alloc::format!("Uncaught {}", e.to_string()));
+                .push(log_line("Uncaught ", &e.to_string()));
             break;
         }
     }
@@ -1674,6 +2326,61 @@ mod tests {
     #[test_case]
     fn arithmetic_and_precedence() {
         assert_eq!(val("1 + 2 * 3"), "7");
+    }
+
+    #[test_case]
+    fn symbol_for_registry() {
+        // React's production bundle starts with `Symbol.for("react.element")`.
+        // Without Symbol.for the page dies with `for is not a function`.
+        // Without Symbol in `===`, two registry lookups never match and React
+        // treats every element as a plain object.
+        assert_eq!(
+            val("Symbol.for('react.element') === Symbol.for('react.element')"),
+            "true"
+        );
+        assert_eq!(
+            val("Symbol.for('a') === Symbol.for('b')"),
+            "false"
+        );
+        assert_eq!(
+            val("Symbol('k') === Symbol('k')"),
+            "false"
+        );
+        assert_eq!(val("Symbol.keyFor(Symbol.for('k'))"), "\"k\"");
+        assert_eq!(val("typeof Symbol.keyFor(Symbol('x'))"), "\"undefined\"");
+    }
+
+    #[test_case]
+    fn function_declarations_are_hoisted() {
+        // ReactDOM minifies to `getModifierState:iu` … later `function iu(){…}`.
+        assert_eq!(
+            val("var o = { f: iu }; function iu(){ return 7; } o.f()"),
+            "7"
+        );
+        assert_eq!(val("typeof g; function g(){}"), "\"function\"");
+    }
+
+    #[test_case]
+    fn host_timers_typeof_function() {
+        // React's scheduler: `F = typeof setTimeout == "function" ? setTimeout : null`.
+        // Without typeof "function" it stores null and later throws
+        // `null is not a function`.
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body></body></html>"#);
+        let mut dom = JsDom::from_document(&doc);
+        let ok = run_scripts_via_just(
+            &mut dom,
+            &[String::from(
+                "console.log(typeof setTimeout);\
+                 console.log(typeof queueMicrotask);\
+                 var n=0; var F=typeof setTimeout=='function'?setTimeout:null;\
+                 F(function(){ n=1; }, 0);\
+                 console.log('n='+n);",
+            )],
+        );
+        assert!(ok);
+        assert!(dom.log.iter().any(|l| l == "function"), "typeof: {:?}", dom.log);
+        assert!(dom.log.iter().any(|l| l == "n=1"), "F(cb) ran: {:?}", dom.log);
     }
 
     #[test_case]
@@ -1910,6 +2617,38 @@ mod tests {
     // --- Stage D: DOM bindings via the DomResolver (run_scripts_via_just) ---
 
     #[test_case]
+    fn dom_element_query_selector_finds_descendant() {
+        // has_method claimed Element.querySelector before call_method implemented
+        // it — feature-detect `root.querySelector && root.querySelector("h1")`
+        // then threw "querySelector is not a function".
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><head><link rel="stylesheet" href="./react-tw.css"></head>
+               <body><div id="root"><h1>React + Tailwind</h1></div></body></html>"#,
+        );
+        let mut dom = JsDom::from_document(&doc);
+        let ok = run_scripts_via_just(
+            &mut dom,
+            &[String::from(
+                r##"
+                var root = document.getElementById("root");
+                console.log("typeof_doc=" + typeof document);
+                console.log("root=" + !!root);
+                console.log("h1=" + !!(root && root.querySelector("h1")));
+                var link = document.querySelector("link");
+                var href = link && (link.getAttribute ? link.getAttribute("href") : link.href);
+                console.log("css=" + !!(href && String(href).indexOf("react-tw.css") >= 0));
+                "##,
+            )],
+        );
+        assert!(ok, "script ok");
+        assert!(dom.log.iter().any(|l| l == "typeof_doc=object"), "{:?}", dom.log);
+        assert!(dom.log.iter().any(|l| l == "root=true"), "{:?}", dom.log);
+        assert!(dom.log.iter().any(|l| l == "h1=true"), "{:?}", dom.log);
+        assert!(dom.log.iter().any(|l| l == "css=true"), "{:?}", dom.log);
+    }
+
+    #[test_case]
     fn dom_get_element_and_set_text() {
         use crate::browser::html;
         let doc = html::parse(r#"<html><body><p id="msg">old</p></body></html>"#);
@@ -1921,6 +2660,91 @@ mod tests {
         assert!(ok, "just DOM run should succeed");
         let el = dom.elements.iter().find(|e| e.id.as_deref() == Some("msg")).unwrap();
         assert_eq!(el.text, "hello 2");
+    }
+
+    #[test_case]
+    fn dom_text_content_clear_and_commit_replaces_placeholder() {
+        // React createRoot clears with `container.textContent = ""` then
+        // appendChild's a new tree. The paint path must drop the parse-time
+        // placeholder and show the JS-built content.
+        use crate::browser::{html, js};
+        let mut doc = html::parse(
+            r#"<html><body><div id="root"><p>loading React bundle…</p></div></body></html>"#,
+        );
+        let mut dom = js::JsDom::from_document(&doc);
+        let ok = run_scripts_via_just(
+            &mut dom,
+            &[String::from(
+                r##"
+                var root = document.getElementById("root");
+                root.textContent = "";
+                var h1 = document.createElement("h1");
+                h1.textContent = "React + Tailwind";
+                root.appendChild(h1);
+                console.log("kids=" + root.childElementCount);
+                console.log("first=" + (root.firstChild && root.firstChild.textContent));
+                "##,
+            )],
+        );
+        assert!(ok, "script ok");
+        assert!(
+            dom.log.iter().any(|l| l == "kids=1"),
+            "JsDom kids: {:?}",
+            dom.log
+        );
+        assert!(
+            dom.log.iter().any(|l| l == "first=React + Tailwind"),
+            "firstChild text: {:?}",
+            dom.log
+        );
+        js::commit_full(&mut doc.root, &dom);
+        let plain = html::collect_text(&doc.root);
+        // Debug-friendly: also assert the JsDom side already had the h1, so a
+        // failure here is specifically commit_full / prune.
+        let root_i = dom
+            .elements
+            .iter()
+            .position(|e| e.id.as_deref() == Some("root"))
+            .expect("root in JsDom");
+        assert_eq!(dom.elements[root_i].children.len(), 1, "JsDom root kids");
+        assert!(
+            plain.contains("React + Tailwind"),
+            "committed tree missing h1 text: {plain:?} root_elem_idx={:?} kids={:?}",
+            doc.root.elem_idx,
+            // count element children under body/root if any
+            dom.elements[root_i].children
+        );
+        assert!(
+            !plain.contains("loading React bundle"),
+            "placeholder must be pruned: {plain:?}"
+        );
+    }
+
+    #[test_case]
+    fn dom_owner_document_and_node_types() {
+        // ReactDOM createRoot → listenToAllSupportedEvents needs ownerDocument
+        // and document.nodeType === 9.
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><div id="root"></div></body></html>"#);
+        let mut dom = JsDom::from_document(&doc);
+        let ok = run_scripts_via_just(
+            &mut dom,
+            &[String::from(
+                "var el = document.getElementById('root');\
+                 var od = el.ownerDocument;\
+                 console.log('nt=' + el.nodeType);\
+                 console.log('dnt=' + document.nodeType);\
+                 console.log('same=' + (od === document));\
+                 od._reactListeningTest = true;\
+                 console.log('expando=' + el.ownerDocument._reactListeningTest);",
+            )],
+        );
+        assert!(ok, "ownerDocument script should succeed");
+        let logs = &dom.log;
+        assert!(logs.iter().any(|l| l == "nt=1"), "elem nodeType: {logs:?}");
+        assert!(logs.iter().any(|l| l == "dnt=9"), "doc nodeType: {logs:?}");
+        assert!(logs.iter().any(|l| l == "same=true"), "ownerDocument===document: {logs:?}");
+        assert!(logs.iter().any(|l| l == "expando=true"), "doc expando: {logs:?}");
     }
 
     #[test_case]
@@ -1972,6 +2796,47 @@ mod tests {
     }
 
     #[test_case]
+    fn dom_data_attr_href_create_canvas() {
+        use crate::browser::{html, js};
+        let doc = html::parse(
+            r#"<html><body>
+              <div id="box" data-k="v" class="a"></div>
+              <a id="link" href="index.html">home</a>
+              <div id="playground"></div>
+              <canvas id="c" width="20" height="20"></canvas>
+            </body></html>"#,
+        );
+        let mut dom = js::JsDom::from_document(&doc);
+        let logs = js::run_scripts(
+            &mut dom,
+            &[String::from(
+                r##"
+                var box = document.getElementById("box");
+                console.log("data=" + box.getAttribute("data-k"));
+                var link = document.getElementById("link");
+                console.log("href=" + link.getAttribute("href"));
+                var host = document.getElementById("playground");
+                var kid = document.createElement("div");
+                kid.id = "created";
+                kid.textContent = "made";
+                host.appendChild(kid);
+                console.log("created=" + document.getElementById("created").textContent);
+                var c = document.getElementById("c");
+                var ctx = c.getContext("2d");
+                ctx.fillStyle = "red";
+                ctx.fillRect(0, 0, 10, 10);
+                console.log("canvas=ok");
+                "##,
+            )],
+        );
+        assert!(logs.iter().any(|l| l == "data=v"), "data-*: {logs:?}");
+        assert!(logs.iter().any(|l| l == "href=index.html"), "href: {logs:?}");
+        assert!(logs.iter().any(|l| l == "created=made"), "createElement: {logs:?}");
+        assert!(logs.iter().any(|l| l == "canvas=ok"), "canvas: {logs:?}");
+        assert!(!dom.canvases.is_empty());
+    }
+
+    #[test_case]
     fn dom_fetch_logs_and_resolves() {
         use crate::browser::{html, js};
         let doc = html::parse("<html><body></body></html>");
@@ -1993,9 +2858,19 @@ mod tests {
         use crate::browser::{html, js};
         let doc = html::parse("<html><body></body></html>");
         let mut dom = js::JsDom::from_document(&doc);
-        let _ = js::run_scripts(&mut dom, &[String::from("window.postMessage('hi', '*');")]);
+        let logs = js::run_scripts(
+            &mut dom,
+            &[String::from(
+                "var got=''; window.addEventListener('message', function(ev){ got = ev.data; }); \
+                 window.postMessage('hi', '*'); console.log(got);",
+            )],
+        );
         assert_eq!(dom.outbound_messages.len(), 1);
         assert_eq!(dom.outbound_messages[0].data, "hi");
+        assert!(
+            logs.iter().any(|l| l == "hi"),
+            "self postMessage should deliver to message listeners: {logs:?}"
+        );
     }
 
     #[test_case]
@@ -2165,6 +3040,337 @@ mod tests {
         .unwrap();
         assert_eq!(text, "ran");
         assert!(has_err, "the bad script's SyntaxError is logged");
+        page_close();
+    }
+
+    // --- The four gaps that kept a real React 18 + Tailwind bundle from
+    // mounting. Each is a one-line JS shape; each cost a whole page.
+
+    #[test_case]
+    fn strings_compare_by_code_unit_not_by_number() {
+        // React guards every DOM access with `typeof document < "u"`. Relational
+        // comparison used to run ToNumber on both sides, making each NaN and the
+        // answer `false` — so React decided the page had no document and the app
+        // reported itself broken on a page that was fine.
+        assert_eq!(val("'object' < 'u'"), "true");
+        assert_eq!(val("'undefined' < 'u'"), "false");
+        assert_eq!(val("typeof {} < 'u'"), "true");
+        assert_eq!(val("'a' < 'b'"), "true");
+        assert_eq!(val("'b' <= 'b'"), "true");
+        assert_eq!(val("'10' < '9'"), "true"); // string order, not numeric
+        assert_eq!(val("10 < 9"), "false"); // …but numbers still compare as numbers
+        assert_eq!(val("'2' < 3"), "true"); // mixed still goes through ToNumber
+    }
+
+    #[test_case]
+    fn destructured_and_defaulted_parameters_bind() {
+        // A parameter list is the full pattern grammar. Binding only plain
+        // identifiers left `function Check({ label, ok })` — an ordinary React
+        // component — throwing `label is not defined` on a correct call.
+        assert_eq!(val("function f({a}){return a;} f({a:1})"), "1");
+        assert_eq!(val("function f({a:b}){return b;} f({a:2})"), "2");
+        assert_eq!(val("function f([x,y]){return x+y;} f([1,2])"), "3");
+        assert_eq!(val("function f({a:b=7}){return b;} f({})"), "7");
+        assert_eq!(val("function f(a=5){return a;} f()"), "5");
+        assert_eq!(val("function f(a,...r){return a+r.length;} f(1,2,3)"), "3");
+        assert_eq!(val("var f=({a})=>a*2; f({a:4})"), "8");
+    }
+
+    #[test_case]
+    fn break_leaves_a_labelled_block_not_just_the_inner_loop() {
+        // ReactDOM's commitPlacement is `e: { for (…) { … break e; } throw … }`.
+        // A loop claims every pending label at entry, so leaving the label
+        // pending on a *block* let the `for` swallow `break e` — the throw then
+        // ran and React reported "expected to find a host parent" on a tree
+        // that had one.
+        assert_eq!(
+            val("function f(){ e: { for (var n=3; n!==0;) { if (n===1) break e; n=n-1; } return 'fell'; } return 'broke'; } f()"),
+            "\"broke\""
+        );
+        // Labelled loops keep working: `continue`/`break` still target them.
+        assert_eq!(
+            val("function g(){var o=0; a: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j===1) continue a; o=o+1; } } return o;} g()"),
+            "3"
+        );
+        assert_eq!(
+            val("function h(){ a: for(var i=0;i<3;i++){ for(var j=0;j<3;j++){ if(j===1) break a; } } return i;} h()"),
+            "0"
+        );
+    }
+
+    #[test_case]
+    fn string_of_an_object_runs_its_own_to_string() {
+        // `String(x)` is ToString, which for an object goes through ToPrimitive
+        // — the no-ctx helper could not, so `String(new Error("boom"))` came
+        // back "[object Object]" while `"" + e` gave the real message.
+        assert_eq!(val("String(new Error('boom'))"), "\"Error: boom\"");
+        assert_eq!(val("String({toString:function(){return 'ok';}})"), "\"ok\"");
+        assert_eq!(val("String(5)"), "\"5\"");
+        assert_eq!(val("String(null)"), "\"null\"");
+    }
+
+    #[test_case]
+    fn a_dom_node_keeps_its_identity_and_its_expandos() {
+        // React stores each fiber on its own node (`node[key] = fiber`) and
+        // reads it back to route events. A fresh wrapper per lookup made both
+        // the identity check and the read-back fail.
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><p id="m">x</p></body></html>"#);
+        let parsed = page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "var a = document.getElementById('m');\
+                 a.__fiber = 42;\
+                 var b = document.getElementById('m');\
+                 console.log('same=' + (a === b));\
+                 console.log('expando=' + (b.__fiber === 42));\
+                 console.log('parent=' + (a.parentNode === document.getElementById('m').parentNode));",
+            )],
+        );
+        assert_eq!(parsed, 1);
+        let log = page_with_dom(|dom| dom.log.clone()).unwrap();
+        assert!(log.iter().any(|l| l == "same=true"), "identity: {log:?}");
+        assert!(log.iter().any(|l| l == "expando=true"), "expando: {log:?}");
+        assert!(log.iter().any(|l| l == "parent=true"), "parent identity: {log:?}");
+        page_close();
+    }
+
+    #[test_case]
+    fn dom_interface_constructors_answer_instanceof() {
+        // `while (node instanceof window.HTMLIFrameElement)` runs in ReactDOM's
+        // commit. An undefined right-hand side is a TypeError, so the commit
+        // threw and nothing mounted; defined, the check is simply false.
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><p id="m">x</p></body></html>"#);
+        page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "var n = document.getElementById('m');\
+                 console.log('iframe=' + (n instanceof window.HTMLIFrameElement));\
+                 console.log('input=' + (n instanceof window.HTMLInputElement));",
+            )],
+        );
+        let log = page_with_dom(|dom| dom.log.clone()).unwrap();
+        assert!(log.iter().any(|l| l == "iframe=false"), "iframe: {log:?}");
+        assert!(log.iter().any(|l| l == "input=false"), "input: {log:?}");
+        assert!(
+            !log.iter().any(|l| l.contains("Uncaught")),
+            "instanceof must not throw: {log:?}"
+        );
+        page_close();
+    }
+
+    #[test_case]
+    fn a_page_cannot_flood_the_log_with_its_own_source() {
+        // The engine's errors embed the source that failed, so a `SyntaxError`
+        // from `eval()` on a minified script carried the whole thing —
+        // google.com/search put 61 KiB of its own JavaScript into the ktrace
+        // pane and the serial log, drowning every other line.
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><p id="m">x</p></body></html>"#);
+        let big: String = core::iter::repeat("var averyLongIdentifierName = 1; ")
+            .take(400)
+            .collect();
+        page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            // A syntax error inside `eval()` — the shape whose message carries
+            // the whole source with it.
+            &[alloc::format!("eval({:?});", alloc::format!("{big} @ not valid"))],
+        );
+        let log = page_with_dom(|dom| dom.log.clone()).unwrap();
+        assert!(
+            log.iter().any(|l| l.contains("Uncaught")),
+            "the error is still reported: {log:?}"
+        );
+        for l in &log {
+            assert!(
+                l.chars().count() <= MAX_LOG_LINE + 64,
+                "log line is bounded ({} chars): {:?}",
+                l.chars().count(),
+                &l.chars().take(80).collect::<String>()
+            );
+        }
+        page_close();
+    }
+
+    #[test_case]
+    fn a_runaway_page_script_is_stopped_and_says_why() {
+        // `/browse` on a real site (38 Next.js chunks, 2.1 MB) ran the shell
+        // thread into a script that never returned: the UI clock kept ticking —
+        // the host hook was installed — but nothing else could ever happen, and
+        // the machine had to be rebooted. The engine now stops on a wall-clock
+        // budget as well as on Ctrl+C, and the page renders without its scripts.
+        use crate::browser::html;
+        use just_engine::runner::host;
+
+        // Stand in for the shell's hook: no UI to pump here, and it reports
+        // "stop" the way an expired budget does.
+        fn always_stop() -> bool {
+            true
+        }
+        let doc = html::parse(r#"<html><body><p id="m">static</p></body></html>"#);
+        host::set_tick_hook(Some(always_stop));
+        let parsed = page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "var n = 0; while (true) { n = n + 1; }                  document.getElementById('m').innerText = 'never';",
+            )],
+        );
+        host::set_tick_hook(None);
+        assert_eq!(parsed, 1, "the script parses — it is the *run* that is endless");
+
+        let (log, text) = page_with_dom(|dom| {
+            (
+                dom.log.clone(),
+                dom.elements
+                    .iter()
+                    .find(|e| e.id.as_deref() == Some("m"))
+                    .map(|e| e.text.clone())
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap();
+        // It stopped…
+        assert!(
+            log.iter().any(|l| l.starts_with("script stopped")),
+            "the abort is reported in the page's own words: {log:?}"
+        );
+        // …and it is NOT reported as a script error, which would be a lie about
+        // a page that is merely too heavy.
+        assert!(
+            !log.iter().any(|l| l.contains("Uncaught")),
+            "an interrupt is not an exception: {log:?}"
+        );
+        // …and the document survives, so the page still renders.
+        assert_eq!(text, "static", "the pre-script DOM is intact");
+        page_close();
+    }
+
+    #[test_case]
+    fn a_script_budget_is_armed_per_entry_and_disarmed_after() {
+        // A budget left armed after a load would abort the first click on the
+        // page; one never armed would leave the next runaway unbounded.
+        disarm_script_budget();
+        assert!(!script_budget_expired(), "nothing running, no budget");
+        arm_script_budget();
+        assert!(
+            !script_budget_expired(),
+            "a freshly armed budget has {}ms to run",
+            SCRIPT_BUDGET_MS
+        );
+        disarm_script_budget();
+        assert!(!script_budget_expired());
+
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><p id="m">x</p></body></html>"#);
+        page_boot(&doc, "https://t.example/", 640, 400, &[String::from("var a = 1;")]);
+        assert!(
+            !script_budget_expired(),
+            "page_boot disarms on the way out, so a later tick cannot abort a click"
+        );
+        page_close();
+    }
+
+    #[test_case]
+    fn the_dom_surface_a_component_library_actually_calls() {
+        // Each of these took out a whole family of shadcn/ui components, and
+        // each failed as a bare `X is not a function` with no clue which
+        // component it belonged to.
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><body><form id="f"><div class="row"><input id="i" /></div></form></body></html>"#,
+        );
+        page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "var i = document.getElementById('i');                 console.log('own=' + i.hasOwnProperty('value'));                 i.__expando = 1;                 console.log('own2=' + i.hasOwnProperty('__expando'));                 console.log('ctor=' + i.constructor.name);                 console.log('proto=' + (typeof i.constructor.prototype));                 console.log('closest=' + (i.closest('form') !== null));                 console.log('closest-miss=' + (i.closest('table') === null));                 console.log('matches=' + i.matches('input'));                 var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');                 console.log('ns=' + svg.tagName);                 console.log('gcs=' + (typeof getComputedStyle(i)));",
+            )],
+        );
+        let log = page_with_dom(|dom| dom.log.clone()).unwrap();
+        let has = |l: &str| log.iter().any(|x| x == l);
+        // ReactDOM's input tracking: `hasOwnProperty` then `constructor.prototype`.
+        assert!(has("own=false"), "hasOwnProperty on a DOM prop: {log:?}");
+        assert!(has("own2=true"), "hasOwnProperty sees an expando: {log:?}");
+        assert!(has("ctor=HTMLInputElement"), "constructor: {log:?}");
+        assert!(has("proto=object"), "constructor.prototype: {log:?}");
+        // Radix finds a control's owning form with `closest`.
+        assert!(has("closest=true"), "closest finds an ancestor: {log:?}");
+        assert!(has("closest-miss=true"), "closest returns null: {log:?}");
+        assert!(has("matches=true"), "matches: {log:?}");
+        // React creates every SVG node through createElementNS — namespace first.
+        assert!(has("ns=SVG"), "createElementNS uses the 2nd arg: {log:?}");
+        assert!(has("gcs=object"), "getComputedStyle: {log:?}");
+        assert!(
+            !log.iter().any(|l| l.contains("Uncaught")),
+            "none of it throws: {log:?}"
+        );
+        page_close();
+    }
+
+    #[test_case]
+    fn a_react_shaped_mount_reaches_the_dom() {
+        // The whole path in miniature: a component written with a destructured
+        // parameter, a `typeof document < "u"` guard, a labelled-block search
+        // for the host parent, then createElement/appendChild into #root.
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><div id="root"></div></body></html>"#);
+        page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "function Card({ label }) { \
+                   var el = document.createElement('h1'); \
+                   el.textContent = label; \
+                   return el; \
+                 } \
+                 function mount(node) { \
+                   e: { \
+                     for (var p = node; p !== null; ) { \
+                       if (p.nodeType === 1 && p.id === 'root') break e; \
+                       p = p.parentNode; \
+                     } \
+                     throw new Error('no host parent'); \
+                   } \
+                   return true; \
+                 } \
+                 var ok = typeof document < 'u'; \
+                 var root = document.getElementById('root'); \
+                 root.appendChild(Card({ label: 'React + Tailwind' })); \
+                 console.log('doc=' + ok + ' mounted=' + mount(root));",
+            )],
+        );
+        let (log, h1) = page_with_dom(|dom| {
+            (
+                dom.log.clone(),
+                dom.elements
+                    .iter()
+                    .find(|e| e.tag == "h1")
+                    .map(|e| e.text.clone()),
+            )
+        })
+        .unwrap();
+        assert!(
+            log.iter().any(|l| l == "doc=true mounted=true"),
+            "guards: {log:?}"
+        );
+        assert_eq!(h1.as_deref(), Some("React + Tailwind"), "h1 in the DOM");
         page_close();
     }
 

@@ -47,6 +47,33 @@ impl<T> Locked<T> {
         Self { locked: AtomicBool::new(false), inner: UnsafeCell::new(value) }
     }
 
+    /// Run `f` only if the lock is free **right now**; `None` if it is held.
+    ///
+    /// The blocking [`with`](Self::with) is not reentrant, so any code that may
+    /// run *inside* a critical section — a log line, a panic path, an
+    /// allocation-failure handler — must use this instead. Taking the same lock
+    /// twice on one core does not fail loudly, it spins forever with interrupts
+    /// disabled: the machine stops, no output, no Ctrl+C, nothing to see. That
+    /// is exactly how an out-of-memory report deadlocked the whole OS while
+    /// trying to say "out of memory".
+    pub fn try_with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        crate::arch::interrupts::without_interrupts(|| {
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                return None;
+            }
+            // SAFETY: the lock is held and interrupts are disabled, so this is
+            // the only live access to `inner` on any core.
+            let inner = unsafe { &mut *self.inner.get() };
+            let result = f(inner);
+            self.locked.store(false, Ordering::Release);
+            Some(result)
+        })
+    }
+
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         crate::arch::interrupts::without_interrupts(|| {
             // Test-and-test-and-set acquire: spin reading (cheap, cache-local)

@@ -33,7 +33,7 @@
 //! browser loader (capability path at the shell); unit tests get a stub body.
 
 use super::html::{Node, NodeKind};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -358,6 +358,13 @@ fn collect_elems(n: &Node, out: &mut Vec<ElemRef>) {
         width_attr,
         height_attr,
         on_attrs,
+        extra_attrs,
+        href,
+        src,
+        name,
+        input_type,
+        placeholder,
+        srcdoc,
         ..
     } = &n.kind
     {
@@ -380,10 +387,44 @@ fn collect_elems(n: &Node, out: &mut Vec<ElemRef>) {
             if let Some(s) = style_attr {
                 attrs.insert(String::from("style"), s.clone());
             }
+            let href_s = href.clone().unwrap_or_default();
+            let src_s = src.clone().unwrap_or_default();
+            let type_s = input_type.clone().unwrap_or_default();
+            let name_s = name.clone().unwrap_or_default();
+            let ph_s = placeholder.clone().unwrap_or_default();
+            if !href_s.is_empty() {
+                attrs.insert(String::from("href"), href_s.clone());
+            }
+            if !src_s.is_empty() {
+                attrs.insert(String::from("src"), src_s.clone());
+            }
+            if !type_s.is_empty() {
+                attrs.insert(String::from("type"), type_s.clone());
+            }
+            if !name_s.is_empty() {
+                attrs.insert(String::from("name"), name_s.clone());
+            }
+            if !ph_s.is_empty() {
+                attrs.insert(String::from("placeholder"), ph_s.clone());
+            }
+            if let Some(sd) = srcdoc {
+                if !sd.is_empty() {
+                    attrs.insert(String::from("srcdoc"), sd.clone());
+                }
+            }
             // Inline event-handler attributes (`onclick="…"`) — dispatch runs
             // these at the target phase.
             for (k, v) in on_attrs {
                 attrs.insert(k.clone(), v.clone());
+            }
+            let mut dataset = BTreeMap::new();
+            for (k, v) in extra_attrs {
+                attrs.insert(k.clone(), v.clone());
+                if let Some(rest) = k.strip_prefix("data-") {
+                    if !rest.is_empty() {
+                        dataset.insert(rest.to_string(), v.clone());
+                    }
+                }
             }
             out.push(ElemRef {
                 tag: tag.clone(),
@@ -406,15 +447,15 @@ fn collect_elems(n: &Node, out: &mut Vec<ElemRef>) {
                 parent: None,
                 children: Vec::new(),
                 listeners: BTreeMap::new(),
-                dataset: BTreeMap::new(),
+                dataset,
                 checked: false,
                 disabled: false,
                 hidden: false,
-                href: String::new(),
-                src: String::new(),
-                type_attr: String::new(),
-                name_attr: String::new(),
-                placeholder: String::new(),
+                href: href_s,
+                src: src_s,
+                type_attr: type_s,
+                name_attr: name_s,
+                placeholder: ph_s,
             });
         }
     }
@@ -603,13 +644,84 @@ pub fn commit_full(root: &mut Node, dom: &JsDom) {
     stamp_elem_indices(root);
     commit_to_tree(root, dom);
     insert_created_elems(root, dom);
+    // JsDom parent.children order is authoritative (insertBefore); the insert
+    // loop walks by element index, so re-order after materializing.
+    reorder_children_to_dom(root, dom);
+    // Drop parse-tree leftovers React cleared in JsDom (e.g. #root's
+    // "loading…" placeholder after `textContent = ""` + appendChild).
+    prune_stale_children(root, dom);
+}
+
+/// Align each element's child order with `JsDom.elements[i].children`.
+fn reorder_children_to_dom(n: &mut Node, dom: &JsDom) {
+    if let Some(i) = n.elem_idx {
+        if let Some(er) = dom.elements.get(i) {
+            let mut ordered: Vec<Node> = Vec::with_capacity(n.children.len());
+            for &ci in &er.children {
+                if let Some(pos) = n.children.iter().position(|c| c.elem_idx == Some(ci)) {
+                    ordered.push(n.children.remove(pos));
+                }
+            }
+            // Keep leftover text nodes (from `er.text` materialization) that
+            // have no elem_idx — after the JsDom-ordered element children.
+            ordered.append(&mut n.children);
+            n.children = ordered;
+        }
+    }
+    let n_ptr = n as *mut Node;
+    // SAFETY: single-threaded; exclusive child walk.
+    let n = unsafe { &mut *n_ptr };
+    for i in 0..n.children.len() {
+        reorder_children_to_dom(&mut n.children[i], dom);
+    }
+}
+
+/// Remove HTML children that JsDom no longer lists under their parent.
+/// Without this, React can empty `#root` in JsDom while the layout tree still
+/// paints the original placeholder.
+fn prune_stale_children(root: &mut Node, dom: &JsDom) {
+    prune_stale_walk(root, dom);
+}
+
+fn prune_stale_walk(n: &mut Node, dom: &JsDom) {
+    if let Some(i) = n.elem_idx {
+        if let Some(er) = dom.elements.get(i) {
+            let want: BTreeSet<usize> = er.children.iter().copied().collect();
+            // Drop parse-leftover *elements* that JsDom no longer lists. Keep
+            // Text/comment children (they have no elem_idx) — insert_created_elems
+            // materializes JS `textContent` as NodeKind::Text under the element.
+            n.children.retain(|c| match c.elem_idx {
+                Some(ci) => want.contains(&ci),
+                None => !matches!(c.kind, NodeKind::Element { .. }),
+            });
+        }
+    }
+    let n_ptr = n as *mut Node;
+    // SAFETY: single-threaded; exclusive child walk after retain.
+    let n = unsafe { &mut *n_ptr };
+    for i in 0..n.children.len() {
+        prune_stale_walk(&mut n.children[i], dom);
+    }
 }
 
 /// Append tree nodes for elements that exist in `dom.elements` but have no
 /// stamped node in the parsed tree (JS-created). Parents may themselves be
 /// created, so iterate until stable (bounded).
 fn insert_created_elems(root: &mut Node, dom: &JsDom) {
-    for _round in 0..4 {
+    // Each round can only place elements whose parent is ALREADY in the tree,
+    // and a scan in index order advances one level of depth per round: React
+    // builds bottom-up, so a child's index is lower than its parent's and the
+    // pass that inserts the parent has already walked past the child.
+    //
+    // The bound used to be a flat 4 rounds, which silently truncated any tree
+    // deeper than that — the outer frames of a component gallery appeared and
+    // every component inside them was missing, with nothing logged and the DOM
+    // itself perfectly correct. The real bound is the tree's depth, which
+    // cannot exceed the number of elements; the loop still exits the moment a
+    // round places nothing, so the common shallow page costs exactly what it
+    // did before.
+    let max_rounds = dom.elements.len().max(1);
+    for _round in 0..max_rounds {
         let mut inserted = false;
         for (i, er) in dom.elements.iter().enumerate() {
             let Some(p) = er.parent else { continue };
@@ -617,45 +729,76 @@ fn insert_created_elems(root: &mut Node, dom: &JsDom) {
                 continue; // already in the tree (parsed or previously inserted)
             }
             let Some(parent_node) = find_mut_by_elem_idx(root, p) else { continue };
-            let mut n = Node {
-                kind: NodeKind::Element {
-                    tag: er.tag.clone(),
-                    href: (!er.href.is_empty()).then(|| er.href.clone()),
-                    alt: None,
-                    src: (!er.src.is_empty()).then(|| er.src.clone()),
-                    id: er.id.clone(),
-                    class: er.class.clone(),
-                    style_attr: (!er.style.is_empty()).then(|| er.style.clone()),
-                    name: None,
-                    value: (!er.value.is_empty()).then(|| er.value.clone()),
-                    input_type: (!er.type_attr.is_empty()).then(|| er.type_attr.clone()),
-                    action: None,
-                    method: None,
-                    placeholder: None,
-                    srcdoc: None,
-                    target: None,
-                    sandbox: None,
-                    width_attr: None,
-                    height_attr: None,
-                    colspan_attr: None,
-                    bgcolor_attr: None,
-                    width_pct: None,
-                    align_attr: None,
-                    rel: None,
-                    srcset: None,
-                    on_attrs: er
-                        .attrs
-                        .iter()
-                        .filter(|(k, _)| k.starts_with("on"))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                },
-                children: Vec::new(),
-                elem_idx: Some(i),
+            // createTextNode / createComment become JsDom "#text"/"#comment"
+            // rows; materialize real Text/Comment nodes (not fake elements).
+            let n = if er.tag == "#text" || er.tag == "#comment" {
+                // Comments have no dedicated NodeKind; skip materializing them
+                // as elements. Text nodes carry `elem_idx` so insert won't
+                // duplicate across rounds.
+                if er.tag == "#comment" {
+                    continue;
+                }
+                Node {
+                    kind: NodeKind::Text(er.text.clone()),
+                    children: Vec::new(),
+                    elem_idx: Some(i),
+                }
+            } else {
+                let mut n = Node {
+                    kind: NodeKind::Element {
+                        tag: er.tag.clone(),
+                        href: (!er.href.is_empty()).then(|| er.href.clone()),
+                        alt: None,
+                        src: (!er.src.is_empty()).then(|| er.src.clone()),
+                        id: er.id.clone(),
+                        class: er.class.clone(),
+                        style_attr: (!er.style.is_empty()).then(|| er.style.clone()),
+                        name: None,
+                        value: (!er.value.is_empty()).then(|| er.value.clone()),
+                        input_type: (!er.type_attr.is_empty()).then(|| er.type_attr.clone()),
+                        action: None,
+                        method: None,
+                        placeholder: None,
+                        srcdoc: None,
+                        target: None,
+                        sandbox: None,
+                        width_attr: None,
+                        height_attr: None,
+                        colspan_attr: None,
+                        rowspan_attr: None,
+                        bgcolor_attr: None,
+                        width_pct: None,
+                        align_attr: None,
+                        rel: None,
+                        srcset: None,
+                        on_attrs: er
+                            .attrs
+                            .iter()
+                            .filter(|(k, _)| k.starts_with("on"))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        extra_attrs: er
+                            .attrs
+                            .iter()
+                            .filter(|(k, _)| {
+                                !k.starts_with("on")
+                                    && !matches!(
+                                        k.as_str(),
+                                        "id" | "class" | "style" | "href" | "src" | "type"
+                                            | "name" | "value" | "placeholder"
+                                    )
+                            })
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    },
+                    children: Vec::new(),
+                    elem_idx: Some(i),
+                };
+                if !er.text.is_empty() {
+                    n.children.push(Node::text(er.text.clone()));
+                }
+                n
             };
-            if !er.text.is_empty() {
-                n.children.push(Node::text(er.text.clone()));
-            }
             parent_node.children.push(n);
             inserted = true;
         }
@@ -3512,8 +3655,8 @@ fn json_parse_simple(s: &str) -> Val {
 /// Network for `fetch` — real loader outside unit tests; stub inside.
 ///
 /// Hardening (prompt-injection / SSRF defence for untrusted page scripts):
-/// - only `http://` / `https://`
-/// - no loopback / link-local / RFC1918 private destinations
+/// - `http(s):` with no loopback / link-local / RFC1918 private destinations
+/// - `file:///samples/…` only (local corpus; no arbitrary store paths)
 /// - non-GET methods refused (no ambient POST exfil from page JS)
 pub(crate) fn host_fetch(method: &str, url: &str, body: &str) -> String {
     let _ = body;
@@ -3526,6 +3669,16 @@ pub(crate) fn host_fetch(method: &str, url: &str, body: &str) -> String {
     }
     #[cfg(not(test))]
     {
+        if super::url::is_file_url(url) {
+            let path = match super::url::file_path(url) {
+                Some(p) => p,
+                None => return String::from("{\"error\":\"invalid file URL\"}"),
+            };
+            return match crate::synapse::fs::read(&path) {
+                Some(b) => String::from_utf8_lossy(&b).into_owned(),
+                None => format!("{{\"error\":\"file not found: {path}\"}}"),
+            };
+        }
         use super::cache::CacheMode;
         use super::loader::{Destination, LoadRequest};
         // Non-GET already refused by `fetch_policy_ok`.
@@ -3546,8 +3699,17 @@ pub(crate) fn fetch_policy_ok(method: &str, url: &str) -> Result<(), &'static st
     if !(m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD")) {
         return Err("page fetch: only GET/HEAD allowed (no POST from untrusted scripts)");
     }
+    // Local sample corpus: pages under file:///samples/ may fetch sibling files.
+    // Anything outside /samples/ stays refused (no file:///etc/passwd).
+    if super::url::is_file_url(url) {
+        match super::url::file_path(url) {
+            Some(p) if p.starts_with("/samples/") => return Ok(()),
+            Some(_) => return Err("page fetch: file:// only under /samples/"),
+            None => return Err("page fetch: bad file url"),
+        }
+    }
     if !super::url::is_http_url(url) {
-        return Err("page fetch: only http(s) URLs");
+        return Err("page fetch: only http(s) or file:///samples/ URLs");
     }
     let host = super::url::split_http(url)
         .map(|(_, h, _)| h)
@@ -3802,6 +3964,89 @@ mod tests {
     use crate::browser::html;
 
     #[test_case]
+    fn commit_full_materializes_a_deep_js_built_tree() {
+        // React builds bottom-up: a child is created (and gets a LOWER element
+        // index) before the parent it is appended to. A commit that scans in
+        // index order therefore advances one level of depth per pass, and the
+        // old fixed 4-pass bound silently truncated anything deeper — a
+        // component gallery drew every section frame with nothing inside, while
+        // the DOM itself was perfectly correct.
+        const DEPTH: usize = 12;
+        let mut doc = html::parse(r#"<html><body><div id="root"></div></body></html>"#);
+        let mut dom = JsDom::from_document(&doc);
+        let root_i = dom.find_id("root").expect("root");
+
+        // Build the chain leaf-first, exactly as `createElement` + `appendChild`
+        // order it, then attach the outermost node to #root last.
+        let mut child: Option<usize> = None;
+        for level in 0..DEPTH {
+            dom.elements.push(empty_elem("div"));
+            let i = dom.elements.len() - 1;
+            if let Some(c) = child {
+                dom.elements[i].children.push(c);
+                dom.elements[c].parent = Some(i);
+            } else {
+                dom.elements[i].text = String::from("deepest");
+            }
+            dom.elements[i].class = Some(alloc::format!("level-{level}"));
+            child = Some(i);
+        }
+        let outer = child.expect("chain");
+        dom.elements[root_i].children.push(outer);
+        dom.elements[outer].parent = Some(root_i);
+
+        commit_full(&mut doc.root, &dom);
+
+        // Every level must be in the tree, and the leaf's text with it.
+        fn depth_of(n: &html::Node) -> usize {
+            1 + n.children.iter().map(depth_of).max().unwrap_or(0)
+        }
+        let text = html::collect_text(&doc.root);
+        assert!(
+            text.contains("deepest"),
+            "the leaf of a {DEPTH}-deep JS-built tree reaches layout: {text:?}"
+        );
+        assert!(
+            depth_of(&doc.root) >= DEPTH,
+            "the whole chain is materialized, not just the first few levels"
+        );
+    }
+
+    #[test_case]
+    fn commit_full_prunes_placeholder_after_js_rebuild() {
+        // Pure (no JS engine): mirror React's clear + appendChild in JsDom, then
+        // commit_full must drop the parse placeholder and keep the new child.
+        let mut doc = html::parse(
+            r#"<html><body><div id="root"><p>loading React bundle…</p></div></body></html>"#,
+        );
+        let mut dom = JsDom::from_document(&doc);
+        let root_i = dom.find_id("root").expect("root");
+        let kids = core::mem::take(&mut dom.elements[root_i].children);
+        for c in kids {
+            if let Some(e) = dom.elements.get_mut(c) {
+                e.parent = None;
+            }
+        }
+        dom.elements[root_i].text.clear();
+        dom.elements.push(empty_elem("h1"));
+        let h1 = dom.elements.len() - 1;
+        dom.elements[h1].text = String::from("React + Tailwind");
+        dom.elements[root_i].children.push(h1);
+        dom.elements[h1].parent = Some(root_i);
+
+        commit_full(&mut doc.root, &dom);
+        let plain = html::collect_text(&doc.root);
+        assert!(
+            plain.contains("React + Tailwind"),
+            "missing h1 after commit_full: {plain:?} root_i={root_i} h1={h1}"
+        );
+        assert!(
+            !plain.contains("loading React bundle"),
+            "placeholder survived prune: {plain:?}"
+        );
+    }
+
+    #[test_case]
     fn fetch_policy_blocks_private_and_post() {
         assert!(super::fetch_policy_ok("GET", "https://example.com/x").is_ok());
         assert!(super::fetch_policy_ok("HEAD", "http://cdn.example.org/a").is_ok());
@@ -3812,6 +4057,8 @@ mod tests {
         assert!(super::fetch_policy_ok("GET", "http://10.0.0.5/").is_err());
         assert!(super::fetch_policy_ok("GET", "http://169.254.169.254/").is_err());
         assert!(super::fetch_policy_ok("GET", "file:///etc/passwd").is_err());
+        assert!(super::fetch_policy_ok("GET", "file:///samples/html/fetch-data.json").is_ok());
+        assert!(super::fetch_policy_ok("GET", "file:///home/secret").is_err());
     }
 
     #[test_case]

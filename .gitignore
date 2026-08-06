@@ -36,6 +36,18 @@ assets/fonts/NotoSansCJKsc-Regular.otf
 tools/webcompat/test262/
 tools/webcompat/wasm-testsuite/
 
+# React+Tailwind and shadcn/ui sample builds (tools/react-tw, tools/react-shadcn)
+# — node_modules + vite dist; the copied artifacts under assets/samples-src/html/
+# are what get embedded.
+tools/react-tw/node_modules/
+tools/react-tw/dist/
+tools/react-shadcn/node_modules/
+tools/react-shadcn/dist/
+tools/react-shadcn/dist-dev/
+
+# Host harness build output (tools/csslayout mounts the kernel's own modules).
+tools/csslayout/target/
+
 # Apple-Silicon device tree blobs for booting via m1n1 — built on demand by
 # tools/build-apple-dtb.sh from the Asahi Linux dts (GPL-2.0). Not vendored:
 # the .dtb is a generated, GPL-derived artifact and the sparse-clone cache is
@@ -50,3 +62,5 @@ userspace/**/*.bin
 # `include_bytes!`s them, exactly as it does `agents/*/assets/tools.wasm`. Without them the
 # tree does not build for anyone who did not run `cargo xtask imgdec` locally.
 !userspace/imgdec/imgdec-*.bin
+
+node_modules/

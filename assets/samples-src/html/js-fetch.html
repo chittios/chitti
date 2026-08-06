@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JS fetch suite</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    #results { font-family: ui-monospace, monospace; font-size: 0.85rem; line-height: 1.4; }
+    #results .pass { color: #2e7d32; }
+    #results .fail { color: #c62828; }
+    #results .sum { margin-top: 0.75rem; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <h1>JS fetch suite</h1>
+    <p>Self-check <code>fetch</code> over <code>file:///samples/…</code> (relative + absolute). Marker: <code>js-fetch ALL PASS</code>.</p>
+  </header>
+  <main class="card">
+    <div id="results">running…</div>
+  </main>
+  <p class="foot"><a href="index.html">← samples index</a> · <a href="fetch-data.json">fetch-data.json</a></p>
+  <script src="harness.js"></script>
+  <script src="js-fetch.js"></script>
+</body>
+</html>

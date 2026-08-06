@@ -103,7 +103,18 @@ fn string_constructor(
     let s = if args.is_empty() {
         JsValue::String(String::new())
     } else {
-        JsValue::String(to_string(&args[0]))
+        // ToString of an *object* runs its own `toString`/`valueOf` — the
+        // no-ctx `to_string` helper cannot, so `String(new Error("x"))` came
+        // back as the literal "[object Object]" while `"" + e` (which does go
+        // through ToPrimitive) gave "Error: x". Objects take the ToPrimitive
+        // path with a string hint; primitives are untouched.
+        let v = match &args[0] {
+            JsValue::Object(_) => {
+                crate::runner::eval::expression::to_primitive(&args[0], "string", ctx)?
+            }
+            other => other.clone(),
+        };
+        JsValue::String(to_string(&v))
     };
     // Only box on `new String` — bare `String(x)` (common in harnesses) must
     // return a primitive string even when `this` is `globalThis`.

@@ -52,6 +52,8 @@ pub enum NodeKind {
         /// Hacker News subtext rows (`<td colspan=2></td><td class=subtext>`)
         /// align under the title column instead of under the rank.
         colspan_attr: Option<u32>,
+        /// `rowspan=` on `<td>` / `<th>` (default 1).
+        rowspan_attr: Option<u32>,
         /// HTML presentational `bgcolor=` (legacy; still used by HN, Google…).
         /// Stored raw (`#f6f6ef` / `orange`); layout parses via `css::parse_color`.
         bgcolor_attr: Option<String>,
@@ -67,6 +69,9 @@ pub enum NodeKind {
         /// Event-handler attributes: any `on*` name (lowercased) with its
         /// value, e.g. `("onclick", "doThing()")`.
         on_attrs: Vec<(String, String)>,
+        /// Catch-all for attributes not mapped to typed fields (`data-*`,
+        /// ARIA, custom). Preserved so `getAttribute` / JS can read them.
+        extra_attrs: Vec<(String, String)>,
     },
     Text(String),
 }
@@ -103,12 +108,14 @@ impl Node {
                 width_attr: None,
                 height_attr: None,
                 colspan_attr: None,
+                rowspan_attr: None,
                 bgcolor_attr: None,
                 width_pct: None,
                 align_attr: None,
                 rel: None,
                 srcset: None,
                 on_attrs: Vec::new(),
+                extra_attrs: Vec::new(),
             },
             children: Vec::new(),
             elem_idx: None,
@@ -191,18 +198,31 @@ pub fn extract_assets_rich(html: &str) -> (String, String, Vec<ScriptTag>, Vec<S
     let mut styles = String::new();
     let mut ordered: Vec<(usize, StyleSrc)> = Vec::new();
     let mut tags: Vec<ScriptTag> = Vec::new();
-    // Style pass runs on the original text, so recorded offsets line up with
-    // the link scan below.
-    let s = take_blocks_attrs(html, "style", &mut |off, _attrs, body| {
+    // `<noscript>` goes FIRST, before any asset is harvested.
+    //
+    // Scripting is enabled here, so per the HTML parsing spec a `<noscript>`
+    // element's content is **raw text** — the markup inside it does not exist,
+    // and neither do its `<style>`, `<script>` or `<link>`. Harvesting styles
+    // from the original source picked them up anyway, and a site that uses the
+    // standard "blank the page for non-JS visitors" trick then blanked it for
+    // us: google.com/search ships
+    // `<noscript><style>table,div,span,p{display:none}</style>…</noscript>`,
+    // and that one rule hid every element on the page. The result looked like a
+    // broken renderer — a page that loads, reports its title, and draws almost
+    // nothing.
+    //
+    // Every later pass runs on this same stripped text, so the recorded style
+    // offsets and the `<link>` scan still line up with each other.
+    let doc = take_blocks(html, "noscript", &mut |_| {});
+    let s = take_blocks_attrs(&doc, "style", &mut |off, _attrs, body| {
         styles.push_str(body);
         styles.push('\n');
         ordered.push((off, StyleSrc::Inline(body.to_string())));
     });
-    let s = take_blocks_attrs(&s, "script", &mut |_off, attrs, body| {
+    let cleaned = take_blocks_attrs(&s, "script", &mut |_off, attrs, body| {
         tags.push(parse_script_tag(attrs, body));
     });
-    let cleaned = take_blocks(&s, "noscript", &mut |_| {});
-    for (off, href) in scan_link_stylesheets(html) {
+    for (off, href) in scan_link_stylesheets(&doc) {
         ordered.push((off, StyleSrc::External(href)));
     }
     ordered.sort_by_key(|(off, _)| *off); // stable: offsets are unique anyway
@@ -339,6 +359,80 @@ fn parse_script_tag(attrs: &str, body: &str) -> ScriptTag {
 /// Scan `html` for `<link rel~="stylesheet" href=…>` tags; return
 /// `(byte offset, href)` per hit. The `rel` match is a case-insensitive
 /// whitespace-separated word match.
+/// The document's `<meta http-equiv="refresh" content="N; url=…">`, as
+/// `(delay_seconds, url_as_written)`.
+///
+/// This is the only redirect a page can express in **markup**, and plenty of
+/// the web still depends on it — google.com/search hands a non-JS browser a
+/// page whose entire body is hidden (`display:none` plus a `<noscript>` block)
+/// and a meta refresh to the real destination. Without it the browser sits on a
+/// blank page that says "please click here if you are not redirected", which
+/// reads as a broken renderer rather than an unimplemented redirect.
+///
+/// A refresh with **no url** is a self-reload timer, not a navigation, and is
+/// deliberately not reported: honouring it would put the page in a loop.
+pub fn meta_refresh(html: &str) -> Option<(u32, String)> {
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
+    while let Some(i) = lower[pos..].find("<meta") {
+        let off = pos + i;
+        let after = &html[off + 5..];
+        let boundary_ok = after
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_whitespace() || c == '>' || c == '/')
+            .unwrap_or(false);
+        let gt = after.find('>').map(|g| off + 5 + g).unwrap_or(html.len());
+        if boundary_ok {
+            let pairs = parse_tag_attrs(&html[off + 5..gt]);
+            let is_refresh = pairs
+                .iter()
+                .any(|(k, v)| k == "http-equiv" && v.trim().eq_ignore_ascii_case("refresh"));
+            if is_refresh {
+                if let Some((_, content)) = pairs.iter().find(|(k, _)| k == "content") {
+                    if let Some(hit) = parse_refresh_content(content) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+        pos = if gt > off + 5 { gt } else { off + 5 };
+    }
+    None
+}
+
+/// `"0; url=/next"` → `(0, "/next")`. The delay may be absent or fractional,
+/// the separator may be `;` or whitespace, and `url=` is case-insensitive and
+/// optionally quoted — all forms seen in the wild.
+fn parse_refresh_content(content: &str) -> Option<(u32, String)> {
+    let (head, rest) = match content.split_once(&[';', ','][..]) {
+        Some((a, b)) => (a, b),
+        // `content="5"` is a self-reload; `content="url=/x"` has no delay.
+        None => (content, ""),
+    };
+    let delay = head
+        .trim()
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    let rest = rest.trim();
+    let url = match rest.get(..4) {
+        Some(p) if p.eq_ignore_ascii_case("url=") => &rest[4..],
+        // A bare URL after the delay (`content="0; /next"`) is not standard but
+        // is accepted by browsers.
+        _ if !rest.is_empty() => rest,
+        _ => return None,
+    };
+    let url = url.trim().trim_matches(['"', '\''].as_ref()).trim();
+    if url.is_empty() {
+        return None;
+    }
+    Some((delay, url.to_string()))
+}
+
 fn scan_link_stylesheets(html: &str) -> Vec<(usize, String)> {
     let lower = html.to_ascii_lowercase();
     let mut out = Vec::new();
@@ -508,14 +602,15 @@ pub fn parse(html: &str) -> Document {
                         width_attr,
                         height_attr,
                         colspan_attr,
+                        rowspan_attr,
                         bgcolor_attr,
                         width_pct,
                         align_attr,
                         rel,
                         srcset,
                         on_attrs,
+                        extra_attrs,
                         tag,
-                        ..
                     } = &mut n.kind
                     {
                         match key.as_str() {
@@ -569,6 +664,9 @@ pub fn parse(html: &str) -> Document {
                             "colspan" => {
                                 *colspan_attr = val.parse().ok().filter(|&n| n >= 1);
                             }
+                            "rowspan" => {
+                                *rowspan_attr = val.parse().ok().filter(|&n| n >= 1);
+                            }
                             "bgcolor" => *bgcolor_attr = Some(val),
                             "align" => *align_attr = Some(val.to_ascii_lowercase()),
                             "rel" => *rel = Some(val),
@@ -576,7 +674,9 @@ pub fn parse(html: &str) -> Document {
                             k if k.starts_with("on") => {
                                 on_attrs.push((k.to_string(), val))
                             }
-                            _ => {}
+                            _ => {
+                                extra_attrs.push((key, val));
+                            }
                         }
                     }
                 }
@@ -1020,6 +1120,84 @@ mod tests {
     use super::*;
 
     #[test_case]
+    fn meta_refresh_forms_and_non_redirects() {
+        // The only redirect a page can express in markup. google.com/search
+        // serves exactly this to a browser it will not give results to.
+        assert_eq!(
+            meta_refresh(r#"<meta content="0;url=/next" http-equiv="refresh">"#),
+            Some((0, String::from("/next")))
+        );
+        // Attribute order, spacing, quoting and case all vary in the wild.
+        assert_eq!(
+            meta_refresh(r#"<META HTTP-EQUIV="Refresh" CONTENT="5; URL='/a b'">"#),
+            Some((5, String::from("/a b")))
+        );
+        assert_eq!(
+            meta_refresh("<meta http-equiv=refresh content=2;url=http://e.example/x>"),
+            Some((2, String::from("http://e.example/x")))
+        );
+        // A fractional delay truncates rather than failing the whole tag.
+        assert_eq!(
+            meta_refresh(r#"<meta http-equiv="refresh" content="1.5; url=/z">"#),
+            Some((1, String::from("/z")))
+        );
+        // No url = a self-reload timer, not a navigation. Following it loops.
+        assert_eq!(meta_refresh(r#"<meta http-equiv="refresh" content="30">"#), None);
+        // Not a refresh, and not a <meta> at all.
+        assert_eq!(
+            meta_refresh(r#"<meta http-equiv="content-type" content="0;url=/x">"#),
+            None
+        );
+        assert_eq!(meta_refresh("<metadata content=\"0;url=/x\">"), None);
+    }
+
+    #[test_case]
+    fn a_style_inside_noscript_does_not_apply() {
+        // Scripting is enabled, so `<noscript>` content is raw text: its
+        // markup — including any `<style>` — does not exist. Harvesting styles
+        // from the raw source applied it anyway, and the standard "blank the
+        // page for non-JS visitors" rule then blanked the page for us.
+        // google.com/search ships `table,div,span,p{display:none}` that way.
+        let (cleaned, styles, _tags, ordered) = extract_assets_rich(
+            r#"<html><body>
+                 <noscript><style>p{display:none}</style><p>fallback</p></noscript>
+                 <style>p{color:#123456}</style>
+                 <p>real content</p>
+               </body></html>"#,
+        );
+        assert!(
+            !styles.contains("display:none"),
+            "the noscript style must not reach the page: {styles:?}"
+        );
+        assert!(styles.contains("#123456"), "the real style still does: {styles:?}");
+        assert_eq!(ordered.len(), 1, "only the page's own sheet is recorded");
+        assert!(
+            !cleaned.contains("fallback"),
+            "noscript content is not rendered either"
+        );
+        assert!(cleaned.contains("real content"));
+    }
+
+    #[test_case]
+    fn a_link_stylesheet_inside_noscript_does_not_apply() {
+        // Same rule, external form.
+        let (_cleaned, _styles, _tags, ordered) = extract_assets_rich(
+            r#"<html><head>
+                 <noscript><link rel="stylesheet" href="hide.css"></noscript>
+                 <link rel="stylesheet" href="real.css">
+               </head><body><p>x</p></body></html>"#,
+        );
+        let hrefs: alloc::vec::Vec<String> = ordered
+            .iter()
+            .filter_map(|s| match s {
+                StyleSrc::External(h) => Some(h.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hrefs, alloc::vec![String::from("real.css")], "got {hrefs:?}");
+    }
+
+    #[test_case]
     fn parses_title_and_paragraph() {
         let doc = parse(
             r#"<!DOCTYPE html><html><head><title>Hello &amp; Hi</title>
@@ -1219,6 +1397,43 @@ mod tests {
             NodeKind::Element { rel, href, .. } => {
                 assert_eq!(rel.as_deref(), Some("stylesheet"));
                 assert_eq!(href.as_deref(), Some("s.css"));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test_case]
+    fn data_attrs_and_href_preserved() {
+        let doc = parse(
+            r#"<html><body><div id="box" data-k="v" class="a"></div><a id="link" href="index.html">x</a></body></html>"#,
+        );
+        fn find<'a>(n: &'a Node, want_id: &str) -> Option<&'a Node> {
+            if let NodeKind::Element { id: Some(i), .. } = &n.kind {
+                if i == want_id {
+                    return Some(n);
+                }
+            }
+            for c in &n.children {
+                if let Some(m) = find(c, want_id) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        let boxn = find(&doc.root, "box").expect("box");
+        match &boxn.kind {
+            NodeKind::Element { extra_attrs, .. } => {
+                assert!(
+                    extra_attrs.iter().any(|(k, v)| k == "data-k" && v == "v"),
+                    "{extra_attrs:?}"
+                );
+            }
+            _ => panic!(),
+        }
+        let a = find(&doc.root, "link").expect("a");
+        match &a.kind {
+            NodeKind::Element { href, .. } => {
+                assert_eq!(href.as_deref(), Some("index.html"));
             }
             _ => panic!(),
         }

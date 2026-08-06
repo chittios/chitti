@@ -227,39 +227,170 @@ fn strip_kw<'a>(t: &'a str, kw: &str) -> Option<&'a str> {
 /// unsupported since there's no real CSS engine, but nothing throws-then-hangs).
 const DOM_MOCK: &str = r#"
 var __noop = function () {};
-function __el() {
+var __doc = null;
+// A *live* tree, not a set of no-ops: React's commit phase is the half that
+// only shows up here — render can complete against stubs while
+// createElement/appendChild silently drop every node. `__dump()` serializes
+// what actually landed, so the sim answers "did it mount?" and not just
+// "did it throw?".
+function __el(tag) {
   var e = {
+    nodeType: 1,
+    tagName: String(tag || "DIV").toUpperCase(),
+    // ReactDOM's input value-tracking reads
+    // `Object.getOwnPropertyDescriptor(node.constructor.prototype, "value")`.
+    constructor: { name: "HTMLElement", prototype: {} },
+    namespaceURI: "http://www.w3.org/1999/xhtml",
+    parentNode: null, ownerDocument: __doc,
     style: { setProperty: __noop, removeProperty: __noop, getPropertyValue: function(){return "";}, cssText: "", length: 0 },
     sheet: { cssRules: [], insertRule: function(){return 0;}, deleteRule: __noop },
     classList: { add: __noop, remove: __noop, toggle: __noop, contains: function(){return false;} },
     attributes: [], childNodes: [], children: [],
+    __attrs: {},
     textContent: "", innerHTML: "", innerText: "", className: "", id: "",
     offsetWidth: 0, offsetHeight: 0, clientWidth: 0, clientHeight: 0,
-    appendChild: function(c){return c;}, removeChild: function(c){return c;},
-    insertBefore: function(c){return c;}, setAttribute: __noop, getAttribute: function(){return null;},
-    removeAttribute: __noop, hasAttribute: function(){return false;},
+    appendChild: function(c){ if (c) { c.parentNode = e; e.childNodes.push(c); } return c; },
+    removeChild: function(c){
+      var out = [];
+      for (var i = 0; i < e.childNodes.length; i++) {
+        if (e.childNodes[i] !== c) { out.push(e.childNodes[i]); }
+      }
+      e.childNodes = out;
+      if (c) { c.parentNode = null; }
+      return c;
+    },
+    insertBefore: function(c, ref){
+      var out = [], placed = false;
+      for (var i = 0; i < e.childNodes.length; i++) {
+        if (e.childNodes[i] === ref) { out.push(c); placed = true; }
+        out.push(e.childNodes[i]);
+      }
+      if (!placed) { out.push(c); }
+      e.childNodes = out;
+      if (c) { c.parentNode = e; }
+      return c;
+    },
+    setAttribute: function(k, v){ e.__attrs[String(k)] = String(v); },
+    getAttribute: function(k){ var k2 = String(k); return (k2 in e.__attrs) ? e.__attrs[k2] : null; },
+    removeAttribute: function(k){ delete e.__attrs[String(k)]; },
+    hasAttribute: function(k){ return String(k) in e.__attrs; },
+    setAttributeNS: function(ns, k, v){ e.__attrs[String(k)] = String(v); },
     addEventListener: __noop, removeEventListener: __noop, dispatchEvent: function(){return true;},
-    cloneNode: function(){return __el();}, remove: __noop, contains: function(){return false;},
-    querySelector: function(){return null;}, querySelectorAll: function(){return [];},
+    cloneNode: function(){return __el(e.tagName);}, remove: __noop, contains: function(){return false;},
+    querySelector: function(sel){ return __find(e, String(sel)); },
+    matches: function(sel){ return __match(e, String(sel)); },
+    closest: function(sel){
+      var n = e;
+      while (n) { if (__match(n, String(sel))) { return n; } n = n.parentNode; }
+      return null;
+    },
+    querySelectorAll: function(){return [];},
     getBoundingClientRect: function(){return {top:0,left:0,right:0,bottom:0,width:0,height:0};},
     focus: __noop, blur: __noop, click: __noop
   };
   return e;
 }
+function __text(t) {
+  return { nodeType: 3, tagName: '#text', nodeValue: String(t), textContent: String(t),
+           constructor: { name: "Text", prototype: {} },
+           parentNode: null, childNodes: [], appendChild: function(c){return c;} };
+}
+// Tag / #id / .class only — the same three forms the in-OS engine matches.
+// React sets `id`/`class` through setAttribute, not as properties, so a
+// matcher that reads only the properties finds nothing on a React-built tree.
+function __attr(node, name) {
+  var p = node[name === "class" ? "className" : name];
+  if (p) { return String(p); }
+  var a = node.getAttribute ? node.getAttribute(name) : null;
+  return a ? String(a) : "";
+}
+function __match(node, sel) {
+  if (!node || node.nodeType !== 1) { return false; }
+  if (sel.charAt(0) === '#') { return __attr(node, "id") === sel.substring(1); }
+  if (sel.charAt(0) === ".") {
+    return (" " + __attr(node, "class") + " ").indexOf(" " + sel.substring(1) + " ") >= 0;
+  }
+  return node.tagName === sel.toUpperCase();
+}
+function __find(root, sel) {
+  var kids = root.childNodes || [];
+  for (var i = 0; i < kids.length; i++) {
+    if (__match(kids[i], sel)) { return kids[i]; }
+    var deep = __find(kids[i], sel);
+    if (deep) { return deep; }
+  }
+  return null;
+}
+function __serialize(node, depth) {
+  if (!node) { return ""; }
+  if (node.nodeType === 3) { return node.nodeValue; }
+  var clsv = __attr(node, "class");
+  var cls = clsv ? ' class=' + JSON.stringify(clsv) : "";
+  var idv = __attr(node, "id");
+  var id = idv ? ' id=' + JSON.stringify(idv) : "";
+  var t = node.tagName.toLowerCase();
+  var inner = "";
+  var kids = node.childNodes || [];
+  for (var i = 0; i < kids.length; i++) { inner = inner + __serialize(kids[i], depth + 1); }
+  // React writes a lone text child straight to `textContent` instead of
+  // creating a text node, so a childNodes-only walk shows an empty element.
+  if (!inner && node.textContent) { inner = String(node.textContent); }
+  return "<" + t + id + cls + ">" + inner + "</" + t + ">";
+}
+function __dump(node) { return __serialize(node, 0); }
+// Run queued timer callbacks (callbacks may queue more — bounded).
+function __drain() {
+  var ran = 0;
+  while (__timer_cursor < __timers.length && ran < 10000) {
+    var fn = __timers[__timer_cursor];
+    __timer_cursor = __timer_cursor + 1;
+    ran = ran + 1;
+    if (typeof fn === "function") { fn(); }
+  }
+  return ran;
+}
+var __byId = {};
 var document = {
-  createElement: function(){return __el();},
-  createElementNS: function(){return __el();},
-  createTextNode: function(t){return {nodeType:3,textContent:t};},
-  createDocumentFragment: function(){return __el();},
-  getElementById: function(){return null;},
-  querySelector: function(){return null;},
+  nodeType: 9,
+  createElement: function(tag){return __el(tag);},
+  createElementNS: function(ns, tag){return __el(tag);},
+  createTextNode: function(t){return __text(t);},
+  createDocumentFragment: function(){return __el('#fragment');},
+  // Search the live tree, then the pre-registered roots — a node created by a
+  // script and appended must be findable by id, like a real DOM.
+  getElementById: function(id){
+    var k = String(id);
+    var hit = __find(document.documentElement, '#' + k);
+    if (hit) { return hit; }
+    return (k in __byId) ? __byId[k] : null;
+  },
+  querySelector: function(sel){ return __find(document.documentElement, String(sel)); },
   querySelectorAll: function(){return [];},
   getElementsByTagName: function(){return [];},
   getElementsByClassName: function(){return [];},
   addEventListener: __noop, removeEventListener: __noop,
-  documentElement: __el(), body: __el(), head: __el(),
+  documentElement: __el("html"), body: __el("body"), head: __el("head"),
   adoptedStyleSheets: [], styleSheets: [], cookie: "", title: "", readyState: "complete"
 };
+// React reaches the document through `container.ownerDocument`; the nodes built
+// before `document` existed need it backfilled.
+__doc = document;
+document.documentElement.ownerDocument = document;
+document.head.ownerDocument = document;
+document.body.ownerDocument = document;
+document.documentElement.appendChild(document.head);
+document.documentElement.appendChild(document.body);
+// A `<link rel=stylesheet href=…>` in <head> and a `#root` in <body>, so a page
+// that probes for either finds what a real document would hand it.
+var __link = __el("link");
+__link.setAttribute("rel", "stylesheet");
+__link.setAttribute("href", "./react-tw.css");
+__link.href = "./react-tw.css";
+document.head.appendChild(__link);
+var __root = __el("div");
+__root.id = "root";
+__byId["root"] = __root;
+document.body.appendChild(__root);
 var CSS = {
   supports: function(){return false;},
   escape: function(s){return String(s);},
@@ -274,7 +405,13 @@ var history = { pushState: __noop, replaceState: __noop, back: __noop, forward: 
 function getComputedStyle(){ return { getPropertyValue: function(){return "";}, length: 0 }; }
 function requestAnimationFrame(cb){ return 0; }
 function cancelAnimationFrame(){}
-function setTimeout(){ return 0; }
+// Timers must actually fire: React 18 does no work inside `render()` — it
+// hands the commit to the scheduler, which reaches for MessageChannel and then
+// setTimeout. A no-op timer means the tree renders in the kernel (whose timers
+// run) and stays empty here, which is the opposite of what a sim is for.
+var __timers = [];
+var __timer_cursor = 0;
+function setTimeout(fn){ __timers.push(fn); return __timers.length; }
 function clearTimeout(){}
 function setInterval(){ return 0; }
 function clearInterval(){}
@@ -287,6 +424,15 @@ var Node = function(){}; Node.prototype = Object.create(EventTarget.prototype);
 var Element = function(){}; Element.prototype = Object.create(Node.prototype);
 var HTMLElement = function(){}; HTMLElement.prototype = Object.create(Element.prototype);
 var HTMLDocument = function(){}; var Document = function(){}; var Window = function(){};
+// ReactDOM's selection restore walks `node instanceof win.HTMLIFrameElement`;
+// an undefined right-hand side is a TypeError, not a false.
+var HTMLIFrameElement = function(){}; HTMLIFrameElement.prototype = Object.create(HTMLElement.prototype);
+var HTMLInputElement = function(){}; var HTMLTextAreaElement = function(){}; var HTMLSelectElement = function(){};
+var HTMLFormElement = function(){}; var HTMLButtonElement = function(){}; var HTMLAnchorElement = function(){};
+var HTMLDivElement = function(){}; var HTMLSpanElement = function(){}; var HTMLImageElement = function(){};
+var HTMLCanvasElement = function(){}; var HTMLLinkElement = function(){}; var HTMLStyleElement = function(){};
+var HTMLScriptElement = function(){}; var HTMLBodyElement = function(){}; var HTMLHtmlElement = function(){};
+var HTMLOptionElement = function(){}; var SVGElement = function(){}; var Text = function(){}; var Comment = function(){};
 var CustomEvent = function(){}; var Event = function(){};
 var MutationObserver = function(){ this.observe=__noop; this.disconnect=__noop; };
 var window = this;
@@ -302,6 +448,16 @@ window.addEventListener = __noop; window.removeEventListener = __noop;
 window.self = window; window.top = window; window.parent = window; window.globalThis = window;
 window.innerWidth = 1280; window.innerHeight = 800; window.devicePixelRatio = 1;
 window.URLSearchParams = URLSearchParams;
+window.HTMLIFrameElement = HTMLIFrameElement; window.HTMLInputElement = HTMLInputElement;
+window.HTMLFormElement = HTMLFormElement; window.HTMLButtonElement = HTMLButtonElement;
+window.HTMLAnchorElement = HTMLAnchorElement; window.HTMLDivElement = HTMLDivElement;
+window.HTMLSpanElement = HTMLSpanElement; window.HTMLImageElement = HTMLImageElement;
+window.HTMLCanvasElement = HTMLCanvasElement; window.HTMLLinkElement = HTMLLinkElement;
+window.HTMLStyleElement = HTMLStyleElement; window.HTMLScriptElement = HTMLScriptElement;
+window.HTMLBodyElement = HTMLBodyElement; window.HTMLHtmlElement = HTMLHtmlElement;
+window.HTMLOptionElement = HTMLOptionElement; window.SVGElement = SVGElement;
+window.Text = Text; window.Comment = Comment;
+window.HTMLTextAreaElement = HTMLTextAreaElement; window.HTMLSelectElement = HTMLSelectElement;
 "#;
 
 /// Run a list of page-script files as one flat-global browser page.
@@ -328,6 +484,9 @@ fn run_browser(files: &[String]) -> ExitCode {
         program.push_str(&strip_module(&src));
         program.push('\n');
     }
+    // Report what the page actually built, not just that it didn't throw.
+    program.push_str("\nconsole.log('__TIMERS__ ' + __drain());\n");
+    program.push_str("\nconsole.log('__DOM__ ' + __dump(document.body));\n");
     println!(
         "browser-sim: {} file(s), {} bytes, budget {}s",
         files.len(),
@@ -344,7 +503,16 @@ fn run_browser(files: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!("parse ok in {:?}", t_parse.elapsed());
+    println!(
+        "parse ok in {:?} (max AST depth {})",
+        t_parse.elapsed(),
+        just_engine::parser::api::AST_DEPTH_MAX.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    println!(
+        "  max PEG rule depth {} (limit {})",
+        just_engine::pest_depth_max(),
+        just_engine::pest_depth_limit()
+    );
 
     // Install the wall-clock budget as the interpreter's host tick.
     *BROWSER_DEADLINE.lock().unwrap() =

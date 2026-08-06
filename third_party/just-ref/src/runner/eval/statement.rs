@@ -250,10 +250,13 @@ fn execute_variable_declaration(
     Ok(Completion::normal())
 }
 
-/// JS var hoisting: pre-create every `var` binding reachable in `body`
-/// (initialized to `undefined`) without descending into nested functions, so a
-/// name is `undefined` rather than a `ReferenceError` before its `var`
-/// statement runs. Called at the top of every function body and the program.
+/// JS var + function-declaration hoisting: pre-create every `var` binding
+/// reachable in `body` (initialized to `undefined`) and bind every
+/// `function` declaration to its function object, without descending into
+/// nested function bodies. Called at the top of every function body and the
+/// program so a name is defined rather than a `ReferenceError` before its
+/// declaration statement runs (React's production bundle leans on this —
+/// `getModifierState:iu` appears lexically before `function iu(){…}`).
 pub fn hoist_var_declarations(body: &[StatementType], ctx: &mut EvalContext) {
     for stmt in body {
         hoist_stmt(stmt, ctx);
@@ -265,6 +268,12 @@ fn declare_hoisted_var(name: &str, ctx: &mut EvalContext) {
         let _ = ctx.create_var_binding(name);
         let _ = ctx.initialize_var_binding(name, JsValue::Undefined);
     }
+}
+
+fn hoist_function_declaration(func_data: &FunctionData, ctx: &mut EvalContext) {
+    // Same binding as execute-time — initialize now so earlier statements can
+    // reference the name. Re-running the declaration later is a no-op overwrite.
+    let _ = execute_function_declaration(func_data, ctx);
 }
 
 fn collect_pattern_names(pattern: &PatternType, out: &mut Vec<String>) {
@@ -303,6 +312,11 @@ fn hoist_stmt(stmt: &StatementType, ctx: &mut EvalContext) {
                     declare_hoisted_var(&n, ctx);
                 }
             }
+        }
+        StatementType::DeclarationStatement(
+            DeclarationType::FunctionOrGeneratorDeclaration(func_data),
+        ) => {
+            hoist_function_declaration(func_data, ctx);
         }
         StatementType::BlockStatement(b) => hoist_var_declarations(&b.body, ctx),
         StatementType::IfStatement { consequent, alternate, .. } => {
@@ -367,7 +381,11 @@ fn hoist_stmt(stmt: &StatementType, ctx: &mut EvalContext) {
 }
 
 /// Bind a pattern to a value, creating bindings for all identifiers in the pattern.
-fn bind_pattern(
+///
+/// Also drives *parameter* binding (`expression::bind_parameters`) — a formal
+/// parameter list is the same pattern grammar as a `var`/`let` target, and the
+/// two must not drift.
+pub(crate) fn bind_pattern(
     pattern: &PatternType,
     value: JsValue,
     ctx: &mut EvalContext,
@@ -668,11 +686,37 @@ fn execute_labelled_statement(
     body: &StatementType,
     ctx: &mut EvalContext,
 ) -> EvalResult {
-    ctx.pending_labels.push(label.to_string());
+    // A label is handed to the statement it labels — and a loop *claims* every
+    // pending label at entry (`loop_labels`) so `continue label` can target it.
+    // So the label may only be left pending when the labelled statement is
+    // itself a loop. On a block, an `if` or a `switch`, leaving it pending lets
+    // a loop nested anywhere inside claim it: `e: { for (…) { break e; } throw
+    // … }` then breaks only the *for* and runs the throw. That is exactly
+    // ReactDOM's commitPlacement — the "expected to find a host parent"
+    // invariant fired on a tree that had one, and a React app never mounted.
+    let is_loop = matches!(
+        body,
+        StatementType::WhileStatement { .. }
+            | StatementType::DoWhileStatement { .. }
+            | StatementType::ForStatement { .. }
+            | StatementType::ForInStatement(_)
+            | StatementType::ForOfStatement(_)
+            // `a: b: for (…)` — the inner labelled statement passes both on.
+            | StatementType::LabelledStatement { .. }
+    );
+    let saved_labels = if is_loop {
+        ctx.pending_labels.push(label.to_string());
+        None
+    } else {
+        Some(core::mem::take(&mut ctx.pending_labels))
+    };
     let result = execute_statement(body, ctx);
-    // A loop drains the labels at entry; for a non-loop body they linger — drop
-    // ours so it can't leak onto a sibling statement.
-    ctx.pending_labels.retain(|l| l != label);
+    match saved_labels {
+        // A loop drains the labels at entry; for a non-loop body they linger —
+        // drop ours so it can't leak onto a sibling statement.
+        None => ctx.pending_labels.retain(|l| l != label),
+        Some(saved) => ctx.pending_labels = saved,
+    }
     let completion = result?;
     match completion.completion_type {
         // `break label` that reached here (labelled block, or a loop that
@@ -1134,12 +1178,29 @@ fn execute_for_in_statement(
     let labels = loop_labels(ctx);
     let mut v: Option<JsValue> = None;
 
+    let fresh_scope = head_is_lexical(&data.left);
     for key in keys {
+        if crate::runner::host::host_tick() {
+            return Err(crate::runner::host::interrupt_error());
+        }
+        if fresh_scope {
+            ctx.push_block_scope();
+        }
         // Bind the key to the loop variable
-        bind_for_iterator_variable(&data.left, JsValue::String(key), ctx)?;
+        let bound = bind_for_iterator_variable(&data.left, JsValue::String(key), ctx);
+        if let Err(e) = bound {
+            if fresh_scope {
+                ctx.pop_block_scope();
+            }
+            return Err(e);
+        }
 
         // Execute the body
-        let completion = execute_statement(&data.body, ctx)?;
+        let body = execute_statement(&data.body, ctx);
+        if fresh_scope {
+            ctx.pop_block_scope();
+        }
+        let completion = body?;
 
         match completion.completion_type {
             CompletionType::Break => {
@@ -1258,12 +1319,37 @@ fn execute_for_of_with_values(
     let labels = loop_labels(ctx);
     let mut v: Option<JsValue> = None;
 
+    // `for (const x of …)` gets a FRESH binding per iteration. Reusing one
+    // binding and assigning to it throws `'x' is set and immutable` on the
+    // second element — which is how a minified bundle died at
+    // `for (const o of …)` with an error naming a variable that was never
+    // reassigned in the source.
+    let fresh_scope = head_is_lexical(&data.left);
     for value in values {
+        // `while`/`for`/`do-while` tick; these two did not, so a long or endless
+        // `for…of` / `for…in` ran with the host unable to pump the UI, answer
+        // Ctrl+C, or apply the script budget.
+        if crate::runner::host::host_tick() {
+            return Err(crate::runner::host::interrupt_error());
+        }
+        if fresh_scope {
+            ctx.push_block_scope();
+        }
         // Bind the value to the loop variable
-        bind_for_iterator_variable(&data.left, value, ctx)?;
+        let bound = bind_for_iterator_variable(&data.left, value, ctx);
+        if let Err(e) = bound {
+            if fresh_scope {
+                ctx.pop_block_scope();
+            }
+            return Err(e);
+        }
 
         // Execute the body
-        let completion = execute_statement(&data.body, ctx)?;
+        let body = execute_statement(&data.body, ctx);
+        if fresh_scope {
+            ctx.pop_block_scope();
+        }
+        let completion = body?;
 
         match completion.completion_type {
             CompletionType::Break => {
@@ -1295,6 +1381,17 @@ fn execute_for_of_with_values(
     }
 
     Ok(Completion::normal_with_value(v.unwrap_or(JsValue::Undefined)))
+}
+
+/// True when a `for (… of/in …)` head declares a **lexical** loop variable
+/// (`let`/`const`), which per spec gets a *fresh binding per iteration*.
+fn head_is_lexical(left: &VariableDeclarationOrPattern) -> bool {
+    match left {
+        VariableDeclarationOrPattern::VariableDeclaration(d) => {
+            !matches!(d.kind, VariableDeclarationKind::Var)
+        }
+        VariableDeclarationOrPattern::Pattern(_) => false,
+    }
 }
 
 /// Bind a value to a for-in/for-of loop variable.

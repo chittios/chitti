@@ -1622,14 +1622,23 @@ impl<V> PropertyData<V> {
         }
     }
 
+    /// `computed` is whether the SOURCE wrote `[expr]`, and it must be passed
+    /// in rather than inferred from `key`'s shape: a computed key that is a
+    /// bare identifier (`{ [node]: v }`) parses to exactly the same
+    /// `Identifier` node as a static one (`{ node: v }`), so inferring it
+    /// silently stored every such property under the *variable's name*.
     pub(crate) fn new_with_any_expression_key(
         meta: Meta,
         key: ExpressionType,
+        computed: bool,
         value: V,
         kind: PropertyKind,
         method: bool,
         shorthand: bool,
     ) -> Self {
+        if computed {
+            return Self::new_with_computed_key(meta, key, value, kind, method);
+        }
         match key {
             ExpressionType::ExpressionWhichCanBePattern(e) => match e {
                 ExpressionPatternType::Identifier(id) => {
@@ -1697,12 +1706,14 @@ impl AssignmentPropertyData {
     pub(crate) fn new_with_any_expression_key(
         meta: Meta,
         key: ExpressionType,
+        computed: bool,
         value: PatternType,
         shorthand: bool,
     ) -> Self {
         AssignmentPropertyData(PropertyData::new_with_any_expression_key(
             meta,
             key,
+            computed,
             Box::new(value),
             PropertyKind::Init,
             false,

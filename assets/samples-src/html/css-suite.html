@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CSS suite</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="suite.css">
+</head>
+<body>
+  <header class="hero">
+    <h1>CSS suite</h1>
+    <p class="muted">Visual checklist for cascade features used by <code>/browse</code>. Styles live in <code>suite.css</code>, which <code>@import</code>s <code>theme.css</code>.</p>
+  </header>
+
+  <section class="card">
+    <h2>1. Selectors</h2>
+    <p class="label">child <code>&gt;</code>, <code>:nth-child</code>, <code>[href]</code>, <code>[type]</code>, <code>[class~=]</code></p>
+    <ul class="sel">
+      <li>odd · 3n+1</li>
+      <li>even</li>
+      <li>odd · 3n+1</li>
+      <li>even</li>
+    </ul>
+    <p>
+      <a href="index.html">link with href</a>
+      · <span class="mark other">class~=mark</span>
+      · <input type="text" value="type=text" readonly>
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>2. Generated content</h2>
+    <p class="gen">middle text should sit between before/after markers</p>
+  </section>
+
+  <section class="card">
+    <h2>3. Flex · calc · var · @media</h2>
+    <div class="flex-row">
+      <div class="box">A · flex:1</div>
+      <div class="box">B · gap + pad from var/calc</div>
+      <div class="box">C · stacks when vw ≤ 480</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>4. Grid</h2>
+    <div class="grid2">
+      <div class="cell">track 1</div>
+      <div class="cell">track 2</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>5. Float + clear</h2>
+    <div class="float-box">float</div>
+    <p>This paragraph wraps beside the float.</p>
+    <p class="after-float ok">cleared — should sit below the float box</p>
+  </section>
+
+  <section class="card">
+    <h2>6. Table · rowspan · table-layout:fixed</h2>
+    <table class="demo">
+      <tr><th>A</th><th>B</th><th>C</th></tr>
+      <tr>
+        <td class="span" rowspan="2">rowspan 2</td>
+        <td>r1c2</td>
+        <td>r1c3</td>
+      </tr>
+      <tr>
+        <td>r2c2</td>
+        <td>r2c3</td>
+      </tr>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>7. Position</h2>
+    <div class="rel">
+      <span class="abs">absolute</span>
+      relative container
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>8. Nested var()</h2>
+    <div class="nested-var">padding from <code>--local: var(--pad)</code>; border uses <code>--accent</code></div>
+  </section>
+
+  <p class="foot"><a href="index.html">← samples index</a></p>
+</body>
+</html>

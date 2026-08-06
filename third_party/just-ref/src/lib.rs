@@ -167,3 +167,16 @@ extern crate lazy_static;
 
 pub mod parser;
 pub mod runner;
+
+/// Deepest PEG rule nesting any parse in this process has reached, and the
+/// limit it is bounded by. Re-exported so a host harness can report them —
+/// the limit exists because overflowing the kernel's stack is unrecoverable,
+/// so it has to be set from measurements of real pages.
+pub fn pest_depth_max() -> usize {
+    pest::parser_state::RULE_DEPTH_MAX.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The bound itself — see [`pest_depth_max`].
+pub fn pest_depth_limit() -> usize {
+    pest::parser_state::MAX_RULE_DEPTH
+}

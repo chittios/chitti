@@ -170,15 +170,22 @@ pub trait JsObject {
                 let mut p = Some(new_value.clone());
                 loop {
                     if let Some(some_p) = p {
-                        if same_js_object(self.as_js_object(), (*(*some_p).borrow()).as_js_object())
-                        {
+                        // `try_borrow`, not `borrow`: the walk can arrive back at
+                        // the very object being mutated, whose cell the caller
+                        // already holds mutably — that is exactly the cycle this
+                        // loop exists to reject, and borrowing it PANICKED
+                        // ("RefCell already mutably borrowed"). In a kernel that
+                        // is a page taking the machine down with three lines of
+                        // JavaScript, so the unborrowable case is treated as what
+                        // it is: a cycle, refused.
+                        let Ok(pb) = (*some_p).try_borrow() else {
+                            return false;
+                        };
+                        if same_js_object(self.as_js_object(), (*pb).as_js_object()) {
                             // To prevent circular chain
                             return false;
-                        } else {
-                            let t1 = (*some_p).borrow();
-                            let t2 = (*t1).as_js_object().get_prototype_of();
-                            p = t2;
                         }
+                        p = (*pb).as_js_object().get_prototype_of();
                     } else {
                         break;
                     }
