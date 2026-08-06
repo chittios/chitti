@@ -5,6 +5,7 @@
 //! standing rule: fiddly logic lives in pure functions; the shell just reads
 //! the file and hands the pixels to the compositor).
 
+pub mod deflate;
 pub mod inflate;
 pub mod jpeg;
 pub mod png;

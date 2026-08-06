@@ -63,6 +63,7 @@ pub mod mm;
 pub mod modal;
 pub mod mouse;
 pub mod msgchan;
+pub mod notify;
 pub mod drivers;
 pub mod net;
 pub mod onnx;
@@ -83,6 +84,8 @@ pub mod qemu;
 /// boot (opt-in via `CHITTI_SAMPLE_FILES`; empty otherwise).
 pub mod samples;
 pub mod sched;
+pub mod schedule;
+pub mod screenshot;
 pub mod security;
 pub mod serial;
 pub mod service;

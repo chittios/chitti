@@ -169,6 +169,19 @@ pub fn confirm(_title: &str, _msg: &str) -> bool {
     false
 }
 
+/// Whether a modal is on screen. Anything that would consume console input or
+/// start work behind one must defer rather than race it.
+#[cfg(not(test))]
+pub fn is_open() -> bool {
+    crate::framebuffer::modal_is_open()
+}
+
+/// Test stub: no framebuffer, so never.
+#[cfg(test)]
+pub fn is_open() -> bool {
+    false
+}
+
 /// Test stub: no framebuffer, so return empty.
 #[cfg(test)]
 pub fn input(_title: &str, _prompt: &str, _masked: bool) -> String {

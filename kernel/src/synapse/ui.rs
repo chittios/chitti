@@ -177,6 +177,17 @@ pub fn owns(task: TaskId, id: u32) -> bool {
     SURFACES.with(|m| m.get(&id).map(|s| s.owner == task).unwrap_or(false))
 }
 
+/// The lowest-numbered surface `task` owns, if any.
+///
+/// The inverse of [`owns`], and the same authority rule read the other way:
+/// asking "which surface is mine" needs no capability because the answer is
+/// derived from ownership, and a task that owns nothing gets `None` rather than
+/// somebody else's id. `/screenshot` uses this to confine a non-root agent to
+/// its own window.
+pub fn surface_of_owner(task: TaskId) -> Option<u32> {
+    SURFACES.with(|m| m.iter().find(|(_, s)| s.owner == task).map(|(id, _)| *id))
+}
+
 /// Apply a draw-op program to a surface the caller owns. Returns the number of
 /// ops applied. Every coordinate is clamped to the surface bounds.
 pub fn draw(task: TaskId, id: u32, ops: &str) -> Result<usize, DrawErr> {

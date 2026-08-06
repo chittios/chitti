@@ -43,6 +43,11 @@ pub const COMMAND_ALIASES: &[&str] = &[
     "uvc",        // → camera
     "touchscreen", // → touch
     "bat",        // → battery
+    "screencap",  // → screenshot
+    "shot",       // → screenshot
+    "notifications", // → notify
+    "notif",      // → notify
+    "cron",       // → schedule
 ];
 
 /// Whether `name` is a known slash command or alias (for completion).
@@ -96,6 +101,7 @@ pub const ENTRIES: &[Entry] = &[
     // Model & agent
     Entry { category: "Model & Agent", title: "Switch Model", name: "model", shortcut: "" },
     Entry { category: "Model & Agent", title: "Approval Mode", name: "mode", shortcut: "" },
+    Entry { category: "Model & Agent", title: "Scheduled Runs", name: "schedule", shortcut: "" },
     Entry { category: "Model & Agent", title: "Thinking", name: "think", shortcut: "" },
     Entry { category: "Model & Agent", title: "Infer (parity)", name: "infer", shortcut: "" },
     Entry { category: "Model & Agent", title: "Perf Benchmark", name: "perf", shortcut: "" },
@@ -162,6 +168,8 @@ pub const ENTRIES: &[Entry] = &[
         name: "camera",
         shortcut: "",
     },
+    Entry { category: "System & UI", title: "Screenshot", name: "screenshot", shortcut: "" },
+    Entry { category: "System & UI", title: "Notifications", name: "notify", shortcut: "" },
     Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },

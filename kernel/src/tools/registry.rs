@@ -175,6 +175,38 @@ fn shell_commands() -> Vec<ToolDef> {
             false,
         ),
         ToolDef::shell("disks", "List every block device and its detected filesystems (read-only).", false),
+        // Inert on purpose: a notification is bytes on the local screen for the
+        // human who is the trust root — no hardware, no memory, no egress — so
+        // it must remain postable from a tainted context, which is exactly the
+        // moment a warning matters most. The two things that keep it from being
+        // a laundering or spoofing channel are enforced in `shell::notify`:
+        // the `source` is stamped from the live identity and never read from the
+        // arguments, and there is no `list` for agents.
+        // Classified by the effect of the action being *installed*, not by a
+        // static bit — see `tools::dispatch::effect_of`. Installing a schedule
+        // that would run `rm` is as destructive as running `rm`, just later, and
+        // the whole point of catching it at creation is that a human is still
+        // there to see it.
+        ToolDef::shell(
+            "schedule",
+            "Run something later, repeatedly. args: 'list' | 'add <name> <recurrence> command <cmd> [args]' | 'add <name> <recurrence> prompt <text>' | 'show|run|pause|resume|remove <name>' | 'next'. Recurrence: 'every 5m' | 'at 09:00 weekdays' | 'on 1 03:00' | 'in 30s'. A schedule you create is bounded by your authority at creation, forever, and cannot get human approval while it runs.",
+            false,
+        ),
+        ToolDef::shell(
+            "notify",
+            "Tell the human something. args: 'post <info|ok|warn|error|action> <title> [-- <body>]'. Write-only for agents: use it for something the human needs to know later, not as a reply. The source is stamped by the kernel.",
+            false,
+        ),
+        // Not marked destructive: it writes one new file and destroys nothing.
+        // Confidentiality is bounded by *identity* instead, inside the command —
+        // a non-root agent's capture is narrowed to the surface it owns, so a
+        // screenshot cannot be used to read across the agent boundary the scope
+        // gate defends.
+        ToolDef::shell(
+            "screenshot",
+            "Capture the screen to a PNG in the store. args: empty=the desktop, or 'panel'|'chat'|'pane <n>'|'region <x>,<y>,<w>,<h>', plus 'after <n>s', '--cursor', and an optional destination path (default /downloads/screenshot-<ms>.png). Non-root agents capture only their own surface.",
+            false,
+        ),
         ToolDef::shell("ls", "List a store directory (Linux-like). args: '[path] [-l]' (default /). Numeric arg lists a disk volume root.", false),
         ToolDef::shell("cat", "Print a store or mounted file. args: a /path.", false),
         ToolDef::shell("grep", "Search store file contents. args: '<query> [path_glob]'.", false),

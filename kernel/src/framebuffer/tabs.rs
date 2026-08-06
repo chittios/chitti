@@ -15,6 +15,7 @@ fn tab_label(m: RightMode) -> alloc::string::String {
         RightMode::Editor => alloc::format!("{} editor", fa::PEN_TO_SQUARE),
         RightMode::Top => alloc::format!("{} top", fa::GAUGE),
         RightMode::Todos => alloc::format!("{} todos", fa::LIST_CHECK),
+        RightMode::Notifications => alloc::format!("{} notify", fa::BELL),
         RightMode::Audio => alloc::format!("{} audio", fa::WAVE_SQUARE),
         RightMode::Surface(IMAGE_SURFACE) => alloc::format!("{} image", fa::IMAGE),
         RightMode::Surface(VIDEO_SURFACE) => alloc::format!("{} video", fa::FILM),

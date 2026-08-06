@@ -2,6 +2,7 @@
 //! compositing paths, and the sub-pixel coverage helper every curve uses.
 
 use super::*;
+use crate::screenshot::Extent;
 
 /// Anti-aliasing sub-sample rate per axis (`AA_SS`×`AA_SS` samples per pixel →
 /// `AA_SS²`+1 coverage levels). 4 gives 16 levels — smooth curves at negligible
@@ -73,6 +74,64 @@ impl Screen {
                 }
             }
         }
+    }
+
+    /// Read `row.len()` pixels starting at **physical** `(x, y)` back as packed
+    /// `0x00RRGGBB` — the read mirror of [`Self::fill_phys`], and the primitive
+    /// behind `/screenshot`.
+    ///
+    /// Physical rather than logical because a screenshot of a letterboxed
+    /// desktop legitimately means either thing, and the whole panel is the
+    /// larger of the two: a logical capture is this reader offset by
+    /// `origin_x`/`origin_y`, which is what [`Self::read_rgb32_row`] does.
+    ///
+    /// Reads short (leaving the tail of `row` untouched) rather than clamping
+    /// silently to a different width — a caller that asked past the panel has a
+    /// geometry bug and should see a black tail, not a narrower image.
+    pub(super) fn read_phys_rgb32_row(&self, x: u64, y: u64, row: &mut [u32]) {
+        if y >= self.fb_h || x >= self.fb_w || row.is_empty() {
+            return;
+        }
+        let n = row.len().min((self.fb_w - x) as usize);
+        let offset = y * self.pitch + x * self.bpp_bytes;
+        // SAFETY: `n` is clipped to the physical scanline and `y` to the panel
+        // height, so the whole span lies inside the `fb_h * pitch` MMIO region
+        // the kernel owns. Read-only.
+        unsafe {
+            let ptr = (self.addr as *const u8).add(offset as usize);
+            if self.bpp_bytes == 4 && self.r_shift == 16 && self.g_shift == 8 && self.b_shift == 0 {
+                // Native XRGB8888: our packing already matches, so mask the
+                // unused high byte and store.
+                let src = ptr as *const u32;
+                for i in 0..n {
+                    row[i] = src.add(i).read_volatile() & 0x00ff_ffff;
+                }
+            } else {
+                for i in 0..n {
+                    let p = ptr.add(i * self.bpp_bytes as usize);
+                    let mut val: u32 = 0;
+                    for b in 0..self.bpp_bytes {
+                        val |= (p.add(b as usize).read_volatile() as u32) << (b * 8);
+                    }
+                    row[i] = (((val >> self.r_shift) & 0xff) << 16)
+                        | (((val >> self.g_shift) & 0xff) << 8)
+                        | ((val >> self.b_shift) & 0xff);
+                }
+            }
+        }
+    }
+
+    /// Read a row of the **logical** desktop back as packed `0x00RRGGBB` — the
+    /// read mirror of [`Self::blit_rgb32_row`].
+    pub(super) fn read_rgb32_row(&self, x: u64, y: u64, row: &mut [u32]) {
+        if y >= self.height || x >= self.width || row.is_empty() {
+            return;
+        }
+        let n = row.len().min((self.width - x) as usize);
+        // The one translation, same as every other framebuffer access.
+        let off = self.fb_offset(x, y);
+        let (px, py) = (off % self.pitch / self.bpp_bytes, off / self.pitch);
+        self.read_phys_rgb32_row(px, py, &mut row[..n]);
     }
 
     /// Paint the dead space around a smaller-than-native desktop.
@@ -573,6 +632,95 @@ impl Screen {
         let nr = (r * 32 / 100).max(2);
         self.fill_disc(cx, cy, nr, node_c);
     }
+}
+
+/// Read a rectangle of the live framebuffer back as `0x00RRGGBB` pixels —
+/// the hardware half of `/screenshot`. All the geometry decisions are made by
+/// [`crate::screenshot`], which is testable; this function only resolves an
+/// [`Extent`] against the live pane tree and does the MMIO read.
+///
+/// The framebuffer is single-buffered, so what this reads is exactly what is on
+/// the screen — including the mouse sprite, which is composited *into* the
+/// framebuffer rather than overlaid at scanout. So unless `cursor` is set, the
+/// sprite is lifted first ([`Screen::cursor_restore`]) and put back after; a
+/// captured pointer in a bug report reads as a rendering artefact rather than
+/// as a pointer.
+pub fn capture(extent: Extent, cursor: bool) -> Result<(u32, u32, Vec<u32>), &'static str> {
+    SCREEN.with(|slot| {
+        let sc = slot.as_mut().ok_or("no framebuffer (serial-only boot)")?;
+
+        // Resolve to a PHYSICAL rectangle. Logical extents add the letterbox
+        // origin; `Panel` is already physical.
+        let (px, py, w, h) = match extent {
+            Extent::Panel => (0u64, 0u64, sc.fb_w, sc.fb_h),
+            Extent::Desktop => (sc.origin_x, sc.origin_y, sc.width, sc.height),
+            Extent::Region { x, y, w, h } => {
+                let (cx, cy, cw, ch) = crate::screenshot::clamp_region(
+                    sc.width as u32,
+                    sc.height as u32,
+                    x,
+                    y,
+                    w,
+                    h,
+                )
+                .ok_or("region lies outside the desktop")?;
+                (cx as u64 + sc.origin_x, cy as u64 + sc.origin_y, cw as u64, ch as u64)
+            }
+            Extent::Chat => {
+                let p = &sc.chat;
+                (p.x + sc.origin_x, p.y + sc.origin_y, p.w, p.h)
+            }
+            Extent::Pane(i) => {
+                let slot = sc.actions.get(i).ok_or("no such action pane")?;
+                let p = &slot.pane;
+                if p.w == 0 || p.h == 0 {
+                    return Err("that action pane is collapsed");
+                }
+                (p.x + sc.origin_x, p.y + sc.origin_y, p.w, p.h)
+            }
+            Extent::Surface(id) => {
+                // Resolved through `mode_dims`, i.e. by *which pane holds that
+                // surface's tab* — never the focused pane. A surface whose tab
+                // is on pane 3 must not be photographed out of pane 1 because
+                // the mouse happens to be there (the same rule the per-view
+                // painters follow).
+                let d = sc
+                    .mode_dims(RightMode::Surface(id))
+                    .ok_or("that surface is not on screen")?;
+                // The interior, not the frame: an app's capture should be its
+                // own pixels, not the pane chrome the compositor drew round it.
+                (d.ix + sc.origin_x, d.iy + sc.origin_y, d.iw, d.ih)
+            }
+        };
+        if w == 0 || h == 0 {
+            return Err("nothing to capture (zero-sized surface)");
+        }
+        let (n_px, n_py) = (w as usize, h as usize);
+        // Refuse before allocating, for the reason `image::png` does: the RGB
+        // buffer alone is 4 bytes a pixel on a first-fit allocator.
+        if n_px.saturating_mul(n_py) > crate::image::png::MAX_PIXELS {
+            return Err("capture is larger than the encoder will accept");
+        }
+
+        let lift = !cursor && sc.cur_vis;
+        if lift {
+            sc.cursor_restore();
+        }
+
+        let mut pixels = Vec::new();
+        // One allocation for the whole capture: growing a multi-megabyte Vec by
+        // doubling is exactly the allocator churn the perf rules warn about.
+        pixels.resize(n_px * n_py, 0u32);
+        for row in 0..h {
+            let off = (row as usize) * n_px;
+            sc.read_phys_rgb32_row(px, py + row, &mut pixels[off..off + n_px]);
+        }
+
+        if lift {
+            sc.cursor_overlay();
+        }
+        Ok((w as u32, h as u32, pixels))
+    })
 }
 
 #[cfg(test)]

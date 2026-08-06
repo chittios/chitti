@@ -600,6 +600,15 @@ pub fn draw_voice(levels: &[f32], status: &str) {
     });
 }
 
+/// Whether a modal is on screen.
+///
+/// A modal owns `console::read_byte` for as long as it is up, so anything that
+/// would consume input or start work behind one (the scheduler's tick, for
+/// instance) must defer rather than race it.
+pub fn modal_is_open() -> bool {
+    MODAL_ON.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Dismiss any modal and repaint the normal UI.
 pub fn modal_dismiss() {
     MODAL_ON.store(false, core::sync::atomic::Ordering::Relaxed);

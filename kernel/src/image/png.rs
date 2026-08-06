@@ -8,6 +8,7 @@
 
 use super::inflate::zlib_decompress;
 use super::Image;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// CRC-32 (IEEE, reflected) over `data` — PNG chunk checksums. Bitwise (no
@@ -232,6 +233,134 @@ pub fn decode(bytes: &[u8]) -> Result<Image, &'static str> {
     Ok(Image { w, h, pixels })
 }
 
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+/// Largest image this will encode: 32 megapixels. Above it the RGB buffer
+/// alone is 96 MB on a first-fit allocator, and the caller is better told than
+/// left to fail inside the allocator — the same posture the PDF renderer takes
+/// with `MAX_PIXELS`/`ERR_TOO_LARGE`.
+pub const MAX_PIXELS: usize = 32 << 20;
+
+/// The five PNG filter types (RFC 2083 §6). `Paeth` reuses the decoder's
+/// [`paeth`] predictor, so the encoder and decoder cannot disagree about it.
+fn filter_row(kind: u8, cur: &[u8], prior: &[u8], bpp: usize, out: &mut [u8]) {
+    for x in 0..cur.len() {
+        let a = if x >= bpp { cur[x - bpp] as i32 } else { 0 };
+        let b = prior[x] as i32;
+        let c = if x >= bpp { prior[x - bpp] as i32 } else { 0 };
+        let pred = match kind {
+            0 => 0,
+            1 => a,
+            2 => b,
+            3 => (a + b) / 2,
+            _ => paeth(a, b, c) as i32,
+        };
+        out[x] = (cur[x] as i32 - pred) as u8;
+    }
+}
+
+/// libpng's minimum-sum-of-absolute-differences heuristic: the filter whose
+/// output has the smallest total deviation from zero is the one LZ77 and the
+/// Huffman coder will do best on. Bytes are read as **signed** deviations,
+/// which is the whole point — `0xFF` is -1, not 255.
+fn filter_cost(row: &[u8]) -> u64 {
+    row.iter().map(|&b| (b as i8).unsigned_abs() as u64).sum()
+}
+
+/// Encode 8-bit RGB (3 bytes per pixel, row-major, no padding) as a PNG.
+///
+/// Per-row adaptive filtering plus fixed-Huffman deflate: a flat UI screenshot
+/// filters to mostly zeros and lands two orders of magnitude below its raw
+/// size, while a photograph still compresses. Returns `Err` rather than
+/// allocating for an image beyond [`MAX_PIXELS`].
+pub fn encode_rgb8(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if w == 0 || h == 0 {
+        return Err("png: zero-sized image");
+    }
+    if w.saturating_mul(h) > MAX_PIXELS {
+        return Err("png: image too large to encode");
+    }
+    if rgb.len() < w * h * 3 {
+        return Err("png: pixel buffer shorter than the declared size");
+    }
+
+    const BPP: usize = 3;
+    let stride = w * BPP;
+    // One filter-type byte plus one filtered scanline per row.
+    let mut raw = Vec::with_capacity((stride + 1) * h);
+    let mut prior = vec![0u8; stride];
+    let mut best = vec![0u8; stride];
+    let mut trial = vec![0u8; stride];
+
+    for y in 0..h {
+        let cur = &rgb[y * stride..y * stride + stride];
+        // Filter 0 is the baseline; anything that beats it wins.
+        filter_row(0, cur, &prior, BPP, &mut best);
+        let mut best_kind = 0u8;
+        let mut best_cost = filter_cost(&best);
+        for kind in 1..=4u8 {
+            filter_row(kind, cur, &prior, BPP, &mut trial);
+            let cost = filter_cost(&trial);
+            if cost < best_cost {
+                best_cost = cost;
+                best_kind = kind;
+                best.copy_from_slice(&trial);
+            }
+        }
+        raw.push(best_kind);
+        raw.extend_from_slice(&best);
+        prior.copy_from_slice(cur);
+    }
+
+    let idat = super::deflate::zlib_compress(&raw);
+    drop(raw);
+
+    let mut out = Vec::with_capacity(idat.len() + 64);
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut chunk = |out: &mut Vec<u8>, typ: &[u8; 4], body: &[u8]| {
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(typ);
+        out.extend_from_slice(body);
+        // The CRC covers the type *and* the body, never the length.
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    };
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+    // depth 8, colour type 2 (truecolour), deflate, adaptive filtering, no interlace
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &idat);
+    chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// Encode `0x00RRGGBB` pixels (the compositor's format, and what [`decode`]
+/// produces) as a PNG. Converts to packed RGB a row at a time so a 4K frame
+/// does not hold both representations at full size.
+pub fn encode_rgb32(w: usize, h: usize, px: &[u32]) -> Result<Vec<u8>, &'static str> {
+    if w == 0 || h == 0 {
+        return Err("png: zero-sized image");
+    }
+    if w.saturating_mul(h) > MAX_PIXELS {
+        return Err("png: image too large to encode");
+    }
+    if px.len() < w * h {
+        return Err("png: pixel buffer shorter than the declared size");
+    }
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for &p in &px[..w * h] {
+        rgb.push((p >> 16) as u8);
+        rgb.push((p >> 8) as u8);
+        rgb.push(p as u8);
+    }
+    encode_rgb8(w, h, &rgb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +410,94 @@ mod tests {
         let mut bad = PNG_RGB.to_vec();
         bad[40] ^= 0xff; // flip an IDAT byte: chunk CRC must catch it
         assert!(decode(&bad).is_err());
+    }
+
+    // --- encoder ---------------------------------------------------------
+
+    /// The property that makes the encoder trustworthy: our own decoder, which
+    /// predates it and has read real files, gets the pixels back exactly.
+    fn round_trip(w: usize, h: usize, px: &[u32]) {
+        let bytes = encode_rgb32(w, h, px).expect("encode");
+        let back = decode(&bytes).expect("our own decoder must accept our own PNG");
+        assert_eq!((back.w, back.h), (w, h));
+        assert_eq!(back.pixels, px[..w * h], "pixels differed at {w}x{h}");
+    }
+
+    #[test_case]
+    fn a_single_pixel_round_trips() {
+        round_trip(1, 1, &[0xcc785c]);
+    }
+
+    /// Odd widths are where a stride assumption breaks, and every filter kind
+    /// has an `x < bpp` edge on the first pixel of a row.
+    #[test_case]
+    fn odd_sizes_round_trip() {
+        for &(w, h) in &[(1usize, 7usize), (7, 1), (3, 3), (5, 4), (17, 13), (64, 1)] {
+            let px: Vec<u32> = (0..w * h)
+                .map(|i| ((i * 37) as u32 & 0xff) << 16 | ((i * 11) as u32 & 0xff) << 8 | (i as u32 & 0xff))
+                .collect();
+            round_trip(w, h, &px);
+        }
+    }
+
+    #[test_case]
+    fn a_flat_fill_compresses_hard() {
+        let (w, h) = (320usize, 200usize);
+        let raw = w * h * 3; // 192 000 bytes of RGB
+        let px = alloc::vec![0x1e1b18u32; w * h];
+        let bytes = encode_rgb32(w, h, &px).unwrap();
+        // The Up filter zeroes every row after the first, so the IDAT is one
+        // long run of zeros — except that PNG puts a filter-type byte between
+        // rows, which breaks the run 199 times and costs a literal plus a fresh
+        // match each time. So the floor is per-row, not per-image: ~1.7 KB here,
+        // i.e. ~110x. Fixed Huffman is what makes it per-row-expensive; dynamic
+        // tables would code the repeated pattern far cheaper. Asserting 1/50th
+        // of raw pins "the compressor is working" without pinning the exact
+        // symbol cost, which a table change would legitimately move.
+        assert!(
+            bytes.len() < raw / 50,
+            "flat fill encoded to {} bytes from {raw} raw",
+            bytes.len()
+        );
+        round_trip(w, h, &px);
+    }
+
+    /// A raw scanline set crossing 65535 bytes exercises the deflate path at
+    /// the stored-block size that used to be the only option.
+    #[test_case]
+    fn an_image_whose_idat_crosses_the_block_boundary_round_trips() {
+        let (w, h) = (211usize, 140usize); // 211*3+1 = 634 bytes/row, 88760 raw
+        let mut s = 0x2468_0acEu32;
+        let px: Vec<u32> = (0..w * h)
+            .map(|_| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                s >> 8 & 0xff_ffff
+            })
+            .collect();
+        round_trip(w, h, &px);
+    }
+
+    #[test_case]
+    fn every_filter_kind_is_exercised_by_a_gradient() {
+        // Horizontal + vertical + diagonal structure so the per-row heuristic
+        // has reason to pick different filters on different rows.
+        let (w, h) = (48usize, 48usize);
+        let px: Vec<u32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                ((x * 5) as u32) << 16 | ((y * 5) as u32) << 8 | ((x ^ y) as u32 & 0xff)
+            })
+            .collect();
+        round_trip(w, h, &px);
+    }
+
+    #[test_case]
+    fn encode_refuses_bad_geometry_rather_than_panicking() {
+        assert!(encode_rgb32(0, 4, &[0; 4]).is_err(), "zero width");
+        assert!(encode_rgb32(4, 0, &[0; 4]).is_err(), "zero height");
+        assert!(encode_rgb32(4, 4, &[0; 3]).is_err(), "short buffer");
+        assert!(encode_rgb8(4, 4, &[0; 47]).is_err(), "short byte buffer");
+        // A 32-megapixel-plus request must be refused before it allocates.
+        assert!(encode_rgb32(1 << 16, 1 << 16, &[]).is_err(), "too large");
     }
 }

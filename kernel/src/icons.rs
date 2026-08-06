@@ -41,6 +41,8 @@ pub mod fa {
     pub const BATTERY: char = '\u{f240}';
     /// clock
     pub const CLOCK: char = '\u{f017}';
+    /// bell — the notification chip, tab and `Severity::Action` glyph
+    pub const BELL: char = '\u{f0f3}';
     /// hard-drive
     pub const HARD_DRIVE: char = '\u{f0a0}';
     /// server
@@ -383,6 +385,8 @@ pub fn for_command(name: &str) -> char {
         "exit" | "restart" => fa::POWER_OFF,
         "memory" | "skills" | "skill" | "plan" | "permissions" => fa::BOOK,
         "todos" => fa::LIST_CHECK,
+        "notify" => fa::BELL,
+        "schedule" | "cron" => fa::CALENDAR,
         "model" | "infer" | "perf" | "bench" | "think" | "mode" => fa::ROBOT,
         "redteam" | "audit" => fa::SHIELD,
         "ls" | "cat" | "open" | "mkdir" | "cp" | "mv" | "rm" | "touch" | "glob" | "grep"
@@ -398,7 +402,10 @@ pub fn for_command(name: &str) -> char {
         "clip" => fa::FILE_LINES,
         "close" => fa::XMARK,
         "voice" | "onnx" => fa::MICROPHONE,
-        "bluetooth" | "camera" | "touchscreen" | "lspci" => fa::MICROCHIP,
+        // `camera` and `screenshot` both take a picture, so both get the camera
+        // glyph; the rest of this arm is genuinely "a piece of hardware".
+        "camera" | "screenshot" => fa::CAMERA,
+        "bluetooth" | "touchscreen" | "lspci" => fa::MICROCHIP,
         _ => fa::TERMINAL,
     }
 }

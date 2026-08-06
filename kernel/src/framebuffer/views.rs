@@ -887,6 +887,105 @@ pub fn draw_todos(items: &[TodoViewItem<'_>], title: &str) {
     });
 }
 
+/// Open the notification queue pane.
+pub fn open_notifications() {
+    set_right(RightMode::Notifications);
+}
+
+/// Whether the action pane shows notifications.
+pub fn is_notifications() -> bool {
+    right_mode() == RightMode::Notifications
+}
+
+/// One row for [`draw_notifications`].
+///
+/// Carries the already-formatted `when` string rather than a timestamp: the
+/// relative-age formatting is in [`crate::notify::relative_age`], which is
+/// testable, and this module is not.
+pub struct NotifyViewItem<'a> {
+    pub severity: crate::notify::Severity,
+    pub source: &'a str,
+    pub title: &'a str,
+    pub when: &'a str,
+    pub read: bool,
+    pub count: u32,
+}
+
+/// Render the notification queue into the action pane, newest first.
+///
+/// Structurally the same as [`draw_todos`] — including painting every cell
+/// through `draw_str_bg` (hence `fill_cell_bg`) rather than a raw `fill_rect` of
+/// the background, so a translucent wallpaper shows through.
+pub fn draw_notifications(items: &[NotifyViewItem<'_>], title: &str) {
+    SCREEN.with(|slot| {
+        let Some(sc) = slot else { return };
+        let Some(d) = sc.mode_dims(RightMode::Notifications) else {
+            return;
+        };
+        sc.cursor_restore();
+        sc.cur_vis = false;
+        let ch = sc.ch();
+        let (px, iy, iw) = (d.ix, d.iy, d.iw);
+        let bg = d.bg;
+        let rows = d.rows;
+        let cols = (iw / sc.cw()).max(1) as usize;
+        let mut y = iy;
+        let head = if title.is_empty() {
+            alloc::format!("{} Notifications", crate::icons::fa::BELL)
+        } else {
+            alloc::format!("{} {title}", crate::icons::fa::BELL)
+        };
+        sc.draw_str_bg(px, y, &pad_trunc(&head, cols), sc.theme.accent, bg);
+        y += ch + ch / 4;
+        if items.is_empty() {
+            sc.draw_str_bg(
+                px,
+                y,
+                &pad_trunc("(nothing to report)", cols),
+                sc.theme.title_dim,
+                bg,
+            );
+            let blank = pad_trunc("", cols);
+            y += ch;
+            while y + ch <= iy + rows * ch {
+                sc.draw_str_bg(px, y, &blank, bg, bg);
+                y += ch;
+            }
+            sc.cursor_overlay();
+            return;
+        }
+        for it in items {
+            use crate::notify::Severity;
+            let mark = if it.read { ' ' } else { '\u{2022}' };
+            let icon = crate::notify::severity_icon(it.severity);
+            let rep = if it.count > 1 { alloc::format!(" x{}", it.count) } else { String::new() };
+            let row =
+                alloc::format!("{mark}{icon} {:>5}  {} — {}{rep}", it.when, it.source, it.title);
+            // Read entries recede; anything still waiting on the human is in the
+            // accent colour, which is the one thing the eye should find.
+            let fg = if it.read {
+                sc.theme.title_dim
+            } else {
+                match it.severity {
+                    Severity::Error | Severity::Action | Severity::Warn => sc.theme.accent,
+                    _ => sc.theme.logs_fg,
+                }
+            };
+            sc.draw_str_bg(px, y, &pad_trunc(&row, cols), fg, bg);
+            y += ch;
+            if y + ch > iy + rows * ch {
+                break;
+            }
+        }
+        let blank = pad_trunc("", cols);
+        while y + ch <= iy + rows * ch {
+            sc.draw_str_bg(px, y, &blank, bg, bg);
+            y += ch;
+        }
+        sc.cursor_overlay();
+    });
+}
+
 /// Open (or focus) the `/open` editor tab.
 pub fn editor_enter() {
     set_right(RightMode::Editor);

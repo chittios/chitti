@@ -235,6 +235,151 @@ pub(super) fn camera_grab(dest: Option<&str>) {
     }
 }
 
+/// The framebuffer read, behind a `cfg` twin because `framebuffer` is
+/// `#[cfg(not(test))]` — the same shape `refresh_todos` and `modal::confirm`
+/// use. The test build has no panel, so it reports exactly what a serial-only
+/// boot reports.
+#[cfg(not(test))]
+fn capture_screen(
+    extent: crate::screenshot::Extent,
+    cursor: bool,
+) -> Result<(u32, u32, alloc::vec::Vec<u32>), &'static str> {
+    crate::framebuffer::capture(extent, cursor)
+}
+
+#[cfg(test)]
+fn capture_screen(
+    _extent: crate::screenshot::Extent,
+    _cursor: bool,
+) -> Result<(u32, u32, alloc::vec::Vec<u32>), &'static str> {
+    Err("no framebuffer (serial-only boot)")
+}
+
+/// `/screenshot [extent] [after <d>] [--cursor] [dest]` — capture the screen to
+/// a PNG in the store.
+///
+/// The framebuffer read is `framebuffer::capture` (ring 0: it is device memory,
+/// so per the standing rule the driver reads and an agent asks) and every
+/// geometry/naming decision is in the pure, unit-tested [`crate::screenshot`].
+/// This function is the glue: parse, wait, capture, encode, write, verify.
+pub(super) fn run_screenshot(arg: &str) {
+    let a = arg.trim();
+    if a == "help" || a == "-h" || a == "--help" {
+        serial_println!("screenshot> usage: /screenshot [desktop|panel|chat|pane <n>|region <x>,<y>,<w>,<h>]");
+        serial_println!("            [after <n>[s|ms]] [--cursor] [<dest>]");
+        serial_println!("            default: the logical desktop, to /downloads/screenshot-<ms>.png");
+        return;
+    }
+    let mut req = match crate::screenshot::parse(a) {
+        Ok(r) => r,
+        Err(e) => {
+            serial_println!("screenshot> {e}");
+            serial_println!("screenshot> try /screenshot help");
+            return;
+        }
+    };
+
+    // A screenshot reads whatever is on the panel, which crosses every agent
+    // boundary the scope gate defends: another agent's surface, the human's
+    // chat, a password modal. So a non-root agent may capture **only its own
+    // surface**. The orchestrator is the human's own shell (invariant: it holds
+    // root authority and is the trust root), so it sees the whole screen.
+    //
+    // Enforced by narrowing the extent rather than refusing, because "your own
+    // window" is what an app agent actually wants and a refusal would just be
+    // worked around with a `ui_draw` read-back.
+    let agent = active_agent_id();
+    if agent != crate::agent::manifest::ORCHESTRATOR_ID.0 {
+        let task = crate::sched::current_task_id();
+        match crate::synapse::ui::surface_of_owner(task) {
+            Some(id) => {
+                if req.extent != crate::screenshot::Extent::Desktop {
+                    serial_println!(
+                        "screenshot> confined to your own surface (agent {agent}); \
+                         ignoring the requested extent"
+                    );
+                }
+                req.extent = crate::screenshot::Extent::Surface(id);
+            }
+            None => {
+                serial_println!(
+                    "screenshot> refused: agent {agent} has no surface of its own, and \
+                     only the shell agent may capture the whole screen"
+                );
+                return;
+            }
+        }
+    }
+
+    // A capture taken the instant the command is submitted shows the command
+    // still in the composer. `after` is how you photograph a menu or a hover
+    // state; the wait pumps the UI and answers Ctrl+C, per the standing rules.
+    if req.delay_ms > 0 {
+        serial_println!("screenshot> capturing in {} ms…", req.delay_ms);
+        let until = crate::arch::now_ms() + req.delay_ms;
+        while crate::arch::now_ms() < until {
+            if crate::shell::poll_interrupt() {
+                serial_println!("screenshot> cancelled");
+                return;
+            }
+            crate::shell::upkeep();
+            crate::sched::yield_now();
+        }
+    }
+
+    let (w, h, pixels) = match capture_screen(req.extent, req.cursor) {
+        Ok(v) => v,
+        Err(e) => {
+            serial_println!("screenshot> {e}");
+            return;
+        }
+    };
+
+    let bytes = match crate::image::png::encode_rgb32(w as usize, h as usize, &pixels) {
+        Ok(b) => b,
+        Err(e) => {
+            serial_println!("screenshot> encode failed: {e}");
+            return;
+        }
+    };
+    // The pixel buffer is up to tens of megabytes; drop it before the write so
+    // the encoded PNG and the raw frame are not both resident (perf trap #3 —
+    // this allocator punishes holding two large buffers at once).
+    drop(pixels);
+
+    let dest = req
+        .dest
+        .as_deref()
+        .map(|d| crate::shell::resolve_path(&crate::screenshot::normalize_dest(d)))
+        .unwrap_or_else(|| crate::screenshot::default_path(crate::arch::now_ms()));
+
+    if crate::synapse::fs::exists(&dest)
+        && !crate::modal::confirm("Overwrite file?", &alloc::format!("{dest} already exists."))
+    {
+        serial_println!("screenshot> cancelled (not overwritten)");
+        return;
+    }
+
+    crate::synapse::fs::write(&dest, &bytes);
+    serial_println!(
+        "screenshot> {}",
+        crate::screenshot::saved_line(&dest, w, h, bytes.len())
+    );
+
+    // Round-trip the file we just wrote, exactly as `/camera grab` does: an
+    // encoder bug that produces a plausible-looking file is otherwise only
+    // discovered later, by a human, on a different machine.
+    match crate::image::png::decode(&bytes) {
+        Ok(img) if img.w as u32 == w && img.h as u32 == h => {}
+        Ok(img) => serial_println!(
+            "screenshot> warning: re-decoded as {}x{}, expected {w}x{h}",
+            img.w,
+            img.h
+        ),
+        Err(e) => serial_println!("screenshot> warning: re-decode failed: {e}"),
+    }
+}
+
 /// `/touch [status]` — digitizer path shares HID pointer decode (Tip Switch → click).
 pub(super) fn run_touch(arg: &str) {
     let a = arg.trim();

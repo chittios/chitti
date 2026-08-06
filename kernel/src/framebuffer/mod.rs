@@ -85,6 +85,10 @@ pub use layout::*;
 pub use menu::*;
 pub use modal::*;
 use paint::*;
+// The only publicly reachable thing in `paint` — the rest of the module is
+// `pub(super)` painters. `/screenshot` needs the read-back, so it is re-exported
+// by name rather than widening `use paint::*` to `pub use`.
+pub use paint::capture;
 use pane::*;
 pub use select::*;
 pub use status::*;
@@ -342,6 +346,8 @@ pub enum RightMode {
     Top,
     /// Live session todo list (`/todos open`).
     Todos,
+    /// The notification queue (`/notify open`).
+    Notifications,
     /// The `/open <file>.wav|.mp3` background audio player.
     Audio,
     /// An agent-owned drawing surface (`synapse::ui`), by surface id.
@@ -536,9 +542,15 @@ pub enum StatusChip {
     /// Software output volume (`sound::volume` / mute).
     Volume = 7,
     Clock = 8,
+    /// Unread notification count (`crate::notify`).
+    ///
+    /// Appended rather than inserted in reading order: the discriminant is used
+    /// as an index into `STATUS_CHIP_RECTS`, so renumbering an existing variant
+    /// silently reassigns everyone's hit rect.
+    Notifications = 9,
 }
 
-const STATUS_CHIP_N: usize = 9;
+const STATUS_CHIP_N: usize = 10;
 
 /// Hit rects for [`StatusChip`] (index = `chip as usize`). Zero-size = absent.
 static STATUS_CHIP_RECTS: Locked<[(u64, u64, u64, u64); STATUS_CHIP_N]> =

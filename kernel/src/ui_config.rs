@@ -112,7 +112,7 @@ impl Default for UiConfig {
             status_left: "ChittiOS v${version}".to_string(),
             // Compact macOS-style clock by default (`Tue Aug 4  19:45`); full
             // form stays available as `${datetime}` / `${tz}` if a user wants it.
-            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime_short}".to_string(),
+            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${datetime_short}".to_string(),
             status_pos: crate::panes_layout::StatusPos::default().as_str().to_string(),
             tz_offset: 0,
             tz_name: String::new(),
@@ -190,6 +190,13 @@ impl UiConfig {
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu}  ${datetime} ${tz}" => d.status_right.clone(),
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${datetime} ${tz}" => d.status_right.clone(),
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime} ${tz}" => {
+                d.status_right.clone()
+            }
+            // Pre-${notifications}. Every entry in this ladder is a default a
+            // user never chose, so mapping it forward is how an existing install
+            // gets a new status variable at all — a config written yesterday
+            // would otherwise never show the bell.
+            t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime_short}" => {
                 d.status_right.clone()
             }
             t => t,
@@ -518,6 +525,11 @@ fn resolve_var(var: &str) -> String {
             let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
             crate::icons::status_mouse(active)
         }
+        // Empty at zero, so `expand` swallows the following separator too and a
+        // machine with nothing unread has a byte-identical bar. Must stay in
+        // step with `framebuffer::status::status_right_chips`, which paints the
+        // clickable chip from the same value.
+        "notifications" => crate::notify::chip_text(crate::notify::unread_count()),
         other => alloc::format!("${{{}}}", other),
     }
 }

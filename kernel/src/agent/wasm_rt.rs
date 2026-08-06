@@ -1533,29 +1533,17 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
     Ok(())
 }
 
-/// zlib-compress `data` using **stored (uncompressed) deflate blocks** — a
-/// valid zlib stream real git inflates and accepts (equivalent to
-/// `core.compression=0`). No Huffman machinery needed on our side.
+/// zlib-compress `data` for the git agent's `host_deflate`.
+///
+/// Deliberately still **stored blocks** ([`crate::image::deflate::zlib_stored`])
+/// and not the real compressor next to it: git objects written by this path are
+/// read back by real `git`, so the bytes-are-in-there-literally property is
+/// worth keeping while nothing has verified our fixed-Huffman output against
+/// libz. Switching this to `zlib_compress` is a one-line change and a
+/// deliberate one — a smaller `.git` is not worth a packfile no other git can
+/// read, until an interop test says otherwise.
 fn zlib_deflate_stored(data: &[u8]) -> alloc::vec::Vec<u8> {
-    let mut out = alloc::vec::Vec::with_capacity(data.len() + data.len() / 65535 * 5 + 11);
-    out.push(0x78);
-    out.push(0x01); // deflate, 32K window, FLEVEL 0 (FCHECK valid)
-    let mut rest = data;
-    loop {
-        let n = rest.len().min(65535);
-        let last = rest.len() <= 65535;
-        out.push(if last { 0x01 } else { 0x00 }); // BFINAL + BTYPE=00 stored
-        let len = n as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(&rest[..n]);
-        rest = &rest[n..];
-        if rest.is_empty() {
-            break;
-        }
-    }
-    out.extend_from_slice(&crate::image::inflate::adler32(data).to_be_bytes());
-    out
+    crate::image::deflate::zlib_stored(data)
 }
 
 /// Apply a settings-app preference to live shell/UI state.

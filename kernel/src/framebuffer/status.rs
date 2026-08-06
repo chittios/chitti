@@ -58,7 +58,10 @@ pub fn status_chip_hit(x: u64, y: u64) -> Option<StatusChip> {
                     5 => StatusChip::Cpu,
                     6 => StatusChip::Battery,
                     7 => StatusChip::Volume,
-                    _ => StatusChip::Clock,
+                    8 => StatusChip::Clock,
+                    // NB the wildcard maps to `Clock`, so a variant added
+                    // without an arm here silently opens the clock dropdown.
+                    _ => StatusChip::Notifications,
                 });
             }
         }
@@ -122,6 +125,14 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> 
         StatusChip::Volume,
         crate::icons::status_volume(crate::sound::muted(), crate::sound::volume()),
     ));
+    // Only shown when there is something unread — the Battery precedent above.
+    // A machine with nothing to say has a byte-identical status bar, and
+    // `ui_config::resolve_var` returns the same empty string so the template
+    // drops the separator too.
+    let unread = crate::notify::chip_text(crate::notify::unread_count());
+    if !unread.is_empty() {
+        out.push((StatusChip::Notifications, unread));
+    }
     // Compact macOS-style clock (no year / seconds / tz — dropdown has the rest).
     out.push((StatusChip::Clock, crate::clock::format_datetime_short()));
     out

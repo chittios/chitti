@@ -284,7 +284,22 @@ pub fn effect_of(def: &registry::ToolDef, call: &ToolCall) -> Effect {
                     .unwrap_or(false);
             let egress =
                 command == "http" || sends || shell_cmd_is_destructive_http(command, &call.args);
-            Effect { irreversible: *destructive, egress }
+            // **Installing a schedule is as effectful as the thing it installs.**
+            // A schedule creates nothing at creation time, so classifying
+            // `schedule` by a static bit would make `schedule add nightly every
+            // 60s command rm -r /` inert — the action would happen later,
+            // through the ordinary gates, but with a `human_confirmed` bit that
+            // an injection had already collected from a human who was told they
+            // were approving a *schedule*. So the effect of the call is the
+            // effect of the action being stored, evaluated here, while a human is
+            // still watching. Same shape as the `channel send` case above, and
+            // found the same way: by asking what each verb of a non-destructive
+            // command can actually cause.
+            let (sched_irrev, sched_egress) = schedule_install_effect(command, &call.args);
+            Effect {
+                irreversible: *destructive || sched_irrev,
+                egress: egress || sched_egress,
+            }
         }
         ToolBinding::RunShellCommand => {
             let cmdline = todo::json_str(&call.args, "command")
@@ -960,6 +975,69 @@ fn shell_http_args_destructive(args: &str) -> bool {
 }
 
 /// Shell binding helper: `http` with POST/body counts as destructive for taint.
+/// The effect of a `/schedule` call, when the call installs or runs an action.
+///
+/// Returns `(irreversible, egress)`. Non-installing verbs (`list`, `show`,
+/// `next`, `pause`, …) are inert; `add`/`run` inherit the effect of the action.
+/// An `Action::Prompt` is treated as irreversible **and** egress by
+/// construction: a model turn can reach any tool in the agent's toolset, so
+/// there is no bound to read off the argument string, and guessing "inert" would
+/// be the permissive reading of an unknown.
+fn schedule_install_effect(command: &str, call_args: &str) -> (bool, bool) {
+    if command != "schedule" && command != "cron" && command != "at" {
+        return (false, false);
+    }
+    let arg = todo::json_str(call_args, "args").unwrap_or_default();
+    let toks: alloc::vec::Vec<&str> = arg.split_whitespace().collect();
+    let verb = toks.first().copied().unwrap_or("");
+    if !matches!(verb, "add" | "new" | "run") {
+        return (false, false);
+    }
+    // `run <name>` fires an existing job: its effect is that job's action.
+    if verb == "run" {
+        let name = toks.get(1).copied().unwrap_or("");
+        return match crate::schedule::get(name).map(|j| j.action) {
+            Some(crate::schedule::Action::Prompt { .. }) => (true, true),
+            Some(crate::schedule::Action::Command { name, .. }) => {
+                (shell_command_is_destructive(&name), name == "http")
+            }
+            // An unknown job cannot be classified, and the call will fail anyway.
+            None => (false, false),
+        };
+    }
+    // `add <name> <recurrence…> command|prompt <tail>`: find the keyword, since
+    // the recurrence is variable-length.
+    let Some(kw) = toks
+        .iter()
+        .position(|t| matches!(*t, "command" | "cmd" | "prompt" | "ask"))
+    else {
+        // Malformed: the command will refuse it. Classify inert so a typo does
+        // not demand approval.
+        return (false, false);
+    };
+    if matches!(toks[kw], "prompt" | "ask") {
+        return (true, true);
+    }
+    let cmd = toks
+        .get(kw + 1)
+        .copied()
+        .unwrap_or("")
+        .trim_start_matches('/');
+    (shell_command_is_destructive(cmd), cmd == "http")
+}
+
+/// Whether a `/command` name is registered as destructive. Read from the
+/// registry rather than a second list, so the two cannot drift.
+fn shell_command_is_destructive(name: &str) -> bool {
+    crate::tools::registry::get(name)
+        .map(|d| matches!(d.binding, ToolBinding::Shell { destructive: true, .. }))
+        .unwrap_or(false)
+        // `mkext4`/`install` are destructive by nature even where the binding
+        // has not said so; the same belt-and-braces list `execute_chat_tool_inner`
+        // keeps for `run_shell_command`.
+        || matches!(name, "rm" | "mkext4" | "install")
+}
+
 fn shell_cmd_is_destructive_http(command: &str, call_args: &str) -> bool {
     if command != "http" {
         return false;

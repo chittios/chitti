@@ -421,6 +421,7 @@ impl Screen {
             | RightMode::Ktrace
             | RightMode::Top
             | RightMode::Todos
+            | RightMode::Notifications
             | RightMode::Audio
             | RightMode::Surface(_) => self.focus_action,
         }

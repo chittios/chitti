@@ -40,6 +40,13 @@ fn run_os() -> ! {
     chitti_kernel::tools::permissions::load();
     // External messaging channels (Telegram, …) — load after the store is up.
     chitti_kernel::msgchan::load();
+    // The notification queue, so anything unread from the last session survives
+    // a reboot: an unread queue that a restart silently emptied would be worse
+    // than no queue at all.
+    chitti_kernel::notify::load();
+    // Scheduled runs. After `notify::load`, because a re-anchor on a moved clock
+    // posts into the notification ring.
+    chitti_kernel::schedule::load();
     // The pump/idle task, before the shell takes over: it is what lets a waiting
     // task actually sleep instead of pumping `upkeep()` itself. Inert until
     // something blocks (it is reached only via the scheduler's empty-queue

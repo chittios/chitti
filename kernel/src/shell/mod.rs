@@ -25,7 +25,9 @@ mod browser;
 mod fs;
 mod install;
 mod media;
+mod notify;
 mod pdf;
+mod schedule;
 mod system;
 mod tooljson;
 mod video;
@@ -40,7 +42,9 @@ pub(crate) use voice::*;
 use agents::*;
 use install::*;
 use media::*;
+pub(crate) use notify::*;
 use pdf::*;
+use schedule::*;
 use system::*;
 use video::*;
 
@@ -257,6 +261,11 @@ pub fn run() -> ! {
         // messages are queued — including right after a channel-wake from
         // idle read_line (otherwise Telegram DMs sit unprocessed forever).
         drain_channel_inbound(&mut chat, &mut orch.session);
+        // Committed scheduled fires. Here rather than in `upkeep` for the same
+        // reason as the line above: a run can be a model turn, and inference is
+        // too heavy for the poll tick. `ChatSession::turn` also gets its 1 MiB
+        // stack for free from this side.
+        drain_schedule_pending(&mut chat, &mut orch.session);
 
         // Bordered input box on the framebuffer; **serial always**
         // gets a classic `>` prompt + character echo so `make run` / mon:stdio
@@ -301,7 +310,7 @@ pub fn run() -> ! {
         // Inbound channel work interrupted the prompt — do not treat `line` as
         // a submitted command; loop to drain, then re-open the prompt with the
         // same draft still in `line`.
-        if matches!(outcome, ReadOutcome::ChannelWake) {
+        if matches!(outcome, ReadOutcome::Wake) {
             continue;
         }
         // Cmd+Space (Agents browser) or other global hotkey — apply pick, keep draft.
@@ -663,6 +672,9 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "battery" | "bat" => run_battery(),
         "bluetooth" | "bt" => run_bluetooth(arg),
         "camera" | "uvc" => run_camera(arg),
+        "screenshot" | "screencap" | "shot" => run_screenshot(arg),
+        "notify" | "notifications" | "notif" => run_notify_cmd(arg),
+        "schedule" | "cron" | "at" => run_schedule_cmd(arg),
         "touchscreen" => run_touch(arg),
         "suspend" | "sleep" => run_suspend(arg),
         // Top-level `/power` (idle + energy mode). WiFi uses `/wifi power`, not this.
@@ -1485,11 +1497,17 @@ fn wifi_cmd(arg: &str) {
 /// return its printed output as the tool result. Reuses every existing command
 /// handler unchanged by capturing serial output for the duration of the call.
 pub fn run_tool_command(name: &str, arg: &str) -> alloc::string::String {
+    // Marks the whole dispatch as agent-chosen — see `in_tool_call`. Set and
+    // cleared here rather than at each command, because the point is precisely
+    // that a command cannot tell who called it.
+    IN_TOOL_CALL.store(true, core::sync::atomic::Ordering::Relaxed);
     crate::serial::capture_begin();
     if !dispatch_system(name, arg) {
         serial_println!("'/{}' is not available as a tool (interactive or agent-internal command)", name);
     }
-    crate::serial::capture_end()
+    let out = crate::serial::capture_end();
+    IN_TOOL_CALL.store(false, core::sync::atomic::Ordering::Relaxed);
+    out
 }
 
 /// List installed skills (L0 metadata). Shared by `/skills` and the agent tool.
@@ -1948,6 +1966,90 @@ pub(crate) fn poll_cancel() -> bool {
 static FOLLOWUP: crate::mm::Locked<alloc::string::String> =
     crate::mm::Locked::new(alloc::string::String::new());
 static CHAT_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether a chat turn is in flight. The scheduler consults this before
+/// enqueuing: a turn already owns the model, so a scheduled run must wait rather
+/// than interleave with it.
+pub fn chat_busy() -> bool {
+    CHAT_BUSY.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// True exactly while `run_tool_command` is on the stack, i.e. while a *model*
+/// chose the `/command` being dispatched rather than a human typing it.
+///
+/// This exists because `dispatch_system` is reached from both, and one of its
+/// commands — `/schedule` — records **who authorised** a standing intent. A
+/// Telegram DM enters the session as `Provenance::UserTyped`, so inferring
+/// "human" from session taint would let a DM-authored schedule act with
+/// typed-human authority forever. The distinction has to come from the call
+/// site, and this is the call site.
+static IN_TOOL_CALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn in_tool_call() -> bool {
+    IN_TOOL_CALL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The worst provenance resident in the live chat context, as a snapshot the
+/// tool path can read without a `&Session`.
+///
+/// Refreshed by `execute_chat_tool_inner` on every tool call, which is the only
+/// moment a `/command` can be reached from a model. Defaults to
+/// `UntrustedIngested` so an unset value is the *safe* reading, not the
+/// permissive one.
+static RESIDENT_TAINT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+
+pub(crate) fn set_resident_taint(p: crate::security::taint::Provenance) {
+    use crate::security::taint::Provenance as P;
+    let v = match p {
+        P::SystemTrusted => 0u8,
+        P::UserTyped => 1,
+        P::UntrustedIngested => 2,
+    };
+    RESIDENT_TAINT.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn resident_taint() -> crate::security::taint::Provenance {
+    use crate::security::taint::Provenance as P;
+    match RESIDENT_TAINT.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => P::SystemTrusted,
+        1 => P::UserTyped,
+        _ => P::UntrustedIngested,
+    }
+}
+
+/// Whether the current work is running with **no human at the console** — set
+/// around a scheduled fire.
+///
+/// The one thing it changes: an approval-requiring tool call must not block on
+/// `modal::confirm`, which spins on `console::read_byte()` waiting for somebody
+/// who is not there. Instead it is refused and a `Severity::Action` notification
+/// is posted, so the decision reaches the human on their next visit rather than
+/// hanging the REPL or being silently denied.
+static UNATTENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The label of the schedule currently firing, for the notification's action.
+static UNATTENDED_JOB: Locked<String> = Locked::new(String::new());
+
+pub fn unattended() -> bool {
+    UNATTENDED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_unattended(on: bool) {
+    UNATTENDED.store(on, core::sync::atomic::Ordering::Relaxed);
+    if !on {
+        UNATTENDED_JOB.with(|s| s.clear());
+    }
+}
+
+pub fn set_unattended_job(name: &str) {
+    UNATTENDED_JOB.with(|s| {
+        s.clear();
+        s.push_str(name);
+    });
+}
+
+pub fn unattended_job() -> String {
+    UNATTENDED_JOB.with(|s| s.clone())
+}
 
 /// Mark chat turn busy (for remote/local mid-turn key capture).
 pub(crate) fn set_chat_busy(on: bool) {
@@ -3271,6 +3373,64 @@ fn execute_chat_tool_inner(
                 ApprovalMode::Bypass | ApprovalMode::Plan => false,
             }
     };
+    // Keep the tool path's view of the live context taint current: `/schedule`
+    // reached as a tool needs it, and this is the only moment a model can get
+    // there. Cheap (one atomic store) and it cannot be forgotten at a call site.
+    set_resident_taint(crate::agent::orchestrator::to_taint(session.resident_max_taint()));
+
+    // **No human at the console — refuse rather than block.** `modal::confirm`
+    // spins on `console::read_byte()`, so asking here would hang the REPL until
+    // somebody happened to walk past; and denying silently would make a
+    // scheduled job that needs approval simply stop working with no explanation.
+    // So: refuse this call, record it in the audit log as `NeedsApproval` (the
+    // outcome already exists for exactly this state), and post the request as a
+    // notification the human finds on their next visit.
+    //
+    // This is the most interesting thing the notification queue carries: "the OS
+    // tried to do the thing you scheduled, could not, and is asking you" is a
+    // completion of the agentic loop that neither half of this feature could
+    // provide alone.
+    if needs_approval && unattended() {
+        let job = unattended_job();
+        let label_owned = label.clone();
+        crate::synapse::audit::record(
+            chat_tool_caller(),
+            "unattended_needs_approval",
+            crate::synapse::audit::fnv1a(label_owned.as_bytes()),
+            crate::synapse::audit::Outcome::NeedsApproval,
+            0,
+        );
+        let (title, action, key) = if job.is_empty() {
+            (
+                alloc::format!("{label_owned} needs your approval"),
+                String::from("/mode"),
+                alloc::format!("approve:{label_owned}"),
+            )
+        } else {
+            (
+                alloc::format!("{job}: {label_owned} needs your approval"),
+                alloc::format!("/schedule run {job}"),
+                alloc::format!("approve:{job}:{label_owned}"),
+            )
+        };
+        let source =
+            if job.is_empty() { String::from("kernel") } else { alloc::format!("schedule:{job}") };
+        crate::notify::post_action(
+            crate::notify::Severity::Action,
+            &source,
+            &title,
+            &alloc::format!(
+                "An unattended run wanted to call {label_owned}, which needs human approval.                  It was refused. Approve by re-running it while you are here."
+            ),
+            &action,
+            &key,
+        );
+        serial_println!("\x1b[33m[unattended: '{label_owned}' needs approval — refused, notification posted]\x1b[0m");
+        return String::from(
+            "Denied: this call needs human approval and the run is unattended (nobody is at the console).              A notification was posted. Do not retry it; finish without it and say what you could not do.",
+        );
+    }
+
     let human_confirmed = if needs_approval {
         // Name the *source*, not just the action. A human asked "approve this
         // delete?" can only answer from the operation; asked "approve this
@@ -6670,9 +6830,9 @@ fn delete_at(buf: &mut String, cur: &mut usize) {
 enum ReadOutcome {
     /// User pressed Enter (line is in `buf`).
     Submitted,
-    /// Inbound messaging-channel work is waiting — leave `buf` as the draft
-    /// and let the main loop drain the agent queue.
-    ChannelWake,
+    /// Background work is waiting — an inbound channel message or a committed
+    /// scheduled fire. Leave `buf` as the draft and let the main loop drain it.
+    Wake,
     /// A global hotkey was handled (e.g. Cmd+Space → Agents browser). Draft
     /// stays in `buf`; main loop applies any pending pick then re-prompts.
     Hotkey,
@@ -7247,11 +7407,16 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 // (drain only happens outside read_line — never block forever).
                 // Checked *before* sleeping, and re-checked on every wakeup, so a
                 // DM the pump's `msgchan::tick` queued while we slept is seen.
-                if crate::msgchan::inbound_len() > 0 {
+                // A scheduled fire is checked here for exactly the reason the
+                // DM case is: `schedule::tick` runs on the pump and only
+                // *enqueues*, so without this a schedule would do nothing at all
+                // while the prompt sat idle — which is most of the time, and is
+                // the whole situation a scheduler exists for.
+                if crate::msgchan::inbound_len() > 0 || crate::schedule::pending_len() > 0 {
                     #[cfg(not(test))]
                     crate::framebuffer::suggest_clear();
                     // Leave `buf` as the in-progress draft for the next prompt.
-                    return ReadOutcome::ChannelWake;
+                    return ReadOutcome::Wake;
                 }
                 // Sleep until something reports console input, instead of
                 // pumping the whole world from the prompt. The pumping still has
@@ -7903,8 +8068,15 @@ pub fn upkeep() {
     crate::service::supervise_tick();
     // External messaging channels (Telegram, …) — short non-blocking poll.
     crate::msgchan::tick();
+    // Scheduled runs: evaluate what is due and enqueue it. Never runs anything —
+    // the fire happens in the interactive loop's drain (see `schedule`'s module
+    // doc for why the split is load-bearing).
+    crate::schedule::tick();
     // Background agent jobs (run_shell_command background + monitor).
     crate::tools::bg::pump();
+    // Persist the notification ring at most every 30 s — see `notify::save_if_dirty`
+    // for why this is not a store write per post.
+    crate::notify::save_if_dirty();
     thinking_tick();
     // Mid-turn interjection: buffer non-cancel keystrokes into a follow-up queue.
     drain_followup_keys();

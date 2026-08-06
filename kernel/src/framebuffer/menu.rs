@@ -33,6 +33,8 @@ pub fn draw_status_menu(chip: StatusChip) {
             StatusChip::Battery => (30, 9),
             StatusChip::Kbd | StatusChip::Mouse => (28, 8),
             StatusChip::Brand => (28, 8),
+            // Wider and taller: it lists actual rows, not a couple of fields.
+            StatusChip::Notifications => (44, 12),
         };
         let bw = cols * cw + 2 * (BORDER + PAD);
         let bh = rows * ch + 2 * (BORDER + PAD);
@@ -91,6 +93,7 @@ pub fn draw_status_menu(chip: StatusChip) {
             StatusChip::Battery => "Battery",
             StatusChip::Volume => "Sound",
             StatusChip::Clock => "Clock",
+            StatusChip::Notifications => "Notifications",
         };
         let icon = match chip {
             StatusChip::Brand => crate::icons::fa::HOUSE,
@@ -104,6 +107,7 @@ pub fn draw_status_menu(chip: StatusChip) {
                 crate::icons::volume_icon(crate::sound::muted(), crate::sound::volume())
             }
             StatusChip::Clock => crate::icons::fa::CLOCK,
+            StatusChip::Notifications => crate::icons::fa::BELL,
         };
         sc.draw_str(
             ix,
@@ -166,6 +170,9 @@ pub fn draw_status_menu(chip: StatusChip) {
             }
             StatusChip::Mouse => {
                 y = draw_input_menu_body(sc, ix, y, ch, bg, false);
+            }
+            StatusChip::Notifications => {
+                y = draw_notify_menu_body(sc, ix, y, content_w, ch, cw, bg);
             }
             StatusChip::Brand => {
                 sc.draw_str(ix, y, "Click for About…", sc.theme.chat_fg, bg);
@@ -450,6 +457,60 @@ fn draw_battery_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb) ->
         sc.draw_str(ix, y, "(desktop / no ACPI pack)", sc.theme.title_dim, bg);
     }
     y + ch
+}
+
+/// The notification dropdown: the newest few entries at a glance.
+///
+/// A *glance*, deliberately — not a scrollable list. Anything longer than this
+/// belongs in the action pane (`/notify`), and building a second scrollable list
+/// widget in a popover would be a second thing to keep themed.
+fn draw_notify_menu_body(
+    sc: &Screen,
+    ix: u64,
+    mut y: u64,
+    content_w: u64,
+    ch: u64,
+    cw: u64,
+    bg: Rgb,
+) -> u64 {
+    let all = crate::notify::list();
+    let cols = (content_w / cw).max(1) as usize;
+    if all.is_empty() {
+        sc.draw_str(ix, y, "Nothing to report", sc.theme.title_dim, bg);
+        y += ch;
+        sc.draw_str(ix, y, "Shell: /notify", sc.theme.title_dim, bg);
+        return y + ch;
+    }
+    let unread = crate::notify::unread_count();
+    sc.draw_str(
+        ix,
+        y,
+        &alloc::format!("{} unread of {}", unread, all.len()),
+        sc.theme.accent,
+        bg,
+    );
+    y += ch;
+    let now = crate::clock::now_unix();
+    const SHOWN: usize = 6;
+    for n in all.iter().take(SHOWN) {
+        // `summary_line` is in `crate::notify` (which is testable) rather than
+        // here, so the row's fitting and truncation are covered by a unit test.
+        let row = crate::notify::summary_line(n, now, cols);
+        let fg = if n.read { sc.theme.title_dim } else { sc.theme.chat_fg };
+        sc.draw_str(ix, y, &row, fg, bg);
+        y += ch;
+    }
+    if all.len() > SHOWN {
+        sc.draw_str(
+            ix,
+            y,
+            &alloc::format!("… {} more — /notify", all.len() - SHOWN),
+            sc.theme.title_dim,
+            bg,
+        );
+        y += ch;
+    }
+    y + ch / 2
 }
 
 fn draw_input_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb, kbd: bool) -> u64 {
