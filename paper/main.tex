@@ -55,7 +55,7 @@
 \title{\textbf{The Determinism Boundary}\\[0.4em]
 \large An Operating-System Capability ABI for Agents as the Unit of Execution}
 
-\author{Vinoth Kumar\\ \small \texttt{Refold}}
+\author{Vinoth Kumar}
 
 % arXiv: avoid \today -- it makes the PDF differ on every rebuild.
 \date{30 July 2026}
@@ -757,11 +757,18 @@ it decides what to serve while native code parses and frames.
 QEMU monitor (\code{screendump}) rather than reconstructed from a terminal
 transcript. The chat pane on the left is the shell agent --- the orchestrator
 whose authority \S\ref{sec:cap} describes --- and the right pane is a live
-\code{/top}, showing the eight cores the SMP fleet is running on, the two tasks
-alive at that moment (the bootstrap task and the parked capability-owning
-orchestrator), and the kernel heap. Everything in the figure is one process
-image on bare metal: compositor, scheduler, network stack, and the inference
-engine that would occupy the ``Model'' slot on a model-loaded boot.}
+\code{/top}, showing the eight cores the SMP fleet is running on, the task table,
+and the kernel heap. The task list is worth reading: alongside the bootstrap task
+and the parked capability-owning orchestrator sit tasks named for \emph{ring-3
+tenants} (\code{tenant-selftest}, \code{imgdec}): userspace address spaces the
+kernel enters to run code that needs no authority at all, an image decoder being
+the case in the shot. They are outside this paper's scope --- the boundary it
+describes is about authority, and these are about privilege --- but they are the
+same instinct applied one layer down, and they are visible here because the figure
+is a real machine rather than a diagram. Everything in it is one process image on
+bare metal:
+compositor, scheduler, network stack, and the inference engine that would occupy
+the ``Model'' slot on a model-loaded boot.}
 \label{fig:system}
 \end{figure}
 
