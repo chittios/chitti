@@ -399,20 +399,19 @@ impl Screen {
         // top, so shade just those (cheap): a darker inner band nearest the box
         // fading to a fainter outer band — a soft web-style drop shadow.
         // Right side.
-        self.shade_rect(x + w, y + s, s, h, 0.35); // inner (darkest)
-        self.shade_rect(x + w + s, y + s, s, h, 0.60); // outer (fainter)
+        self.shade_rect(x + w, y + s, s, h, 0.28); // inner (darkest)
+        self.shade_rect(x + w + s, y + s, s, h, 0.52); // outer (fainter)
         // Bottom side.
-        self.shade_rect(x + s, y + h, w, s, 0.35);
-        self.shade_rect(x + s, y + h + s, w + s, s, 0.60);
+        self.shade_rect(x + s, y + h, w, s, 0.28);
+        self.shade_rect(x + s, y + h + s, w + s, s, 0.52);
         // Bottom-right corner, so the two bands meet cleanly.
-        self.shade_rect(x + w, y + h, s, s, 0.35);
+        self.shade_rect(x + w, y + h, s, s, 0.28);
     }
 
     /// Fill `(x,y,w,h)` with the pixels beneath it darkened toward black by
     /// `factor` (0 = black, 1 = unchanged) — a cheap translucent-shadow effect
     /// without an alpha channel. Reads + rewrites each pixel.
-    pub(super) fn shade_rect(&self, x: u64, y: u64, w: u64, h: u64, factor: f32) {
-        let x1 = (x + w).min(self.width);
+    pub(super) fn shade_rect(&self, x: u64, y: u64, w: u64, h: u64, factor: f32) {        let x1 = (x + w).min(self.width);
         let y1 = (y + h).min(self.height);
         for py in y..y1 {
             for px in x..x1 {
@@ -421,6 +420,13 @@ impl Screen {
                 self.put_pixel(px, py, (d(r), d(g), d(b)));
             }
         }
+    }
+
+    /// Blend a colour toward white by `t` (0 = unchanged, 1 = white) — the
+    /// crisp 1px inner highlight just inside an active border.
+    pub(super) fn lighten(&self, c: Rgb, t: f32) -> Rgb {
+        let d = |x: u8| (x as f32 + (255.0 - x as f32) * t) as u8;
+        (d(c.0), d(c.1), d(c.2))
     }
 
     /// Draw a `t`-thick rectangle outline (the pane border).

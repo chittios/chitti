@@ -32,10 +32,10 @@ const THEME_DEFAULTS: &[(&str, &str)] = &[
     ("logs_bg", "#141311"),
     ("chat_fg", "#faf9f5"),      // cream / on-dark
     ("logs_fg", "#a09d96"),      // on-dark-soft
-    ("border_dim", "#3a3733"),
+    ("border_dim", "#4c4943"),
     ("title_active", "#cc785c"),
     ("title_dim", "#6c6a64"),    // muted
-    ("sep_dim", "#2a2825"),
+    ("sep_dim", "#2e2c28"),
     ("status_bg", "#252320"),    // surface-dark-elevated — status bar fill
     ("status_fg", "#a09d96"),    // status bar text **and** FA icons
     ("editor_bg", "#1f1e1b"),
@@ -43,7 +43,7 @@ const THEME_DEFAULTS: &[(&str, &str)] = &[
     ("editor_lineno", "#6c6a64"),
     ("editor_sel", "#5a3a2e"),   // terracotta-tinted selection
     ("composer_bg", "#252320"),  // elevated input box (bordered)
-    ("composer_border", "#3a3733"),
+    ("composer_border", "#4c4943"),
     ("composer_hint", "#6c6a64"),
 ];
 

@@ -58,10 +58,10 @@ impl Theme {
         accent: (204, 120, 92),        // primary #cc785c
         logo: (204, 120, 92),          // matches accent unless ui.json overrides
         logo_node: (250, 249, 245),    // cream node
-        border_dim: (58, 55, 51),      // inactive border
+        border_dim: (76, 73, 66),      // inactive border — lifted for a crisp edge on dark bg
         title_active: (204, 120, 92),  // primary
         title_dim: (108, 106, 100),    // muted #6c6a64
-        sep_dim: (42, 40, 37),
+        sep_dim: (46, 44, 40),
         status_bg: (37, 35, 32),       // surface-dark-elevated #252320
         status_fg: (160, 157, 150),    // on-dark-soft — icons + status text
         editor_bg: (31, 30, 27),       // surface-dark-soft
@@ -69,7 +69,7 @@ impl Theme {
         editor_lineno: (108, 106, 100),
         editor_sel: (90, 58, 46),      // terracotta-tinted selection
         composer_bg: (37, 35, 32),     // elevated like status_bg
-        composer_border: (58, 55, 51), // matches border_dim when unfocused
+        composer_border: (76, 73, 66), // matches border_dim when unfocused
         composer_hint: (108, 106, 100), // muted
         tool_bg: (48, 47, 44),         // chat_bg lifted 8% toward the cream text
     };

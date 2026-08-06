@@ -874,6 +874,13 @@ impl Screen {
         let border = if active { self.theme.accent } else { self.theme.border_dim };
         let title_c = if active { self.theme.title_active } else { self.theme.title_dim };
         self.rect_outline(p.x, p.y, p.w, p.h, BORDER, border);
+        // Crisp raised edge on the focused pane: a lighter 1px line just inside
+        // the accent border (top + bottom) reads as a bezel, not a flat ring.
+        if active {
+            let hi = self.lighten(border, 0.35);
+            self.fill_rect(p.x + BORDER, p.y + BORDER, p.w - 2 * BORDER, 1, hi);
+            self.fill_rect(p.x + BORDER, p.y + p.h - BORDER - 1, p.w - 2 * BORDER, 1, hi);
+        }
         // Title, just inside the top border — ellipsize so a long path never
         // paints into the close button / pane edge.
         let ty = p.y + BORDER + 4;
