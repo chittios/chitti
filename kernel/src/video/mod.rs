@@ -368,6 +368,11 @@ pub struct StreamDecoder {
     /// Raw SPS/PPS NALs (with header) for re-initialising rust_h264 on seek.
     avcc_sps: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     avcc_pps: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    /// Raw VPS/SPS/PPS NALs for re-initialising the HEVC decoder on a
+    /// backward seek (same role as `avcc_*` for H.264).
+    hevc_vps: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    hevc_sps: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    hevc_pps: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     /// Which backend is active (for status / debugging).
     pub backend: &'static str,
 }
@@ -580,6 +585,9 @@ impl StreamDecoder {
             display_edge: DISPLAY_MAX_EDGE,
             avcc_sps: avcc.sps,
             avcc_pps: avcc.pps,
+            hevc_vps: Vec::new(),
+            hevc_sps: Vec::new(),
+            hevc_pps: Vec::new(),
             backend,
         })
     }
@@ -624,6 +632,9 @@ impl StreamDecoder {
             display_edge: DISPLAY_MAX_EDGE,
             avcc_sps: Vec::new(),
             avcc_pps: Vec::new(),
+            hevc_vps: Vec::new(),
+            hevc_sps: Vec::new(),
+            hevc_pps: Vec::new(),
             backend: "vp9",
         })
     }
@@ -680,6 +691,9 @@ impl StreamDecoder {
             display_edge: DISPLAY_MAX_EDGE,
             avcc_sps: Vec::new(),
             avcc_pps: Vec::new(),
+            hevc_vps: hvcc.vps,
+            hevc_sps: hvcc.sps,
+            hevc_pps: hvcc.pps,
             backend: "hevc",
         })
     }
@@ -898,6 +912,40 @@ impl StreamDecoder {
         }
     }
 
+    /// Ensure the HEVC picture for decode sample `si` is in `pending`.
+    ///
+    /// HEVC's DPB holds up to `max_num_reorder_pics` decoded pictures before
+    /// the lowest-POC one is released, so the sample that *coded* `si` is not
+    /// the sample that *releases* it. Feed further AUs until it appears; at
+    /// the end of the track, flush the reorder buffer.
+    fn ensure_hevc_frame(&mut self, si: usize) {
+        loop {
+            let has = matches!(
+                &self.engine,
+                Engine::Hevc { pending, .. } if pending.contains_key(&si)
+            );
+            if has {
+                return;
+            }
+            if self.next < self.samples.len() {
+                if self.decode_one().is_err() {
+                    return;
+                }
+                continue;
+            }
+            // EOS: drain whatever the DPB is still holding.
+            if let Engine::Hevc { dec, pending, next_out } = &mut self.engine {
+                for f in dec.flush() {
+                    if *next_out < self.display.len() {
+                        pending.insert(self.display[*next_out], f);
+                        *next_out += 1;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     /// True if decode sample `si` can be skipped entirely without corrupting
     /// later pictures: every slice NAL in it is **non-reference**
     /// (`nal_ref_idc == 0`) — nothing else predicts from it.
@@ -950,6 +998,9 @@ impl StreamDecoder {
         ) || matches!(
             &self.engine,
             Engine::RustH264 { pending, .. } if pending.contains_key(&target)
+        ) || matches!(
+            &self.engine,
+            Engine::Hevc { pending, .. } if pending.contains_key(&target)
         );
         if target + 1 < self.next && !cached {
             // Rewind to the latest keyframe ≤ target and reset decode state.
@@ -961,6 +1012,13 @@ impl StreamDecoder {
             match &mut self.engine {
                 Engine::Hevc { dec, pending, next_out } => {
                     *dec = hevc::decoder::HevcDecoder::new();
+                    // A bare `new()` has no parameter sets — re-feed the ones
+                    // we kept from `hvcC` or every post-seek AU fails closed.
+                    let _ = dec.set_parameter_sets(
+                        &self.hevc_vps,
+                        &self.hevc_sps,
+                        &self.hevc_pps,
+                    );
                     pending.clear();
                     *next_out = 0;
                 }
@@ -1019,6 +1077,15 @@ impl StreamDecoder {
         // rust_h264 holds the last picture until the next AU or flush.
         if matches!(self.engine, Engine::RustH264 { .. }) {
             self.ensure_rust_h264_frame(target);
+        }
+        // HEVC holds up to `sps_max_num_reorder_pics` pictures before the
+        // lowest-POC one is released (Main B-pyramid is typically 2). Feeding
+        // only through `target` therefore leaves `pending` empty for the first
+        // couple of samples — open shows nothing and the player freezes on
+        // frame 0. Keep decoding past the target until it appears, then flush
+        // at EOS for the tail of the reorder buffer.
+        if matches!(self.engine, Engine::Hevc { .. }) {
+            self.ensure_hevc_frame(target);
         }
         let pts = self.pts_ms(idx);
         let edge = self.display_edge;
