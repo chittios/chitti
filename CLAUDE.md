@@ -2454,6 +2454,125 @@ scenario (drive raw `b"\x03"` via `guest.send_raw`, assert it aborts fast **and*
 the next command still runs) and a unit test on the pure poll logic
 (`poll_interrupt_ctrl_c_only_and_pushes_back`, `console::pushback_*`).
 
+**There is exactly one documented exception: the login gate**
+(`auth::prompt::gate`). A gate you can Ctrl+C out of is not a gate. Ctrl+C and Esc
+stay *responsive* there — they clear the typed field and repaint, so the key is
+never dead — but neither returns from the loop. Do not "fix" it.
+
+## STANDING RULE — human-only commands are absent from `dispatch_system`, not guarded inside it
+
+`/passwd` and `/lock` (`kernel/src/shell/auth.rs`, [`crate::auth`]) are matched in
+the **interactive-only** arm of the REPL, above the `dispatch_system`
+fall-through, and must never move into `dispatch_system`. This is the security
+property, not a filing decision:
+
+- **`run_shell_command` needs no registry entry.** `tools/shell_cmd.rs` passes any
+  `[A-Za-z0-9_-]+` token straight to `dispatch_system`, registered `ToolDef` or
+  not — and it is in `CORE_TOOLS` and the orchestrator manifest. So the moment a
+  human-only command gains a `dispatch_system` arm, **every agent can call it**,
+  with no capability and no manifest change.
+- **There is no `Right::Shell` and no `CapDomain::Shell`.** Shell commands are not
+  capability-gated at all, so "don't grant the capability" was never available.
+- **`dispatch_system` has exactly one agent-reachable call site**
+  (`run_tool_command`), and *everything* funnels through it — `run_shell_command`,
+  `tools::bg::pump`, the `ToolBinding::Shell` executor, scheduled `Action::Command`
+  fires, Telegram-driven turns, package-UI apps and sub-agents. The last two call
+  `Router::call` directly and **skip `tool_in_chat_toolset` entirely**, so a
+  manifest toolset is not a boundary either. Being absent from `dispatch_system`
+  closes all of them at once, by construction.
+
+The `in_tool_call()` refusals inside those handlers are defence in depth. Keep
+them, and note that **taint cannot answer this question**: a Telegram DM enters
+the session as `Provenance::UserTyped`, so `UserTyped` does not mean "a human at
+this console". `in_tool_call()` is the only signal that does — and it is a **depth
+counter**, not a flag, because `bg::pump` calls `run_tool_command` from inside
+`upkeep()`, which long-running commands call, so a nested call's exit used to
+clear the marker while the outer dispatch was still running (that bug also
+affected `/screenshot` and `/record`). Pinned by
+`passwd_and_lock_are_unreachable_from_the_tool_surface` and
+`in_tool_call_survives_a_nested_run_tool_command`.
+
+`catalog::RESERVED_HUMAN_ONLY` carries the names so `/schedule add … command
+passwd` is refused at creation (a fire has no human at the keyboard, so it could
+only ever fail — silently, at 3am) and no package manifest can claim one as a
+`command_hooks` name.
+
+## STANDING RULE — key material comes from `security::rng`, never `arch::hw_rand()`
+
+`arch::hw_rand()` returns **0** when `RDRAND`/`RNDR` is absent — which is every
+QEMU and HVF default CPU model, i.e. every machine we develop and test on. A
+caller that fills a buffer straight from it produces **all zeros** on exactly the
+machines the tests run on, and real entropy only on hardware nobody tests against.
+`block::volcrypto::fill_random` did precisely that, so every C4VE volume formatted
+under QEMU had an all-zero salt and an all-zero master key — invisible, because an
+all-zero key encrypts, decrypts, mounts and accepts its passphrase perfectly.
+
+Use `security::rng::fill_random` / `seed_rng` (ChaCha20 over hardware words *plus*
+cycle-counter jitter across yields). It cannot degrade to zeros: the diffuser folds
+the cycle counter in unconditionally, which
+`entropy_survives_a_dead_hardware_rng` pins with `hw = 0` — the companion
+"not all zeros" test alone passes under `-cpu max` even with the bug present.
+`net::tls::seed_rng` is a re-export of the same function, so there is one
+implementation. NB it yields, so it must not be called with a `Locked` held.
+
+## The login gate (`kernel/src/auth/`)
+
+Single-user, fixed user `chitti`, independent of the volume passphrase. Boot gate
+(in `shell::run`, after the theme/fonts/display/panes are applied so it looks like
+this OS, and **before** the session resume, which prints the previous session's id
+and message count — disclosure before authentication), `/lock`, idle auto-lock,
+and re-auth on resume from suspend. Pure logic in `auth/mod.rs`; the blocking
+screen is `auth/prompt.rs`, `#[cfg(not(test))]` with a **deny-by-default** stub.
+
+Six things worth knowing before touching it:
+
+- **No record = no gate, anywhere.** One state, one `fs::exists`. That is also why
+  the e2e harness needs no bypass flag: its guests run on a memfs store where
+  nothing can ever have been enrolled, so every existing scenario is untouched.
+- **The gate mirrors to serial and must keep doing so.** `modal::input` renders
+  *only* to the framebuffer, so a modal-based gate is invisible to
+  `-serial mon:stdio` and to the whole e2e harness — a machine that has silently
+  stopped responding. It also returns `""` on Esc, which for an auth prompt is an
+  empty password attempt, not a cancel. Hence its own loop.
+- **It pumps `status_tick()`, not `upkeep()`, and that is load-bearing.** Besides
+  the usual "a modal consumes its own clicks" reason, the shell task stays
+  *runnable* throughout, so the scheduler never reaches the idle pump task — the
+  only caller of `upkeep()` — so `msgchan::tick`, `schedule::tick`,
+  `service::supervise_tick` and `tools::bg::pump` do not fire behind the lock
+  screen. A Telegram DM cannot drive an agent turn while the console is locked.
+  Swapping in `upkeep()` looks like a harmless cleanup and silently opens that door.
+- **The credential record is protected by two layers, and the second is the one
+  that enforces it.** The Synapse executor denies `/configs/core/auth.json` for
+  read *and* write/edit/delete (layered inside Gate 4 — `GATE_COUNT` stays 4, the
+  paper's published contract), which is the correct statement of the policy. But
+  `/cat`, `/rm`, `/cp`, `/mv`, `/touch`, `/grep` and `/glob` are `ToolBinding::Shell`
+  tools that reach `synapse::fs` **directly and never enter the executor**, so the
+  refusal that actually holds is the `CredentialAccess` guard in the store facade.
+  `synapse::fs::list` filters the record out, which covers `MEM_FS_LIST`,
+  `MEM_FS_SEARCH` and `Router::readable_paths` (glob/grep/list_dir) in one place —
+  and makes `rm -r` of an ancestor skip it by construction.
+- **The idle timestamp already exists twice and covers everything.**
+  `console::read_byte` stamps in the *merged* reader (serial, PS/2, xHCI/HID,
+  virtio-keyboard, PL011) and `mouse::activity_ms()` is the pointer half. Do not
+  add a third, and never call `mouse::tick()` to read it — that is a *consuming*
+  poll that would steal the caller's clicks. The check is polled **only** in
+  `read_line`'s idle arm, because "idle" means idle *at the prompt*: it must not
+  fire mid-`/http`, mid-inference or mid-video.
+- **Resume auth goes at the end of `power::resume_devices()`**, after the i8042 is
+  re-initialised and interrupts are unmasked — the controller comes back with its
+  configuration byte reset, so a prompt placed earlier has no keyboard and the
+  machine looks hung rather than locked. There rather than in `run_suspend` so
+  every resume path locks, including a future lid-close handler.
+
+Honest limits, stated in the module doc and in `/passwd`'s own output rather than
+discovered: on an **unencrypted** disk the gate is bypassable offline in minutes
+(mount elsewhere, delete the record) — it is a *console* lock, not
+confidentiality, and `/encrypt` is what protects the data; on a memfs store it
+does not persist; PBKDF2-HMAC-SHA256 is GPU-friendly (the `kdf` field exists so a
+future argon2 is a migration); passwords are printable ASCII only, enforced at
+enrolment because both input paths are; a reboot resets the backoff; and there is
+no recovery path.
+
 ## Build / run / test
 
 Everything goes through `cargo xtask`. Arch is chosen explicitly, never

@@ -788,6 +788,217 @@ def s_suspend_resume(_g):
         g.close()
 
 
+def s_login_resume(_g):
+    """A machine with a login password resumes from S3 **into the lock screen**.
+
+    Shares `s_suspend_resume`'s shape and its constraints: ACPI S3 is x86, and it
+    boots its own guest because a suspend that does not resume leaves the VM
+    unusable.
+
+    What this proves that a unit test cannot: the gate is reachable from
+    `power::resume_devices`, and it runs *after* the i8042 has been re-initialised
+    — the controller comes back with its configuration byte reset, so a prompt
+    placed earlier in that function would have no working keyboard and the machine
+    would look hung rather than locked.
+    """
+    if RUN_ARCH != "x86_64":
+        return None, f"skipped (ACPI S3 is x86; arch={RUN_ARCH})"
+    PW = "resume-lock-pass"
+    g = boot_guest("x86_64", "qwen3.5-0.8b", RUN_VERBOSE, "off", None, no_model=True,
+                   attempts=1, ready_timeout=600)
+    if g is None:
+        return None, "skipped (x86_64 guest would not boot)"
+    try:
+        m = g.mark()
+        g.send("/suspend plan")
+        if not g.wait_for("suspend>", 60, m):
+            return None, "skipped (/suspend plan printed nothing)"
+        plan = g.text()[m:]
+        if "NOT ready" in plan or "cannot suspend" in plan:
+            return None, "skipped (guest reports it cannot suspend)"
+
+        m = g.mark()
+        g.send(f"/passwd set --new {PW} --yes")
+        if not g.wait_for("passwd> password set", 90, m):
+            return False, "could not enrol a password"
+
+        m = g.mark()
+        g.send("/suspend now --yes")
+        if not g.wait_for("entering S3", 90, m):
+            return False, "guest never reported entering S3"
+
+        time.sleep(4)
+        wm = g.mark()
+        g.send_raw(b"\x01c")
+        time.sleep(0.8)
+        g.send_raw(b"system_wakeup\n")
+        time.sleep(1.0)
+        g.send_raw(b"\x01c")
+        if not g.wait_for("chitti login: locked (resume)", 120, wm):
+            return False, "resumed without locking the console"
+
+        # Still locked: a command typed at the gate is a password attempt.
+        m = g.mark()
+        g.send("/info")
+        if g.wait_for("RAM installed", 12, m):
+            return False, "the shell ran a command while the resumed console was locked"
+
+        m = g.mark()
+        g.send(PW)
+        if not g.wait_for("login> unlocked", 90, m):
+            return False, "the password did not unlock the resumed console"
+        m = g.mark()
+        g.send("/info")
+        if not g.wait_for("RAM installed", 60, m):
+            return False, "unlocked but the shell did not answer"
+        m = g.mark()
+        g.send("/passwd clear --yes")
+        g.wait_for("passwd> password cleared", 30, m)
+        return True, "resumed from S3 into the lock screen, password unlocked it"
+    finally:
+        g.close()
+
+
+def s_login_lock(_g):
+    """Enrol a login password, lock the console, and get back in.
+
+    Boots its own guest. A login gate that goes wrong leaves a machine nobody can
+    type into, and that must not take the shared guest down with it.
+
+    This is the only way the auth path is testable end to end here: the harness
+    has no durable store, so persistence across a reboot cannot be exercised, and
+    a real idle timeout is minutes of wall clock. `/lock` reaches exactly the same
+    gate by a different door, inside one boot.
+
+    `/passwd set` takes `--new` because a framebuffer modal is invisible over
+    serial — the same escape hatch `/suspend now --yes` and `/agents install
+    --yes` already use.
+    """
+    PW = "e2e-login-pass"
+    g = boot_guest(RUN_ARCH, "qwen3.5-0.8b", RUN_VERBOSE, "off", None, no_model=True,
+                   attempts=1, ready_timeout=600)
+    if g is None:
+        return None, f"skipped ({RUN_ARCH} guest would not boot)"
+    try:
+        # Nothing enrolled: the machine must not have asked for anything at boot,
+        # which is what keeps every other scenario working with no bypass flag.
+        m = g.mark()
+        g.send("/passwd status")
+        if not g.wait_for("passwd> not set", 30, m):
+            return False, "/passwd status did not report an unset password"
+
+        # Enrolling on the harness's memfs store must warn that it will not last.
+        m = g.mark()
+        g.send(f"/passwd set --new {PW} --yes")
+        if not g.wait_for("passwd> password set", 90, m):
+            return False, "/passwd set did not confirm"
+        if "will NOT survive a reboot" not in g.text()[m:]:
+            return False, "no durability warning on a memfs store"
+
+        # Lock, and check the banner names *why* — four causes, one message each.
+        m = g.mark()
+        g.send("/lock")
+        if not g.wait_for("chitti login: locked (manual)", 30, m):
+            return False, "no lock banner"
+        if not g.wait_for("password:", 15, m):
+            return False, "the gate never prompted"
+
+        # A wrong password is refused and does not let go of the console.
+        m = g.mark()
+        g.send("wrong-one")
+        if not g.wait_for("login> incorrect password", 30, m):
+            return False, "a wrong password was not refused"
+
+        # Proof the gate is still holding: a command typed at it must be eaten as
+        # a password attempt, not run. If `/info` answered here, the lock is a
+        # decoration.
+        m = g.mark()
+        g.send("/info")
+        if g.wait_for("RAM installed", 12, m):
+            return False, "the shell ran a command while the console was locked"
+
+        m = g.mark()
+        g.send(PW)
+        if not g.wait_for("login> unlocked", 60, m):
+            return False, "the correct password did not unlock"
+
+        # And the shell really came back.
+        m = g.mark()
+        g.send("/info")
+        if not g.wait_for("RAM installed", 60, m):
+            return False, "unlocked but the shell did not answer afterwards"
+
+        # Auto-lock is configurable, and clearing really disables the gate.
+        m = g.mark()
+        g.send("/passwd idle 0")
+        if not g.wait_for("passwd> auto-lock disabled", 30, m):
+            return False, "/passwd idle 0 did not disable auto-lock"
+
+        m = g.mark()
+        g.send("/passwd clear --yes")
+        if not g.wait_for("passwd> password cleared", 30, m):
+            return False, "/passwd clear did not confirm"
+        m = g.mark()
+        g.send("/lock")
+        if not g.wait_for("lock> no password set", 30, m):
+            return False, "/lock still armed after the password was cleared"
+        return True, "enrolled, locked, refused a wrong password, unlocked, cleared"
+    finally:
+        g.close()
+
+
+def s_login_deny_path(g):
+    """The credential record is unreachable from the filesystem on a running OS.
+
+    This is the half that needs a booted kernel: `/cat`, `/rm`, `/glob` and
+    `/grep` are shell-bound commands that reach the store *directly*, never
+    entering the Synapse executor, so the executor's Gate-4 deny does not cover
+    them — the guard in the store facade does, and only a real store exercises it.
+
+    The other half of the property — that `/passwd` and `/lock` are absent from
+    `dispatch_system`, so `run_shell_command` cannot reach them — is asserted in
+    `passwd_and_lock_are_unreachable_from_the_tool_surface`, because there is no
+    `/tool` command to drive the tool path from here (same reason
+    `s_skills_bundled` defers its equivalent assertion to a unit test).
+    """
+    PW = "deny-path-pass"
+    m = g.mark()
+    g.send(f"/passwd set --new {PW} --yes")
+    if not g.wait_for("passwd> password set", 90, m):
+        return False, "could not enrol a password to test against"
+    try:
+        # The record itself: not readable by any file command, and not removable.
+        for cmd in ("/cat /configs/core/auth.json",
+                    "/rm /configs/core/auth.json",
+                    "/glob /configs/core/*",
+                    "/grep pbkdf2 /configs/core"):
+            m = g.mark()
+            g.send(cmd)
+            time.sleep(1.5)
+            out = g.text()[m:]
+            if "pbkdf2-hmac-sha256" in out or '"salt"' in out:
+                return False, f"{cmd} leaked the credential record: {out.strip()[:200]}"
+
+        # Whatever those did, the password is still enrolled.
+        m = g.mark()
+        g.send("/passwd status")
+        if not g.wait_for("passwd> kdf:", 30, m):
+            return False, "the credential record was destroyed by a file command"
+
+        # A scheduled run is the other way automation could reach a human-only
+        # command, and it is refused at creation rather than left to fail forever
+        # at 3am with nobody watching.
+        m = g.mark()
+        g.send("/schedule add nightly every 1h command passwd clear")
+        if not g.wait_for("requires a human at the console", 30, m):
+            return False, "/schedule accepted a job that runs /passwd"
+        return True, "record unreadable and unremovable; /passwd cannot be scheduled"
+    finally:
+        m = g.mark()
+        g.send("/passwd clear --yes")
+        g.wait_for("passwd> password cleared", 30, m)
+
+
 def s_power_button(_g):
     """Press the machine's power button for real and assert a clean shutdown.
 
@@ -4029,6 +4240,9 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("battery", s_battery),
     ("power_button", s_power_button),
     ("suspend_resume", s_suspend_resume),
+    ("login_lock", s_login_lock),
+    ("login_deny_path", s_login_deny_path),
+    ("login_resume", s_login_resume),
     ("skills_bundled", s_skills_bundled),
     ("plan_mode_and_permissions", s_plan_mode_and_permissions),
     ("todos_pane", s_todos_pane),
