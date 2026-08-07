@@ -1097,6 +1097,57 @@ def s_browse(g):
     return ok, "rendered harness HTML (title E2E Browser)" if ok else "browse did not report title"
 
 
+def s_heap_ab(g):
+    """`/heap` — the switchable allocator, and the A/B that justifies it.
+
+    The size-class front end is off by default, so the thing worth asserting is
+    not that it is faster (a timing assertion in an e2e is a flake) but that
+    **both modes serve memory and the switch survives live allocations**: the
+    class lists are populated while the mode is on, and turning it off has to
+    keep those blocks reachable rather than stranding them. The bench prints
+    both rows, so the scenario also pins that the two are measured with the
+    same denominator — the bug that made the class mode report 8 allocations
+    for a 40,000-allocation workload and so a meaningless steps/alloc.
+    """
+    m = g.mark()
+    g.send("/heap")
+    if not g.wait_for("first-fit", 20, m):
+        return False, "/heap did not report the default mode"
+
+    # Switch on, do real allocating work, switch back.
+    for cmd, want in [("/heap sizeclass", "class lists"), ("/heap firstfit", "address-ordered")]:
+        m = g.mark()
+        g.send(cmd)
+        if not g.wait_for(want, 20, m):
+            return False, f"{cmd} did not confirm the switch"
+        m = g.mark()
+        g.send("/ls /samples")
+        if not g.wait_for("~ >", 20, m):
+            return False, f"the shell stopped working after {cmd}"
+
+    m = g.mark()
+    g.send("/heap bench 5000")
+    if not g.wait_for("mode restored", 180, m):
+        return False, "/heap bench did not finish"
+    out = g.since(m)
+    rows = [l for l in out.splitlines() if "first-fit" in l or "size-class" in l]
+    if len(rows) < 2:
+        return False, f"bench printed {len(rows)} mode row(s), expected 2"
+    # Same workload -> same allocation count in both modes, within a hair.
+    counts = []
+    for r in rows:
+        parts = r.replace("heap>", "").split()
+        for p in parts:
+            if p.isdigit() and int(p) > 100:
+                counts.append(int(p))
+                break
+    if len(counts) == 2 and max(counts) > min(counts) * 1.05:
+        return False, f"modes ran different workloads: {counts} allocations"
+    if "SUSPECT" in out:
+        return False, "bench reported a zero-length batch"
+    return True, f"both modes served the workload ({counts} allocs), switch is live"
+
+
 def s_browse_runaway(g):
     """A page whose script never returns must not take the machine with it.
 
@@ -2943,12 +2994,22 @@ def s_keyboard_shortcuts(g):
         if "PrtSc" not in g.since(m):
             return False, "the screenshot shortcut is not listed in /shortcuts"
 
-        # The keymap really produces those sequences, on every layout.
+        # The keymap really produces those sequences, on every layout — the
+        # function-key forms **and** the Mac chords, which exist because an Apple
+        # keyboard has no Print Screen key and needs Fn for a bare F-key.
         for cmd, want in [
             ("/keyboard test us f1", "U+001B U+005B U+0031 U+0031 U+007E"),
             ("/keyboard test us f12", "U+001B U+005B U+0032 U+0034 U+007E"),
             ("/keyboard test us prtsc", "U+001B U+005B U+0032 U+0034 U+007E"),
             ("/keyboard test de f1", "U+001B U+005B U+0031 U+0031 U+007E"),
+            # Cmd+/ and Ctrl+/ -> help; Cmd+Shift+3 and Ctrl+Shift+3 -> screenshot.
+            ("/keyboard test us cmd+/", "U+001B U+005B U+0068"),
+            ("/keyboard test us ctrl+/", "U+001B U+005B U+0068"),
+            ("/keyboard test us cmd+shift+3", "U+001B U+005B U+0073"),
+            ("/keyboard test us ctrl+shift+3", "U+001B U+005B U+0073"),
+            # The chords must not eat the characters they are built on.
+            ("/keyboard test us /", "U+002F"),
+            ("/keyboard test us shift+3", "U+0023"),
         ]:
             g.wait_quiet(0.3, 10)
             m = g.mark()
@@ -2991,7 +3052,26 @@ def s_keyboard_shortcuts(g):
         g.send("/pwd")
         if not g.wait_for("/home/chitti", 10, m):
             return False, "the shell did not survive the help shortcut"
-        return True, "F1 opens help, F12/PrtSc captures, both mid-line, draft intact"
+
+        # The Mac chord forms reach the same handlers. These are the ones that
+        # matter on an Apple keyboard, where the F-key forms need Fn.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send_raw(b"\x1b[s")          # Cmd+Shift+3 / Ctrl+Shift+3
+        if not g.wait_for("screenshot>", 30, m):
+            return False, "the Cmd+Shift+3 chord did not take a screenshot"
+        g.wait_quiet(0.5, 20)
+        m = g.mark()
+        g.send_raw(b"\x1b[h")          # Cmd+/ / Ctrl+/
+        if not g.wait_for("help>", 15, m) and not g.wait_for("Chitti commands:", 5, m):
+            return False, "the Cmd+/ chord did not open help"
+        g.send_raw(b"\x1b")
+        g.wait_quiet(0.5, 10)
+        m = g.mark()
+        g.send("/pwd")
+        if not g.wait_for("/home/chitti", 10, m):
+            return False, "the shell did not survive the chord shortcuts"
+        return True, "F1/F12/PrtSc and the Cmd chords, mid-line, draft intact"
     except Exception as e:
         return False, f"exception: {e}"
 
@@ -3663,6 +3743,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("git", s_git),
     ("install_plan", s_install_plan),
     ("synapse_bench", s_synapse_bench),
+    ("heap_ab", s_heap_ab),
     ("redteam", s_redteam),
     ("battery", s_battery),
     ("power_button", s_power_button),

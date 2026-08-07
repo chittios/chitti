@@ -363,6 +363,29 @@ fn nav_sequence(u: Usage, mods: Mods) -> Option<&'static str> {
         // Cmd/Super+Space (or Ctrl+Space, since a macOS host usually eats
         // ⌘+Space for Spotlight first) opens the Agents browser.
         0x2c if mods.has(Mods::GUI) || mods.has(Mods::CTRL) => "\x1b[g",
+        // **Chords for the two global shortcuts, because a Mac keyboard cannot
+        // reach the F-key forms without help.** An Apple keyboard has no Print
+        // Screen key at all, and sends the *consumer-page* brightness/volume
+        // usage for a bare F1/F12 — ChittiOS reads only the boot-keyboard page,
+        // so it sees nothing unless Fn is held. Under QEMU on macOS the window
+        // server often eats those keys first as well.
+        //
+        // Both are bound on **Cmd and Ctrl**, which is the same belt-and-braces
+        // the Agents browser above uses and for the same reason: the natural
+        // chord is the one fingers know, and the Ctrl form is the one that
+        // survives a host that steals it.
+        //
+        // `Cmd+/` (usage 0x38) for help — what Slack, GitHub and half the web
+        // use for "show shortcuts", and not a macOS system shortcut.
+        0x38 if mods.has(Mods::GUI) || mods.has(Mods::CTRL) => "\x1b[h",
+        // `Cmd+Shift+3` (usage 0x20 = the digit 3) for screenshot — macOS's own
+        // screenshot chord, so it needs no learning. NB macOS *does* take this
+        // one system-wide, so inside a QEMU window the host will grab it and
+        // `Ctrl+Shift+3` is the form that reaches the guest; on real hardware
+        // (an m1n1 boot) there is no host to intervene and ⌘⇧3 works directly.
+        0x20 if mods.has(Mods::SHIFT) && (mods.has(Mods::GUI) || mods.has(Mods::CTRL)) => {
+            "\x1b[s"
+        }
         _ => return None,
     })
 }
@@ -1146,6 +1169,34 @@ mod tests {
         // Plain Tab and Space are still characters.
         assert_eq!(tr(us, 0x2b, 0), "\t");
         assert_eq!(tr(us, 0x2c, 0), " ");
+    }
+
+    /// The two global shortcuts must be reachable without Fn, because an Apple
+    /// keyboard has no Print Screen key and sends media usages for bare F-keys.
+    #[test_case]
+    fn the_global_shortcuts_have_chords_that_need_no_function_key() {
+        let us = &layouts::US;
+        // Help: Cmd+/ and Ctrl+/.
+        assert_eq!(tr(us, 0x38, Mods::GUI), "\x1b[h", "Cmd+/");
+        assert_eq!(tr(us, 0x38, Mods::CTRL), "\x1b[h", "Ctrl+/");
+        // Screenshot: Cmd+Shift+3 and Ctrl+Shift+3.
+        assert_eq!(tr(us, 0x20, Mods::GUI | Mods::SHIFT), "\x1b[s", "Cmd+Shift+3");
+        assert_eq!(tr(us, 0x20, Mods::CTRL | Mods::SHIFT), "\x1b[s", "Ctrl+Shift+3");
+
+        // And the chords must not eat the ordinary characters they are built on.
+        assert_eq!(tr(us, 0x38, 0), "/", "a bare slash is still a slash");
+        assert_eq!(tr(us, 0x38, Mods::SHIFT), "?");
+        assert_eq!(tr(us, 0x20, 0), "3");
+        assert_eq!(tr(us, 0x20, Mods::SHIFT), "#", "Shift+3 is still a hash");
+        // Cmd+3 without Shift is not the screenshot chord.
+        assert_eq!(tr(us, 0x20, Mods::GUI), "3");
+
+        // They follow the *layout*, so on a layout where `/` sits elsewhere the
+        // chord moves with it rather than staying at the US position.
+        let fr = layouts::LAYOUTS.iter().find(|l| l.id == "fr").unwrap();
+        // French puts `!` on the US `/` key and `:` on the US `.` key; the chord
+        // is positional, which is what a keyboard shortcut should be.
+        assert_eq!(tr(fr, 0x38, Mods::CTRL), "\x1b[h", "the chord is positional");
     }
 
     /// F-keys produced **nothing** on every transport before the keymap existed,

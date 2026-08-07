@@ -710,6 +710,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "wifi" => wifi_cmd(arg),
         "tls" => tls_cmd(arg),
         "decoder" => decoder_cmd(arg),
+        "heap" => heap_cmd(arg),
         "js" => run_js(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
@@ -934,6 +935,92 @@ fn decoder_cmd(arg: &str) {
             serial_println!("decoder> images now decode IN THE KERNEL -- a malformed file is a kernel parser bug away from halting the machine");
         }
         _ => serial_println!("decoder> usage: /decoder [status] | /decoder ring3|kernel"),
+    }
+}
+
+/// `/heap` — which small-block allocator is in use, and what it costs.
+///
+/// The `/decoder ring3|kernel` pattern: the incumbent (first-fit) stays the
+/// default, the challenger (size classes) is switchable, and `bench` runs the
+/// same workload through both so the choice is made on a measurement rather
+/// than on the expectation that segregated lists must be faster.
+fn heap_cmd(arg: &str) {
+    use crate::mm::heap::{self, HeapMode};
+
+    let arg = arg.trim();
+    match arg {
+        "" | "status" => {
+            let (allocs, steps) = heap::alloc_stats();
+            let (blocks, bytes) = heap::class_stats();
+            let per = if allocs == 0 { 0.0 } else { steps as f32 / allocs as f32 };
+            let which = match heap::heap_mode() {
+                HeapMode::FirstFit => "first-fit (one address-ordered list, coalescing)",
+                HeapMode::SizeClass => "size-class (segregated lists <= 2 KiB, O(1) hit)",
+            };
+            serial_println!("heap> small allocations served by {which}");
+            serial_println!(
+                "heap>   {allocs} alloc(s), {steps} free-list step(s) -- {per:.1} per alloc"
+            );
+            serial_println!("heap>   {blocks} block(s) / {bytes} B parked in class lists");
+            serial_println!("heap>   /heap firstfit|sizeclass | /heap bench [rounds]");
+        }
+        "firstfit" | "first-fit" | "off" => {
+            heap::set_heap_mode(HeapMode::FirstFit);
+            serial_println!("heap> small allocations now go to the address-ordered list");
+        }
+        "sizeclass" | "size-class" | "classes" | "on" => {
+            heap::set_heap_mode(HeapMode::SizeClass);
+            serial_println!("heap> small allocations now come from segregated class lists");
+        }
+        _ if arg == "bench" || arg.starts_with("bench ") => {
+            let rounds = arg
+                .strip_prefix("bench")
+                .and_then(|r| r.trim().parse::<usize>().ok())
+                .unwrap_or(20_000)
+                .clamp(1_000, 200_000);
+            serial_println!("heap> {rounds} rounds of small-block churn through each mode...");
+            let results = heap::bench(rounds);
+            serial_println!(
+                "heap>   {:<12} {:>10} {:>12} {:>12} {:>10}",
+                "mode", "allocs", "steps", "steps/alloc", "ticks"
+            );
+            for r in &results {
+                let name = match r.mode {
+                    HeapMode::FirstFit => "first-fit",
+                    HeapMode::SizeClass => "size-class",
+                };
+                serial_println!(
+                    "heap>   {:<12} {:>10} {:>12} {:>12.1} {:>10}",
+                    name,
+                    r.allocs,
+                    r.steps,
+                    r.steps_per_alloc(),
+                    r.ticks
+                );
+            }
+            let (ff, sc) = (&results[0], &results[1]);
+            if sc.steps_per_alloc() > 0.0 {
+                serial_println!(
+                    "heap>   size-class walks {:.1}x fewer free-list nodes per allocation",
+                    ff.steps_per_alloc() / sc.steps_per_alloc()
+                );
+            } else if ff.steps > 0 {
+                serial_println!("heap>   size-class walked NO free-list nodes at all");
+            }
+            // A tick figure is a constant-rate counter, not a CPU cycle, and a
+            // zero-length batch is a broken measurement rather than a fast one
+            // -- the same rule `synapse::bench` prints its rate beside.
+            if sc.ticks == 0 || ff.ticks == 0 {
+                serial_println!("heap>   SUSPECT: a batch measured 0 ticks -- raise the round count");
+            } else {
+                serial_println!(
+                    "heap>   wall: {:.2}x (ticks are a constant-rate counter, not CPU cycles)",
+                    ff.ticks as f32 / sc.ticks as f32
+                );
+            }
+            serial_println!("heap>   mode restored to what it was before the bench");
+        }
+        _ => serial_println!("heap> usage: /heap [status] | /heap firstfit|sizeclass | /heap bench [rounds]"),
     }
 }
 
@@ -7212,24 +7299,24 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 // human pressed this, so `in_tool_call()` is false and
                 // `/screenshot` captures the whole screen regardless of which
                 // agent the chat is homed to.
-                if fin == Some(b'~') {
-                    match param {
-                        11 => {
-                            // F1 — the universal help key.
-                            serial_println!();
-                            print_help("");
-                            composer_sync(buf, cur);
-                            continue;
-                        }
-                        24 => {
-                            // F12 / Print Screen.
-                            serial_println!();
-                            run_screenshot("");
-                            composer_sync(buf, cur);
-                            continue;
-                        }
-                        _ => {}
+                // F1 / F12 / Print Screen arrive as VT220 `~` codes; the Mac
+                // chords (`Cmd+/`, `Cmd+Shift+3`, and their Ctrl twins) arrive as
+                // private finals, because an Apple keyboard cannot reach the
+                // F-key forms without Fn and has no Print Screen key at all.
+                let shortcut = match (fin, param) {
+                    (Some(b'~'), 11) | (Some(b'h'), _) => Some(true),  // help
+                    (Some(b'~'), 24) | (Some(b's'), _) => Some(false), // screenshot
+                    _ => None,
+                };
+                if let Some(is_help) = shortcut {
+                    serial_println!();
+                    if is_help {
+                        print_help("");
+                    } else {
+                        run_screenshot("");
                     }
+                    composer_sync(buf, cur);
+                    continue;
                 }
                 // Editor tab active: forward arrow/nav sequences to the editor.
                 if fb_editor_active() {

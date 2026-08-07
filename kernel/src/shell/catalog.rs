@@ -114,6 +114,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Files", title: "Print File", name: "cat", shortcut: "" },
     Entry { category: "Files", title: "Open / Edit / Play", name: "open", shortcut: "" },
     Entry { category: "Files", title: "Image Decoder (ring 3)", name: "decoder", shortcut: "" },
+    Entry { category: "System", title: "Heap Allocator (A/B)", name: "heap", shortcut: "" },
     Entry {
         category: "Files",
         title: "JavaScript (Node-style -e / file)",
@@ -169,7 +170,7 @@ pub const ENTRIES: &[Entry] = &[
         name: "camera",
         shortcut: "",
     },
-    Entry { category: "System & UI", title: "Screenshot", name: "screenshot", shortcut: "PrtSc / F12" },
+    Entry { category: "System & UI", title: "Screenshot", name: "screenshot", shortcut: "Cmd+Shift+3 / PrtSc" },
     Entry { category: "System & UI", title: "Keyboard Layout & IME", name: "keyboard", shortcut: "" },
     Entry { category: "System & UI", title: "Notifications", name: "notify", shortcut: "" },
     Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },
@@ -183,7 +184,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Clipboard", name: "clip", shortcut: "" },
     Entry { category: "System & UI", title: "Close Action Pane", name: "close", shortcut: "Ctrl+W" },
     Entry { category: "System & UI", title: "About ChittiOS", name: "about", shortcut: "" },
-    Entry { category: "System & UI", title: "Commands Help", name: "help", shortcut: "F1" },
+    Entry { category: "System & UI", title: "Commands Help", name: "help", shortcut: "Cmd+/ or F1" },
     // Media
     Entry { category: "Media", title: "Voice", name: "voice", shortcut: "" },
     Entry { category: "Media", title: "PDF Viewer", name: "pdf", shortcut: "" },
