@@ -474,31 +474,52 @@ fn yuv_from_rust_h264(f: rust_h264::decoder::Frame) -> h264::decoder::DecodedFra
 /// consumes the native layout from `hevcseq`.
 fn hevc_frame_to_8bit(f: &hevc::decoder::DecodedFrame) -> h264::decoder::DecodedFrame {
     let shift = f.bit_depth.saturating_sub(8);
-    let y: alloc::vec::Vec<u8> = f.y.iter().map(|&s| (s >> shift) as u8).collect();
+    // 8-bit 4:2:0 is the common path (samplelib Main, most web clips): tight
+    // loops beat `map().collect()` by avoiding the iterator/alloc dance per
+    // sample on a multi-megapixel plane.
+    let mut y = alloc::vec![0u8; f.y.len()];
+    if shift == 0 {
+        for (d, &s) in y.iter_mut().zip(f.y.iter()) {
+            *d = s as u8;
+        }
+    } else {
+        for (d, &s) in y.iter_mut().zip(f.y.iter()) {
+            *d = (s >> shift) as u8;
+        }
+    }
     let (cw, ch) = (f.w / 2, f.h / 2);
     // Mid-grey chroma for monochrome and as the base for 4:2:0 conversion.
     let mut cb = alloc::vec![128u8; cw * ch];
     let mut cr = alloc::vec![128u8; cw * ch];
     if f.chroma_format_idc != 0 && f.cw > 0 && f.ch > 0 {
-        for j in 0..ch {
-            let sj = match f.chroma_format_idc {
-                1 => j,                         // 4:2:0: already half height
-                2 => j * 2,                     // 4:2:2: full height → take even rows
-                _ => j * 2,                     // 4:4:4: take even rows
-            };
-            if sj >= f.ch {
-                break;
+        if f.chroma_format_idc == 1 && f.cw == cw && f.ch == ch && shift == 0 {
+            for (d, &s) in cb.iter_mut().zip(f.cb.iter()) {
+                *d = s as u8;
             }
-            for i in 0..cw {
-                let si = match f.chroma_format_idc {
-                    3 => i * 2, // 4:4:4: take even cols
-                    _ => i,     // 4:2:0 / 4:2:2: already half width
+            for (d, &s) in cr.iter_mut().zip(f.cr.iter()) {
+                *d = s as u8;
+            }
+        } else {
+            for j in 0..ch {
+                let sj = match f.chroma_format_idc {
+                    1 => j,     // 4:2:0: already half height
+                    2 => j * 2, // 4:2:2: full height → take even rows
+                    _ => j * 2, // 4:4:4: take even rows
                 };
-                if si >= f.cw {
+                if sj >= f.ch {
                     break;
                 }
-                cb[j * cw + i] = (f.cb[sj * f.cw + si] >> shift) as u8;
-                cr[j * cw + i] = (f.cr[sj * f.cw + si] >> shift) as u8;
+                for i in 0..cw {
+                    let si = match f.chroma_format_idc {
+                        3 => i * 2, // 4:4:4: take even cols
+                        _ => i,     // 4:2:0 / 4:2:2: already half width
+                    };
+                    if si >= f.cw {
+                        break;
+                    }
+                    cb[j * cw + i] = (f.cb[sj * f.cw + si] >> shift) as u8;
+                    cr[j * cw + i] = (f.cr[sj * f.cw + si] >> shift) as u8;
+                }
             }
         }
     }
@@ -1002,7 +1023,21 @@ impl StreamDecoder {
             &self.engine,
             Engine::Hevc { pending, .. } if pending.contains_key(&target)
         );
-        if target + 1 < self.next && !cached {
+        // Whether we must restart the decoder from a keyframe. H.264 assumes
+        // sample index ≈ decode order, so `target + 1 < next` means "we already
+        // passed this picture". HEVC B-pyramids break that: a high-POC P is
+        // *coded* early and *shown* late, so `next` runs ahead of `target` for
+        // most of the GOP — treating that as a rewind re-decoded from every
+        // IDR and pinned playback at ~1 fps (254 decode_one calls for 30
+        // frames on sample-h265). HEVC rewinds only on a true backward step
+        // in *display* order when the picture is not already pending.
+        let hevc = matches!(self.engine, Engine::Hevc { .. });
+        let need_rewind = if hevc {
+            !cached && self.cur_idx.map(|c| idx < c).unwrap_or(false)
+        } else {
+            !cached && target + 1 < self.next
+        };
+        if need_rewind {
             // Rewind to the latest keyframe ≤ target and reset decode state.
             let mut s = target;
             while s > 0 && !self.samples[s].is_sync {
@@ -1103,8 +1138,13 @@ impl StreamDecoder {
                 let f = pending.get(&target).map(|f| {
                     frame_from_yuv(&hevc_frame_to_8bit(f), pts, edge)
                 });
-                let min_future = self.display[idx..].iter().copied().min().unwrap_or(target);
-                let dead: Vec<usize> = pending.range(..min_future).map(|(&k, _)| k).collect();
+                // Keys are decode-sample indices assigned in *display* release
+                // order, so they are not monotonic. Drop by display position.
+                let dead: alloc::vec::Vec<usize> = pending
+                    .keys()
+                    .copied()
+                    .filter(|&si| self.disp_of.get(si).copied().unwrap_or(0) < idx)
+                    .collect();
                 for k in dead {
                     pending.remove(&k);
                 }
