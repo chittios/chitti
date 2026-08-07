@@ -30,6 +30,7 @@ mod media;
 mod notify;
 mod pdf;
 mod schedule;
+pub mod record;
 mod system;
 mod tooljson;
 mod video;
@@ -47,6 +48,7 @@ use keyboard::*;
 use media::*;
 pub(crate) use notify::*;
 use pdf::*;
+use record::*;
 use schedule::*;
 use system::*;
 use video::*;
@@ -725,6 +727,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "bluetooth" | "bt" => run_bluetooth(arg),
         "camera" | "uvc" => run_camera(arg),
         "screenshot" | "screencap" | "shot" => run_screenshot(arg),
+        "record" | "screencast" | "rec" => run_record(arg),
         "notify" | "notifications" | "notif" => run_notify_cmd(arg),
         "schedule" | "cron" | "at" => run_schedule_cmd(arg),
         "keyboard" | "kbd" => run_keyboard(arg),
@@ -7550,17 +7553,21 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                 // chords (`Cmd+/`, `Cmd+Shift+3`, and their Ctrl twins) arrive as
                 // private finals, because an Apple keyboard cannot reach the
                 // F-key forms without Fn and has no Print Screen key at all.
+                // Global chords: help / screenshot / record. Record uses a
+                // third arm (`r`) rather than overloading screenshot — the two
+                // must stay distinct (macOS: ⌘⇧3 still vs ⌘⇧5 record).
                 let shortcut = match (fin, param) {
-                    (Some(b'~'), 11) | (Some(b'h'), _) => Some(true),  // help
-                    (Some(b'~'), 24) | (Some(b's'), _) => Some(false), // screenshot
+                    (Some(b'~'), 11) | (Some(b'h'), _) => Some(0u8), // help
+                    (Some(b'~'), 24) | (Some(b's'), _) => Some(1),    // screenshot
+                    (Some(b'r'), _) => Some(2),                       // record toggle
                     _ => None,
                 };
-                if let Some(is_help) = shortcut {
+                if let Some(kind) = shortcut {
                     serial_println!();
-                    if is_help {
-                        print_help("");
-                    } else {
-                        run_screenshot("");
+                    match kind {
+                        0 => print_help(""),
+                        1 => run_screenshot(""),
+                        _ => crate::shell::record::toggle_shortcut(),
                     }
                     composer_sync(buf, cur);
                     continue;
@@ -8046,6 +8053,10 @@ fn ui_tick() {
                 use crate::framebuffer::StatusChip;
                 match chip {
                     StatusChip::Brand => run_about(""),
+                    // Click the ● chip to stop — macOS menu-bar stop control.
+                    StatusChip::Recording => {
+                        crate::shell::record::stop_and_save();
+                    }
                     other => crate::modal::status_menu(other),
                 }
             } else if let Some(which) = crate::framebuffer::divider_hit(t.x, t.y) {
@@ -8572,6 +8583,8 @@ pub fn upkeep() {
     // alone until it expires — which is what keeps a transient overlay at two KMS
     // round trips per notification rather than one per pulse.
     crate::notify::tick_banner();
+    // Screen recording frame pump (start/stop session; at most one frame per tick).
+    crate::shell::record::tick();
     thinking_tick();
     // Mid-turn interjection: buffer non-cancel keystrokes into a follow-up queue.
     drain_followup_keys();

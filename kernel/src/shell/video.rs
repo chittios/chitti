@@ -59,30 +59,30 @@ pub(super) static VIDEO: crate::mm::Locked<Option<VideoPlayer>> = crate::mm::Loc
 /// "video" action-pane tab. Non-blocking: `pump_video` advances frames from the
 /// idle tick. `/close` or Ctrl+C stops it.
 #[cfg(not(feature = "server"))]
-pub(super) fn play_video(path: &str) {
+pub(super) fn play_video(path: &str) -> Result<(), alloc::string::String> {
     let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
         serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
-        return;
+        return Err(alloc::format!("{path} not found under any mount or in the store"));
     };
-    play_video_bytes(path, bytes);
+    play_video_bytes(path, bytes)
 }
 
 /// Start the video player from already-loaded bytes (browser `<video>` click).
 #[cfg(not(feature = "server"))]
-pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) {
+pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result<(), alloc::string::String> {
     let t0 = crate::arch::now_ms();
     // Probe first so we can report clearly and handle unsupported streams.
     match crate::video::probe(&bytes) {
         Ok(info) => {
             serial_println!("open> {} — {} {}x{} {} frames {}:{:02}", name, info.codec, info.width, info.height, info.frame_count, info.duration_ms / 60000, info.duration_ms % 60000 / 1000);
             if !info.decodable {
-                serial_println!("open>   cannot decode yet: {}", if info.cabac { "CABAC entropy coding (baseline/CAVLC only)" } else { "unsupported profile" });
-                return;
+                serial_println!("open>   cannot decode: {}", info.unsupported_reason);
+                return Err(alloc::string::String::from(info.unsupported_reason));
             }
         }
         Err(e) => {
             serial_println!("open> cannot open {}: {}", name, e);
-            return;
+            return Err(alloc::string::String::from(e));
         }
     }
     // Demux/describe audio; if AAC-LC, decode PCM now so pump_video can sync it.
@@ -168,8 +168,12 @@ pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) {
                 present_video_frame();
             }
         }
-        Err(e) => serial_println!("open> decode failed: {}", e),
+        Err(e) => {
+            serial_println!("open> decode failed: {}", e);
+            return Err(alloc::string::String::from(e));
+        }
     }
+    Ok(())
 }
 
 /// Present the current video frame into the video tab (no-op if not active).

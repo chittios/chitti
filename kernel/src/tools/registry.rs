@@ -212,6 +212,13 @@ fn shell_commands() -> Vec<ToolDef> {
             "Capture the screen to a PNG in the store. args: empty=the desktop, or 'panel'|'chat'|'pane <n>'|'region <x>,<y>,<w>,<h>', plus 'after <n>s', '--cursor', and an optional destination path (default /downloads/screenshot-<ms>.png). Non-root agents capture only their own surface.",
             false,
         ),
+        // Not destructive: one new APNG file. Same surface-ownership gate as
+        // screenshot for non-root agents (identity, not a capability right).
+        ToolDef::shell(
+            "record",
+            "Start or stop screen recording (H.264/MP4). Bare call toggles. args: 'start'|'stop'|'status', optional 'for <n>s|m' timer, 'fps <n>', 'scale <pct>', same extents as /screenshot, dest path. Shortcut Cmd+Shift+5. Status-bar ● while live — click to stop. Non-root agents record only their own surface.",
+            false,
+        ),
         ToolDef::shell("ls", "List a store directory (Linux-like). args: '[path] [-l]' (default /). Numeric arg lists a disk volume root.", false),
         ToolDef::shell("cat", "Print a store or mounted file. args: a /path.", false),
         ToolDef::shell("grep", "Search store file contents. args: '<query> [path_glob]'.", false),

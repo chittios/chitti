@@ -269,13 +269,23 @@ fn filter_cost(row: &[u8]) -> u64 {
     row.iter().map(|&b| (b as i8).unsigned_abs() as u64).sum()
 }
 
-/// Encode 8-bit RGB (3 bytes per pixel, row-major, no padding) as a PNG.
+/// Write one PNG chunk: 4-byte length, type, body, CRC over type+body.
+fn write_chunk(out: &mut Vec<u8>, typ: &[u8; 4], body: &[u8]) {
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    let start = out.len();
+    out.extend_from_slice(typ);
+    out.extend_from_slice(body);
+    // The CRC covers the type *and* the body, never the length.
+    let crc = crc32(&out[start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Filter + zlib-compress one RGB frame into the raw IDAT/fdAT payload.
 ///
-/// Per-row adaptive filtering plus fixed-Huffman deflate: a flat UI screenshot
-/// filters to mostly zeros and lands two orders of magnitude below its raw
-/// size, while a photograph still compresses. Returns `Err` rather than
-/// allocating for an image beyond [`MAX_PIXELS`].
-pub fn encode_rgb8(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>, &'static str> {
+/// Shared by still PNG and APNG so a screencast frame and a screenshot cannot
+/// disagree about filtering. Returns only the compressed bytes (no chunk
+/// framing) so the caller can wrap them as `IDAT` or `fdAT`.
+pub fn compress_rgb8(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>, &'static str> {
     if w == 0 || h == 0 {
         return Err("png: zero-sized image");
     }
@@ -314,35 +324,11 @@ pub fn encode_rgb8(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>, &'static s
         prior.copy_from_slice(cur);
     }
 
-    let idat = super::deflate::zlib_compress(&raw);
-    drop(raw);
-
-    let mut out = Vec::with_capacity(idat.len() + 64);
-    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
-    let mut chunk = |out: &mut Vec<u8>, typ: &[u8; 4], body: &[u8]| {
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        let start = out.len();
-        out.extend_from_slice(typ);
-        out.extend_from_slice(body);
-        // The CRC covers the type *and* the body, never the length.
-        let crc = crc32(&out[start..]);
-        out.extend_from_slice(&crc.to_be_bytes());
-    };
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
-    // depth 8, colour type 2 (truecolour), deflate, adaptive filtering, no interlace
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-    chunk(&mut out, b"IHDR", &ihdr);
-    chunk(&mut out, b"IDAT", &idat);
-    chunk(&mut out, b"IEND", &[]);
-    Ok(out)
+    Ok(super::deflate::zlib_compress(&raw))
 }
 
-/// Encode `0x00RRGGBB` pixels (the compositor's format, and what [`decode`]
-/// produces) as a PNG. Converts to packed RGB a row at a time so a 4K frame
-/// does not hold both representations at full size.
-pub fn encode_rgb32(w: usize, h: usize, px: &[u32]) -> Result<Vec<u8>, &'static str> {
+/// Compress `0x00RRGGBB` pixels into a zlib IDAT body (no chunk framing).
+pub fn compress_rgb32(w: usize, h: usize, px: &[u32]) -> Result<Vec<u8>, &'static str> {
     if w == 0 || h == 0 {
         return Err("png: zero-sized image");
     }
@@ -358,7 +344,164 @@ pub fn encode_rgb32(w: usize, h: usize, px: &[u32]) -> Result<Vec<u8>, &'static 
         rgb.push((p >> 8) as u8);
         rgb.push(p as u8);
     }
-    encode_rgb8(w, h, &rgb)
+    compress_rgb8(w, h, &rgb)
+}
+
+/// Encode 8-bit RGB (3 bytes per pixel, row-major, no padding) as a PNG.
+///
+/// Per-row adaptive filtering plus fixed-Huffman deflate: a flat UI screenshot
+/// filters to mostly zeros and lands two orders of magnitude below its raw
+/// size, while a photograph still compresses. Returns `Err` rather than
+/// allocating for an image beyond [`MAX_PIXELS`].
+pub fn encode_rgb8(w: usize, h: usize, rgb: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let idat = compress_rgb8(w, h, rgb)?;
+
+    let mut out = Vec::with_capacity(idat.len() + 64);
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+    // depth 8, colour type 2 (truecolour), deflate, adaptive filtering, no interlace
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    write_chunk(&mut out, b"IHDR", &ihdr);
+    write_chunk(&mut out, b"IDAT", &idat);
+    write_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// Encode `0x00RRGGBB` pixels (the compositor's format, and what [`decode`]
+/// produces) as a PNG. Converts to packed RGB a row at a time so a 4K frame
+/// does not hold both representations at full size.
+pub fn encode_rgb32(w: usize, h: usize, px: &[u32]) -> Result<Vec<u8>, &'static str> {
+    let idat = compress_rgb32(w, h, px)?;
+    let mut out = Vec::with_capacity(idat.len() + 64);
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    write_chunk(&mut out, b"IHDR", &ihdr);
+    write_chunk(&mut out, b"IDAT", &idat);
+    write_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// Largest number of frames an APNG may carry. A screencast that kept
+/// unbounded frames would fill the heap with compressed IDATs; the shell caps
+/// duration × fps against this too.
+pub const MAX_APNG_FRAMES: usize = 300;
+
+/// Assemble an animated PNG from pre-compressed frame payloads.
+///
+/// Each entry of `idats` is the zlib body of one full-frame image (what
+/// [`compress_rgb32`] returns). Frame delay is `delay_num / delay_den` seconds
+/// (APNG §0); `delay_den == 0` means 100 per the spec, which we refuse here so
+/// a typo cannot silently change the frame rate. Plays once (`num_plays = 1`).
+///
+/// Our still decoder ignores `acTL`/`fcTL`/`fdAT` and shows the first frame —
+/// so `/open` on a recording still works, and a browser or VLC plays the
+/// animation. That is deliberate: H.264 encode is the long road; APNG reuses
+/// the PNG path we already trust.
+pub fn encode_apng_from_idats(
+    w: usize,
+    h: usize,
+    idats: &[Vec<u8>],
+    delay_num: u16,
+    delay_den: u16,
+) -> Result<Vec<u8>, &'static str> {
+    if w == 0 || h == 0 {
+        return Err("png: zero-sized image");
+    }
+    if w.saturating_mul(h) > MAX_PIXELS {
+        return Err("png: image too large to encode");
+    }
+    if idats.is_empty() {
+        return Err("png: animated PNG needs at least one frame");
+    }
+    if idats.len() > MAX_APNG_FRAMES {
+        return Err("png: too many animation frames");
+    }
+    if delay_den == 0 {
+        return Err("png: animation delay denominator must be non-zero");
+    }
+    for (i, idat) in idats.iter().enumerate() {
+        if idat.is_empty() {
+            return Err("png: empty frame payload");
+        }
+        // A single empty-looking frame is fine; this is the "nothing at all" case.
+        let _ = i;
+    }
+
+    let n = idats.len() as u32;
+    // Rough capacity: signature + IHDR + acTL + n × (fcTL + IDAT/fdAT) + IEND.
+    let payload: usize = idats.iter().map(|f| f.len() + 64).sum();
+    let mut out = Vec::with_capacity(payload + 128);
+    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    write_chunk(&mut out, b"IHDR", &ihdr);
+
+    // acTL: num_frames, num_plays (1 = play once, then stop).
+    let mut actl = [0u8; 8];
+    actl[0..4].copy_from_slice(&n.to_be_bytes());
+    actl[4..8].copy_from_slice(&1u32.to_be_bytes());
+    write_chunk(&mut out, b"acTL", &actl);
+
+    // Sequence numbers run across every fcTL and fdAT in file order.
+    let mut seq: u32 = 0;
+    for (i, idat) in idats.iter().enumerate() {
+        // fcTL: seq, w, h, x, y, delay_num, delay_den, dispose_op, blend_op.
+        let mut fctl = [0u8; 26];
+        fctl[0..4].copy_from_slice(&seq.to_be_bytes());
+        seq = seq.wrapping_add(1);
+        fctl[4..8].copy_from_slice(&(w as u32).to_be_bytes());
+        fctl[8..12].copy_from_slice(&(h as u32).to_be_bytes());
+        // x_offset = y_offset = 0 (full-frame).
+        fctl[16..18].copy_from_slice(&delay_num.to_be_bytes());
+        fctl[18..20].copy_from_slice(&delay_den.to_be_bytes());
+        fctl[20] = 0; // dispose_op = APNG_DISPOSE_OP_NONE
+        fctl[21] = 0; // blend_op = APNG_BLEND_OP_SOURCE
+        write_chunk(&mut out, b"fcTL", &fctl);
+
+        if i == 0 {
+            // First frame is a regular IDAT so a non-APNG decoder still shows it.
+            write_chunk(&mut out, b"IDAT", idat);
+        } else {
+            // fdAT: sequence_number + frame data.
+            let mut body = Vec::with_capacity(4 + idat.len());
+            body.extend_from_slice(&seq.to_be_bytes());
+            seq = seq.wrapping_add(1);
+            body.extend_from_slice(idat);
+            write_chunk(&mut out, b"fdAT", &body);
+        }
+    }
+    write_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+/// Encode a multi-frame `0x00RRGGBB` sequence as an animated PNG.
+///
+/// Convenience wrapper: compresses each frame then hands off to
+/// [`encode_apng_from_idats`]. Prefer the IDAT form when the caller already
+/// compresses frame-by-frame (so pixel buffers are not all resident at once).
+pub fn encode_apng_rgb32(
+    w: usize,
+    h: usize,
+    frames: &[&[u32]],
+    delay_num: u16,
+    delay_den: u16,
+) -> Result<Vec<u8>, &'static str> {
+    if frames.is_empty() {
+        return Err("png: animated PNG needs at least one frame");
+    }
+    let mut idats = Vec::with_capacity(frames.len());
+    for px in frames {
+        idats.push(compress_rgb32(w, h, px)?);
+    }
+    encode_apng_from_idats(w, h, &idats, delay_num, delay_den)
 }
 
 #[cfg(test)]
@@ -499,5 +642,63 @@ mod tests {
         assert!(encode_rgb8(4, 4, &[0; 47]).is_err(), "short byte buffer");
         // A 32-megapixel-plus request must be refused before it allocates.
         assert!(encode_rgb32(1 << 16, 1 << 16, &[]).is_err(), "too large");
+    }
+
+    #[test_case]
+    fn apng_round_trips_the_first_frame_through_the_still_decoder() {
+        // Two solid frames of different colours. The still decoder ignores
+        // animation chunks and must recover frame 0 exactly — that is what
+        // `/open` on a recording does.
+        let (w, h) = (4usize, 3usize);
+        let red: Vec<u32> = alloc::vec![0xff0000; w * h];
+        let blue: Vec<u32> = alloc::vec![0x0000ff; w * h];
+        let bytes = encode_apng_rgb32(w, h, &[&red, &blue], 1, 5).expect("encode apng");
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]));
+        // The animation control chunks must actually be present — otherwise we
+        // wrote a still PNG and called it a recording.
+        assert!(
+            bytes.windows(4).any(|w| w == b"acTL"),
+            "missing acTL"
+        );
+        assert!(
+            bytes.windows(4).any(|w| w == b"fcTL"),
+            "missing fcTL"
+        );
+        assert!(
+            bytes.windows(4).any(|w| w == b"fdAT"),
+            "second frame must be an fdAT"
+        );
+        let img = decode(&bytes).expect("still decode");
+        assert_eq!((img.w, img.h), (w, h));
+        assert!(img.pixels.iter().all(|&p| p == 0xff0000), "first frame is red");
+    }
+
+    #[test_case]
+    fn apng_refuses_empty_and_zero_delay_denominator() {
+        assert!(encode_apng_from_idats(4, 4, &[], 1, 10).is_err());
+        let idat = compress_rgb32(2, 2, &[0, 0, 0, 0]).unwrap();
+        assert!(encode_apng_from_idats(2, 2, &[idat], 1, 0).is_err());
+    }
+
+    #[test_case]
+    fn compress_then_still_encode_matches_direct_encode() {
+        // Refactoring still encode onto compress_rgb* must not change the
+        // bytes a screenshot produces.
+        let (w, h) = (8usize, 5usize);
+        let px: Vec<u32> = (0..w * h)
+            .map(|i| ((i as u32 * 17) << 16) | ((i as u32 * 3) << 8) | (i as u32 & 0xff))
+            .collect();
+        let a = encode_rgb32(w, h, &px).unwrap();
+        let idat = compress_rgb32(w, h, &px).unwrap();
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        write_chunk(&mut b, b"IHDR", &ihdr);
+        write_chunk(&mut b, b"IDAT", &idat);
+        write_chunk(&mut b, b"IEND", &[]);
+        assert_eq!(a, b);
     }
 }

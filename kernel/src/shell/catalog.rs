@@ -45,6 +45,8 @@ pub const COMMAND_ALIASES: &[&str] = &[
     "bat",        // → battery
     "screencap",  // → screenshot
     "shot",       // → screenshot
+    "screencast", // → record
+    "rec",        // → record
     "notifications", // → notify
     "notif",      // → notify
     "cron",       // → schedule
@@ -188,6 +190,7 @@ pub const ENTRIES: &[Entry] = &[
         shortcut: "",
     },
     Entry { category: "System & UI", title: "Screenshot", name: "screenshot", shortcut: "Cmd+Shift+3 / PrtSc" },
+    Entry { category: "System & UI", title: "Screen record (start/stop)", name: "record", shortcut: "Cmd+Shift+5" },
     Entry { category: "System & UI", title: "Keyboard Layout & IME", name: "keyboard", shortcut: "" },
     Entry { category: "System & UI", title: "Notifications", name: "notify", shortcut: "" },
     Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },

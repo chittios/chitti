@@ -35,6 +35,7 @@ pub fn draw_status_menu(chip: StatusChip) {
             StatusChip::Brand => (28, 8),
             // Wider and taller: it lists actual rows, not a couple of fields.
             StatusChip::Notifications => (44, 12),
+            StatusChip::Recording => (28, 6),
         };
         let bw = cols * cw + 2 * (BORDER + PAD);
         let bh = rows * ch + 2 * (BORDER + PAD);
@@ -94,6 +95,7 @@ pub fn draw_status_menu(chip: StatusChip) {
             StatusChip::Volume => "Sound",
             StatusChip::Clock => "Clock",
             StatusChip::Notifications => "Notifications",
+            StatusChip::Recording => "Recording",
         };
         let icon = match chip {
             StatusChip::Brand => crate::icons::fa::HOUSE,
@@ -108,6 +110,7 @@ pub fn draw_status_menu(chip: StatusChip) {
             }
             StatusChip::Clock => crate::icons::fa::CLOCK,
             StatusChip::Notifications => crate::icons::fa::BELL,
+            StatusChip::Recording => crate::icons::fa::CIRCLE,
         };
         sc.draw_str(
             ix,
@@ -178,6 +181,11 @@ pub fn draw_status_menu(chip: StatusChip) {
                 sc.draw_str(ix, y, "Click for About…", sc.theme.chat_fg, bg);
                 y += ch;
                 sc.draw_str(ix, y, &alloc::format!("v{}", crate::VERSION), sc.theme.title_dim, bg);
+            }
+            StatusChip::Recording => {
+                // Click is handled as stop at the shell; this is a fallback.
+                sc.draw_str(ix, y, "Click chip to stop", sc.theme.chat_fg, bg);
+                y += ch;
             }
         }
 

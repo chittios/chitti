@@ -3,9 +3,9 @@
 //! The **power / peripherals / display / theme** command surface carved out
 //! of the former 16k-line `shell/mod.rs` monolith: `/power`, `/suspend`,
 //! `/battery`, `/datetime`, `/ntp`, `/bluetooth`, `/camera`, `/touch`,
-//! `/ui`, `/statusbar`, `/theme` and the ktrace/close actions. Moved
-//! verbatim; `use super::*` keeps the parent's statics visible, and the
-//! parent re-imports this module's items with `pub(crate) use system::*`.
+//! `/screenshot`, `/record`, `/ui`, `/statusbar`, `/theme` and the ktrace/close
+//! actions. Moved verbatim; `use super::*` keeps the parent's statics visible,
+//! and the parent re-imports this module's items with `pub(crate) use system::*`.
 
 use super::*;
 
@@ -239,8 +239,9 @@ pub(super) fn camera_grab(dest: Option<&str>) {
 /// `#[cfg(not(test))]` — the same shape `refresh_todos` and `modal::confirm`
 /// use. The test build has no panel, so it reports exactly what a serial-only
 /// boot reports.
+/// Shared by `/screenshot` and `/record` (sibling modules see only `pub(super)`).
 #[cfg(not(test))]
-fn capture_screen(
+pub(super) fn capture_screen(
     extent: crate::screenshot::Extent,
     cursor: bool,
 ) -> Result<(u32, u32, alloc::vec::Vec<u32>), &'static str> {
@@ -248,7 +249,7 @@ fn capture_screen(
 }
 
 #[cfg(test)]
-fn capture_screen(
+pub(super) fn capture_screen(
     _extent: crate::screenshot::Extent,
     _cursor: bool,
 ) -> Result<(u32, u32, alloc::vec::Vec<u32>), &'static str> {

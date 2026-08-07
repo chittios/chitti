@@ -59,9 +59,10 @@ pub fn status_chip_hit(x: u64, y: u64) -> Option<StatusChip> {
                     6 => StatusChip::Battery,
                     7 => StatusChip::Volume,
                     8 => StatusChip::Clock,
-                    // NB the wildcard maps to `Clock`, so a variant added
-                    // without an arm here silently opens the clock dropdown.
-                    _ => StatusChip::Notifications,
+                    9 => StatusChip::Notifications,
+                    // Recording is last; a future chip must add an arm, not fall
+                    // through here (that used to silently open Notifications).
+                    _ => StatusChip::Recording,
                 });
             }
         }
@@ -132,6 +133,12 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> 
     let unread = crate::notify::chip_text(crate::notify::unread_count());
     if !unread.is_empty() {
         out.push((StatusChip::Notifications, unread));
+    }
+    // Red ● + elapsed while a take is live; absent otherwise (same empty-chip
+    // rule as notifications). Clicking it stops the recording.
+    let rec = crate::shell::record::chip_text();
+    if !rec.is_empty() {
+        out.push((StatusChip::Recording, rec));
     }
     // Compact macOS-style clock (no year / seconds / tz — dropdown has the rest).
     out.push((StatusChip::Clock, crate::clock::format_datetime_short()));

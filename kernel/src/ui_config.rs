@@ -120,7 +120,7 @@ impl Default for UiConfig {
             status_left: "ChittiOS v${version}".to_string(),
             // Compact macOS-style clock by default (`Tue Aug 4  19:45`); full
             // form stays available as `${datetime}` / `${tz}` if a user wants it.
-            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${datetime_short}".to_string(),
+            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${recording}  ${datetime_short}".to_string(),
             status_pos: crate::panes_layout::StatusPos::default().as_str().to_string(),
             tz_offset: 0,
             tz_name: String::new(),
@@ -211,6 +211,11 @@ impl UiConfig {
             // gets a new status variable at all — a config written yesterday
             // would otherwise never show the bell.
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime_short}" => {
+                d.status_right.clone()
+            }
+            // Pre-${recording}: adopt the current default so a saved ui.json
+            // gains the chip without a hand edit.
+            t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${datetime_short}" => {
                 d.status_right.clone()
             }
             t => t,
@@ -630,6 +635,9 @@ fn resolve_var(var: &str) -> String {
         // step with `framebuffer::status::status_right_chips`, which paints the
         // clickable chip from the same value.
         "notifications" => crate::notify::chip_text(crate::notify::unread_count()),
+        // Empty when idle — expand swallows the separator, so the bar is
+        // byte-identical to before until a take starts.
+        "recording" => crate::shell::record::chip_text(),
         other => alloc::format!("${{{}}}", other),
     }
 }
@@ -650,6 +658,11 @@ const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
         "Cmd+Shift+3 | Ctrl+Shift+3 | PrtSc | F12",
         "screenshot",
         "capture the screen to a PNG in /downloads (same as /screenshot)",
+    ),
+    (
+        "Cmd+Shift+5 | Ctrl+Shift+5",
+        "record",
+        "start or stop screen recording (H.264/MP4) — same as /record",
     ),
     ("Ctrl+V", "paste", "paste the clipboard into the shell line"),
     ("Backspace", "erase", "delete the character before the cursor"),

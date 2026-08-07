@@ -562,9 +562,12 @@ pub enum StatusChip {
     /// as an index into `STATUS_CHIP_RECTS`, so renumbering an existing variant
     /// silently reassigns everyone's hit rect.
     Notifications = 9,
+    /// Live screen recording (`crate::shell::record`). Empty when idle.
+    /// Click stops the take — the macOS menu-bar stop control.
+    Recording = 10,
 }
 
-const STATUS_CHIP_N: usize = 10;
+const STATUS_CHIP_N: usize = 11;
 
 /// Hit rects for [`StatusChip`] (index = `chip as usize`). Zero-size = absent.
 static STATUS_CHIP_RECTS: Locked<[(u64, u64, u64, u64); STATUS_CHIP_N]> =

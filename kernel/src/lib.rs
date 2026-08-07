@@ -89,6 +89,8 @@ pub mod samples;
 pub mod sched;
 pub mod schedule;
 pub mod screenshot;
+/// Screen recording (`/record`): pure parse/timing + APNG assembly helpers.
+pub mod screencast;
 pub mod security;
 pub mod serial;
 pub mod service;

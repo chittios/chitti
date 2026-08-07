@@ -18,6 +18,7 @@ pub mod cavlc;
 pub mod deblock;
 pub mod decoder;
 pub mod decoder_cabac;
+pub mod encoder;
 pub mod inter;
 pub mod intra;
 pub mod transform;

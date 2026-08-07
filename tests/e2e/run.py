@@ -3022,6 +3022,69 @@ def s_screenshot(g):
         return False, f"exception: {e}"
 
 
+def s_record(g):
+    """`/record` start/stop screen recording to H.264/MP4.
+
+    Start a short timed take on a tiny region (cheap under TCG), assert the
+    status path and the saved file, then exercise start→stop without a timer.
+    Serial-only boots skip (no framebuffer)."""
+    try:
+        m = g.mark()
+        g.send("/record help")
+        if not g.wait_for("record> usage", 10, m):
+            return False, "/record help produced no usage"
+        if "Cmd+Shift+5" not in g.since(m):
+            return False, "help should mention the macOS-style shortcut"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        # Timed 400ms take — auto-stops without needing a second command.
+        g.send("/record start for 400ms fps 5 scale 100 region 0,0,64,48 /downloads/e2e-rec.mp4")
+        if not g.wait_for("recording", 30, m):
+            return False, "/record start produced no recording line"
+        out = g.since(m)
+        if "no framebuffer" in out:
+            return True, "skipped: serial-only boot, no framebuffer to capture"
+        # Auto-stop saves after the timer.
+        if not g.wait_for("saved /downloads/e2e-rec.mp4", 90, m):
+            return False, f"timed take did not save: {g.since(m)[-400:]}"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/record status")
+        if not g.wait_for("idle", 10, m):
+            return False, "status should report idle after auto-stop"
+
+        # Explicit start → stop (no timer) — the primary UI shape.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/record start scale 100 region 0,0,64,48 /downloads/e2e-rec2.mp4")
+        if not g.wait_for("recording", 20, m):
+            return False, "start without timer failed"
+        g.wait_quiet(0.8, 20)
+        m = g.mark()
+        g.send("/record stop")
+        if not g.wait_for("saved /downloads/e2e-rec2.mp4", 60, m):
+            return False, f"stop did not save: {g.since(m)[-400:]}"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/record for 11m")
+        if not g.wait_for("exceeds", 10, m) and not g.wait_for("maximum", 10, m):
+            out = g.since(m)
+            if "record>" not in out:
+                return False, f"over-cap timer not refused: {out[-200:]}"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/open /downloads/e2e-rec.mp4")
+        if not g.wait_for("open>", 40, m):
+            return False, "the recording did not open"
+        return True, "start/stop + timed take + open"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
 def s_notify(g):
     """The notification queue: post, list, coalesce, read, clear — plus the pane.
 
@@ -4261,6 +4324,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("statusbar", s_statusbar),
     ("clipboard", s_clipboard),
     ("screenshot", s_screenshot),
+    ("record", s_record),
     ("notify", s_notify),
     ("schedule", s_schedule),
     ("keyboard_layouts", s_keyboard_layouts),

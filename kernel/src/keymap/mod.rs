@@ -386,6 +386,12 @@ fn nav_sequence(u: Usage, mods: Mods) -> Option<&'static str> {
         0x20 if mods.has(Mods::SHIFT) && (mods.has(Mods::GUI) || mods.has(Mods::CTRL)) => {
             "\x1b[s"
         }
+        // `Cmd+Shift+5` (usage 0x22 = the digit 5) toggles screen recording —
+        // macOS's screenshot/recording toolbar key. Same Cmd/Ctrl twinning as
+        // the screenshot chord above.
+        0x22 if mods.has(Mods::SHIFT) && (mods.has(Mods::GUI) || mods.has(Mods::CTRL)) => {
+            "\x1b[r"
+        }
         _ => return None,
     })
 }
@@ -1182,6 +1188,9 @@ mod tests {
         // Screenshot: Cmd+Shift+3 and Ctrl+Shift+3.
         assert_eq!(tr(us, 0x20, Mods::GUI | Mods::SHIFT), "\x1b[s", "Cmd+Shift+3");
         assert_eq!(tr(us, 0x20, Mods::CTRL | Mods::SHIFT), "\x1b[s", "Ctrl+Shift+3");
+        // Record: Cmd+Shift+5 and Ctrl+Shift+5 (macOS capture toolbar key).
+        assert_eq!(tr(us, 0x22, Mods::GUI | Mods::SHIFT), "\x1b[r", "Cmd+Shift+5");
+        assert_eq!(tr(us, 0x22, Mods::CTRL | Mods::SHIFT), "\x1b[r", "Ctrl+Shift+5");
 
         // And the chords must not eat the ordinary characters they are built on.
         assert_eq!(tr(us, 0x38, 0), "/", "a bare slash is still a slash");
@@ -1190,6 +1199,7 @@ mod tests {
         assert_eq!(tr(us, 0x20, Mods::SHIFT), "#", "Shift+3 is still a hash");
         // Cmd+3 without Shift is not the screenshot chord.
         assert_eq!(tr(us, 0x20, Mods::GUI), "3");
+        assert_eq!(tr(us, 0x22, Mods::SHIFT), "%", "Shift+5 is still a percent");
 
         // They follow the *layout*, so on a layout where `/` sits elsewhere the
         // chord moves with it rather than staying at the US position.

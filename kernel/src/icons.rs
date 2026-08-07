@@ -404,8 +404,9 @@ pub fn for_command(name: &str) -> char {
         "close" => fa::XMARK,
         "voice" | "onnx" => fa::MICROPHONE,
         // `camera` and `screenshot` both take a picture, so both get the camera
-        // glyph; the rest of this arm is genuinely "a piece of hardware".
+        // glyph; `record` is a video capture and gets the film/video mark.
         "camera" | "screenshot" => fa::CAMERA,
+        "record" | "screencast" | "rec" => fa::VIDEO,
         "bluetooth" | "touchscreen" | "lspci" => fa::MICROCHIP,
         _ => fa::TERMINAL,
     }
