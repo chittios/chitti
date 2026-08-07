@@ -2948,8 +2948,34 @@ def s_notify(g):
         g.send("/notify list")
         if not g.wait_for("notify test", 10, m):
             return False, "recording did not resume"
+        # --- the banner -------------------------------------------------------
+        # Posting raises a banner; a screenshot taken while it is up is the only
+        # way to check the overlay actually painted, and capturing it also proves
+        # the save/restore did not corrupt the pane underneath.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify post warn banner check -- the heading must be legible")
+        if not g.wait_for("posted", 10, m):
+            return False, "the banner post failed"
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/screenshot /downloads/e2e-banner.png")
+        if not g.wait_for("screenshot>", 30, m):
+            return False, "could not capture the banner"
+        out = g.since(m)
+        if "no framebuffer" not in out and "saved" not in out:
+            return False, f"the capture failed: {out[-200:]}"
+        # The banner expires on its own; after that the shell must be intact —
+        # a save/restore bug shows up as a rectangle of stale pixels, and as the
+        # next command failing to echo.
+        g.wait_quiet(1.0, 20)
+        m = g.mark()
+        g.send("/pwd")
+        if not g.wait_for("/home/chitti", 10, m):
+            return False, "the shell did not survive the banner"
+
         g.send("/notify clear")
-        return True, "post, list, severity, read, clear, pane, on/mute/off policy"
+        return True, "post, list, severity, read, clear, pane, policy, banner"
     except Exception as e:
         return False, f"exception: {e}"
 

@@ -197,6 +197,55 @@ impl Policy {
     }
 }
 
+/// A colour **role**, so the palette choice is decidable without a framebuffer.
+///
+/// The banner lives in `framebuffer/toast.rs`, which is `#[cfg(not(test))]` and
+/// therefore cannot be tested — and the first version of it picked
+/// `theme.sep_dim` for an `Info` heading. `sep_dim` is `#2e2c28`, a hairline
+/// separator, on a `#252320` box: the heading was *there* and invisible. Naming
+/// the role here rather than the colour there means "which text may be faint" is
+/// a decision a test can hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ink {
+    /// The theme accent — draws the eye. For anything the human should look at.
+    Accent,
+    /// Ordinary foreground. Always legible.
+    Normal,
+    /// Secondary foreground: readable, but recedes behind `Normal`.
+    Soft,
+    /// A hairline/chrome tint. **Never text** — see [`heading_ink`].
+    Faint,
+}
+
+/// The heading's colour role.
+///
+/// Never [`Ink::Faint`]: the heading is the line that says *who* is talking to
+/// you, which is the first thing a human needs and the whole reason the source is
+/// kernel-stamped. A notification whose heading cannot be read is a notification
+/// that failed at its one job.
+pub fn heading_ink(sev: super::Severity) -> Ink {
+    match sev {
+        super::Severity::Error | super::Severity::Warn | super::Severity::Action => Ink::Accent,
+        super::Severity::Info | super::Severity::Success => Ink::Normal,
+    }
+}
+
+/// The body's colour role — one step back from the heading, so the two read as a
+/// hierarchy rather than a wall.
+pub fn body_ink(_sev: super::Severity) -> Ink {
+    Ink::Soft
+}
+
+/// The chrome's colour role: the outline and the severity stripe. This is the one
+/// place a faint tint is right — it is a border, not a word.
+pub fn chrome_ink(sev: super::Severity) -> Ink {
+    match sev {
+        super::Severity::Error | super::Severity::Warn | super::Severity::Action => Ink::Accent,
+        super::Severity::Success => Ink::Soft,
+        super::Severity::Info => Ink::Faint,
+    }
+}
+
 /// The live banner: what is shown and until when.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toast {
@@ -363,6 +412,62 @@ mod tests {
         // The painter indexes `lines`, so it must never be empty.
         let (_, body) = lines("", "", "", 0, 20);
         assert_eq!(body.len(), 1);
+    }
+
+    /// The bug this enum exists for: an `Info` heading was drawn in `sep_dim`,
+    /// a hairline separator colour, on a box only six shades away from it. The
+    /// text was there and unreadable.
+    #[test_case]
+    fn no_banner_text_is_ever_drawn_in_a_hairline_colour() {
+        for sev in [
+            Severity::Info,
+            Severity::Success,
+            Severity::Warn,
+            Severity::Error,
+            Severity::Action,
+        ] {
+            assert_ne!(
+                heading_ink(sev),
+                Ink::Faint,
+                "{sev:?}: the heading names the source — it must always be legible"
+            );
+            assert_ne!(body_ink(sev), Ink::Faint, "{sev:?}: the body must be legible");
+        }
+    }
+
+    #[test_case]
+    fn the_heading_outranks_the_body_and_urgency_outranks_both() {
+        // A hierarchy, not a wall: the heading is at least as prominent as the
+        // body for every severity.
+        fn rank(i: Ink) -> u8 {
+            match i {
+                Ink::Accent => 3,
+                Ink::Normal => 2,
+                Ink::Soft => 1,
+                Ink::Faint => 0,
+            }
+        }
+        for sev in [
+            Severity::Info,
+            Severity::Success,
+            Severity::Warn,
+            Severity::Error,
+            Severity::Action,
+        ] {
+            assert!(
+                rank(heading_ink(sev)) > rank(body_ink(sev)),
+                "{sev:?}: the heading must stand out from the body"
+            );
+        }
+        // What wants attention gets the accent; what does not, does not.
+        for sev in [Severity::Warn, Severity::Error, Severity::Action] {
+            assert_eq!(heading_ink(sev), Ink::Accent, "{sev:?} should draw the eye");
+            assert_eq!(chrome_ink(sev), Ink::Accent);
+        }
+        for sev in [Severity::Info, Severity::Success] {
+            assert_eq!(heading_ink(sev), Ink::Normal, "{sev:?} should be calm but readable");
+            assert_ne!(chrome_ink(sev), Ink::Accent, "{sev:?} should not shout");
+        }
     }
 
     #[test_case]
