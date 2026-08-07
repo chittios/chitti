@@ -547,7 +547,9 @@ fn hevcseq(bytes: &[u8], limit: usize) {
             } else if *x == 0xFFFE {
                 eprintln!("  pu ({:2},{:2}) flag={} mv=({},{}) merge={}", y & 0xff, y >> 8, l2, *c as i8, *mode as i8, cbf);
             } else if *x == 0xFFFF {
-                eprintln!("  coef dc={} maxxy={} c{} qp={} skip={}", *y as i16, l2, c, mode, cbf);
+                eprintln!("  coef dc={} maxxy={} c{} scan={} ncoeff={}", *y as i16, l2, c, mode>>4, cbf);
+            } else if *x == 0xFFF1 {
+                eprintln!("  last=({},{}) scan={} c{} log2={}", y, l2, c, mode, cbf);
             } else if *x == 0xFFA0 {
                 eprintln!("  mode@({},{}) mode={} candL={} candA={} prev={}", y&0xff, y>>8, l2, c, mode, cbf);
             } else {

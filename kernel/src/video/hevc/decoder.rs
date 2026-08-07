@@ -242,7 +242,12 @@ impl HevcDecoder {
     /// Returns the pictures that became displayable, lowest POC first.
     pub fn decode_au(&mut self, nals: &[super::Nal]) -> Result<Vec<DecodedFrame>, &'static str> {
         for n in nals {
-            let rbsp = n.rbsp();
+            // Body is the NAL after its 2-byte header — still carrying
+            // emulation-prevention bytes. Entry-point offsets are measured in
+            // those bytes (the on-the-wire length), so the WPP/tile re-entry
+            // path needs the body, not just the unescaped RBSP.
+            let body = n.payload.get(2..).unwrap_or(&[]);
+            let rbsp = super::super::bits::unescape_rbsp(body);
             match n.kind {
                 NalType::Sps => {
                     let s = super::parse_sps(&rbsp)?;
@@ -252,7 +257,7 @@ impl HevcDecoder {
                     let p = super::parse_pps(&rbsp)?;
                     self.ppss.insert(p.id, p);
                 }
-                k if k.is_slice() => self.decode_slice(k, &rbsp)?,
+                k if k.is_slice() => self.decode_slice(k, &rbsp, body)?,
                 _ => {}
             }
         }
@@ -335,7 +340,12 @@ impl HevcDecoder {
         self.ready.insert(p.poc, f);
     }
 
-    fn decode_slice(&mut self, nal: NalType, rbsp: &[u8]) -> Result<(), &'static str> {
+    fn decode_slice(
+        &mut self,
+        nal: NalType,
+        rbsp: &[u8],
+        body: &[u8],
+    ) -> Result<(), &'static str> {
         // The slice header names its PPS, which names its SPS.
         // Peek the PPS id: first_slice flag (+ no_output for IRAP), then ue().
         let pps_id = super::peek_slice_pps_id(rbsp, nal)?;
@@ -445,6 +455,12 @@ impl HevcDecoder {
         let init_type = super::cabac_init_type(sh.slice_type, sh.cabac_init);
         let qp = sh.qp.clamp(0, 51);
         let cabac = Cabac::new_hevc(data, qp, init_type, &ct::INIT_VALUES)?;
+        // WPP/tile entry points are sizes in the NAL body (with emulation-
+        // prevention bytes). Convert them to offsets into the unescaped
+        // slice-data RBSP so a re-entry lands on the same byte a multi-
+        // threaded decoder using the raw NAL would.
+        let entry_starts =
+            entry_point_starts_rbsp(&sh.entry_point_offsets, sh.data_byte_offset, body);
 
         let mut sd = SliceDecoder {
             sps: &sps,
@@ -463,6 +479,7 @@ impl HevcDecoder {
             slice_index: sh.segment_address as i32,
             ctb_addr: sh.segment_address as usize,
             data,
+            entry_starts,
             qp_init: qp,
             init_type,
             trace_on: self.trace_on,
@@ -620,12 +637,92 @@ struct SliceDecoder<'a> {
     ctb_addr: usize,
     /// The slice's CABAC data, kept so a WPP substream can re-enter it.
     data: &'a [u8],
+    /// Byte offsets into `data` for each WPP/tile entry point (RBSP, EPB-
+    /// adjusted). Index 0 is always 0 (start of the first substream).
+    entry_starts: Vec<usize>,
     qp_init: i32,
     init_type: usize,
     trace_on: bool,
     trace: Vec<(u16, u16, u8, u8, u8, u8)>,
     ctus: usize,
     tile_map: Option<tiles::TileMap>,
+}
+
+/// Positions of emulation-prevention `0x03` bytes in a NAL body (after the
+/// 2-byte HEVC header), matching [`crate::video::bits::unescape_rbsp`].
+fn epb_positions(body: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut zeros = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let b = body[i];
+        if zeros >= 2 && b == 0x03 && i + 1 < body.len() && body[i + 1] <= 0x03 {
+            out.push(i);
+            zeros = 0;
+            i += 1;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        i += 1;
+    }
+    out
+}
+
+/// Convert slice-header entry-point sizes into RBSP offsets into the slice
+/// data (relative to `data_byte_offset`).
+///
+/// The syntax element is a byte count of the coded NAL body — including any
+/// emulation-prevention bytes that `unescape_rbsp` drops. Applying the sizes
+/// straight to the RBSP lands one byte late for every EPB in a prior
+/// substream, which is exactly how a WPP row that is bit-exact in isolation
+/// desynchronises the next row on real x265 output.
+pub fn entry_point_starts_rbsp(
+    sizes: &[u32],
+    data_byte_offset: usize,
+    body: &[u8],
+) -> Vec<usize> {
+    let epbs = epb_positions(body);
+    // Body index of the first slice-data byte: walk the body the same way
+    // unescape does until `data_byte_offset` RBSP bytes have been kept.
+    let mut rbsp_i = 0usize;
+    let mut data_body = 0usize;
+    let mut zeros = 0usize;
+    let mut i = 0usize;
+    while i < body.len() && rbsp_i < data_byte_offset {
+        let b = body[i];
+        if zeros >= 2 && b == 0x03 && i + 1 < body.len() && body[i + 1] <= 0x03 {
+            zeros = 0;
+            i += 1;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp_i += 1;
+        i += 1;
+        data_body = i;
+    }
+    // If the header had no body left, fall back to a pure-RBSP reading so a
+    // stream without EPBs (and unit tests that pass an empty body) still
+    // produces cumulative sizes.
+    if body.is_empty() || epbs.is_empty() {
+        let mut starts = alloc::vec![0usize];
+        for &o in sizes {
+            let last = *starts.last().unwrap();
+            starts.push(last + o as usize);
+        }
+        return starts;
+    }
+    let mut starts = alloc::vec![0usize];
+    let mut nal_pos = 0usize;
+    for &sz in sizes {
+        let lo = data_body + nal_pos;
+        let hi = lo + sz as usize;
+        let n_epb = epbs.iter().filter(|&&e| e >= lo && e < hi).count();
+        let rbsp_sz = (sz as usize).saturating_sub(n_epb);
+        let next = *starts.last().unwrap() + rbsp_sz;
+        starts.push(next);
+        nal_pos += sz as usize;
+    }
+    starts
 }
 
 impl<'a> SliceDecoder<'a> {
@@ -672,11 +769,8 @@ impl<'a> SliceDecoder<'a> {
         let tiles_on = self.pps.tiles_enabled;
         let save_col = if ctb_w > 1 { 1usize } else { 0 };
         let mut saved: Option<([u8; 1024], [u8; 4])> = None;
-        let mut starts: Vec<usize> = alloc::vec![0usize];
-        for &o in self.sh.entry_point_offsets.iter() {
-            let last = *starts.last().unwrap();
-            starts.push(last + o as usize);
-        }
+        // EPB-adjusted starts into `self.data` (see `entry_point_starts_rbsp`).
+        let starts = self.entry_starts.clone();
         let mut entry_i = 0usize;
 
         let start_rs = self.sh.segment_address as usize;
@@ -2035,7 +2129,7 @@ impl<'a> SliceDecoder<'a> {
             self.intra_predict(x0, y0, log2_trafo_size, 0, mode);
         }
         if cbf_luma {
-            let scan = ctu::scan_order(self.cu.intra, log2_trafo_size, mode);
+            let scan = ctu::scan_order(self.cu.intra, log2_trafo_size, mode, 0);
             self.residual_block(x0, y0, log2_trafo_size, 0, scan, mode)?;
             self.mark_cbf(x0, y0, 1 << log2_trafo_size);
         }
@@ -2059,7 +2153,10 @@ impl<'a> SliceDecoder<'a> {
                         self.intra_predict(cx, cy, l2c, c_idx, mode_c);
                     }
                     if present {
-                        let scan = ctu::scan_order(self.cu.intra, l2c, mode_c);
+                        // Pass the chroma plane index so 8x8 chroma stays on
+                        // the diagonal scan (§7.4.9.11: mode-dependent only
+                        // for 4x4 any-plane or 8x8 luma).
+                        let scan = ctu::scan_order(self.cu.intra, l2c, mode_c, c_idx);
                         self.residual_block(cx, cy, l2c, c_idx, scan, mode_c)?;
                     }
                 }
@@ -2067,7 +2164,8 @@ impl<'a> SliceDecoder<'a> {
         } else if blk_idx == 3 {
             // 4x4 luma sub-block of a larger CU: the fourth one carries the
             // parent's chroma transform (same as 4:2:0, but with 4:2:2's
-            // second vertical TU when needed).
+            // second vertical TU when needed). Chroma is also 4x4 here, so
+            // mode-dependent scan *does* apply.
             let l2c = log2_trafo_size;
             let cx = xbase >> hs;
             let cy0 = ybase >> vs;
@@ -2078,7 +2176,7 @@ impl<'a> SliceDecoder<'a> {
                         self.intra_predict(cx, cy, l2c, c_idx, mode_c);
                     }
                     if present {
-                        let scan = ctu::scan_order(self.cu.intra, l2c, mode_c);
+                        let scan = ctu::scan_order(self.cu.intra, l2c, mode_c, c_idx);
                         self.residual_block(cx, cy, l2c, c_idx, scan, mode_c)?;
                     }
                 }
@@ -2169,14 +2267,22 @@ impl<'a> SliceDecoder<'a> {
             &mut self.stat_coeff,
             &p,
         );
-        if self.trace_on && self.trace.len() < 4 {
+        if self.trace_on {
             self.trace.push((
                 0xFFFF,
                 coeffs[0] as u16,
                 r.max_xy as u8,
                 c_idx as u8,
-                qp as u8,
-                r.transform_skip as u8,
+                ((r.scan_idx as u8) << 4) | (qp as u8 & 0x0f),
+                r.num_coeff.min(255) as u8,
+            ));
+            self.trace.push((
+                0xFFF1,
+                r.last_x as u16,
+                r.last_y as u8,
+                r.scan_idx as u8,
+                c_idx as u8,
+                log2_size as u8,
             ));
         }
 
@@ -2680,5 +2786,38 @@ fn sao_picture(p: &mut Pic) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod entry_point_tests {
+    use super::{entry_point_starts_rbsp, epb_positions};
+
+    /// With no emulation-prevention bytes the starts are a plain prefix sum —
+    /// the path every synthetic WPP fixture takes.
+    #[test_case]
+    fn entry_points_without_epb_are_a_prefix_sum() {
+        let sizes = [10u32, 20, 5];
+        let starts = entry_point_starts_rbsp(&sizes, 0, &[]);
+        assert_eq!(starts, alloc::vec![0, 10, 30, 35]);
+        // Body without EPBs, same result.
+        let body = alloc::vec![0xAAu8; 100];
+        assert_eq!(entry_point_starts_rbsp(&sizes, 4, &body), alloc::vec![0, 10, 30, 35]);
+    }
+
+    /// An EPB inside the first substream shrinks that substream by one RBSP
+    /// byte, so every later start moves down by one — the sample-h265 failure
+    /// mode, pinned as a pure table.
+    #[test_case]
+    fn entry_points_subtract_epbs_inside_prior_substreams() {
+        // Body: 4 header bytes, then slice data. Plant 00 00 03 01 (an EPB)
+        // at body index 4+5 = 9, inside a first substream of size 10.
+        let mut body = alloc::vec![0x11u8; 4]; // header → data_byte_offset = 4
+        body.extend_from_slice(&[1, 1, 1, 1, 1, 0, 0, 3, 1, 1]); // 10 NAL bytes, 1 EPB
+        body.extend_from_slice(&[2u8; 20]); // second substream
+        assert_eq!(epb_positions(&body), alloc::vec![9]);
+        let starts = entry_point_starts_rbsp(&[10, 20], 4, &body);
+        // First substream: 10 NAL − 1 EPB = 9 RBSP; second starts at 9.
+        assert_eq!(starts, alloc::vec![0, 9, 29]);
     }
 }

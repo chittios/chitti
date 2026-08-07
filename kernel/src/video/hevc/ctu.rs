@@ -206,12 +206,20 @@ pub fn chroma_mode_422(mode: u8) -> u8 {
 
 /// Residual scan order for a transform block (§7.4.9.11).
 ///
-/// Only **intra** blocks below 16x16 use a mode-dependent scan; everything else
-/// is diagonal. So a wrong intra mode transposes the residual as well as
-/// mispredicting — two errors from one cause, which is why a mode bug here
-/// looks so much worse than a mode bug in a large block.
-pub fn scan_order(intra: bool, log2_size: u32, mode: u8) -> usize {
-    if !intra || log2_size >= 4 {
+/// Mode-dependent scan applies only to **intra 4x4 (any plane)** and **intra
+/// 8x8 luma**. Intra 8x8 chroma is always diagonal — that is the rule a naive
+/// "size < 16" reading gets wrong, and it desynchronises CABAC the moment a
+/// 16x16 luma TU carries an angular chroma mode (the residual is coded on the
+/// diagonal scan while the decoder walks horizontal or vertical).
+///
+/// A wrong scan does not just transpose coefficients: the group walk, the
+/// significance contexts and the last-position expand all follow the scan, so
+/// the next syntax element is read from the wrong bit and every CU after it is
+/// garbage.
+pub fn scan_order(intra: bool, log2_size: u32, mode: u8, c_idx: usize) -> usize {
+    // H.265 §7.4.9.11: mode-dependent only when log2TrafoSize==2, or when
+    // log2TrafoSize==3 and cIdx==0.
+    if !intra || !(log2_size == 2 || (log2_size == 3 && c_idx == 0)) {
         return super::residual::SCAN_DIAG;
     }
     if (6..=14).contains(&mode) {
@@ -432,31 +440,33 @@ mod tests {
         // Inter blocks are always diagonal, whatever the mode value happens to
         // be — an inter CU's "mode" field is not an intra mode at all.
         for mode in 0..=34u8 {
-            assert_eq!(scan_order(false, 2, mode), SCAN_DIAG);
-            assert_eq!(scan_order(false, 3, mode), SCAN_DIAG);
+            assert_eq!(scan_order(false, 2, mode, 0), SCAN_DIAG);
+            assert_eq!(scan_order(false, 3, mode, 0), SCAN_DIAG);
         }
-        // 16x16 and 32x32 intra are diagonal too.
+        // 16x16 and 32x32 intra are diagonal too (any plane).
         for mode in 0..=34u8 {
-            assert_eq!(scan_order(true, 4, mode), SCAN_DIAG);
-            assert_eq!(scan_order(true, 5, mode), SCAN_DIAG);
+            assert_eq!(scan_order(true, 4, mode, 0), SCAN_DIAG);
+            assert_eq!(scan_order(true, 5, mode, 0), SCAN_DIAG);
+            assert_eq!(scan_order(true, 3, mode, 1), SCAN_DIAG, "8x8 chroma always DIAG");
+            assert_eq!(scan_order(true, 3, mode, 2), SCAN_DIAG, "8x8 chroma always DIAG");
         }
-        // 4x4 and 8x8 intra: near-horizontal modes scan vertically and vice
-        // versa, because the residual's energy lies across the prediction
-        // direction, not along it.
-        for log2 in [2u32, 3] {
-            assert_eq!(scan_order(true, log2, 10), SCAN_VERT, "horizontal mode");
-            assert_eq!(scan_order(true, log2, 26), SCAN_HORIZ, "vertical mode");
-            assert_eq!(scan_order(true, log2, 6), SCAN_VERT);
-            assert_eq!(scan_order(true, log2, 14), SCAN_VERT);
-            assert_eq!(scan_order(true, log2, 22), SCAN_HORIZ);
-            assert_eq!(scan_order(true, log2, 30), SCAN_HORIZ);
+        // 4x4 (any plane) and 8x8 **luma**: near-horizontal modes scan
+        // vertically and vice versa, because residual energy lies across the
+        // prediction direction, not along it.
+        for (log2, c_idx) in [(2u32, 0usize), (2, 1), (2, 2), (3, 0)] {
+            assert_eq!(scan_order(true, log2, 10, c_idx), SCAN_VERT, "horizontal mode");
+            assert_eq!(scan_order(true, log2, 26, c_idx), SCAN_HORIZ, "vertical mode");
+            assert_eq!(scan_order(true, log2, 6, c_idx), SCAN_VERT);
+            assert_eq!(scan_order(true, log2, 14, c_idx), SCAN_VERT);
+            assert_eq!(scan_order(true, log2, 22, c_idx), SCAN_HORIZ);
+            assert_eq!(scan_order(true, log2, 30, c_idx), SCAN_HORIZ);
             // Just outside the bands, and the two non-angular modes.
-            assert_eq!(scan_order(true, log2, 5), SCAN_DIAG);
-            assert_eq!(scan_order(true, log2, 15), SCAN_DIAG);
-            assert_eq!(scan_order(true, log2, 21), SCAN_DIAG);
-            assert_eq!(scan_order(true, log2, 31), SCAN_DIAG);
-            assert_eq!(scan_order(true, log2, 0), SCAN_DIAG);
-            assert_eq!(scan_order(true, log2, 1), SCAN_DIAG);
+            assert_eq!(scan_order(true, log2, 5, c_idx), SCAN_DIAG);
+            assert_eq!(scan_order(true, log2, 15, c_idx), SCAN_DIAG);
+            assert_eq!(scan_order(true, log2, 21, c_idx), SCAN_DIAG);
+            assert_eq!(scan_order(true, log2, 31, c_idx), SCAN_DIAG);
+            assert_eq!(scan_order(true, log2, 0, c_idx), SCAN_DIAG);
+            assert_eq!(scan_order(true, log2, 1, c_idx), SCAN_DIAG);
         }
     }
 

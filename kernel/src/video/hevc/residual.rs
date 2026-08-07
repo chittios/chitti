@@ -80,6 +80,10 @@ pub struct ResidualResult {
     /// `max(last_x, last_y)`; zero means the block holds only a DC coefficient,
     /// which is what selects the closed-form inverse transform.
     pub max_xy: u32,
+    pub last_x: u32,
+    pub last_y: u32,
+    pub scan_idx: usize,
+    pub num_coeff: usize,
 }
 
 /// Read `n` bypass bins as one value, most significant first.
@@ -520,7 +524,16 @@ pub fn residual_coding(
         }
     }
 
-    ResidualResult { transform_skip, explicit_rdpcm, explicit_rdpcm_dir, max_xy }
+    ResidualResult {
+        transform_skip,
+        explicit_rdpcm,
+        explicit_rdpcm_dir,
+        max_xy,
+        last_x,
+        last_y,
+        scan_idx: p.scan_idx,
+        num_coeff,
+    }
 }
 
 #[cfg(test)]
