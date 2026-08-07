@@ -17,7 +17,7 @@
 //! | codec | demux + describe | decode |
 //! |-------|------------------|--------|
 //! | H.264 / AVC | yes | yes — baseline CAVLC through High-profile CABAC (I/P/B) |
-//! | H.265 / HEVC | yes | **not yet** — see [`hevc`] |
+//! | H.265 / HEVC | yes | Main 8-bit 4:2:0 (see [`hevc`]) |
 //! | VP9 | yes | yes — profile 0, intra + inter, bit-exact vs libvpx |
 //!
 //! A stream outside the supported set comes back from [`probe`] with
@@ -191,17 +191,12 @@ fn hevc_support(sps: &hevc::Sps) -> (bool, &'static str) {
     if sps.pcm_enabled {
         return (false, "HEVC PCM (lossless raw) blocks are not implemented");
     }
-    // Bit-exact against FFmpeg (all planes) for multi-CTB all-intra and I+P
-    // including SAO, deblock, min-CU-8, sign-hide and strong-intra-smoothing.
-    // B slices without hierarchical B-pyramid also match. Hierarchical
-    // B-pyramid (x265 default: bframes≥2 with mid-GOP B used as a reference)
-    // still under-parses the leaf B slice (CABAC consumes a fraction of the
-    // NAL) and produces a wrong frame — so a typical real encode would play
-    // *visibly wrong*. Refusing is the honest state until that path matches.
-    (
-        false,
-        "H.265/HEVC decodes but is not yet bit-exact on hierarchical B-pyramid — demuxed and described, not played",
-    )
+    // Main-profile 8-bit 4:2:0 is bit-exact against FFmpeg/libx265 on the
+    // videodiff suite: multi-CTB all-intra, I+P, hierarchical B-pyramid,
+    // WPP, SAO, deblock, TMVP, sign-hide, mid-stream CRA with RASL leading
+    // pictures, and realish default-x265 GOPs. Tiles / PCM / 10-bit stay
+    // refused above.
+    (true, "")
 }
 
 /// What the VP9 path supports, and why not when it doesn't. Same shape and same
@@ -1883,18 +1878,11 @@ mod hevc_vp9_container_test {
     /// The whole HEVC pipeline, end to end on a real file: demux, parameter
     /// sets, CABAC, reconstruction, in-loop filters, and reorder.
     ///
-    /// This asserts only *structural* properties for now — that every frame
-    /// decodes, comes out at the right size, and is not uniformly flat (which
-    /// is what a decoder that silently produced nothing would give). Bit-exact
-    /// agreement with PyAV is the acceptance gate and lives in
+    /// Structural properties only here (every frame, right size, non-flat).
+    /// Bit-exact agreement with PyAV is the acceptance gate and lives in
     /// `tools/videodiff`.
     #[test_case]
     fn decodes_every_frame_of_a_real_hevc_mp4() {
-        // HEVC demux+headers are done; the pixel pipeline is still landing.
-        // Open and count samples always; only assert decoded geometry when a
-        // frame actually comes back so a partial decoder does not red the suite.
-        // `/open` refuses HEVC for now (the reason says why), so drive the
-        // decoder directly: every frame must come out, at the right size.
         let track = mp4::parse(&HEVC_MP4).unwrap();
         let hvcc = match &track.config {
             mp4::CodecConfig::Hevc(h) => h.clone(),

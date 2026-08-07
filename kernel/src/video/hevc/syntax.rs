@@ -196,8 +196,18 @@ pub fn inter_pred_idc<S: BinSource>(s: &mut S, w: usize, h: usize, ct_depth: usi
 
 /// `ref_idx_lX`: truncated unary, context-coded for the first two bins and
 /// bypass beyond.
-pub fn ref_idx<S: BinSource>(s: &mut S, list: usize, num_ref_idx: usize) -> usize {
-    let base = if list == 0 { ct::REF_IDX_L0 } else { ct::REF_IDX_L1 };
+///
+/// **Both lists share the `ref_idx_l0` contexts.** The specification's context
+/// table has a separate `ref_idx_l1` pair, but every production encoder and
+/// decoder (HM, x265, FFmpeg) codes both lists against the L0 pair — x265's
+/// `OFF_REF_NO_CTX` is list-agnostic, and FFmpeg's `ff_hevc_ref_idx_lx_decode`
+/// hard-codes `REF_IDX_L0_OFFSET`. Using the L1 pair desynchronises the coder
+/// the first time a bi-predicted AMVP block has more than one L1 reference
+/// (the hierarchical B-pyramid leaf case: `num_ref_idx_l0 == num_ref_idx_l1
+/// == 2`), because that is the first time both lists' ref-idx bins fire in the
+/// same prediction unit.
+pub fn ref_idx<S: BinSource>(s: &mut S, _list: usize, num_ref_idx: usize) -> usize {
+    let base = ct::REF_IDX_L0;
     let max = num_ref_idx.saturating_sub(1);
     let max_ctx = max.min(2);
     let mut i = 0usize;

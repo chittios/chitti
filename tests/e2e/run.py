@@ -2528,15 +2528,14 @@ _VP9_WEBM_B64 = (
 
 
 def s_open_hevc_vp9(_g):
-    """H.265/HEVC and VP9 on the real kernel: the two codecs added alongside
-    H.264 must **demux and describe** correctly from both container families,
-    and — because neither pixel pipeline exists yet — `/open` must say so
-    plainly instead of failing with an H.264-shaped error message.
+    """H.265/HEVC and VP9 on the real kernel: both codecs demux from their
+    container families and **play** in the streaming player.
 
-    That last part is the regression this scenario really guards. The player
-    used to print "CABAC entropy coding (baseline/CAVLC only)" for anything it
-    could not decode, which is a true statement about H.264 and a nonsense one
-    about HEVC (always CABAC) or VP9 (no CABAC at all)."""
+    Also guards a historical mis-message: the player used to print "CABAC
+    entropy coding (baseline/CAVLC only)" for anything it could not decode,
+    which is true of H.264 and nonsense about HEVC (always CABAC) or VP9
+    (no CABAC). A refusal must still name a codec-specific reason — and for
+    these two fixtures, there should be no refusal at all."""
     import base64
     import tempfile
 
@@ -2569,15 +2568,24 @@ def s_open_hevc_vp9(_g):
                 return False, "HEVC level printed with AVC's x10 convention"
             if not g2.wait_for("4 frames", 8, m):
                 return False, "HEVC sample table did not yield 4 frames"
-            if not g2.wait_for("cannot decode", 8, m):
-                return False, "HEVC reported as playable, but there is no HEVC pixel pipeline"
-            if not g2.wait_for("not implemented", 8, m):
-                return False, "HEVC refusal did not name the real reason"
+            # HEVC **plays**: Main 8-bit 4:2:0 is bit-exact against FFmpeg.
+            if not g2.wait_for("decoder=hevc", 15, m):
+                return False, "HEVC did not open in the streaming player"
+            if not g2.wait_for("ready in", 15, m):
+                return False, "HEVC opened but decoded no frame"
+            m2 = g2.mark()
+            g2.send_raw(b"\x1b[T")   # Ctrl+Tab: focus the video tab
+            g2.wait_quiet(0.3, 10)
+            g2.send_raw(b" ")        # pause
+            g2.send_raw(b"\x1b[C")   # seek forward
+            g2.send_raw(b"\x03")     # Ctrl+C stops
+            if not g2.wait_for("video stopped", 12, m2):
+                return False, "HEVC transport controls did not stop playback"
             # …and the shell is still alive afterwards.
             m = g2.mark()
             g2.send("/pwd")
             if not g2.wait_for("/home/chitti", 10, m):
-                return False, "the shell did not survive an undecodable HEVC file"
+                return False, "the shell did not survive an HEVC open"
 
             # VP9-in-WebM: no CodecPrivate at all, raw frames with no length
             # prefix — the two ways a demuxer written for H.264 rejects every
@@ -2611,8 +2619,8 @@ def s_open_hevc_vp9(_g):
             g2.send("/pwd")
             if not g2.wait_for("/home/chitti", 10, m):
                 return False, "the shell did not survive the VP9 clip"
-            return True, ("HEVC (hvcC/hvc1 in mp4) demuxes + describes and refuses with the "
-                          "right reason; VP9 (V_VP9 in WebM) decodes and plays")
+            return True, ("HEVC (hvcC/hvc1 in mp4) and VP9 (V_VP9 in WebM) "
+                          "both demux, decode and play")
         return False, "no 64x64 probe from /open on any mount"
     finally:
         g2.close()

@@ -349,9 +349,16 @@ impl HevcDecoder {
                     || sets.st_foll.contains(&f.poc);
                 fl.short_ref = named;
             }
-            if nal.is_irap() {
+            // IDR and BLA always empty the DPB (NoRaslOutputFlag = 1). CRA does
+            // *not* when it is mid-stream: its RASL leading pictures predict from
+            // the previous GOP, so wiping the buffer here turns a continuous
+            // keyint into three broken frames before every CRA. At true random
+            // access the DPB is already empty, so treating CRA like a normal
+            // picture is also correct there (missing refs fall back below).
+            if nal.is_idr() || nal.is_bla() {
                 for (fl, _) in self.dpb.iter_mut() {
                     fl.short_ref = false;
+                    fl.long_ref = false;
                 }
             }
             self.dpb.retain(|(fl, _)| fl.short_ref || fl.long_ref);
