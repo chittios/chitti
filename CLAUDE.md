@@ -1045,7 +1045,7 @@ FDT claims a GICv3 but carries no readable `reg`.
   Javy plugin (`tools/javy-plugin/`, `javy-plugin-api` 7.1.0, rebuilt by
   `cargo xtask javy-plugin`), which imports the `chitti.host_*` functions and exposes
   them as a `Chitti` global — `storageGet/Set/Remove/List`, `fsRead/Write/List/Exists`,
-  `uiDraw`, `hud`, `http`, `log`, `sha1`, `home`, `userHome`, `nowMs/nowUnix`. Same
+  `uiDraw`, `hud`, `http`, `notify`, `log`, `sha1`, `home`, `userHome`, `nowMs/nowUnix`. Same
   imports, same gates, so **the authority does not widen**: only who can call it.
   Refusals **throw** into the script rather than returning empty, and "no value"
   returns `null` (localStorage's shape) because `JSON.stringify` drops `undefined`,
@@ -1113,11 +1113,49 @@ FDT claims a GICv3 but carries no readable `reg`.
   `${notifications}` — *absent* at zero unread, because `chip_text` returns `""`
   and `ui_config::expand` swallows the following separator, so a quiet machine has
   a byte-identical status bar — plus a dropdown and a `RightMode::Notifications`
-  action-pane tab. **No toast**, deliberately: there is no compositor layer for a
-  transient overlay, it would re-damage a rect every pulse for something nobody is
-  looking at, and it would land over the composer; `modal` already exists for the
-  rare thing that must interrupt. Ships with **one real producer** so it is not
-  decorative — `service::supervise_tick` exhausting a daemon's restart budget.
+  action-pane tab, **and a banner** (`notify/toast.rs` + `framebuffer/toast.rs`).
+
+  The banner reverses an earlier decision in this file, and the reasoning is worth
+  keeping: a transient overlay was rejected on three grounds, and two of them were
+  about a banner placed *anywhere*. Pinned **top-right of the content rect** they
+  dissolve — nothing is typed there (the composer is at the bottom), and a banner
+  that does not animate damages exactly twice (appear, lift) rather than once per
+  pulse, which `Toast::needs_repaint` is what enforces. The third — a transient
+  overlay must save and restore the pixels beneath it on a single-buffered
+  framebuffer — is real, and is solved the way the **mouse cursor** solves it:
+  `toast_saved` is `cur_saved` with a different name. Anchoring to the *content*
+  rect rather than the screen means all four `/statusbar` edges work with no match
+  on which edge it is. A full `redraw` invalidates the saved pixels
+  (`toast_forget`, called inside `redraw` rather than at its eight call sites, so a
+  ninth cannot get it wrong).
+
+  **`/notify on|mute|off`** is three states, not a switch, because "stop making
+  noise at me" and "stop recording anything" are different requests and one switch
+  answers one of them wrongly. `mute` keeps the queue — which is most of its value
+  — and `off` records nothing at all, which is what "fully disable" means. Both
+  persist to `ui.json` (normalized through the parser, so a typo leaves
+  notifications *on*: the safe reading of an unreadable setting is the one that
+  still tells you things), and an empty listing under `off` says *why* it is empty,
+  because "nothing is arriving" otherwise has two indistinguishable causes.
+
+  **The chime** is a two- or three-note figure per severity, not a beep: a single
+  tone carries no information, so success rises, error falls, and `Action` is a
+  longer three-note figure. `Info` never rings at all — a five-second scheduled job
+  would be a metronome, and that is how an OS sound gets turned off for good. Every
+  chime is under 400 ms, playing is best-effort, and a full audio queue drops it
+  (the notification is already on screen; nothing waits on audio).
+
+  **The agent API** is `host_notify` (wasm) and `Chitti.notify(severity, title,
+  body?)` (JS). Same three rules as the tool: the source is stamped from the
+  binding and cannot be chosen; it is write-only, so a posted notification cannot
+  be read back (no laundering channel, for zero policy); and it shares the
+  `log_count` rate-limit budget, because the chime makes spam louder than usual.
+  `Severity::Action` is deliberately **not** reachable from a guest — it means "a
+  human decision is waiting", which only the kernel's unattended-approval path is
+  entitled to claim; a guest asking for it gets `Warn`.
+
+  Ships with **one real producer** so it is not decorative —
+  `service::supervise_tick` exhausting a daemon's restart budget.
 - **Scheduled runs** (`schedule/`, `/schedule`) — a stored intent that acts later.
   Deliberately **not five-field cron**, because the wall clock here may be fiction:
   with no readable RTC `clock::DEFAULT_UNIX` puts the machine in January 2026 until
@@ -1917,6 +1955,355 @@ FDT claims a GICv3 but carries no readable `reg`.
   The e2e `open_video` scenario muxes a real x264 baseline multi-slice clip into
   mp4 (stdlib muxer) and asserts the on-kernel probe + streaming decode ("N
   frame(s), ready in …") + transport controls; it auto-skips where x264 is absent.
+
+  **H.265/HEVC and VP9: the bitstream and container layers exist; the pixel
+  pipelines do not.** This is the same staging the H.264 work used, and the split
+  is deliberate — `/open` **demuxes and describes** an HEVC or VP9 file correctly
+  and then says it cannot play it, rather than reporting a codec it will fail on.
+  `probe` carries the reason (`VideoInfo::unsupported_reason`), because the player
+  used to *infer* one at the call site and printed "CABAC entropy coding
+  (baseline/CAVLC only)" for every undecodable stream — true of H.264, nonsense
+  about HEVC (always CABAC) and VP9 (no CABAC at all). What is done:
+
+  - **The demuxers are codec-agnostic.** `mp4::CodecConfig` is `Avc(AvcC) |
+    Hevc(HvcC) | Vp9(VpcC)`; mp4 reads `avc1/avc3`, `hvc1/hev1` and `vp09`, mkv
+    reads `V_MPEG4/ISO/AVC`, `V_MPEGH/ISO/HEVC` and `V_VP9`. Three traps, each
+    of which silently produces a plausible wrong track: **`hvcC`'s fixed part is
+    22 bytes, not `avcC`'s 5** (it carries the whole `profile_tier_level`), and
+    reading it the short way lands the NAL arrays inside the constraint flags,
+    where the lengths are large believable numbers; **VP9 has no `CodecPrivate`
+    and needs none** (every frame header is self-describing), so requiring one
+    rejects every WebM file; and **VP9 samples carry no length prefix at all**,
+    so `CodecConfig::length_size()` is 0 there and a caller that assumes framing
+    reads the frame header's first four bytes as a NAL length.
+  - Fixed while generalising, both pre-existing and both invisible on a
+    video-only file: the mkv demuxer took blocks from **every** track (an mkv
+    with audio interleaved audio frames into the video sample list — `TrackType`
+    is now honoured and blocks are filtered by track number), and it read only
+    `SimpleBlock`, so a file using `BlockGroup`/`Block` demuxed to **zero**
+    frames. A `BlockGroup` has no keyframe bit; the absence of a
+    `ReferenceBlock` is what marks one.
+  - **HEVC** (`video/hevc.rs`) — NAL split (Annex-B and HVCC), VPS/SPS/PPS,
+    `profile_tier_level`, scaling lists, short-term RPS, and the slice segment
+    header. Reuses `video::bits` verbatim (HEVC's RBSP escaping and Exp-Golomb
+    are AVC's) and nothing above it. Four things that are each a silent
+    mis-decode: **the NAL header is two bytes** (`nal_unit_type` is 6 bits at bit
+    1), so AVC's `hdr & 0x1f` types every unit wrong; **`SliceType` is numbered
+    backwards from AVC's** (0 is B here, I there); **the profile block is 88
+    bits** and, when `maxNumSubLayersMinus1 > 0`, the *unused* sub-layer slots up
+    to 8 are padded 2 bits each — omit that and every SPS field after it decodes
+    to plausible nonsense; and **the default scaling lists are not flat** (H.265
+    Table 7-6 is a real matrix above 4x4), so a flat default decodes every
+    scaling-list stream slightly soft rather than erroring. The slice header
+    *consumes* `pred_weight_table` and reference-list modification even though
+    the decoder does not use them yet, because their length is data-dependent and
+    a `data_byte_offset` that is right only for simple streams decodes garbage
+    instead of erroring.
+  - **VP9** (`video/vp9.rs`) — superframe index, the boolean decoder, and the
+    uncompressed frame header. **A container sample is not a frame**: almost
+    every libvpx stream packs an invisible ALTREF with the frame that shows it,
+    and treating the sample as one frame decodes the ALTREF and displays it. The
+    bool decoder is libvpx's windowed form; a test proves it is arithmetically
+    identical to the spec's bit-serial `split = 1 + (((range - 1) * p) >> 8)` for
+    every reachable `(range, prob)`, since the serial renormalise is too slow for
+    the coefficient layer. Its first bit is a marker that must be 0, which is the
+    only check that a compressed-header *size* was read correctly — get it wrong
+    and a whole frame decodes as noise with no error. Also: the interpolation
+    filter's 2-bit literal is **not** the enum order (literal 0 is
+    `EIGHTTAP_SMOOTH`), and `s(n)` is magnitude-then-sign, not two's complement.
+  - **`tools/videodiff/`** is the host harness for all three codecs (the
+    `h264diff`/onnxdiff pattern — mounts `kernel/src/video/*` via `#[path]`, so
+    there is one implementation): `probe`, `headers` (per-frame/per-slice header
+    dump — the bring-up view, since "the demuxer found no frames" and "the
+    headers do not parse" are different failures with the same symptom), and
+    `yuv`. `diff.py` cross-checks codec/geometry/frame-count against **PyAV**,
+    which is the independent implementation our own tests structurally cannot be.
+    Verified against real x265 and libvpx output in both container families,
+    including tiled, multi-slice, 10-bit and 1024x576 clips: the HEVC B-pyramid
+    comes out as POCs 0,4,2,1,3 with a CRA at the second keyframe, 4-slice
+    frames at CTB addresses 0/20/40/60, and 2 WPP entry points for 3 CTB rows.
+    NB `h264diff` also had to be repaired — it had stopped compiling against
+    `video/mt.rs`'s arch-neutral `parallel_for` facade.
+  - Tests: the parameter-set fixtures are **real x265/libvpx bytes**, not
+    hand-built bit patterns (a fixture built by the parser's author parses fine
+    by construction), plus whole embedded `hvc1` mp4 and `V_VP9` WebM files, plus
+    an `open_hevc_vp9` e2e scenario that embeds those same two files base64 so it
+    always runs instead of skipping when x265/vpxenc are absent.
+
+  **VP9 decodes, and it is bit-exact against libvpx.** `/open` plays a VP9 file
+  — profile 0 (8-bit 4:2:0), intra and inter, sub-8x8 partitions, all four
+  transform types at all four sizes, multiple tile columns, and the in-loop
+  deblocking filter. Verified frame-for-frame against PyAV/libvpx on nine
+  clips including a 1280x720 real-world file, a 1024x576 four-tile clip,
+  deeply-searched encodes that use every partition shape, and a
+  non-frame-parallel stream that needs backward adaptation: **zero differing
+  samples in any plane**. `tools/videodiff vp9seq` + `cmpseq` is that harness.
+
+  The build is `kernel/src/video/vp9/`: `tables.rs` (generated),
+  `idct_kernels.rs` (transpiled), `transform.rs`, `intra.rs`, `header.rs`
+  (compressed header), `tokens.rs`, `tile.rs`, `inter.rs`, `loopfilter.rs`,
+  `decoder.rs`. **Two of those files are machine-produced and must not be
+  hand-edited**: `tools/gen_vp9_tables.py` parses ~9000 probability, scan,
+  neighbour, filter and dequantiser values out of libvpx, and
+  `tools/gen_vp9_idct.py` transpiles the seven 1-D transform kernels (`idct32`
+  alone is 328 statements). Regenerate, do not retype.
+
+  Eleven bugs were found bringing this up, and every one of them was silent —
+  worth reading before touching any of it:
+
+  - **The table generator dropped the minus sign** on `-PARTITION_NONE`-style
+    tree leaves, because `-?\d+|[A-Za-z_]\w*` cannot match a negated
+    identifier. Every leaf became a node index, so `read_tree` walked
+    `1 -> 2 -> 1` forever: a **hang**, not a crash. Guarded now by a
+    tree-termination test.
+  - **The intra frame's partition probabilities are the constant
+    `vp9_kf_partition_probs`, not the frame context** (libvpx
+    `set_partition_probs`). This is the only probability set on the keyframe
+    path that is not adaptive, and using the adaptive one desynchronises the
+    whole tile while the *mode grid still looks plausible* — because keyframe Y
+    and UV modes come from their own constant tables. A sensible-looking
+    partition/mode dump over a completely wrong picture is the signature.
+  - **`ADST_DCT` means ADST on the *columns*.** libvpx's table is
+    `typedef struct { transform_1d cols, rows; }` and its `ADST_DCT` entry is
+    `{ iadst, idct }` — the **first** member is the column kernel. Swapping them
+    is invisible on `DCT_DCT`, on `ADST_ADST` and on any DC-only block, so it
+    survives every cheap test; it showed up as chroma (all-DC) bit-exact while
+    luma was off by ~25 everywhere.
+  - **The residual covers the mode-info block, not the prediction block.**
+    `n4_w = (bw << 1) >> ssx` with `bw` in 8x8 MI units, so a `BLOCK_4X4` still
+    carries a full 8x8 of luma — **four** 4x4 transforms. Sizing it from
+    `num_4x4_blocks_wide` reads one, leaving three quarters of the coefficients
+    unread. Only content the encoder searches deeply enough to *use* sub-8x8
+    partitions trips it, so a fast encode of a clip was bit-exact while a slow
+    encode of the same clip overran its tile.
+  - **The 4x4 directional intra predictors are hand-written special cases**
+    (`intra_pred_no_4x4` generates the generic form only for 8/16/32). `d45` at
+    4x4 continues the diagonal through `above[7]` where the generic one clamps
+    to `above[bs-1]`. Running the generic code at 4x4 gives a plausible diagonal
+    that is wrong in its lower-right triangle.
+  - **Intra edge availability is per *block*, and the left edge is
+    tile-relative.** `left_mi` is null at a tile's left column, which feeds the
+    skip context, the transform-size context and the Y-mode probabilities — so
+    it changes *bit consumption*, not just prediction. Invisible on single-tile
+    content. Above-right is also only ever read for 4x4 transforms, and past a
+    frame edge the last real sample repeats rather than the buffer's padding
+    being read (which would decode differently on a seek than on linear play).
+  - **The output shift is per transform size** (4/5/6/6), and the 32x32 row pass
+    has *no* pre-shift. One constant makes large blocks come out at the wrong
+    contrast.
+  - **The bool decoder legitimately reads past the end.** It pre-loads ~56 bits,
+    so every well-formed partition ends holding virtual zeros; libvpx adds
+    `LOTS_OF_BITS` to `count` there and only errors when a decode runs *far*
+    past. Flagging the first read past the last byte rejects every valid frame.
+  - **`num_4x4_w`/`num_4x4_h` for sub-8x8 inter blocks come from the
+    partition**, and having them the wrong way round makes a `BLOCK_4X4` read
+    **one** motion vector instead of four.
+  - **`get_sub_block_mv` uses a table** (`idx_n_column_to_subblock`,
+    `{1,2},{1,3},{3,2},{3,3}`), not a derivable rule. A plausible hand-derived
+    version differs from it on exactly the cases a deep encode produces — it was
+    worth 33 wrong pixels in one 10x6 region, which then propagated.
+
+  Also fixed while here, and both pre-existing: the **mkv demuxer took blocks
+  from every track** (an mkv with audio interleaved audio frames into the video
+  sample list) and read only `SimpleBlock`, so a `BlockGroup` file demuxed to
+  **zero** frames.
+
+  **Backward probability adaptation is built too**, which is what makes a stream
+  encoded with frame-parallel decoding *off* decode at all: the probabilities
+  the next frames start from are this frame's symbol counts merged into the
+  context it was decoded against. Two things about it are not guessable.
+  `mode_mv_merge_probs` **returns the probability unchanged when there are no
+  observations** rather than falling back to 128 — which would throw away the
+  forward update the header just transmitted. And motion vectors are counted
+  from the **reconstructed difference**, not from the symbols as they were read:
+  `vp9_inc_mv` recomputes the joint and the magnitude class from the value, and
+  counts the high-precision bit *always*, including where the bitstream coded
+  none (its value is then the implicit 1). Counting per-symbol leaves the hp
+  tallies short and desynchronises a frame several removes later — it was worth
+  exactly three good frames and then noise.
+
+  Still refused rather than guessed at: segmentation, reference scaling
+  (a mid-stream resolution change) and profiles 1-3.
+
+  **HEVC's pixel pipeline is being built stage by stage, and the pure stages are
+  in.** `/open` still refuses an HEVC file with a reason — nothing below is
+  wired to a picture yet, and it will not be claimed as playing until whole
+  frames match PyAV. What exists, each pure and unit-tested off-hardware:
+
+  - **The CABAC engine is H.264's, shared rather than copied**
+    (`Cabac::new_hevc`). The arithmetic, `rangeTabLPS` and the state transitions
+    are byte-identical between the two standards; only the context
+    initialisation differs. FFmpeg writes that derivation as
+    `pre = 2p - 127; pre ^= pre >> 31; clamp`, which **reads like an absolute
+    value and is not** — for negative `x`, `x ^ (x >> 31)` is `-x - 1`, and that
+    off-by-one is exactly the specification's asymmetry between `63 - p` (valMPS
+    0) and `p - 64` (valMPS 1). "Cleaning it up" into `abs()` is wrong on every
+    context that starts with valMPS 0, each one state too confident, which no
+    bitstream rejects.
+  - **199 contexts and ~1200 constants are generated, never transcribed**
+    (`tools/gen_hevc_tables.py` -> `hevc/cabac_tables.rs`, `hevc/tables.rs`).
+    Two traps the generator had to learn: `HEVC_CONTEXTS` is the *allocated*
+    size (199, sized for the range extensions) while only **179** are
+    initialised, so the parse must accept `3 x (<= n)` and zero-pad as C does;
+    and a **zero-bin element occupies no context slot** — the X-macro sets
+    `NAME_END = NAME_OFFSET + NUM_BINS - 1`, so with 0 bins `END` falls *below*
+    `OFFSET` and the next element starts at the same index. Advancing by one
+    there shifts every later element's contexts, which decodes one syntax
+    element against another's probabilities: not a failure, a picture that is
+    wrong in a way that looks like a different bug. The offsets are checked by
+    `pos == used` at generation time.
+  - **The inverse DCT is a matrix multiply, deliberately** (`hevc/transform.rs`).
+    Every decoder in the wild writes it as `TR_4` inside `TR_8` inside `TR_16`
+    inside `TR_32` — four nested macros of hand-placed constants. That
+    factorisation is an optimisation, not the definition: the specification
+    defines `out[i] = sum_k M[k][i] * src[k]` over one 32x32 basis, and because
+    both passes sum in full precision before their single rounding step, the
+    direct form is **bit-exact** with the butterfly rather than merely close. So
+    the whole transform path contains no hand-written constant, driven from the
+    generated `TRANSFORM`; the 4x4 luma DST is the one exception and is
+    cross-checked against FFmpeg's butterfly on every basis vector.
+  - **Intra prediction** (`hevc/intra.rs`) — reference substitution, the weak
+    3-tap and strong bilinear reference filters, and all 35 modes. Substitution
+    propagates **in the specification's scan order** (up the left edge, around
+    the corner, along the top), not from the nearest available sample: the
+    obvious reading gives a different picture at every block touching a slice or
+    picture boundary, and both look plausible. The corner is filtered from
+    *both* edges at once — one wrong pixel there seeds every negative-angle
+    projection through it.
+  - **Deblocking sample filters** (`hevc/deblock.rs`) — HEVC filters on an
+    **8x8 grid**, and each 8-sample edge is two independently decided halves
+    whose strong/weak choice comes from **lines 0 and 3 only** and applies to
+    all four. Deciding per line gives a smoother, plausible, wrong picture. `tc`
+    is looked up at `qp + 2 * (bS - 1)`, so dropping the `bS` term still filters
+    every edge that should be filtered, just uniformly — which reads as slightly
+    soft intra edges and nothing else.
+  - **SAO** (`hevc/sao.rs`) — band and edge offset. The classifier must read
+    **unfiltered** neighbours, so it cannot run in place: doing so makes column
+    `x`'s category depend on column `x-1`'s offset, a directional bias that
+    looks like a motion-compensation bug. And `edge_idx` remaps the five
+    relations to `{1,2,0,3,4}` so the flat case lands on the always-zero entry;
+    indexing four offsets directly is off by one for two of the five categories.
+
+  - **Residual coding** (`hevc/residual.rs`) — the CABAC syntax layer: the
+    last-significant-coefficient position, 4x4 coefficient groups walked
+    backwards, greater1/greater2 flags, Golomb-Rice remainders with
+    `stat_coeff` adaptation, and sign data hiding. Nearly every rule in it is a
+    *context selection* rule, which is the mistake that does not fail — a bin
+    decoded against the wrong model still yields a 0 or a 1, the stream stays in
+    sync for a while, and the picture is wrong in a way that looks like a
+    different bug. Two pieces of bookkeeping to hold on to:
+    `significant_coeff_flag_idx` is filled in **decreasing** scan order (so
+    entry 0 is the *highest* position, and reading those names the other way
+    round inverts sign hiding's distance test), and `greater1_ctx` is **carried
+    across coefficient groups** rather than reset per group.
+    The Rice code is validated by round-tripping against an encoder written
+    separately from the specification's description, over every Rice parameter —
+    and that needed a real **arithmetic** bypass encoder, because a bypass bin
+    is *not* a raw bit. With `range` fixed at 510 the state obeys
+    `offset_k = S_k - 510 * N_k` (`S_k` = the first `9 + k` bits as an integer,
+    `N_k` = the bins so far), which inverts to `N_k = S_k / 510`; the first
+    version of that helper assumed bits passed straight through and would have
+    tested the bit reader instead of the code.
+  - **Coding-unit derivations** (`hevc/ctu.rs`) — the MPM list, chroma mode
+    resolution, scan-order selection, partition geometry and `bS`. The MPM ring
+    is 32 wide over modes 2..=33, so mode 2's predecessor is **33** and mode 34
+    folds onto the same neighbours — not what "extend the angle by one step"
+    suggests. The non-MPM path **sorts** the candidates before skipping, which
+    is easy to omit because the MPM path does not need it, and omitting it still
+    yields a legal mode. The chroma escape on a collision is **mode 34**, not
+    the next table entry. And `bS` matches references **by picture, not by list
+    index** — the same picture can sit at different indices in the two lists, so
+    index-matching calls two identical predictions different — with both
+    pairings tried when a block predicts twice from one picture.
+  - **Inter prediction** (`hevc/inter.rs`) — MV scaling, the merge candidate
+    list, and motion compensation. MC works in a **14-bit intermediate**: every
+    fractional filter leaves its result there and the final shift happens once,
+    in the uni- or bi-prediction combine, which is why bi-prediction is more
+    accurate than averaging two rounded predictions. Five shifts have to agree
+    (`<< (14-B)`, `>> (B-8)`, `>> 6`, `>> (14-B)`, `>> (15-B)`) and a flat
+    reference reconstructing exactly through every fractional position pins all
+    of them at once. Merge pruning compares each position against a **fixed
+    short list** of predecessors, not against everything found so far — B0
+    duplicating A1 is still kept — and B2 is dropped once four candidates exist,
+    a rule about the *count* rather than about the list being full.
+    `mv_scale`'s `+ 127 + (negative)` is a round-half-away-from-zero; a plain
+    shift biases every scaled vector towards negative infinity and drifts a
+    whole GOP of B-frames.
+
+  Two tables in this work were **recalled and wrong**, which is the standing
+  reason everything here is generated: the 4:2:2 chroma mode map (`tab_mode_idx`)
+  came out right for the first 14 entries and wrong for the remaining 21 — it is
+  a gentle monotone curve either way, so nothing about it looks suspicious — and
+  FFmpeg's context-init `pre ^= pre >> 31` reads as an absolute value but is
+  `-x - 1`, which *is* the specification's `63 - p` / `p - 64` asymmetry.
+
+  **What is still missing is the part that turns those into a frame**: the CTU
+  quadtree *walk* that calls all of the above in bitstream order (the split,
+  skip, part-mode and CBF flags plus the transform tree), AMVP, the temporal
+  merge candidate's collocated lookup, and DPB/POC/RPS management. Those are the
+  stages that can only be validated end-to-end, so the order stays: build, then
+  diff whole frames against PyAV via `tools/videodiff`, and claim nothing before
+  that. The tooling pattern VP9 established transfers directly — fetch the
+  reference, generate the tables, transpile the straight-line kernels, diff
+  against PyAV.
+- **Switchable engines, and the rule for adding another.** Two subsystems run an
+  alternative implementation **alongside** ours on the `/decoder ring3|kernel`
+  pattern — a `bench` subcommand compares them:
+  **`/heap firstfit|sizeclass`** (`mm/heap.rs`) and **`/html ours|tl`**
+  (`browser/html_tl.rs` over the vendored `third_party/tl`). Note the defaults
+  point opposite ways, and deliberately: **size-class is the default** because it
+  moved page boot 3.8x, while **our HTML parser stays the default** because
+  `tl`'s 6.75x is 6.75x of ~3 ms — its value is being a second implementation,
+  not being faster. Five rules, each of which cost a debugging cycle or a wrong
+  number:
+  - **A/B only what is like-for-like; share everything else.** The `tl` adapter
+    reuses `extract_assets_rich`, `preprocess`, `set_attribute` and
+    `finalize_document` verbatim — the last two were *extracted* for it, and the
+    third was found missing when the cross-engine test compared a title of
+    `"Untitled"` against `""`. Otherwise the comparison measures the divergence
+    rather than the engine.
+  - **A bench must never fall back; a page load must.** An adapter returns
+    `None` on failure so a measurement cannot attribute our result to the
+    challenger; the page path may fall back but must **count** it, so "X is
+    selected" and "X actually did this" stay distinguishable.
+  - **Report agreement before speed.** `/html bench` prints whether both engines
+    built the same tree, and restores the previous engine afterwards. A faster
+    engine that produces something else has changed the page, not won.
+  - **A shared front end dilutes the ratio.** `/html bench` times
+    `extract_assets_rich` + `preprocess` for both engines because a page load
+    really pays them, so on a small page the ratio collapses toward 1x —
+    **1.9x on a 2 KiB fixture against 6-9x on real 700 KiB pages**
+    (`tools/webbench`). The command says so under 64 KiB.
+  - **A fixed iteration count is only sound when the thing timed is slow
+    relative to the counter.** Flex placement is microseconds, so at 2,000
+    iterations four runs of the same benchmark reported 21.8x, 6.6x, 18.0x and
+    82.8x — the *denominator* was noise. `shell::time_until` extends a batch
+    until it reaches a tick floor and the benches report **per iteration**,
+    which is also what makes batches of different length comparable; a batch
+    that never reaches the floor prints SUSPECT instead of a ratio.
+
+  **Where the time actually goes, measured:** on the shadcn page, JS is ~99% of
+  page boot (686 ms of 695 ms; 2651 of 2654 before the allocator). HTML parsing
+  and flex layout are rounding errors, which is why `tl` is kept as an oracle
+  rather than adopted, and why the next real lever is the JS engine.
+
+  **taffy was evaluated and removed.** It agreed with `browser::flex` to within
+  1 px on every shape — rows, columns, gaps, `space-between`, wrap, `flex-grow` —
+  and cost ~20x per placement under first-fit and **~70x under the size-class
+  heap**: the gap *widens* with a better allocator, because both are
+  allocation-dominated and ours more so (size-class made taffy 4.1x faster and
+  ours 9.0x). That cost is a property of a per-call boundary that builds and
+  drops a whole `TaffyTree`, not a verdict on taffy, whose design is a persistent
+  tree with dirty-subtree recompute — but there is no adoption case at this
+  boundary, so the dependency is gone. **The agreement is the finding worth
+  keeping:** two independently written implementations landing on the same pixels
+  is evidence `browser::flex` is correct that our own unit tests structurally
+  cannot provide. Re-vendor it as a `#[cfg(test)]` oracle if flex is ever
+  reworked; do not put it back on the page-load path.
+
+  Neither `tl` nor ours implements implied end tags, so switching does **not**
+  buy `<p>a<p>b` as siblings.
+
 - **Agent chat protocol** — the shell chat is an agentic ReAct loop on the
   Qwen3.5 template: the prompt advertises a small CORE tool set plus
   `search_tools` (progressive discovery over the registry — manifest

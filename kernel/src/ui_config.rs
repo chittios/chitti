@@ -87,6 +87,9 @@ pub struct UiConfig {
     pub kbd_layout: String,
     /// Input method (`off`, `hiragana`, `katakana`) — see `crate::ime`.
     pub ime: String,
+    /// Notification policy: `on` (banner + sound + queue), `mute` (queue only) or
+    /// `off` (nothing recorded at all). See `crate::notify::toast::Policy`.
+    pub notify: String,
     pub splash: bool,         // show the boot splash (logo + wordmark)
     /// Colour palette as `(name, "#rrggbb")` pairs (kept as strings so the config
     /// layer stays independent of the framebuffer, which is absent in test builds).
@@ -123,6 +126,7 @@ impl Default for UiConfig {
             tz_name: String::new(),
             kbd_layout: "us".to_string(),
             ime: "off".to_string(),
+            notify: "on".to_string(),
             splash: true,
             theme: THEME_DEFAULTS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             theme_name: "dark".to_string(),
@@ -152,6 +156,7 @@ impl UiConfig {
             ("tz_offset".to_string(), Json::Num(self.tz_offset as f64)),
             ("kbd_layout".to_string(), Json::Str(self.kbd_layout.clone())),
             ("ime".to_string(), Json::Str(self.ime.clone())),
+            ("notify".to_string(), Json::Str(self.notify.clone())),
             ("tz_name".to_string(), Json::Str(self.tz_name.clone())),
             ("splash".to_string(), Json::Bool(self.splash)),
             ("theme_name".to_string(), Json::Str(self.theme_name.clone())),
@@ -236,6 +241,17 @@ impl UiConfig {
                     want
                 } else {
                     d.kbd_layout.clone()
+                }
+            },
+            // Normalized through the policy parser, so a typo leaves
+            // notifications *on* rather than silently disabling them — the safe
+            // reading of an unreadable setting is the one that still tells you
+            // things.
+            notify: {
+                let want = s("notify", &d.notify);
+                match crate::notify::Policy::parse(&want) {
+                    Some(p) => alloc::string::String::from(p.as_str()),
+                    None => d.notify.clone(),
                 }
             },
             ime: {
@@ -400,6 +416,9 @@ pub fn load_and_apply() {
 /// dependency, so there is no reason to skip them in the test build.
 pub fn apply_input() {
     let cfg = current();
+    if let Some(p) = crate::notify::Policy::parse(&cfg.notify) {
+        crate::notify::set_policy(p);
+    }
     if !crate::keymap::set_layout(&cfg.kbd_layout) {
         // `from_json` normalizes, so this can only happen for a hand-edited
         // in-memory config; report it rather than leaving a mismatch.
@@ -466,6 +485,14 @@ pub fn persist_tz(offset_secs: i32) {
 pub fn persist_kbd_layout(id: &str) {
     let mut cfg = current();
     cfg.kbd_layout = alloc::string::String::from(id);
+    write_ui(&cfg);
+    store(cfg);
+}
+
+/// Persist the notification policy from `/notify on|mute|off`.
+pub fn persist_notify_policy(policy: &str) {
+    let mut cfg = current();
+    cfg.notify = alloc::string::String::from(policy);
     write_ui(&cfg);
     store(cfg);
 }

@@ -1111,8 +1111,11 @@ def s_heap_ab(g):
     """
     m = g.mark()
     g.send("/heap")
-    if not g.wait_for("first-fit", 20, m):
-        return False, "/heap did not report the default mode"
+    # Not a literal mode name: size-class is the default now, and pinning the
+    # default here would make this scenario fail every time that choice is
+    # revisited — which is a decision, not a regression.
+    if not g.wait_for("small allocations served by", 20, m):
+        return False, "/heap did not report which allocator is in use"
 
     # Switch on, do real allocating work, switch back.
     for cmd, want in [("/heap sizeclass", "class lists"), ("/heap firstfit", "address-ordered")]:
@@ -1146,6 +1149,49 @@ def s_heap_ab(g):
     if "SUSPECT" in out:
         return False, "bench reported a zero-length batch"
     return True, f"both modes served the workload ({counts} allocs), switch is live"
+
+
+def s_engine_ab(g):
+    """`/html` — the switchable HTML engine, kept as a differential oracle.
+
+    What is asserted is **agreement**, not speed: a timing assertion in an e2e
+    is a flake, but "the two engines produce the same tree" is the property that
+    makes `tl` an oracle for our parser rather than a second browser. The bench
+    reports that itself, so the scenario reads its verdict.
+
+    It also drives a real page through each HTML engine, because the unit tests
+    only cover markup fixtures — `/samples/html/shadcn.html` is 223 KiB of
+    React and Tailwind output and is the input that actually found the `tl`
+    trailing-slash bug.
+    """
+    m = g.mark()
+    g.send("/html")
+    if not g.wait_for("ours", 20, m):
+        return False, "/html did not report the default engine"
+
+    # Each engine must render the sample page.
+    for engine, marker in [("tl", "tl"), ("ours", "ours")]:
+        m = g.mark()
+        g.send(f"/html {engine}")
+        if not g.wait_for(marker, 20, m):
+            return False, f"/html {engine} did not confirm the switch"
+        m = g.mark()
+        g.send("/browse /samples/html/shadcn.html")
+        if not g.wait_for("browser:js ", 240, m):
+            return False, f"the shadcn page did not load under {engine}"
+        g.wait_quiet(quiet=2.0, timeout=120)
+
+    m = g.mark()
+    g.send("/html bench /samples/html/shadcn.html")
+    if not g.wait_for("engine restored", 240, m):
+        return False, "/html bench did not finish"
+    out = g.since(m)
+    if "TREES DIFFER" in out:
+        return False, f"the two HTML engines built different trees: {out.strip()[-200:]}"
+    if "trees agree" not in out:
+        return False, "/html bench did not report tree agreement either way"
+
+    return True, "both HTML engines render the shadcn gallery and build the same tree"
 
 
 def s_browse_runaway(g):
@@ -2435,6 +2481,143 @@ def s_open_video(_g):
         g2.close()
 
 
+# Real encoder output, embedded so this scenario always runs rather than
+# skipping when x265/vpxenc are absent (which is most CI runners, and skipping
+# is how a codec regression goes unnoticed). Tiny on purpose: 64x64, 4 frames.
+#   x265 4.2  --keyint 4 --bframes 2 --info 0   → I,P,B,P with POCs 0,2,1,3
+#   libvpx-vp9 -g 4 -deadline realtime          → KEY + 3 inter frames
+_HEVC_MP4_B64 = (
+    "AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAAAhmcmVlAAABMm1kYXQAAABCKAGvHYD307m2hM6BqgDPWtzdmndgrmvH"
+    "kvO55etq8zd00MSKKqq8jjD9TZyYIc6wxPK8V+FauM5wD1wk0zHUHZ2YAAAAkAIB0BFXhDGOQK5i+tesFlmPI9Pq/OID6CSh"
+    "XczZUtF4aZ5jzwVoQfEj8Suj1acgfxdzDIrogvAGq2z9mNJXSsuR3LlBc+5V3M2xRMmdr05lz7Fj6zzqQisqNFMN40U+0jRJ"
+    "/yCt8raSIvATW+EkXGDu15ZKD5PUMrYJRbfIA/cACcZfZMFv81pPyhn6gqXT1gAAABIAAeAkv4YUwDLc43nqKDuZLbcAAAA2"
+    "AgHQGfX1EMGOQK4vUBXnUt16e1qR0bcscdMd8yta9JZ2Qb3xqNb4Hhz2PnpXO+8VpiWKfzGTAAADqW1vb3YAAABsbXZoZAAA"
+    "AAAAAAAAAAAAAAAAA+gAAACgAAEAAAEAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAALTdHJhawAAAFx0a2hkAAAAAwAAAAAAAAAAAAAAAQAAAAAAAACgAAAAAAAA"
+    "AAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAABAAAAAQAAAAAAAJGVkdHMAAAAcZWxzdAAA"
+    "AAAAAAABAAAAoAAABAAAAQAAAAACS21kaWEAAAAgbWRoZAAAAAAAAAAAAAAAAAAAMgAAAAoAVcQAAAAAAC1oZGxyAAAAAAAA"
+    "AAB2aWRlAAAAAAAAAAAAAAAAVmlkZW9IYW5kbGVyAAAAAfZtaW5mAAAAFHZtaGQAAAABAAAAAAAAAAAAAAAkZGluZgAAABxk"
+    "cmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAAG2c3RibAAAAO5zdHNkAAAAAAAAAAEAAADeaGV2MQAAAAAAAAABAAAAAAAAAAAA"
+    "AAAAAAAAAABAAEAASAAAAEgAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABj//wAAAHRodmNDAQFg"
+    "AAAAkAAAAAAAHvAA/P34+AAADwMgAAEAGEABDAH//wFgAAADAJAAAAMAAAMAHpWQCSEAAQAnQgEBAWAAAAMAkAAAAwAAAwAe"
+    "oCCBBZZWSSTK5oCAAAADAIAAAAyEIgABAAdEAcFytCJAAAAAFGJ0cnQAAAAAAAA6NAAAAAAAAAAYc3R0cwAAAAAAAAABAAAA"
+    "BAAAAgAAAAAUc3RzcwAAAAAAAAABAAAAAQAAABBzZHRwAAAAACAQGBAAAAAwY3R0cwAAAAAAAAAEAAAAAQAABAAAAAABAAAG"
+    "AAAAAAEAAAIAAAAAAQAABAAAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAQAAAABAAAAJHN0c3oAAAAAAAAAAAAAAAQAAABGAAAA"
+    "lAAAABYAAAA6AAAAFHN0Y28AAAAAAAAAAQAAACwAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBw"
+    "bAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYyLjEyLjEwMg=="
+)
+_VP9_WEBM_B64 = (
+    "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAARuEU2bdLpNu4tTq4QVSalmU6yBoU27i1Or"
+    "hBZUrmtTrIHYTbuMU6uEElTDZ1OsggEbTbuMU6uEHFO7a1OsggRY7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsirX"
+    "sYMPQkBNgI1MYXZmNjIuMTIuMTAyV0GNTGF2ZjYyLjEyLjEwMkSJiEBkAAAAAAAAFlSua76uAQAAAAAAADXXgQFzxYi3Znt2"
+    "yrQD7pyBACK1nIN1bmSIgQCGhVZfVlA5g4EBI+ODhAJiWgDghrCBQLqBQBJUw2fYc3OgY8CAZ8iaRaOHRU5DT0RFUkSHjUxh"
+    "dmY2Mi4xMi4xMDJzc7JjwItjxYi3Znt2yrQD7mfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDAuMTYwMDAwMDAwAB9DtnVC2ueB"
+    "AKNBWIEAAICCSYNCAAPwA/YGOCQcGEoAAqBQYB/N/571n8f6/1fx/q/T/B8n9l9SSyvn0vNR91wM+fxRwZRncYBF4AB+nX3e"
+    "hfENDcRuoUVntNuK2/zEZ0MZ/bzTapCq7AtpeEzZzHMORbJ3AarriOgZISN6hN0+IWy3jLHzV5GxClyeHXgw27JsFj3nuS/N"
+    "oDy32htKPDchej++radfn5aveQkb1CcnangCz7dfM56RRlvHh7dhnrBAJzzTUeB96NS2MhaAs/sreyLPe8KkSaULDeSvRca4"
+    "jkzgktruXxAYFffVo4xuw2Cx7ztOWASSshX9pd9yPN28KBpkAhwVRkwTV5Uos/jrbmBi88ro+hjJO97wHa/ZkU+3kJR0Be6d"
+    "9AyQkb1B+aBBuBDT6N2GwWPedpywCSVkK/tsgHV/zYJPXPzwtrwijl/zZGswgzWfnHPeUaGPhpt5tMgAo0DRgQAoAIYAQJLx"
+    "IUAAAGB2n17uI6vVY+LKlv6/jFgKwFVSLCrwIAB1Q18Z/jr9e7Q/1RJmvEGHV0sX7UFzRNEQPS6WHo5eCqfrW/LYfvFq7kzK"
+    "Rz1KbM5phfVIvtsEMCLiCaJ8D7Auy9ToW+kP39lZMB/2BdmDpGpFC3yPEpNMPgaBNQbDzA7ihscfwCghKamcoSRYst2Ts9C2"
+    "0DNclVYRu27PyzJCJdcqOfniDY9bhyIO3MtKWaLFY4hKNx/AKCEpqZyhJiIcZztYQYpjpCLugACj14EAUACGAECSnEBO4AAD"
+    "cAAAETPJ4AAP26BUT1bVX8LH53md+fkxgNU+/JWQODt4hwJ7z7rD8O7gGAXhGW/c2ZDYub98neYh+mLPR0OWSZAHukcIWncw"
+    "AKPNgQB4AIYAQJKcSFAAAANwAAAdNxOTjEL4lKYoJ359CwUgHUB89Knd//Zu4FOgAAAB17clYAAALeUePgWucAAAAC/iwe4l"
+    "oAAAQ4oJAAAcU7trkbuPs4EAt4r3gQHxggF48IED"
+)
+
+
+def s_open_hevc_vp9(_g):
+    """H.265/HEVC and VP9 on the real kernel: the two codecs added alongside
+    H.264 must **demux and describe** correctly from both container families,
+    and — because neither pixel pipeline exists yet — `/open` must say so
+    plainly instead of failing with an H.264-shaped error message.
+
+    That last part is the regression this scenario really guards. The player
+    used to print "CABAC entropy coding (baseline/CAVLC only)" for anything it
+    could not decode, which is a true statement about H.264 and a nonsense one
+    about HEVC (always CABAC) or VP9 (no CABAC at all)."""
+    import base64
+    import tempfile
+
+    hevc = os.path.join(tempfile.gettempdir(), "chitti-e2e-hevc.mp4")
+    vp9 = os.path.join(tempfile.gettempdir(), "chitti-e2e-vp9.webm")
+    with open(hevc, "wb") as f:
+        f.write(base64.b64decode(_HEVC_MP4_B64))
+    with open(vp9, "wb") as f:
+        f.write(base64.b64decode(_VP9_WEBM_B64))
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="off",
+               model_disk=f"{hevc}:{vp9}")
+    try:
+        if not g2.wait_for("net: configured", 180):
+            return False, "hevc/vp9 guest never booted"
+        for d in range(4):
+            g2.send(f"/mount {d} 0 /hv{d}")
+            g2.wait_quiet(0.5, 30)
+            m = g2.mark()
+            g2.send(f"/open /hv{d}/chitti-e2e-hevc.mp4")
+            if not g2.wait_for("64x64", 15, m):
+                continue
+            # The hvcC record, the two-byte NAL header and profile_tier_level
+            # all have to be right to get this line: Main profile at level 1.0
+            # (coded 30, so a x10 AVC-style print would say "level 3.0").
+            if not g2.wait_for("H.265", 8, m):
+                return False, "HEVC file was not identified as H.265"
+            if not g2.wait_for("Main profile", 8, m):
+                return False, "HEVC profile_tier_level did not parse to Main"
+            if not g2.wait_for("level 1.0", 8, m):
+                return False, "HEVC level printed with AVC's x10 convention"
+            if not g2.wait_for("4 frames", 8, m):
+                return False, "HEVC sample table did not yield 4 frames"
+            if not g2.wait_for("cannot decode", 8, m):
+                return False, "HEVC reported as playable, but there is no HEVC pixel pipeline"
+            if not g2.wait_for("not implemented", 8, m):
+                return False, "HEVC refusal did not name the real reason"
+            # …and the shell is still alive afterwards.
+            m = g2.mark()
+            g2.send("/pwd")
+            if not g2.wait_for("/home/chitti", 10, m):
+                return False, "the shell did not survive an undecodable HEVC file"
+
+            # VP9-in-WebM: no CodecPrivate at all, raw frames with no length
+            # prefix — the two ways a demuxer written for H.264 rejects every
+            # WebM file it is handed.
+            m = g2.mark()
+            g2.send(f"/open /hv{d}/chitti-e2e-vp9.webm")
+            if not g2.wait_for("matroska", 8, m) and not g2.wait_for("VP9", 8, m):
+                return False, "VP9 WebM was not demuxed"
+            if not g2.wait_for("VP9", 8, m):
+                return False, "VP9 file was not identified"
+            if not g2.wait_for("profile 0", 8, m):
+                return False, "VP9 frame header did not parse to profile 0"
+            if not g2.wait_for("64x64", 8, m):
+                return False, "VP9 geometry came from the container, not the frame header"
+            # VP9 **plays**: the decoder is bit-exact against libvpx, so this
+            # asserts the streaming player actually opened it rather than that
+            # it refused politely.
+            if not g2.wait_for("decoder=vp9", 15, m):
+                return False, "VP9 did not open in the streaming player"
+            if not g2.wait_for("ready in", 15, m):
+                return False, "VP9 opened but decoded no frame"
+            m2 = g2.mark()
+            g2.send_raw(b"\x1b[T")   # Ctrl+Tab: focus the video tab
+            g2.wait_quiet(0.3, 10)
+            g2.send_raw(b" ")        # pause
+            g2.send_raw(b"\x1b[C")   # seek forward
+            g2.send_raw(b"\x03")     # Ctrl+C stops
+            if not g2.wait_for("video stopped", 12, m2):
+                return False, "VP9 transport controls / Ctrl+C did not stop playback"
+            m = g2.mark()
+            g2.send("/pwd")
+            if not g2.wait_for("/home/chitti", 10, m):
+                return False, "the shell did not survive the VP9 clip"
+            return True, ("HEVC (hvcC/hvc1 in mp4) demuxes + describes and refuses with the "
+                          "right reason; VP9 (V_VP9 in WebM) decodes and plays")
+        return False, "no 64x64 probe from /open on any mount"
+    finally:
+        g2.close()
+
+
 def s_panes(g):
     """Pane layout: resize the split, fullscreen toggle, reset — driven by the
     /pane command (serial-observable) + a Ctrl+F fullscreen keystroke."""
@@ -2702,7 +2885,71 @@ def s_notify(g):
         g.send("/notify clear")
         if not g.wait_for("notify> cleared", 10, m):
             return False, "clear failed"
-        return True, "post, list, severity, read, clear, pane (focus intact)"
+
+        # --- the policy switch ------------------------------------------------
+        # `mute` and `off` are different requests and one switch would answer one
+        # of them wrongly, so the distinction is asserted rather than assumed:
+        # muted still records, off records nothing.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify mute")
+        if not g.wait_for("queue only", 10, m):
+            return False, "/notify mute did not report what it does"
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/notify test")
+        g.wait_for("posted", 10, m)
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/notify list")
+        if not g.wait_for("notify test", 10, m):
+            return False, "muted must still record — the queue is most of its value"
+        if not g.wait_for("[mute]", 5, m):
+            return False, "the listing does not report the policy"
+
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify clear")
+        g.wait_for("cleared", 10, m)
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/notify off")
+        if not g.wait_for("fully disabled", 10, m):
+            return False, "/notify off did not report what it does"
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/notify test")
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/notify list")
+        if not g.wait_for("no notifications", 10, m):
+            return False, "off must record nothing at all"
+        # …and it says *why* nothing is arriving, which otherwise has two
+        # indistinguishable causes.
+        if not g.wait_for("are OFF", 5, m):
+            return False, "the empty listing does not explain that notifications are off"
+
+        # The setting persists, and turning it back on works.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/cat /configs/core/ui.json")
+        if not g.wait_for('"notify"', 10, m):
+            return False, "the policy was not persisted to ui.json"
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/notify on")
+        if not g.wait_for("banner", 10, m):
+            return False, "/notify on failed"
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/notify test")
+        g.wait_quiet(0.3, 10)
+        m = g.mark()
+        g.send("/notify list")
+        if not g.wait_for("notify test", 10, m):
+            return False, "recording did not resume"
+        g.send("/notify clear")
+        return True, "post, list, severity, read, clear, pane, on/mute/off policy"
     except Exception as e:
         return False, f"exception: {e}"
 
@@ -3757,6 +4004,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("open_media", s_open_media),
     ("open_pdf", s_open_pdf),
     ("open_video", s_open_video),
+    ("open_hevc_vp9", s_open_hevc_vp9),
     ("samples", s_samples),
     ("tabs", s_tabs),
     ("panes", s_panes),
@@ -3773,7 +4021,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

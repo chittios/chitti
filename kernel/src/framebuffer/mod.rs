@@ -73,6 +73,7 @@ mod status;
 mod surface;
 mod tabs;
 mod text;
+mod toast;
 mod views;
 
 use clock::*;
@@ -95,6 +96,7 @@ pub use status::*;
 pub use surface::*;
 pub use tabs::*;
 use text::*;
+pub use toast::*;
 pub use views::*;
 
 const CELL_W: u64 = CW as u64;
@@ -254,6 +256,15 @@ pub struct Screen {
     /// `composer_line` — it is uncommitted text, so the shell's buffer must not
     /// contain it.
     composer_preedit: String,
+    /// The notification banner's saved background — the same shape as
+    /// `cur_saved`, and for the same reason: a single-buffered framebuffer means
+    /// a transient overlay has to put back what it covered.
+    toast_saved: Vec<Rgb>,
+    toast_x: u64,
+    toast_y: u64,
+    /// Zero width means no banner is on screen.
+    toast_w: u64,
+    toast_h: u64,
     /// Hint bar under the composer (left / right halves).
     composer_hint_l: String,
     composer_hint_r: String,

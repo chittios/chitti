@@ -385,6 +385,11 @@ The same capability-gated surface a Rust tool module gets:\n\
 - `Chitti.fsRead(path)` / `fsWrite(path, data)` / `fsList(path)` / `fsExists(path)` —\n\
   confined to the agent's own folder unless its manifest grants a wider `fs` scope.\n\
 - `Chitti.http(requestJson)` — only if the manifest declares a `net` capability.\n\
+- `Chitti.notify(severity, title, body?)` — tell the human something that outlives\n\
+  this call. `severity` is `info` | `ok` | `warn` | `error`. Use it for what they\n\
+  need to know **later** (a job finished, a fetch failed), never as a reply — a\n\
+  tool's return value is the reply. Write-only: an agent cannot read notifications\n\
+  back, and the source is stamped by the OS, so it always says which agent posted.\n\
 - `Chitti.log(msg)`, `Chitti.sha1(data)`, `Chitti.home()`, `Chitti.nowMs()`.\n\
 \n\
 Anything the agent may not do **throws**; a value that simply is not there comes back\n\

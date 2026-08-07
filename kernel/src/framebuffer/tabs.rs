@@ -333,7 +333,7 @@ fn close_active_slot(slot: &mut Option<Screen>) {
     // A lone action pane collapses the band when its last tab closes (the classic
     // two-pane behaviour); a grid keeps its now-empty pane as a drop target.
     if !any && old.actions.len() == 1 {
-        let ns = rebuilt(old, false);
+        let mut ns = rebuilt(old, false);
         ns.redraw();
         *slot = Some(ns);
     } else {

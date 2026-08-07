@@ -108,7 +108,7 @@ pub fn reinit_scanout(
     });
 }
 
-fn init_from(screen: Screen) {
+fn init_from(mut screen: Screen) {
     // Brand splash first (logo + wordmark), held briefly, then the live UI.
     if screen.layout.splash {
         screen.draw_splash();
@@ -269,7 +269,13 @@ impl Screen {
     ///
     /// Parked panes (`w == 0`, fullscreen) are skipped entirely — their content
     /// is preserved in memory via [`Pane::take_content`] and restored on unpark.
-    pub(super) fn redraw(&self) {
+    pub(super) fn redraw(&mut self) {
+        // A full repaint is about to overwrite everything, so the notification
+        // banner's saved background is stale: restoring it later would paint a
+        // copy of the *old* screen over fresh content, and after a relayout it
+        // would land in the wrong place entirely. Forgotten here rather than at
+        // the eight call sites, so a ninth cannot get it wrong.
+        self.toast_forget();
         crate::kms::damage(0, 0, self.fb_w as u32, self.fb_h as u32);
         // Dead space around a smaller-than-native desktop. A no-op at native, and
         // painted here (not per-frame) because the letterbox only changes when the

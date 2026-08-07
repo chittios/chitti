@@ -30,7 +30,7 @@
 //! for something it has no capability for has to be able to tell that apart from a
 //! key that genuinely holds no value.
 
-use javy_plugin_api::javy::quickjs::prelude::Func;
+use javy_plugin_api::javy::quickjs::prelude::{Func, Opt};
 use javy_plugin_api::javy::quickjs::{Ctx, Exception, IntoJs, Object, Result as JsResult, Value};
 use javy_plugin_api::javy::Runtime;
 use javy_plugin_api::{import_namespace, Config};
@@ -63,6 +63,7 @@ unsafe extern "C" {
     fn host_ui_draw(op: i32, ol: i32) -> i32;
     fn host_hud_set(tp: i32, tl: i32) -> i32;
     fn host_log(mp: i32, ml: i32);
+    fn host_notify(sev: i32, tp: i32, tl: i32, bp: i32, bl: i32) -> i32;
     fn host_now_ms() -> i64;
     fn host_now_unix() -> i64;
     fn host_sha1(sp: i32, sl: i32, out: i32) -> i32;
@@ -381,6 +382,40 @@ fn modify_runtime(runtime: Runtime) -> Runtime {
                     let body = taken(len);
                     Ok(format!("{{\"status\":{status},\"body\":{}}}", json_string(&body)))
                 }),
+            )
+            .unwrap();
+
+        // --- notifications ---------------------------------------------------
+        //
+        // `Chitti.notify(severity, title, body?)` — tell the human something that
+        // outlives this call. Write-only by design: there is no `notifyList`, so a
+        // notification an agent posts cannot be read back, which removes the
+        // laundering channel for zero policy. The `source` is stamped by the host
+        // from this agent's binding and cannot be set from here.
+        //
+        // `severity` is "info" | "ok" | "warn" | "error". `action` is deliberately
+        // not reachable: it means "a human decision is waiting", which only the
+        // kernel's own unattended-approval path is entitled to claim.
+        chitti
+            .set(
+                "notify",
+                Func::from(
+                    |ctx: Ctx<'_>, severity: String, title: String, body: Opt<String>| -> JsResult<()> {
+                        let sev = match severity.trim().to_ascii_lowercase().as_str() {
+                            "ok" | "success" | "done" => 1,
+                            "warn" | "warning" => 2,
+                            "error" | "err" | "fail" => 3,
+                            _ => 0,
+                        };
+                        let body = body.0.unwrap_or_default();
+                        let ((tp, tl), (bp, bl)) = stage2(&title, &body);
+                        let r = unsafe { host_notify(sev, tp, tl, bp, bl) };
+                        if r < 0 {
+                            return Err(refuse(&ctx, "notify", r));
+                        }
+                        Ok(())
+                    },
+                ),
             )
             .unwrap();
 

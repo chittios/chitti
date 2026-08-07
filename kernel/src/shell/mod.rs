@@ -711,6 +711,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "tls" => tls_cmd(arg),
         "decoder" => decoder_cmd(arg),
         "heap" => heap_cmd(arg),
+        "html" => html_cmd(arg),
         "js" => run_js(arg),
         "think" => run_think(arg),
         "mode" => run_mode(arg),
@@ -938,6 +939,169 @@ fn decoder_cmd(arg: &str) {
     }
 }
 
+/// Time `f` until the batch has accumulated `min_ticks`, starting at `start`
+/// iterations and doubling. Returns `(ticks, iterations)`.
+///
+/// A fixed iteration count is only sound when the thing being timed is slow
+/// relative to the counter. `browser::flex`'s placement is not: at 2,000
+/// iterations four runs of the same benchmark reported the same comparison as
+/// 21.8x, 6.6x, 18.0x and 82.8x, because the denominator was a few thousand
+/// ticks of mostly interrupt. Extending the batch until it is long enough to
+/// measure is the fix; reporting **per iteration** is what makes two batches of
+/// different length comparable.
+///
+/// The cap exists so a pathological case cannot spin forever — the caller
+/// reports a batch that never reached the floor as SUSPECT rather than printing
+/// its ratio as though it meant something.
+fn time_until(min_ticks: u64, start: u32, mut f: impl FnMut()) -> (u64, u32) {
+    const MAX_ITERS: u32 = 1 << 22;
+    let mut iters = start.max(1);
+    loop {
+        let t0 = crate::arch::cycle_count();
+        for _ in 0..iters {
+            f();
+        }
+        let elapsed = crate::arch::cycle_count().wrapping_sub(t0);
+        if elapsed >= min_ticks || iters >= MAX_ITERS {
+            return (elapsed, iters);
+        }
+        // Cooperative scheduler: a growing batch is a long loop like any other.
+        crate::shell::status_tick();
+        iters = iters.saturating_mul(4).min(MAX_ITERS);
+    }
+}
+
+/// `/html` — which HTML tree builder `/browse` uses, and what each costs.
+///
+/// Our parser stays the default; `tl` (vendored, `third_party/tl`) is the
+/// alternative. `bench` parses the same source with both and reports time and
+/// the tree each produced — **both numbers matter**: a parser that is faster
+/// and builds a different tree has not won anything, it has changed the page.
+fn html_cmd(arg: &str) {
+    use crate::browser::{self, HtmlEngine};
+
+    let arg = arg.trim();
+    match arg {
+        "" | "status" => {
+            let which = match browser::html_engine() {
+                HtmlEngine::Ours => "ours (browser::html — tokenizer + explicit stack)",
+                HtmlEngine::Tl => "tl (vendored third_party/tl 0.7.8, no_std)",
+            };
+            serial_println!("html> /browse parses with {which}");
+            serial_println!("html>   /html ours|tl | /html bench [path-or-url]");
+        }
+        "ours" | "own" | "default" => {
+            browser::set_html_engine(HtmlEngine::Ours);
+            serial_println!("html> /browse now parses with our tokenizer");
+        }
+        "tl" => {
+            browser::set_html_engine(HtmlEngine::Tl);
+            serial_println!("html> /browse now parses with tl");
+        }
+        _ if arg == "bench" || arg.starts_with("bench ") => {
+            let src = arg.strip_prefix("bench").map(|r| r.trim()).unwrap_or("");
+            let path = if src.is_empty() {
+                "/samples/html/shadcn.html"
+            } else {
+                src
+            };
+            let Some(html) = read_page_source(path) else {
+                serial_println!("html> cannot read {path}");
+                return;
+            };
+            serial_println!("html> {} ({} KiB)", path, html.len() / 1024);
+            // Both timings include the SHARED front end (`extract_assets_rich`
+            // + `preprocess`), because both engines really pay it on a page
+            // load — so this ratio answers "how much faster is the page
+            // parsed", not "how much faster is the tree builder". On a small
+            // page the shared half dominates and the ratio collapses towards
+            // 1x: measured 1.9x on a 2 KiB fixture against 6-9x on real
+            // 700 KiB pages (`tools/webbench`). Bench a real page.
+            if html.len() < 64 * 1024 {
+                serial_println!(
+                    "html>   note: under 64 KiB the shared front end dominates both engines -- this ratio understates the tree builder"
+                );
+            }
+            serial_println!(
+                "html>   {:<8} {:>10} {:>10} {:>10} {:>26}",
+                "engine", "ticks/parse", "nodes", "elems", "title"
+            );
+            let saved = browser::html_engine();
+            let mut results = alloc::vec::Vec::new();
+            for engine in [HtmlEngine::Ours, HtmlEngine::Tl] {
+                browser::set_html_engine(engine);
+                // Warm-up: the first parse pays to grow the heap, and charging
+                // that to whichever engine ran first makes the comparison an
+                // artifact of ordering (the `synapse::bench` rule).
+                let _ = core::hint::black_box(browser::parse_html(&html));
+                // One parse is one sample, and one sample of a millisecond-scale
+                // operation is noise — the same mistake `/flex bench` made. Run
+                // until the batch is long enough to measure and report per parse.
+                let (ticks_total, n) = time_until(2_000_000, 4, || {
+                    core::hint::black_box(browser::parse_html(&html));
+                });
+                let ticks = ticks_total / n.max(1) as u64;
+                let doc = browser::parse_html(&html);
+                let elems = count_elements(&doc.root);
+                results.push((engine, ticks, doc.node_count, elems, doc.title.clone()));
+                crate::shell::status_tick();
+            }
+            browser::set_html_engine(saved);
+            for (engine, ticks, nodes, elems, title) in &results {
+                let name = match engine {
+                    HtmlEngine::Ours => "ours",
+                    HtmlEngine::Tl => "tl",
+                };
+                let t: alloc::string::String = title.chars().take(24).collect();
+                serial_println!(
+                    "html>   {name:<8} {ticks:>10} {nodes:>10} {elems:>10} {t:>26}"
+                );
+            }
+            if results.len() == 2 {
+                let (a, b) = (&results[0], &results[1]);
+                if b.1 > 0 {
+                    serial_println!(
+                        "html>   tl is {:.2}x our parser (ticks are a constant-rate counter, not CPU cycles)",
+                        a.1 as f32 / b.1 as f32
+                    );
+                }
+                // The trees must agree, or the faster one is faster at a
+                // different job. Reported, never asserted away.
+                if a.3 == b.3 && a.4 == b.4 {
+                    serial_println!("html>   trees agree: same element count and title");
+                } else {
+                    serial_println!(
+                        "html>   TREES DIFFER: {} vs {} elements, title {:?} vs {:?}",
+                        a.3, b.3, a.4, b.4
+                    );
+                }
+            }
+            serial_println!("html>   engine restored to what it was before the bench");
+        }
+        _ => serial_println!("html> usage: /html [status] | /html ours|tl | /html bench [path]"),
+    }
+}
+
+/// Read a page's source for `/html bench`.
+///
+/// Store paths only, deliberately: a bench that fetched over the network would
+/// fold DNS, TLS and the server's latency into a figure about a parser, and
+/// re-running it would not re-measure the same bytes. Save a page with
+/// `/http -O` first and bench the file.
+fn read_page_source(path: &str) -> Option<alloc::string::String> {
+    let resolved = resolve_path(path);
+    let bytes = crate::fs::vfs::read(&resolved)
+        .ok()
+        .or_else(|| crate::synapse::fs::read(&resolved))?;
+    alloc::string::String::from_utf8(bytes).ok()
+}
+
+/// Elements (not text nodes) in a tree — the cross-check for `/html bench`.
+fn count_elements(n: &crate::browser::html::Node) -> usize {
+    let here = matches!(n.kind, crate::browser::html::NodeKind::Element { .. }) as usize;
+    here + n.children.iter().map(count_elements).sum::<usize>()
+}
+
 /// `/heap` — which small-block allocator is in use, and what it costs.
 ///
 /// The `/decoder ring3|kernel` pattern: the incumbent (first-fit) stays the
@@ -963,6 +1127,11 @@ fn heap_cmd(arg: &str) {
             );
             serial_println!("heap>   {blocks} block(s) / {bytes} B parked in class lists");
             serial_println!("heap>   /heap firstfit|sizeclass | /heap bench [rounds]");
+            if crate::mm::heap::heap_mode() == HeapMode::SizeClass {
+                serial_println!(
+                    "heap>   class lists do not coalesce -- switch to firstfit if a large model or voice run reports OOM"
+                );
+            }
         }
         "firstfit" | "first-fit" | "off" => {
             heap::set_heap_mode(HeapMode::FirstFit);
@@ -8304,6 +8473,11 @@ pub fn upkeep() {
     // Persist the notification ring at most every 30 s — see `notify::save_if_dirty`
     // for why this is not a store write per post.
     crate::notify::save_if_dirty();
+    // Draw a fresh notification banner, or lift an expired one. Cheap: the common
+    // case takes one lock and returns, and a banner already on screen is left
+    // alone until it expires — which is what keeps a transient overlay at two KMS
+    // round trips per notification rather than one per pulse.
+    crate::notify::tick_banner();
     thinking_tick();
     // Mid-turn interjection: buffer non-cancel keystrokes into a follow-up queue.
     drain_followup_keys();
@@ -8799,8 +8973,15 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
                 if path.is_empty() {
                     return alloc::string::String::from("error: missing path");
                 }
-                play_video(&path);
-                alloc::format!("ok:video playing {path}")
+                // The tool's answer must come from what actually happened.
+                // It used to say "ok:video playing" unconditionally, so a file
+                // the player had just refused on screen was reported back to
+                // the agent as playing — and the agent then told the user so,
+                // directly under the refusal.
+                match play_video(&path) {
+                    Ok(()) => alloc::format!("ok:video playing {path}"),
+                    Err(why) => alloc::format!("error:cannot play {path}: {why}"),
+                }
             }
             "video_control" => {
                 let frames = json_str(args_json, "frames")

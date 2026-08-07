@@ -1105,6 +1105,74 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_sound_play")?;
 
+    // host_notify(severity, title_ptr, title_len, body_ptr, body_len) -> i32
+    //
+    // The agent-facing notification API. Same three rules the `notify` shell tool
+    // follows, and for the same reasons:
+    //
+    //   1. **The source is stamped from the binding**, never taken from the
+    //      guest. A guest that could name its own source could post as `kernel`,
+    //      which is a transfer of authority wearing a label.
+    //   2. **Write-only.** There is no `host_notify_list`, so a notification an
+    //      agent posts cannot be read back — which removes the laundering channel
+    //      (untrusted content re-entering its own context with the tag stripped)
+    //      for zero policy rather than a tagging path.
+    //   3. **Rate-limited**, sharing the `log_count` budget with `host_log` and
+    //      `host_sound_play`. A notification pane must not be a guest-controlled
+    //      spam surface, and the chime makes that louder than usual.
+    //
+    // Requires a real agent binding: an unbound page instance has no identity to
+    // stamp, so it has nothing to say.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_notify",
+            |mut caller: Caller<'_, HostState>,
+             sev: i32,
+             tptr: i32,
+             tlen: i32,
+             bptr: i32,
+             blen: i32|
+             -> i32 {
+                let bind = caller.data().bind;
+                if bind.agent_id == 0 {
+                    caller.data_mut().last_error = Some("notify: no agent binding");
+                    return -3;
+                }
+                if caller.data().log_count >= 32 {
+                    return -4;
+                }
+                caller.data_mut().log_count = caller.data().log_count.saturating_add(1);
+                let Some(title) = read_guest_str(&caller, tptr, tlen) else {
+                    return -1;
+                };
+                if title.trim().is_empty() {
+                    caller.data_mut().last_error = Some("notify: a notification needs a title");
+                    return -1;
+                }
+                let body = if blen > 0 {
+                    read_guest_str(&caller, bptr, blen).unwrap_or_default()
+                } else {
+                    alloc::string::String::new()
+                };
+                let sev = match sev {
+                    1 => crate::notify::Severity::Success,
+                    2 => crate::notify::Severity::Warn,
+                    3 => crate::notify::Severity::Error,
+                    // `Action` is deliberately **not** reachable from a guest: it
+                    // means "a human decision is waiting", which only the kernel's
+                    // own unattended-approval path is entitled to claim. A guest
+                    // asking for it gets `Warn`.
+                    4 => crate::notify::Severity::Warn,
+                    _ => crate::notify::Severity::Info,
+                };
+                let source = alloc::format!("agent:{}", bind.agent_id);
+                crate::notify::post(sev, &source, &title, &body);
+                0
+            },
+        )
+        .map_err(|_| "define host_notify")?;
+
     // host_sys_set(key, val) / host_sys_get(key, out) — apply or read OS UI
     // preferences from the settings package. Keys: theme, mode, opacity.
     // Requires a real agent binding so unbound page instances cannot flip mode.

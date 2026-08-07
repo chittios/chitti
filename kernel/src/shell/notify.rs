@@ -24,6 +24,16 @@ pub(super) fn run_notify_cmd(arg: &str) {
             let n = crate::notify::clear();
             serial_println!("notify> cleared {n} notification(s)");
         }
+        "on" | "mute" | "silent" | "off" | "disable" | "enable" => set_policy(verb),
+        "policy" | "mode" => {
+            if rest.is_empty() {
+                let p = crate::notify::policy();
+                serial_println!("notify> {} — {}", p.as_str(), p.describe());
+                serial_println!("notify> /notify on | mute | off");
+            } else {
+                set_policy(rest);
+            }
+        }
         "test" => {
             // The e2e handle: one deterministic notification with no dependency
             // on a schedule, a daemon or a model.
@@ -46,20 +56,52 @@ fn usage() {
     serial_println!("notify> usage: /notify [open|list [n]|post <severity> <title> [-- <body>]");
     serial_println!("               |read <id>|read all|dismiss <id>|clear|test]");
     serial_println!("               severity: info|ok|warn|error|action");
+    serial_println!("notify> /notify on | mute | off   — banner+sound | queue only | fully disabled");
+}
+
+/// `/notify on|mute|off` — how much the system may do about a notification.
+///
+/// Three states rather than a switch, because "stop making noise at me" and
+/// "stop recording anything" are different requests and one switch answers one of
+/// them wrongly. `mute` keeps the queue, which is most of its value; `off` is the
+/// hard kill, and a post under it is not stored at all.
+fn set_policy(word: &str) {
+    let word = match word.trim() {
+        "disable" => "off",
+        "enable" => "on",
+        w => w,
+    };
+    let Some(p) = crate::notify::Policy::parse(word) else {
+        serial_println!("notify> unknown '{word}' — /notify on | mute | off");
+        return;
+    };
+    crate::notify::set_policy(p);
+    crate::ui_config::persist_notify_policy(p.as_str());
+    serial_println!("notify> {} — {}", p.as_str(), p.describe());
+    if matches!(p, crate::notify::Policy::Off) {
+        serial_println!("notify> nothing will be recorded while this is off; ktrace still logs posts");
+    }
 }
 
 fn list(rest: &str) {
     let limit: usize = rest.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(20);
     let all = crate::notify::list();
     if all.is_empty() {
-        serial_println!("notify> (no notifications)");
+        let p = crate::notify::policy();
+        serial_println!("notify> (no notifications) [{}]", p.as_str());
+        if !p.records() {
+            // "nothing is arriving" otherwise has two indistinguishable causes.
+            serial_println!("notify> notifications are OFF — /notify on to re-enable");
+        }
         return;
     }
     let now = crate::clock::now_unix();
+    let p = crate::notify::policy();
     serial_println!(
-        "notify> {} notification(s), {} unread",
+        "notify> {} notification(s), {} unread [{}]",
         all.len(),
-        crate::notify::unread_count()
+        crate::notify::unread_count(),
+        p.as_str()
     );
     for n in all.iter().take(limit) {
         let mark = if n.read { ' ' } else { '*' };

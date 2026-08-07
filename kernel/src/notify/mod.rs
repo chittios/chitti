@@ -39,6 +39,25 @@
 //! JSON round trip and the row/chip formatting are all covered by
 //! `cargo xtask test`. The painter over in `framebuffer::views` is then pure
 //! presentation over values these tests already pin.
+//!
+//! ## The banner, and a reversed decision
+//!
+//! An earlier version of this note rejected a transient overlay outright. That
+//! was too conservative, and [`toast`] records why: two of the three objections
+//! were about a banner placed *anywhere*, and both dissolve once it is pinned
+//! **top-right** — nothing is typed there, and a banner that does not animate
+//! damages exactly twice (appear, lift) rather than once per pulse. The third,
+//! that a transient overlay must save and restore the pixels beneath it, is real
+//! but already solved: it is what the mouse cursor does on this same
+//! single-buffered framebuffer, every frame.
+//!
+//! What the banner is *not* is a modal. It never waits for a dismissal, it is
+//! capped at three lines, and the full text stays in the queue — so missing one
+//! costs nothing.
+
+pub mod toast;
+
+pub use toast::Policy;
 
 use crate::json::Json;
 use crate::mm::Locked;
@@ -131,6 +150,12 @@ pub struct Notification {
 }
 
 static NOTIFS: Locked<Vec<Notification>> = Locked::new(Vec::new());
+/// What the system is allowed to do — see [`toast::Policy`]. `0`/`1`/`2` are
+/// `On`/`Mute`/`Off`; an atomic rather than a `Locked` because the banner path
+/// reads it from `upkeep` on every pulse.
+static POLICY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The banner currently on screen, if any.
+static TOAST: Locked<Option<toast::Toast>> = Locked::new(None);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static DIRTY: AtomicBool = AtomicBool::new(false);
 static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(0);
@@ -411,12 +436,178 @@ fn post_full(
         n.source,
         n.title
     ));
+    // The ktrace line is emitted *before* the policy check on purpose: `Off`
+    // means "do not surface this to me", not "hide it from the trace log", and a
+    // machine whose notifications are disabled is exactly the one where the trace
+    // is the only remaining record.
+    let pol = policy();
+    if !pol.records() {
+        return 0;
+    }
+    let (sev, source_c, title_c, body_c, count_c) =
+        (n.severity, n.source.clone(), n.title.clone(), n.body.clone(), n.count);
     let id = NOTIFS.with(|v| push_into(v, n, CAP));
     DIRTY.store(true, Ordering::Relaxed);
+    // The banner, raised *immediately* rather than on the next `upkeep` pulse —
+    // "immediately" is the whole difference between a notification and a log
+    // line. `raise_banner` only records what to draw; the painting happens on the
+    // next pump, which is milliseconds away and is the only place that may touch
+    // the framebuffer.
+    if pol.banner() {
+        // The coalesced count is read back from the ring, so a repeat says
+        // "(x4)" on the banner as well as in the list.
+        let count = NOTIFS
+            .with(|v| v.iter().find(|e| e.id == id).map(|e| e.count))
+            .unwrap_or(count_c);
+        raise_banner(id, sev, &source_c, &title_c, &body_c, count);
+    }
+    if toast::should_chime(sev, pol) {
+        chime(sev);
+    }
     // Repaint the pane only if it is actually on screen — a notification posted
     // while the tab is closed must not force a relayout.
     refresh_pane_if_open();
     id
+}
+
+/// The current policy.
+pub fn policy() -> Policy {
+    match POLICY.load(Ordering::Relaxed) {
+        1 => Policy::Mute,
+        2 => Policy::Off,
+        _ => Policy::On,
+    }
+}
+
+/// Set the policy. Turning it off lifts any banner already on screen — a switch
+/// that leaves the last banner sitting there has not really turned anything off.
+pub fn set_policy(p: Policy) {
+    POLICY.store(
+        match p {
+            Policy::On => 0,
+            Policy::Mute => 1,
+            Policy::Off => 2,
+        },
+        Ordering::Relaxed,
+    );
+    if !p.banner() {
+        clear_banner();
+    }
+    crate::ktrace::log_fmt(format_args!("notify: policy {} ({})", p.as_str(), p.describe()));
+}
+
+/// Record a banner to be drawn on the next pump.
+fn raise_banner(id: u64, sev: Severity, source: &str, title: &str, body: &str, count: u32) {
+    let cols = banner_cols();
+    let (head, lines) = toast::lines(source, title, body, count, cols);
+    let until = crate::arch::now_ms() + toast::dwell_ms(sev);
+    TOAST.with(|t| {
+        // A new notification replaces the one on screen rather than queueing
+        // behind it: the newest is the one you want, and a queue of banners is a
+        // way to be shouted at for a minute.
+        *t = Some(toast::Toast { id, severity: sev, head, lines, until_ms: until, painted: false });
+    });
+}
+
+#[cfg(not(test))]
+fn banner_cols() -> usize {
+    let desktop = crate::framebuffer::desktop_cols();
+    toast::width_cols(desktop)
+}
+
+#[cfg(test)]
+fn banner_cols() -> usize {
+    toast::WANT_COLS
+}
+
+/// Lift any banner and forget it.
+pub fn clear_banner() {
+    let had = TOAST.with(|t| t.take()).is_some();
+    if had {
+        lift_banner();
+    }
+}
+
+#[cfg(not(test))]
+fn lift_banner() {
+    crate::framebuffer::toast_hide();
+}
+
+#[cfg(test)]
+fn lift_banner() {}
+
+/// A snapshot of the banner to draw, if one is pending.
+pub fn pending_banner() -> Option<toast::Toast> {
+    TOAST.with(|t| t.clone())
+}
+
+/// Mark the banner as drawn, so a static overlay is not repainted every pulse.
+pub fn mark_banner_painted() {
+    TOAST.with(|t| {
+        if let Some(b) = t.as_mut() {
+            b.painted = true;
+        }
+    });
+}
+
+/// Pumped from `shell::upkeep`: draw a fresh banner, or lift an expired one.
+///
+/// Cheap by construction — the common case is `None` and returns after one lock
+/// take. A drawn banner is left alone until it expires, which is what keeps the
+/// KMS damage at two round trips per notification.
+pub fn tick_banner() {
+    let now = crate::arch::now_ms();
+    let action = TOAST.with(|t| match t.as_mut() {
+        None => 0u8,
+        Some(b) if b.expired(now) => {
+            *t = None;
+            2 // lift
+        }
+        Some(b) if b.needs_repaint() => 1, // draw
+        Some(_) => 0,
+    });
+    match action {
+        1 => {
+            if let Some(b) = pending_banner() {
+                draw_banner(&b);
+                mark_banner_painted();
+            }
+        }
+        2 => lift_banner(),
+        _ => {}
+    }
+}
+
+#[cfg(not(test))]
+fn draw_banner(b: &toast::Toast) {
+    crate::framebuffer::toast_show(b.severity, &b.head, &b.lines);
+}
+
+#[cfg(test)]
+fn draw_banner(_b: &toast::Toast) {}
+
+/// Play the chime for `sev`.
+///
+/// Best-effort and non-blocking: a machine with no sound device, or one whose
+/// output queue is full because something else is playing, simply does not ring.
+/// A notification must never wait on audio.
+fn chime(sev: Severity) {
+    #[cfg(not(test))]
+    {
+        if !crate::sound::is_up() || crate::sound::muted() {
+            return;
+        }
+        const RATE: u32 = 16_000;
+        let mut pcm: alloc::vec::Vec<i16> = alloc::vec::Vec::new();
+        for &(hz, ms) in toast::chime(sev) {
+            pcm.extend_from_slice(&crate::sound::test_tone(hz, ms, RATE));
+        }
+        // Deliberately ignored: a full queue means audio is busy, and dropping
+        // the chime is the right answer — the notification is already on screen.
+        let _ = crate::sound::play(&pcm, RATE);
+    }
+    #[cfg(test)]
+    let _ = sev;
 }
 
 #[cfg(not(test))]
@@ -564,6 +755,8 @@ pub fn reset_for_test() {
     NEXT_ID.store(1, Ordering::Relaxed);
     BUDGET.with(|b| *b = (0, 0));
     DIRTY.store(false, Ordering::Relaxed);
+    TOAST.with(|t| *t = None);
+    set_policy(Policy::On);
 }
 
 #[cfg(test)]
@@ -852,6 +1045,95 @@ mod tests {
         assert_eq!(len(), 1);
         assert_eq!(clear(), 1);
         assert_eq!(len(), 0);
+        reset_for_test();
+    }
+
+    #[test_case]
+    fn the_policy_gates_the_record_the_banner_and_the_chime() {
+        reset_for_test();
+        // On: recorded, and a banner is raised.
+        assert_eq!(policy(), Policy::On);
+        post(Severity::Warn, "kernel", "one", "");
+        assert_eq!(len(), 1);
+        assert!(pending_banner().is_some(), "On must raise a banner");
+
+        // Mute: still recorded — the queue is most of its value — but silent.
+        reset_for_test();
+        set_policy(Policy::Mute);
+        post(Severity::Error, "kernel", "two", "");
+        assert_eq!(len(), 1, "muted must still record");
+        assert!(pending_banner().is_none(), "muted must not raise a banner");
+        assert!(!toast::should_chime(Severity::Error, policy()));
+
+        // Off: nothing is stored at all, which is what "fully disable" means.
+        reset_for_test();
+        set_policy(Policy::Off);
+        let id = post(Severity::Error, "kernel", "three", "");
+        assert_eq!(id, 0, "a dropped post reports no id");
+        assert_eq!(len(), 0, "off must record nothing");
+        assert!(pending_banner().is_none());
+        assert_eq!(unread_count(), 0);
+        reset_for_test();
+    }
+
+    #[test_case]
+    fn turning_notifications_off_lifts_a_banner_already_on_screen() {
+        // A switch that leaves the last banner sitting there has not turned
+        // anything off.
+        reset_for_test();
+        post(Severity::Warn, "kernel", "up", "");
+        assert!(pending_banner().is_some());
+        set_policy(Policy::Off);
+        assert!(pending_banner().is_none(), "the banner must be lifted");
+        reset_for_test();
+    }
+
+    #[test_case]
+    fn a_new_notification_replaces_the_banner_rather_than_queueing_behind_it() {
+        reset_for_test();
+        post(Severity::Info, "kernel", "first", "");
+        let a = pending_banner().expect("first banner");
+        post(Severity::Error, "kernel", "second", "");
+        let b = pending_banner().expect("second banner");
+        assert_ne!(a.id, b.id, "the newest notification is the one you want to see");
+        assert_eq!(b.severity, Severity::Error);
+        assert!(b.lines.iter().any(|l| l.contains("second")), "{:?}", b.lines);
+        reset_for_test();
+    }
+
+    #[test_case]
+    fn a_coalesced_repeat_shows_its_count_on_the_banner() {
+        reset_for_test();
+        post_keyed(Severity::Warn, "schedule:j", "j failed", "", "j");
+        post_keyed(Severity::Warn, "schedule:j", "j failed", "", "j");
+        post_keyed(Severity::Warn, "schedule:j", "j failed", "", "j");
+        assert_eq!(len(), 1, "the ring coalesced");
+        let b = pending_banner().expect("banner");
+        assert!(b.head.contains("x3"), "the banner must show the count: {:?}", b.head);
+        reset_for_test();
+    }
+
+    #[test_case]
+    fn the_banner_expires_and_the_tick_is_idempotent() {
+        reset_for_test();
+        post(Severity::Info, "kernel", "hi", "");
+        let b = pending_banner().expect("banner");
+        assert!(b.needs_repaint());
+        // The pump draws it once, then leaves it alone.
+        tick_banner();
+        assert!(!pending_banner().unwrap().needs_repaint(), "painted once");
+        tick_banner();
+        tick_banner();
+        assert!(pending_banner().is_some(), "still up before its dwell elapses");
+        // Force expiry and pump: it lifts, and pumping again is harmless.
+        TOAST.with(|t| {
+            if let Some(x) = t.as_mut() {
+                x.until_ms = 0;
+            }
+        });
+        tick_banner();
+        assert!(pending_banner().is_none(), "expired banners are lifted");
+        tick_banner();
         reset_for_test();
     }
 
