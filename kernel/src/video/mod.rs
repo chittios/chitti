@@ -17,7 +17,7 @@
 //! | codec | demux + describe | decode |
 //! |-------|------------------|--------|
 //! | H.264 / AVC | yes | yes — baseline CAVLC through High-profile CABAC (I/P/B) |
-//! | H.265 / HEVC | yes | Main 8/10/12-bit 4:2:0, tiles, PCM (see [`hevc`]) |
+//! | H.265 / HEVC | yes | Main/RExt 8/10/12-bit 4:2:0/4:2:2/4:4:4, tiles, PCM |
 //! | VP9 | yes | yes — profile 0, intra + inter, bit-exact vs libvpx |
 //!
 //! A stream outside the supported set comes back from [`probe`] with
@@ -185,11 +185,13 @@ fn hevc_support(sps: &hevc::Sps) -> (bool, &'static str) {
     if !(8..=12).contains(&sps.bit_depth_luma) || sps.bit_depth_luma != sps.bit_depth_chroma {
         return (false, "HEVC bit depth must be 8–12 and equal for luma/chroma");
     }
-    if sps.chroma_format_idc != 1 {
-        return (false, "non-4:2:0 chroma (4:2:2/4:4:4 range extensions)");
+    // 0 = monochrome (no chroma plane we present), 1/2/3 = 4:2:0 / 4:2:2 / 4:4:4.
+    if sps.chroma_format_idc == 0 || sps.chroma_format_idc > 3 {
+        return (false, "monochrome or unknown HEVC chroma_format_idc");
     }
-    // Main / Main 10 / Main 12, 4:2:0. Samples are u16 internally; the player
-    // downshifts to 8-bit for display. Tiles and PCM are decoded when present.
+    // Main / RExt 4:2:0, 4:2:2 and 4:4:4 at 8–12 bit. Samples are u16
+    // internally; the player downshifts and (if needed) 4:2:0-sub-samples for
+    // the RGB converter. Tiles and PCM are decoded when present.
     (true, "")
 }
 
@@ -455,18 +457,46 @@ fn yuv_from_rust_h264(f: rust_h264::decoder::Frame) -> h264::decoder::DecodedFra
     }
 }
 
-/// Downshift an HEVC frame to 8-bit planes for the RGB converter / player.
+/// Downshift an HEVC frame to 8-bit **4:2:0** planes for the RGB converter.
+///
+/// 4:2:2 / 4:4:4 are point-sampled into 4:2:0 (take even rows/cols). The
+/// player only paints 4:2:0 today; bit-exact work lives in `videodiff`, which
+/// consumes the native layout from `hevcseq`.
 fn hevc_frame_to_8bit(f: &hevc::decoder::DecodedFrame) -> h264::decoder::DecodedFrame {
     let shift = f.bit_depth.saturating_sub(8);
-    let down = |p: &[u16]| -> alloc::vec::Vec<u8> {
-        p.iter().map(|&s| (s >> shift) as u8).collect()
-    };
+    let y: alloc::vec::Vec<u8> = f.y.iter().map(|&s| (s >> shift) as u8).collect();
+    let (cw, ch) = (f.w / 2, f.h / 2);
+    let mut cb = alloc::vec![128u8; cw * ch];
+    let mut cr = alloc::vec![128u8; cw * ch];
+    if f.chroma_format_idc != 0 && f.cw > 0 && f.ch > 0 {
+        for j in 0..ch {
+            let sj = match f.chroma_format_idc {
+                1 => j,                         // 4:2:0: already half height
+                2 => j * 2,                     // 4:2:2: full height → take even rows
+                _ => j * 2,                     // 4:4:4: take even rows
+            };
+            if sj >= f.ch {
+                break;
+            }
+            for i in 0..cw {
+                let si = match f.chroma_format_idc {
+                    3 => i * 2, // 4:4:4: take even cols
+                    _ => i,     // 4:2:0 / 4:2:2: already half width
+                };
+                if si >= f.cw {
+                    break;
+                }
+                cb[j * cw + i] = (f.cb[sj * f.cw + si] >> shift) as u8;
+                cr[j * cw + i] = (f.cr[sj * f.cw + si] >> shift) as u8;
+            }
+        }
+    }
     h264::decoder::DecodedFrame {
         w: f.w,
         h: f.h,
-        y: down(&f.y),
-        cb: down(&f.cb),
-        cr: down(&f.cr),
+        y,
+        cb,
+        cr,
     }
 }
 

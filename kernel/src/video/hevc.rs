@@ -655,8 +655,31 @@ impl Sps {
             1 => (2, 2), // 4:2:0
             2 => (2, 1), // 4:2:2
             3 => (1, 1), // 4:4:4
-            _ => (1, 1), // monochrome
+            _ => (1, 1), // monochrome (no chroma plane)
         }
+    }
+
+    /// `hShift` / `vShift` as used by FFmpeg and the residual/MC path:
+    /// `log2(SubWidthC)` / `log2(SubHeightC)`. Monochrome returns `(0, 0)`.
+    pub fn chroma_shifts(&self) -> (u32, u32) {
+        match self.chroma_format_idc {
+            1 => (1, 1),
+            2 => (1, 0),
+            3 => (0, 0),
+            _ => (0, 0),
+        }
+    }
+
+    /// Chroma plane width in samples.
+    pub fn chroma_width(&self) -> u32 {
+        let (sw, _) = self.chroma_subsampling();
+        self.pic_width_in_luma_samples / sw.max(1)
+    }
+
+    /// Chroma plane height in samples.
+    pub fn chroma_height(&self) -> u32 {
+        let (_, sh) = self.chroma_subsampling();
+        self.pic_height_in_luma_samples / sh.max(1)
     }
 
     /// Display width: coded width minus the conformance window, which is

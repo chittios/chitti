@@ -17,8 +17,8 @@
 //!   from a *copy* — an in-place SAO would classify each sample against its
 //!   already-offset neighbour.
 //!
-//! Scope: 4:2:0, 8/10/12-bit, tiles and PCM supported. Range extensions
-//! (4:2:2/4:4:4) are refused by name rather than mis-decoded.
+//! Scope: 4:2:0 / 4:2:2 / 4:4:4, 8/10/12-bit, tiles and PCM. Monochrome
+//! (`chroma_format_idc == 0`) is refused by name.
 
 use alloc::rc::Rc;
 use alloc::vec;
@@ -39,6 +39,11 @@ pub struct DecodedFrame {
     pub h: usize,
     /// Bit depth of the sample arrays (8, 10 or 12).
     pub bit_depth: u32,
+    /// `chroma_format_idc`: 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4.
+    pub chroma_format_idc: u32,
+    /// Chroma plane width / height in samples.
+    pub cw: usize,
+    pub ch: usize,
     pub y: Vec<u16>,
     pub cb: Vec<u16>,
     pub cr: Vec<u16>,
@@ -58,9 +63,24 @@ pub struct RefFrame {
     pub cw: usize,
     pub chh: usize,
     pub bit_depth: u32,
+    pub chroma_format_idc: u32,
     pub y: Vec<u16>,
     pub cb: Vec<u16>,
     pub cr: Vec<u16>,
+}
+
+fn frame_from_ref(f: &RefFrame) -> DecodedFrame {
+    DecodedFrame {
+        w: f.w,
+        h: f.h,
+        bit_depth: f.bit_depth,
+        chroma_format_idc: f.chroma_format_idc,
+        cw: f.cw,
+        ch: f.chh,
+        y: f.y.clone(),
+        cb: f.cb.clone(),
+        cr: f.cr.clone(),
+    }
 }
 
 /// Per-4x4 motion and prediction record — what every neighbour derivation
@@ -140,6 +160,10 @@ struct Pic {
     log2_ctb: u32,
     bit_depth_luma: u32,
     bit_depth_chroma: u32,
+    chroma_format_idc: u32,
+    /// log2(SubWidthC) / log2(SubHeightC).
+    hshift: u32,
+    vshift: u32,
 }
 
 impl Pic {
@@ -246,14 +270,7 @@ impl HevcDecoder {
         while self.ready.len() > reorder {
             let k = *self.ready.keys().next().unwrap();
             let f = self.ready.remove(&k).unwrap();
-            out.push(DecodedFrame {
-                w: f.w,
-                h: f.h,
-                bit_depth: f.bit_depth,
-                y: f.y.clone(),
-                cb: f.cb.clone(),
-                cr: f.cr.clone(),
-            });
+            out.push(frame_from_ref(&f));
         }
         Ok(out)
     }
@@ -265,14 +282,7 @@ impl HevcDecoder {
         let keys: Vec<i32> = self.ready.keys().copied().collect();
         for k in keys {
             let f = self.ready.remove(&k).unwrap();
-            out.push(DecodedFrame {
-                w: f.w,
-                h: f.h,
-                bit_depth: f.bit_depth,
-                y: f.y.clone(),
-                cb: f.cb.clone(),
-                cr: f.cr.clone(),
-            });
+            out.push(frame_from_ref(&f));
         }
         out
     }
@@ -302,6 +312,7 @@ impl HevcDecoder {
             cw: p.cw,
             chh: p.ch,
             bit_depth: p.bit_depth_luma,
+            chroma_format_idc: p.chroma_format_idc,
             y: p.y,
             cb: p.cb,
             cr: p.cr,
@@ -327,8 +338,8 @@ impl HevcDecoder {
         let sps = self.spss.get(&pps.sps_id).ok_or("hevc: PPS names an unknown SPS")?.clone();
         let sh = super::parse_slice_header(rbsp, nal, &sps, &pps)?;
 
-        if sps.chroma_format_idc != 1 {
-            return Err("hevc: only 4:2:0 is supported");
+        if sps.chroma_format_idc == 0 || sps.chroma_format_idc > 3 {
+            return Err("hevc: monochrome or unknown chroma_format_idc");
         }
         // 8/10/12-bit Main family; tiles and PCM handled in the walk.
 
@@ -477,8 +488,9 @@ impl Pic {
     fn new(sps: &Sps, poc: i32) -> Pic {
         let w = sps.pic_width_in_luma_samples as usize;
         let h = sps.pic_height_in_luma_samples as usize;
-        let cw = w / 2;
-        let ch = h / 2;
+        let (hshift, vshift) = sps.chroma_shifts();
+        let cw = sps.chroma_width() as usize;
+        let ch = sps.chroma_height() as usize;
         let log2_ctb = sps.log2_ctb_size as usize;
         let ctb = 1usize << log2_ctb;
         let ctb_w = w.div_ceil(ctb);
@@ -545,6 +557,9 @@ impl Pic {
             log2_ctb: sps.log2_ctb_size,
             bit_depth_luma: sps.bit_depth_luma,
             bit_depth_chroma: sps.bit_depth_chroma,
+            chroma_format_idc: sps.chroma_format_idc,
+            hshift,
+            vshift,
         }
     }
 }
@@ -1021,10 +1036,14 @@ impl<'a> SliceDecoder<'a> {
             } else {
                 self.sps.max_transform_hierarchy_depth_inter
             };
-            self.transform_tree(x0, y0, x0, y0, log2_cb_size, log2_cb_size, 0, 0, [false; 2])?;
+            self.transform_tree(
+                x0, y0, x0, y0, log2_cb_size, log2_cb_size, 0, 0, [false; 2], [false; 2],
+            )?;
         } else if self.cu.intra {
             // An intra CU always predicts, even with no residual.
-            self.transform_tree(x0, y0, x0, y0, log2_cb_size, log2_cb_size, 0, 0, [false; 2])?;
+            self.transform_tree(
+                x0, y0, x0, y0, log2_cb_size, log2_cb_size, 0, 0, [false; 2], [false; 2],
+            )?;
         }
         self.set_qp(x0, y0, size);
         Ok(())
@@ -1036,7 +1055,10 @@ impl<'a> SliceDecoder<'a> {
         let bd_c = self.sps.pcm_bit_depth_chroma;
         let n_y = size * size * bd_y as usize;
         let n_c = if self.sps.chroma_format_idc != 0 {
-            2 * (size / 2) * (size / 2) * bd_c as usize
+            let (sw, sh) = self.sps.chroma_subsampling();
+            let cw = size / sw as usize;
+            let ch = size / sh as usize;
+            2 * cw * ch * bd_c as usize
         } else {
             0
         };
@@ -1060,7 +1082,9 @@ impl<'a> SliceDecoder<'a> {
             }
         }
         if self.sps.chroma_format_idc != 0 {
-            let (cx, cy, cw, ch) = (x0 / 2, y0 / 2, size / 2, size / 2);
+            let (sw, sh) = self.sps.chroma_subsampling();
+            let (cx, cy) = (x0 / sw as usize, y0 / sh as usize);
+            let (cw, ch) = (size / sw as usize, size / sh as usize);
             for plane in 0..2usize {
                 let dst = if plane == 0 {
                     &mut self.pic.cb
@@ -1289,21 +1313,42 @@ impl<'a> SliceDecoder<'a> {
                 self.set_ipm(px, py, pb, mode);
             }
         }
-        // **One chroma mode per CU in 4:2:0**, however many luma partitions
-        // there are — only 4:4:4 signals one per partition. Reading `side*side`
-        // of them consumes three extra syntax elements on every NxN intra CU
-        // and desynchronises everything after it.
-        let sig = syn::intra_chroma_pred_mode(&mut self.c);
-        for k in 0..side * side {
-            self.cu.ipm_c[k] = ctu::chroma_intra_mode(sig, self.cu.ipm[k]);
+        // 4:2:0 / 4:2:2: one chroma mode per CU. 4:4:4: one per partition
+        // when the CU is NxN (H.265 §7.3.8.5).
+        let cf = self.sps.chroma_format_idc;
+        if cf == 3 && split {
+            for k in 0..side * side {
+                let sig = syn::intra_chroma_pred_mode(&mut self.c);
+                self.cu.ipm_c[k] = ctu::chroma_intra_mode(sig, self.cu.ipm[k]);
+            }
+        } else if cf != 0 {
+            let sig = syn::intra_chroma_pred_mode(&mut self.c);
+            let mut m = ctu::chroma_intra_mode(sig, self.cu.ipm[0]);
+            if cf == 2 {
+                m = ctu::chroma_mode_422(m);
+            }
+            for k in 0..4 {
+                self.cu.ipm_c[k] = if k < side * side {
+                    let mut mk = ctu::chroma_intra_mode(sig, self.cu.ipm[k]);
+                    if cf == 2 {
+                        mk = ctu::chroma_mode_422(mk);
+                    }
+                    mk
+                } else {
+                    m
+                };
+            }
+            // For non-split, all partitions share partition 0's mode.
+            if !split {
+                for k in 1..4 {
+                    self.cu.ipm_c[k] = self.cu.ipm_c[0];
+                }
+            }
         }
         if !split {
             self.cu.ipm[1] = self.cu.ipm[0];
             self.cu.ipm[2] = self.cu.ipm[0];
             self.cu.ipm[3] = self.cu.ipm[0];
-            self.cu.ipm_c[1] = self.cu.ipm_c[0];
-            self.cu.ipm_c[2] = self.cu.ipm_c[0];
-            self.cu.ipm_c[3] = self.cu.ipm_c[0];
         }
         Ok(())
     }
@@ -1671,10 +1716,22 @@ impl<'a> SliceDecoder<'a> {
             (false, false) => {}
         }
 
-        // Chroma: half the resolution, so eighth-pel phases and half-sized
-        // blocks. A prediction unit narrower than 8 luma samples still has a
-        // chroma block, of 2 or 4 samples.
-        let (cx, cy, cw, chh) = (x0 / 2, y0 / 2, (w / 2).max(1), (h / 2).max(1));
+        // Chroma: geometry follows SubWidthC / SubHeightC. MV fractional bits
+        // and the integer shift are `2 + hshift` / `2 + vshift` (FFmpeg's
+        // `chroma_mc_*`); the phase is then left-shifted into 1/8-pel for the
+        // shared 4-tap epel kernel.
+        if self.pic.chroma_format_idc == 0 {
+            return;
+        }
+        let (hs, vs) = (self.pic.hshift as usize, self.pic.vshift as usize);
+        let cx = x0 >> hs;
+        let cy = y0 >> vs;
+        let cw = (w >> hs).max(1);
+        let chh = (h >> vs).max(1);
+        let mx_bits = 2 + self.pic.hshift;
+        let my_bits = 2 + self.pic.vshift;
+        let mx_mask = (1i16 << mx_bits) - 1;
+        let my_mask = (1i16 << my_bits) - 1;
         for plane in 0..2usize {
             let mut cmid: [Vec<i16>; 2] = [Vec::new(), Vec::new()];
             let mut cused = [false; 2];
@@ -1690,15 +1747,20 @@ impl<'a> SliceDecoder<'a> {
                 let src = if plane == 0 { &f.cb } else { &f.cr };
                 let p = Plane { data: src, stride: f.cw, width: f.cw, height: f.chh };
                 let mut buf = vec![0i16; MAX_PB * MAX_PB];
+                let mx = (mv.0 & mx_mask) as usize;
+                let my = (mv.1 & my_mask) as usize;
+                // Scale residual phase bits up to the epel 0..7 range.
+                let epel_x = mx << (1 - self.pic.hshift as usize);
+                let epel_y = my << (1 - self.pic.vshift as usize);
                 inter::put_chroma(
                     &mut buf,
                     &p,
-                    cx as i32 + (mv.0 >> 3) as i32,
-                    cy as i32 + (mv.1 >> 3) as i32,
+                    cx as i32 + (mv.0 >> mx_bits) as i32,
+                    cy as i32 + (mv.1 >> my_bits) as i32,
                     cw,
                     chh,
-                    (mv.0 & 7) as usize,
-                    (mv.1 & 7) as usize,
+                    epel_x,
+                    epel_y,
                     self.bd_chroma(),
                 );
                 cmid[l] = buf;
@@ -1744,10 +1806,13 @@ impl<'a> SliceDecoder<'a> {
         log2_trafo_size: u32,
         depth: u32,
         blk_idx: usize,
-        base_cbf: [bool; 2],
+        // Per-component CBFs; index 1 is the second vertical chroma TU of 4:2:2.
+        base_cbf_cb: [bool; 2],
+        base_cbf_cr: [bool; 2],
     ) -> Result<(), &'static str> {
-        let mut cbf_cb = base_cbf[0];
-        let mut cbf_cr = base_cbf[1];
+        let mut cbf_cb = base_cbf_cb;
+        let mut cbf_cr = base_cbf_cr;
+        let cf = self.pic.chroma_format_idc;
 
         let split = if log2_trafo_size <= self.sps.log2_max_tb_size
             && log2_trafo_size > self.sps.log2_min_tb_size
@@ -1765,15 +1830,22 @@ impl<'a> SliceDecoder<'a> {
                 || inter_split
         };
 
-        // Chroma CBFs are only coded while the block is above 4x4 — below that
-        // the four luma sub-blocks share one chroma transform, carried by the
-        // parent's flag.
-        if log2_trafo_size > 2 {
-            if depth == 0 || base_cbf[0] {
-                cbf_cb = syn::cbf_chroma(&mut self.c, depth as usize);
+        // Chroma CBFs: coded when the luma TB is above 4x4, or always for
+        // 4:4:4 (which keeps a same-size chroma TB at every level). For 4:2:2
+        // a second vertical CBF is read when the tree is a leaf or the TB is
+        // 8x8 (H.265 §7.3.8.10 / FFmpeg `hls_transform_tree`).
+        if cf != 0 && (log2_trafo_size > 2 || cf == 3) {
+            if depth == 0 || base_cbf_cb[0] {
+                cbf_cb[0] = syn::cbf_chroma(&mut self.c, depth as usize);
+                if cf == 2 && (!split || log2_trafo_size == 3) {
+                    cbf_cb[1] = syn::cbf_chroma(&mut self.c, depth as usize);
+                }
             }
-            if depth == 0 || base_cbf[1] {
-                cbf_cr = syn::cbf_chroma(&mut self.c, depth as usize);
+            if depth == 0 || base_cbf_cr[0] {
+                cbf_cr[0] = syn::cbf_chroma(&mut self.c, depth as usize);
+                if cf == 2 && (!split || log2_trafo_size == 3) {
+                    cbf_cr[1] = syn::cbf_chroma(&mut self.c, depth as usize);
+                }
             }
         }
 
@@ -1789,16 +1861,19 @@ impl<'a> SliceDecoder<'a> {
                     log2_trafo_size - 1,
                     depth + 1,
                     i,
-                    [cbf_cb, cbf_cr],
+                    cbf_cb,
+                    cbf_cr,
                 )?;
             }
             return Ok(());
         }
 
+        let any_c =
+            cbf_cb[0] || cbf_cr[0] || (cf == 2 && (cbf_cb[1] || cbf_cr[1]));
         // A luma CBF is inferred for an inter CU at the root of a tree that was
         // reached at all: something must be coded, or `rqt_root_cbf` would have
         // been zero.
-        let cbf_luma = if self.cu.intra || depth != 0 || cbf_cb || cbf_cr {
+        let cbf_luma = if self.cu.intra || depth != 0 || any_c {
             syn::cbf_luma(&mut self.c, depth as usize)
         } else {
             true
@@ -1819,15 +1894,22 @@ impl<'a> SliceDecoder<'a> {
         depth: u32,
         blk_idx: usize,
         cbf_luma: bool,
-        cbf_cb: bool,
-        cbf_cr: bool,
+        cbf_cb: [bool; 2],
+        cbf_cr: [bool; 2],
     ) -> Result<(), &'static str> {
         let mode = if self.cu.intra_split { self.cu.ipm[blk_idx] } else { self.cu.ipm[0] };
-        let mode_c = if self.cu.intra_split { self.cu.ipm_c[blk_idx] } else { self.cu.ipm_c[0] };
+        let mode_c = if self.cu.intra_split {
+            self.cu.ipm_c[blk_idx]
+        } else {
+            self.cu.ipm_c[0]
+        };
+        let cf = self.pic.chroma_format_idc;
+        let (hs, vs) = (self.pic.hshift, self.pic.vshift);
+        let any_c = cbf_cb[0] || cbf_cr[0] || (cf == 2 && (cbf_cb[1] || cbf_cr[1]));
 
         // The QP delta is coded once per quantisation group, in the first
         // transform unit that carries any coefficient at all.
-        if (cbf_luma || cbf_cb || cbf_cr)
+        if (cbf_luma || any_c)
             && self.pps.cu_qp_delta_enabled
             && !self.cu.qp_delta_coded
         {
@@ -1853,7 +1935,7 @@ impl<'a> SliceDecoder<'a> {
                 log2_trafo_size as u8,
                 0,
                 mode,
-                cbf_luma as u8 | (cbf_cb as u8) << 1 | (cbf_cr as u8) << 2,
+                cbf_luma as u8 | (cbf_cb[0] as u8) << 1 | (cbf_cr[0] as u8) << 2,
             ));
         }
         self.mark_edges(x0, y0, 1 << log2_trafo_size, 1 << log2_trafo_size, false);
@@ -1869,30 +1951,51 @@ impl<'a> SliceDecoder<'a> {
             self.mark_cbf(x0, y0, 1 << log2_trafo_size);
         }
 
-        // Chroma follows at half the size; a 4x4 luma block has no chroma
-        // transform of its own — the fourth sub-block carries the parent's.
-        if log2_trafo_size > 2 {
-            let l2c = log2_trafo_size - 1;
-            for (c_idx, present) in [(1usize, cbf_cb), (2usize, cbf_cr)] {
-                if self.cu.intra {
-                    self.intra_predict(x0 / 2, y0 / 2, l2c, c_idx, mode_c);
-                }
-                if present {
-                    let scan = ctu::scan_order(self.cu.intra, l2c, mode_c);
-                    self.residual_block(x0 / 2, y0 / 2, l2c, c_idx, scan, mode_c)?;
+        if cf == 0 {
+            let _ = depth;
+            return Ok(());
+        }
+
+        // Chroma residual size is luma minus hShift (and for 4:2:2 a second
+        // vertical TU sits at y + (1 << log2_trafo_size_c)).
+        let n_vert = if cf == 2 { 2usize } else { 1usize };
+        if log2_trafo_size > 2 || cf == 3 {
+            let l2c = log2_trafo_size - hs;
+            let cx = x0 >> hs;
+            let cy0 = y0 >> vs;
+            for i in 0..n_vert {
+                let cy = cy0 + (i << l2c as usize);
+                for (c_idx, present) in [(1usize, cbf_cb[i]), (2usize, cbf_cr[i])] {
+                    if self.cu.intra {
+                        self.intra_predict(cx, cy, l2c, c_idx, mode_c);
+                    }
+                    if present {
+                        let scan = ctu::scan_order(self.cu.intra, l2c, mode_c);
+                        self.residual_block(cx, cy, l2c, c_idx, scan, mode_c)?;
+                    }
                 }
             }
         } else if blk_idx == 3 {
+            // 4x4 luma sub-block of a larger CU: the fourth one carries the
+            // parent's chroma transform (same as 4:2:0, but with 4:2:2's
+            // second vertical TU when needed).
             let l2c = log2_trafo_size;
-            for (c_idx, present) in [(1usize, cbf_cb), (2usize, cbf_cr)] {
-                if self.cu.intra {
-                    self.intra_predict(xbase / 2, ybase / 2, l2c, c_idx, mode_c);
-                }
-                if present {
-                    let scan = ctu::scan_order(self.cu.intra, l2c, mode_c);
-                    self.residual_block(xbase / 2, ybase / 2, l2c, c_idx, scan, mode_c)?;
+            let cx = xbase >> hs;
+            let cy0 = ybase >> vs;
+            for i in 0..n_vert {
+                let cy = cy0 + (i << l2c as usize);
+                for (c_idx, present) in [(1usize, cbf_cb[i]), (2usize, cbf_cr[i])] {
+                    if self.cu.intra {
+                        self.intra_predict(cx, cy, l2c, c_idx, mode_c);
+                    }
+                    if present {
+                        let scan = ctu::scan_order(self.cu.intra, l2c, mode_c);
+                        self.residual_block(cx, cy, l2c, c_idx, scan, mode_c)?;
+                    }
                 }
             }
+        } else if self.cu.intra && (log2_trafo_size > 2 || cf == 3) {
+            // Intra with no residual still predicts chroma.
         }
         let _ = depth;
         Ok(())
@@ -1929,7 +2032,10 @@ impl<'a> SliceDecoder<'a> {
             } else {
                 self.pps.cr_qp_offset + self.sh.cr_qp_offset
             };
-            transform::chroma_qp((self.qp_y + off).clamp(0, 57), 1)
+            transform::chroma_qp(
+                (self.qp_y + off).clamp(0, 57),
+                self.pic.chroma_format_idc as u8,
+            )
         };
 
         let bd = if c_idx == 0 {
@@ -2024,7 +2130,18 @@ impl<'a> SliceDecoder<'a> {
     /// consulting a differently-shaped neighbourhood from its luma.
     fn intra_predict(&mut self, x0: usize, y0: usize, log2_size: u32, c_idx: usize, mode: u8) {
         let n = 1usize << log2_size;
-        let scale = if c_idx == 0 { 1usize } else { 2 };
+        // Availability is tested in *luma* coordinates, so chroma positions
+        // are scaled up by SubWidthC / SubHeightC.
+        let scale_x = if c_idx == 0 {
+            1usize
+        } else {
+            1usize << self.pic.hshift
+        };
+        let scale_y = if c_idx == 0 {
+            1usize
+        } else {
+            1usize << self.pic.vshift
+        };
         let (pw, ph, stride) = if c_idx == 0 {
             (self.pic.w, self.pic.h, self.pic.w)
         } else {
@@ -2043,13 +2160,16 @@ impl<'a> SliceDecoder<'a> {
                 && (sx as usize) < pw
                 && (sy as usize) < ph
                 && self.available(
-                    x0 * scale,
-                    y0 * scale,
-                    sx * scale as isize,
-                    sy * scale as isize,
+                    x0 * scale_x,
+                    y0 * scale_y,
+                    sx * scale_x as isize,
+                    sy * scale_y as isize,
                 )
                 && (!self.pps.constrained_intra_pred
-                    || self.pic.pu_at((sx as usize) * scale, (sy as usize) * scale).intra);
+                    || self
+                        .pic
+                        .pu_at((sx as usize) * scale_x, (sy as usize) * scale_y)
+                        .intra);
             if ok {
                 let src = match c_idx {
                     0 => &self.pic.y,
@@ -2248,9 +2368,19 @@ fn deblock_picture(p: &mut Pic) {
             }
         }
 
-        // Chroma: only intra edges (bS == 2) filter, on a 16-luma-sample grid.
-        for a in (16..outer).step_by(16) {
-            for b in (0..inner).step_by(16) {
+        // Chroma: only intra edges (bS == 2). Step size in luma samples is
+        // `8 * Sub{Width,Height}C` so 4:2:0 is 16×16, 4:2:2 is 16×8, 4:4:4 is 8×8.
+        if p.chroma_format_idc == 0 {
+            return;
+        }
+        let step_x = 8usize << p.hshift; // 8 * SubWidthC
+        let step_y = 8usize << p.vshift; // 8 * SubHeightC
+        // In the vertical pass `a` is the edge's x and `b` runs along y.
+        let a_step = if vertical { step_x } else { step_y };
+        let b_step = if vertical { step_y } else { step_x };
+        let half_along = b_step / 2;
+        for a in (a_step..outer).step_by(a_step) {
+            for b in (0..inner).step_by(b_step) {
                 let (ex, ey) = if vertical { (a / 8, b / 8) } else { (b / 8, a / 8) };
                 if ey * p.edge_w + ex >= p.edges.len() {
                     continue;
@@ -2266,7 +2396,7 @@ fn deblock_picture(p: &mut Pic) {
                 let tc_off = p.db_tc.get(ctb).copied().unwrap_or(0) as i32 * 2;
                 let mut tcs = [0i32; 2];
                 for half in 0..2usize {
-                    let along = b + half * 8;
+                    let along = b + half * half_along;
                     if along >= inner {
                         continue;
                     }
@@ -2280,20 +2410,23 @@ fn deblock_picture(p: &mut Pic) {
                         continue;
                     }
                     let qp_l = (qp_of(p, px, py) + qp_of(p, qx, qy) + 1) >> 1;
-                    let qp_c = transform::chroma_qp(qp_l, 1);
+                    let qp_c = transform::chroma_qp(qp_l, p.chroma_format_idc as u8);
                     tcs[half] = super::deblock::tc(qp_c, bs, tc_off);
                 }
                 if tcs[0] == 0 && tcs[1] == 0 {
                     continue;
                 }
-                let (ca, cb_) = (a / 2, b / 2);
+                let ca = a >> p.hshift;
+                let cb_ = b >> p.vshift;
+                // Chroma edge needs room for the 4-sample filter on both sides.
                 if vertical && (ca < 2 || ca + 2 > p.cw) {
                     continue;
                 }
                 if !vertical && (ca < 2 || ca + 2 > p.ch) {
                     continue;
                 }
-                if cb_ + 8 > (if vertical { p.ch } else { p.cw }) {
+                let along_c = if vertical { p.ch } else { p.cw };
+                if cb_ + 8 > along_c {
                     continue;
                 }
                 let (base, xs, ys) = if vertical {
@@ -2337,20 +2470,24 @@ fn sao_picture(p: &mut Pic) {
                 if s.type_idx[c_idx] == 0 {
                     continue;
                 }
-                let sh = if c_idx == 0 { 0 } else { 1 };
-                let (pw, ph, stride) = if c_idx == 0 {
-                    (p.w, p.h, p.w)
+                let (pw, ph, stride, bsw, bsh) = if c_idx == 0 {
+                    (p.w, p.h, p.w, ctb, ctb)
                 } else {
-                    (p.cw, p.ch, p.cw)
+                    (
+                        p.cw,
+                        p.ch,
+                        p.cw,
+                        ctb >> p.hshift,
+                        ctb >> p.vshift,
+                    )
                 };
-                let bs = ctb >> sh;
-                let x0 = rx * bs;
-                let y0 = ry * bs;
+                let x0 = rx * bsw;
+                let y0 = ry * bsh;
                 if x0 >= pw || y0 >= ph {
                     continue;
                 }
-                let w = bs.min(pw - x0);
-                let h = bs.min(ph - y0);
+                let w = bsw.min(pw - x0);
+                let h = bsh.min(ph - y0);
                 let src: &[u16] = match c_idx {
                     0 => &src_y,
                     1 => &src_cb,

@@ -438,7 +438,7 @@ fn demux(bytes: &[u8]) -> (CodecConfig, Vec<video::mp4::Sample>) {
 }
 
 /// Write one plane: for 8-bit, raw bytes; for 10/12-bit, little-endian u16
-/// samples (yuv420p10le / yuv420p12le layout).
+/// samples (yuv420p{10,12}le / yuv422p* / yuv444p* layout matching plane size).
 fn write_hevc_plane(w: &mut impl Write, plane: &[u16], bit_depth: u32) {
     if bit_depth <= 8 {
         let bytes: Vec<u8> = plane.iter().map(|&s| s as u8).collect();
