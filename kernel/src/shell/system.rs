@@ -480,6 +480,15 @@ pub(super) fn run_suspend(arg: &str) {
         serial_println!("suspend> refusing: preconditions above are not met");
         return;
     }
+    // `/suspend plan` stays agent-readable, but actually suspending does not.
+    // With a login password set the machine resumes into a lock screen, and an
+    // agent-initiated suspend would put that prompt inside
+    // `serial::capture_begin()`'s buffer rather than on the console — invisible to
+    // the human, who sees a machine that went to sleep and came back hung.
+    if crate::shell::in_tool_call() {
+        serial_println!("suspend> refused: only a human at the console may suspend the machine");
+        return;
+    }
     #[cfg(not(test))]
     if !assume_yes
         && !crate::modal::confirm(

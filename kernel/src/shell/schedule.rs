@@ -301,6 +301,14 @@ fn add(rest: &str) {
             serial_println!("schedule> '/{cmd}' is not a command (see /help)");
             return;
         }
+        // The login commands are interactive-only, so a scheduled one could never
+        // do anything: a fire runs with no human at the keyboard and under
+        // `IN_TOOL_CALL`. Refuse here rather than leaving a job that fails
+        // forever and silently at 3am.
+        if crate::shell::catalog::is_human_only(cmd) {
+            serial_println!("schedule> '/{cmd}' cannot be scheduled — it requires a human at the console");
+            return;
+        }
     }
 
     // **Human or agent is decided here, not inferred from session taint.** A

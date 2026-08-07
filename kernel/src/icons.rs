@@ -389,7 +389,7 @@ pub fn for_command(name: &str) -> char {
         "keyboard" => fa::KEYBOARD,
         "schedule" | "cron" => fa::CALENDAR,
         "model" | "infer" | "perf" | "bench" | "think" | "mode" => fa::ROBOT,
-        "redteam" | "audit" => fa::SHIELD,
+        "redteam" | "audit" | "passwd" | "password" | "lock" => fa::SHIELD,
         "ls" | "cat" | "open" | "mkdir" | "cp" | "mv" | "rm" | "touch" | "glob" | "grep"
         | "pwd" | "decoder" | "js" => fa::FOLDER,
         "disks" | "mounts" | "mount" | "umount" | "install" | "mkext4" => fa::HARD_DRIVE,

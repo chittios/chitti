@@ -25,6 +25,7 @@ mod browser;
 mod fs;
 mod install;
 mod keyboard;
+mod auth;
 mod media;
 mod notify;
 mod pdf;
@@ -203,6 +204,29 @@ pub fn run() -> ! {
     // `crate::clipboard`). Copy-out uses OSC 52 from `clipboard::set`.
     crate::clipboard::enable_host_paste();
 
+    // ── The login gate ───────────────────────────────────────────────────
+    //
+    // Here, and not in `main.rs`: everything the prompt needs to look like part
+    // of this OS has just happened — theme and palette applied, the fallback
+    // fonts registered, the display resolution and font scale applied, the pane
+    // layout built. `run_os` runs before all of that, so a gate there would draw
+    // in the built-in palette at the wrong font scale on a high-DPI panel.
+    //
+    // And **before** the session resume below, which hydrates the previous
+    // conversation and prints its id and message count: that is disclosure before
+    // authentication.
+    //
+    // No password enrolled means no gate, anywhere — which is also why the e2e
+    // harness needs no bypass flag: its guests run on a memfs store where nothing
+    // can ever have been enrolled.
+    #[cfg(not(test))]
+    {
+        crate::auth::store::refresh();
+        if crate::auth::enrolled() {
+            crate::auth::prompt::gate(crate::auth::Reason::Boot);
+        }
+    }
+
     // The agent-layer orchestrator (session persistence for the shell agent —
     // `/session`, `/info`), reused across the session so its Session persists.
     use crate::agent::{manifest as amanifest, orchestrator};
@@ -322,6 +346,17 @@ pub fn run() -> ! {
             }
             continue;
         }
+        // Lock the console. Performed here rather than in `read_line` or
+        // `upkeep()` for the same reason the power button is acted on in this
+        // loop: the gate takes over the console, and entering it from under a
+        // pump would re-enter the shell from whatever stack happened to be
+        // running. `line` is untouched, so the draft survives the lock.
+        if matches!(outcome, ReadOutcome::Locked) {
+            let reason = crate::auth::take_lock_request().unwrap_or(crate::auth::Reason::Idle);
+            #[cfg(not(test))]
+            crate::auth::prompt::gate(reason);
+            continue;
+        }
         let submitted = alloc::string::String::from(line.trim());
         line.clear();
         if submitted.is_empty() {
@@ -393,6 +428,21 @@ pub fn run() -> ! {
                 "http" => run_http(arg),
                 "ws" => run_ws(arg),
                 "mcp" => run_mcp(arg),
+                // The login commands live **here**, in the interactive-only match,
+                // and must never move down into `dispatch_system`.
+                //
+                // `run_shell_command` hands any `[A-Za-z0-9_-]+` token straight to
+                // `dispatch_system` without needing a registry entry, and it is in
+                // `CORE_TOOLS` and the orchestrator manifest — so a `dispatch_system`
+                // arm would be callable by every agent, with no capability and no
+                // manifest change. There is no `Right::Shell` to withhold either;
+                // shell commands are not capability-gated at all. Every agent surface
+                // (scheduled fires, Telegram turns, package-UI apps, sub-agents)
+                // funnels through `run_tool_command` -> `dispatch_system`, so being
+                // absent from it is what makes these unreachable — all at once, by
+                // construction rather than by a guard somebody can forget.
+                "passwd" | "password" => auth::run_passwd(arg),
+                "lock" => auth::run_lock(arg),
                 "todos" | "todo" => run_todos(arg, &orch.session),
                 // Sticky declassification is authority a human handed out, so it
                 // has to be visible and revocable -- a standing grant nobody can
@@ -1759,13 +1809,13 @@ pub fn run_tool_command(name: &str, arg: &str) -> alloc::string::String {
     // Marks the whole dispatch as agent-chosen — see `in_tool_call`. Set and
     // cleared here rather than at each command, because the point is precisely
     // that a command cannot tell who called it.
-    IN_TOOL_CALL.store(true, core::sync::atomic::Ordering::Relaxed);
+    enter_tool_call();
     crate::serial::capture_begin();
     if !dispatch_system(name, arg) {
         serial_println!("'/{}' is not available as a tool (interactive or agent-internal command)", name);
     }
     let out = crate::serial::capture_end();
-    IN_TOOL_CALL.store(false, core::sync::atomic::Ordering::Relaxed);
+    leave_tool_call();
     out
 }
 
@@ -2248,10 +2298,35 @@ pub fn chat_busy() -> bool {
 /// "human" from session taint would let a DM-authored schedule act with
 /// typed-human authority forever. The distinction has to come from the call
 /// site, and this is the call site.
-static IN_TOOL_CALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+///
+/// **A depth counter, not a flag.** Nested `run_tool_command` really happens:
+/// `tools::bg::pump` calls it, `pump` is driven from `shell::upkeep`, and
+/// `upkeep` is called from inside long-running commands — which are themselves
+/// often running under `run_tool_command`. With a plain `AtomicBool` the inner
+/// call's exit stored `false` while the outer dispatch was still running, so
+/// everything gated on this (`/screenshot`'s surface narrowing, `/record`,
+/// `/schedule`'s authorship, and now `/passwd` and `/lock`) saw "a human typed
+/// it" for the rest of the outer call. Incrementing and decrementing makes the
+/// answer correct at any depth.
+static IN_TOOL_CALL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 pub fn in_tool_call() -> bool {
-    IN_TOOL_CALL.load(core::sync::atomic::Ordering::Relaxed)
+    IN_TOOL_CALL.load(core::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// Mark entry to a tool-chosen dispatch. Paired with [`leave_tool_call`].
+pub(crate) fn enter_tool_call() {
+    IN_TOOL_CALL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Mark exit. Saturating, so a stray unpaired exit cannot wrap the counter to
+/// `usize::MAX` and wedge the machine into "a model is always calling" forever.
+pub(crate) fn leave_tool_call() {
+    let _ = IN_TOOL_CALL.fetch_update(
+        core::sync::atomic::Ordering::Relaxed,
+        core::sync::atomic::Ordering::Relaxed,
+        |n| Some(n.saturating_sub(1)),
+    );
 }
 
 /// The worst provenance resident in the live chat context, as a snapshot the
@@ -7133,6 +7208,9 @@ enum ReadOutcome {
     /// A global hotkey was handled (e.g. Cmd+Space → Agents browser). Draft
     /// stays in `buf`; main loop applies any pending pick then re-prompts.
     Hotkey,
+    /// The console should lock — the idle timeout expired, or `/lock` asked.
+    /// Draft stays in `buf`, so locking never costs a half-typed command.
+    Locked,
 }
 
 /// Pending pick from the Agents browser opened by Cmd+Space (`ESC [ g`).
@@ -7813,6 +7891,22 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                     crate::framebuffer::suggest_clear();
                     // Leave `buf` as the in-progress draft for the next prompt.
                     return ReadOutcome::Wake;
+                }
+                // Lock, if `/lock` asked or the machine has gone idle.
+                //
+                // **This is the only place the idle clock is read**, and that is
+                // deliberate: "idle" means *idle at the prompt*, so the timeout
+                // must not fire in the middle of `/http`, an inference turn or a
+                // video. This arm is reached regularly even while the shell
+                // sleeps, because `upkeep()` blanket-wakes `Wait::Console` on
+                // every pump. The lock itself happens in the REPL, not here —
+                // `read_line` owns the console and the gate needs to own it too.
+                // Peeked, not consumed: the reason has to survive to the REPL,
+                // which is what actually enters the gate.
+                if crate::auth::lock_pending() || crate::auth::should_lock_for_idle() {
+                    #[cfg(not(test))]
+                    crate::framebuffer::suggest_clear();
+                    return ReadOutcome::Locked;
                 }
                 // Sleep until something reports console input, instead of
                 // pumping the whole world from the prompt. The pumping still has
@@ -10796,5 +10890,199 @@ mod prompt_tests {
 
         crate::synapse::fs::write("/home/chitti/work/repo/.git/HEAD", b"ref: refs/heads/main\n");
         set_shell_cwd(crate::agent::home::USER_HOME);
+    }
+}
+
+#[cfg(test)]
+mod login_reachability_tests {
+    use super::*;
+
+    /// **The test that pins the whole "human-only" property of `/passwd` and
+    /// `/lock`**, and the one that would have caught the hole this design exists
+    /// to close.
+    ///
+    /// `run_shell_command` hands any `[A-Za-z0-9_-]+` token straight to
+    /// `dispatch_system` without needing a registry entry, and it is in
+    /// `CORE_TOOLS` and the orchestrator manifest — so the *instant* these names
+    /// gain a `dispatch_system` arm, every agent in the OS can call them. There is
+    /// no capability to withhold: shell commands are not capability-gated at all.
+    ///
+    /// So the property is "absent from `dispatch_system`", and this asserts
+    /// exactly that. If someone later tidies the arms down into `dispatch_system`,
+    /// this fails.
+    #[test_case]
+    fn passwd_and_lock_are_unreachable_from_the_tool_surface() {
+        for (name, arg) in [("passwd", "status"), ("password", "status"), ("lock", "")] {
+            assert!(
+                !dispatch_system(name, arg),
+                "'/{name}' is reachable from dispatch_system, so every agent holding \
+                 run_shell_command can call it"
+            );
+        }
+
+        // No `ToolDef` either, so `search_tools` cannot discover them and
+        // `for_agent` yields nothing — not even for a `"*"` toolset, which grants
+        // the entire registry.
+        for name in ["passwd", "password", "lock"] {
+            assert!(
+                crate::tools::registry::get(name).is_none(),
+                "'{name}' is a registered tool"
+            );
+        }
+        let everything = crate::tools::registry::for_agent(&[alloc::string::String::from("*")]);
+        for name in ["passwd", "password", "lock"] {
+            assert!(
+                !everything.iter().any(|t| t.name == name),
+                "'{name}' reached an agent through a '*' toolset"
+            );
+        }
+
+        // And the tool path reports them as unavailable rather than running them.
+        let out = run_tool_command("passwd", "clear --yes");
+        assert!(
+            out.contains("not available as a tool"),
+            "run_tool_command ran /passwd instead of refusing: {out}"
+        );
+
+        // Still discoverable by the human: `/help`, Tab completion and the
+        // suggestion popup all read the catalogue, so making them agent-unreachable
+        // must not have made them invisible.
+        for name in ["passwd", "lock"] {
+            assert!(
+                crate::shell::catalog::is_command_name(name),
+                "'{name}' vanished from the command catalogue"
+            );
+        }
+        // …but automation may not install them.
+        for name in ["passwd", "password", "lock"] {
+            assert!(crate::shell::catalog::is_human_only(name), "'{name}' is not reserved");
+        }
+        assert!(!crate::shell::catalog::is_human_only("info"), "an ordinary command was reserved");
+    }
+
+    /// `in_tool_call()` must survive a **nested** `run_tool_command`.
+    ///
+    /// This really happens: `tools::bg::pump` calls `run_tool_command`, `pump` runs
+    /// from `shell::upkeep`, and `upkeep` is called from inside long-running
+    /// commands — which are themselves often already under `run_tool_command`. With
+    /// the old `AtomicBool` the inner call's exit cleared the flag while the outer
+    /// dispatch was still running, so everything gated on it saw "a human typed
+    /// this" for the rest of the outer call.
+    #[test_case]
+    fn in_tool_call_survives_a_nested_run_tool_command() {
+        assert!(!in_tool_call(), "a previous test leaked a tool-call marker");
+        enter_tool_call();
+        assert!(in_tool_call());
+        {
+            // The inner call, as `bg::pump` would make it. `pwd` is a real
+            // `dispatch_system` command, so this exercises the whole
+            // enter/dispatch/leave path rather than the early-out.
+            let inner = run_tool_command("pwd", "");
+            assert!(inner.contains("pwd>"), "the nested call did not actually dispatch: {inner}");
+            assert!(
+                in_tool_call(),
+                "a nested run_tool_command cleared the marker while the outer call was still running"
+            );
+        }
+        leave_tool_call();
+        assert!(!in_tool_call(), "the marker outlived the outermost call");
+
+        // An unpaired exit must not wrap the counter into "always in a tool call".
+        leave_tool_call();
+        assert!(!in_tool_call(), "an unpaired leave_tool_call wedged the counter");
+    }
+}
+
+#[cfg(test)]
+mod credential_bypass_tests {
+    use super::*;
+
+    /// **The test that pins the facade guard**, and the reason it exists at all.
+    ///
+    /// The Synapse executor's Gate-4 deny is the correct *statement* of the
+    /// policy, but it is not what enforces it: `/cat`, `/rm`, `/cp`, `/mv`,
+    /// `/touch`, `/grep` and `/glob` are `ToolBinding::Shell` tools that reach
+    /// `synapse::fs` **directly** through `shell::fs`, never entering the executor.
+    /// Without the guard in the store facade, an agent could read the verifier for
+    /// offline cracking, or simply delete the record and remove the gate.
+    ///
+    /// Every case runs through `run_tool_command`, i.e. exactly the path a model
+    /// takes via `run_shell_command`.
+    #[test_case]
+    fn no_shell_file_command_can_read_or_remove_the_credential_record() {
+        const DECOY: &[u8] = b"{\"salt\":\"c0ffee00c0ffee00\",\"hash\":\"feedface\"}";
+        const SECRET: &str = "c0ffee00c0ffee00";
+
+        // Plant a decoy through the one legitimate door.
+        {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::write(crate::auth::PATH, DECOY);
+        }
+
+        // Commands given the path directly. These echo the caller's own argument
+        // back in their error, which is not a disclosure — the path is a
+        // compile-time constant, so anyone able to run these already knows it. The
+        // properties under test are that the *contents* never come back and the
+        // record is not modified.
+        let direct: &[(&str, alloc::string::String)] = &[
+            ("cat", alloc::string::String::from(crate::auth::PATH)),
+            ("rm", alloc::string::String::from(crate::auth::PATH)),
+            // A recursive remove of the *parent* must not take it either.
+            ("rm", alloc::string::String::from("-r /configs/core")),
+            ("mv", alloc::format!("{} /tmp/stolen.json", crate::auth::PATH)),
+            ("cp", alloc::format!("{} /tmp/stolen.json", crate::auth::PATH)),
+            ("touch", alloc::string::String::from(crate::auth::PATH)),
+            // Normalisation is not a way round it.
+            ("cat", alloc::string::String::from("/configs/core/../core/auth.json")),
+        ];
+        for (cmd, arg) in direct {
+            let out = run_tool_command(cmd, arg);
+            assert!(
+                !out.contains(SECRET),
+                "'/{cmd} {arg}' leaked the credential record's contents: {out}"
+            );
+        }
+
+        // Enumeration is the case where naming the file *is* the leak: these were
+        // never given the path, so mentioning it means the record was discoverable
+        // (and `grep` would go on to oracle its contents).
+        let enumerating: &[(&str, alloc::string::String)] = &[
+            ("grep", alloc::string::String::from("c0ffee /configs/core")),
+            ("glob", alloc::string::String::from("/configs/core/*")),
+            ("ls", alloc::string::String::from("/configs/core")),
+        ];
+        for (cmd, arg) in enumerating {
+            let out = run_tool_command(cmd, arg);
+            assert!(
+                !out.contains(SECRET),
+                "'/{cmd} {arg}' leaked the credential record's contents: {out}"
+            );
+            assert!(
+                !out.contains("auth.json"),
+                "'/{cmd} {arg}' enumerated the credential record: {out}"
+            );
+        }
+
+        // It survived every attempt, byte for byte.
+        let still = {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::read(crate::auth::PATH)
+        };
+        assert_eq!(
+            still.as_deref(),
+            Some(DECOY),
+            "a shell file command modified or removed the credential record"
+        );
+
+        // And the copy targets were never created.
+        assert!(
+            !crate::synapse::fs::exists("/tmp/stolen.json"),
+            "the record was copied out to a readable path"
+        );
+
+        {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::delete(crate::auth::PATH);
+        }
     }
 }

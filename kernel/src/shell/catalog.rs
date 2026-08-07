@@ -49,7 +49,23 @@ pub const COMMAND_ALIASES: &[&str] = &[
     "notif",      // → notify
     "cron",       // → schedule
     "kbd",        // → keyboard
+    "password",   // → passwd
 ];
+
+/// Commands a **scheduled run** may never install, and a package manifest may
+/// never claim as a `command_hooks` name.
+///
+/// These are the interactive-only login commands. A schedule fires with no human
+/// at the keyboard (and under `IN_TOOL_CALL`), so a scheduled `/passwd` could
+/// only ever be refused — leaving a job that fails forever and silently. A
+/// manifest hook is dead code for the same reason `dispatch_system` never sees
+/// these names, but reserving them says so out loud rather than relying on it.
+pub const RESERVED_HUMAN_ONLY: &[&str] = &["passwd", "password", "lock"];
+
+/// Whether `name` names a human-only command that automation must not install.
+pub fn is_human_only(name: &str) -> bool {
+    RESERVED_HUMAN_ONLY.iter().any(|&r| r == name)
+}
 
 /// Whether `name` is a known slash command or alias (for completion).
 pub fn is_command_name(name: &str) -> bool {
@@ -174,6 +190,12 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Keyboard Layout & IME", name: "keyboard", shortcut: "" },
     Entry { category: "System & UI", title: "Notifications", name: "notify", shortcut: "" },
     Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },
+    // Login. Listed here so `/help` and Tab completion find them — they are
+    // **interactive-only** (matched in the REPL, never in `dispatch_system`), so
+    // being in this catalogue does not make them reachable by an agent. See
+    // `shell::auth` for why that distinction is the whole security property.
+    Entry { category: "System & UI", title: "Login Password", name: "passwd", shortcut: "" },
+    Entry { category: "System & UI", title: "Lock Console", name: "lock", shortcut: "" },
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
     Entry { category: "System & UI", title: "UI Config", name: "ui", shortcut: "" },
     Entry { category: "System & UI", title: "Theme", name: "theme", shortcut: "" },

@@ -954,6 +954,15 @@ pub fn resolve_command_hook(command: &str, path: &str) -> Option<OpenHookMatch> 
 /// matching agent's tool receives it under its `path_arg` key. `None` when no
 /// agent claims the command.
 pub fn resolve_command_hook_bare(command: &str) -> Option<OpenHookMatch> {
+    // Reserved names a manifest may never claim. Today this is dead code — the
+    // login commands are matched in the REPL above the fall-through that reaches
+    // hooks, so one could never fire for them — but the reservation says the
+    // intent out loud instead of depending on the order of two `match` arms in
+    // another file.
+    let bare = command.trim_start_matches('/');
+    if crate::shell::catalog::is_human_only(bare) {
+        return None;
+    }
     let cmd = if command.starts_with('/') {
         command.to_string()
     } else {

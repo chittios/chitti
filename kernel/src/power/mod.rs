@@ -380,6 +380,20 @@ fn resume_devices() {
         x86_64::interrupts::enable();
         crate::ktrace::log("resume", "APIC timer, i8042 and interrupts re-armed");
     }
+
+    // Re-authenticate, **last**: the gate needs a working console, and on x86 the
+    // i8042 was only just re-initialised a few lines above (it comes back with its
+    // configuration byte reset) and interrupts only just unmasked. A prompt before
+    // those would have no keyboard.
+    //
+    // Here rather than in `shell::system::run_suspend` so that *every* resume path
+    // locks — including a future lid-close handler that will not go through
+    // `/suspend`. Both arches' `enter()` call this and only on the resume side, so
+    // a refused suspend never reaches it.
+    #[cfg(not(test))]
+    if crate::auth::enrolled() && crate::auth::lock_on_resume() {
+        crate::auth::prompt::gate(crate::auth::Reason::Resume);
+    }
 }
 
 #[cfg(test)]
