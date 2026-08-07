@@ -77,12 +77,18 @@ fn drop_meta(path: &str) {
 
 /// Metadata for a store key, if recorded.
 pub fn meta(path: &str) -> Option<FileMeta> {
+    if credential_refused(path) {
+        return None;
+    }
     let key = vpath::normalize(path);
     META.with(|m| m.get(&key).copied())
 }
 
 /// Set owner (agent id). Cosmetic — does not grant authority.
 pub fn chown(path: &str, uid: u32) -> Result<(), &'static str> {
+    if credential_refused(path) {
+        return Err(CREDENTIAL_REFUSAL);
+    }
     let key = vpath::normalize(path);
     if !exists(&key) {
         return Err("no such file");
@@ -98,6 +104,9 @@ pub fn chown(path: &str, uid: u32) -> Result<(), &'static str> {
 
 /// Set permission bits (low 12). Cosmetic for listings.
 pub fn chmod(path: &str, mode_bits: u16) -> Result<(), &'static str> {
+    if credential_refused(path) {
+        return Err(CREDENTIAL_REFUSAL);
+    }
     let key = vpath::normalize(path);
     if !exists(&key) {
         return Err("no such file");
@@ -148,6 +157,11 @@ static TAINT: Locked<BTreeMap<String, crate::security::Provenance>> = Locked::ne
 /// The path is normalised first, because [`write`] normalises its key and a tag
 /// filed under the raw string would never be found again.
 pub fn write_tagged(path: &str, contents: &[u8], prov: crate::security::Provenance) {
+    // `write` would refuse the credential record anyway; returning here as well
+    // stops a taint tag being filed for a file that was never created.
+    if credential_refused(path) {
+        return;
+    }
     write(path, contents);
     let key = vpath::normalize(path);
     TAINT.with(|m| {
@@ -230,9 +244,66 @@ pub fn end_batch() {
     });
 }
 
+// ── The login credential record ──────────────────────────────────────────
+//
+// The Synapse executor denies the credential path at Gate 4, which is the
+// architecturally correct statement of the policy — but it is **not** what
+// enforces it. `/cat`, `/rm`, `/cp`, `/mv`, `/touch`, `/grep` and `/glob` are
+// `ToolBinding::Shell` tools that reach this module *directly* through
+// `shell::fs`, never entering the executor at all, and so do the editor and the
+// download path. So the refusal has to live here, at the store facade every one
+// of them shares.
+//
+// Everything is refused — read included. The record is a salt plus a PBKDF2
+// digest, i.e. an offline cracking target, and deleting it would remove the gate
+// entirely. `exists` is deliberately left open: `/passwd status` needs it and it
+// discloses nothing that `list`'s absence would not.
+
+/// What a refused **mutation** reports.
+///
+/// Only the `Result`-returning entry points can say this; the `Option`-returning
+/// readers (`read`, `meta`, `size_of`) have no channel for a reason, so their
+/// callers render "not found". That asymmetry is fine and not worth plumbing
+/// away: the path is a compile-time constant, so an attacker who can call `/cat`
+/// on it already knows it exists. The properties that matter are that the bytes
+/// never come back and the record cannot be changed — which is what
+/// `no_shell_file_command_can_read_or_remove_the_credential_record` asserts.
+pub const CREDENTIAL_REFUSAL: &str = "refused: the login credential record is not reachable from the filesystem";
+
+/// Set while `auth::store` is legitimately touching the record. The only way
+/// through [`credential_refused`].
+static CREDENTIAL_ACCESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// RAII permission to touch the credential record, held only by
+/// [`crate::auth::store`]. Restores the previous value on drop rather than
+/// clearing unconditionally, so a nested access (a save that reads first) cannot
+/// drop the outer guard's permission.
+pub(crate) struct CredentialAccess(bool);
+
+impl CredentialAccess {
+    pub(crate) fn new() -> CredentialAccess {
+        CredentialAccess(CREDENTIAL_ACCESS.swap(true, core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for CredentialAccess {
+    fn drop(&mut self) {
+        CREDENTIAL_ACCESS.store(self.0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether this store operation must be refused because it names the login
+/// credential record and no [`CredentialAccess`] is held.
+fn credential_refused(path: &str) -> bool {
+    !CREDENTIAL_ACCESS.load(core::sync::atomic::Ordering::Relaxed) && crate::auth::is_credential_path(path)
+}
+
 /// Create or replace the file at `path` with `contents`.
 /// Paths are normalised (`..` / `//` collapsed) so keys stay canonical.
 pub fn write(path: &str, contents: &[u8]) {
+    if credential_refused(path) {
+        return;
+    }
     let path = vpath::normalize(path);
     STORE.with(|b| match b {
         Backend::Memory(s) => {
@@ -245,6 +316,9 @@ pub fn write(path: &str, contents: &[u8]) {
 
 /// Read the file at `path`, or `None` if it does not exist.
 pub fn read(path: &str) -> Option<Vec<u8>> {
+    if credential_refused(path) {
+        return None;
+    }
     let path = vpath::normalize(path);
     STORE.with(|b| match b {
         Backend::Memory(s) => s.get(&path).cloned(),
@@ -262,17 +336,29 @@ pub fn exists(path: &str) -> bool {
 }
 
 /// All file paths, sorted, so `list` output is deterministic run-to-run.
+///
+/// The credential record is filtered out: `list` feeds `glob`, `grep` and the
+/// tool router's `readable_paths`, so leaving it in would let an agent find it
+/// (and, with `grep`, oracle its contents a byte at a time) without ever calling
+/// `read`.
 pub fn list() -> Vec<String> {
-    STORE.with(|b| match b {
+    let all: Vec<String> = STORE.with(|b| match b {
         Backend::Memory(s) => s.keys().cloned().collect(),
         Backend::Ext4(s) => s.list(),
-    })
+    });
+    if CREDENTIAL_ACCESS.load(core::sync::atomic::Ordering::Relaxed) {
+        return all;
+    }
+    all.into_iter().filter(|p| !crate::auth::is_credential_path(p)).collect()
 }
 
 /// Delete the file at `path`. Returns whether a file was actually removed.
 /// **Destructive / irreversible** -- the reason `mem_fs_delete` is gated on
 /// provenance by the Synapse taint gate (Phase 6).
 pub fn delete(path: &str) -> bool {
+    if credential_refused(path) {
+        return false;
+    }
     let path = vpath::normalize(path);
     // Drop the integrity tag with the object. Keeping it would make a *new*
     // file created at the same path inherit the deleted one's taint, which
@@ -287,6 +373,9 @@ pub fn delete(path: &str) -> bool {
 
 /// Byte size of a file key, or `None` if missing.
 pub fn size_of(path: &str) -> Option<usize> {
+    if credential_refused(path) {
+        return None;
+    }
     let path = vpath::normalize(path);
     STORE.with(|b| match b {
         Backend::Memory(s) => s.get(&path).map(|v| v.len()),
@@ -334,6 +423,9 @@ pub fn is_file(path: &str) -> bool {
 /// Create a directory by writing an empty `.keep` marker (idempotent).
 /// With `parents`, create every missing ancestor the same way.
 pub fn mkdir(path: &str, parents: bool) -> Result<(), &'static str> {
+    if credential_refused(path) {
+        return Err(CREDENTIAL_REFUSAL);
+    }
     let path = vpath::normalize(path);
     if path == "/" {
         return Ok(());
@@ -379,6 +471,9 @@ pub fn mkdir(path: &str, parents: bool) -> Result<(), &'static str> {
 
 /// Create an empty file (or update mtime-equivalent by rewriting).
 pub fn touch(path: &str) -> Result<(), &'static str> {
+    if credential_refused(path) {
+        return Err(CREDENTIAL_REFUSAL);
+    }
     let path = vpath::normalize(path);
     if path == "/" {
         return Err("is a directory");
@@ -405,6 +500,11 @@ pub fn touch(path: &str) -> Result<(), &'static str> {
 
 /// Copy a file, or a directory tree when `recursive`.
 pub fn copy(src: &str, dst: &str, recursive: bool) -> Result<usize, &'static str> {
+    // Both ends: copying *from* the record would duplicate the verifier to a
+    // readable path, and copying *onto* it would replace the password.
+    if credential_refused(src) || credential_refused(dst) {
+        return Err(CREDENTIAL_REFUSAL);
+    }
     let src = vpath::normalize(src);
     let dst_in = vpath::normalize(dst);
     let keys = list();
@@ -461,6 +561,11 @@ pub fn copy(src: &str, dst: &str, recursive: bool) -> Result<usize, &'static str
 
 /// Rename/move a file or directory tree.
 pub fn rename(src: &str, dst: &str) -> Result<usize, &'static str> {
+    // Both ends: renaming the record *away* removes the gate as surely as
+    // deleting it, and renaming something *onto* it replaces the password.
+    if credential_refused(src) || credential_refused(dst) {
+        return Err(CREDENTIAL_REFUSAL);
+    }
     let src = vpath::normalize(src);
     let dst_in = vpath::normalize(dst);
     let keys = list();
@@ -540,7 +645,15 @@ pub fn rename(src: &str, dst: &str) -> Result<usize, &'static str> {
 }
 
 /// Remove a file, or a directory tree when `recursive`.
+///
+/// A recursive remove of an *ancestor* (`rm -r /configs/core`) is covered too,
+/// and by construction rather than by a second check: the tree comes from
+/// [`list`], which filters the credential record out, and [`delete`] guards it
+/// again anyway.
 pub fn remove(path: &str, recursive: bool) -> Result<usize, &'static str> {
+    if credential_refused(path) {
+        return Err(CREDENTIAL_REFUSAL);
+    }
     let path = vpath::normalize(path);
     if path == "/" {
         return Err("refusing to remove /");

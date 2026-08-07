@@ -316,6 +316,37 @@ pub fn draw_about() {
 }
 
 /// Draw a text-input modal (masked = password dots). `caret_on` blinks the caret.
+/// Blank the whole desktop behind a lock screen.
+///
+/// A modal card alone leaves the previous session's transcript legible around
+/// it, which defeats the point of `/lock` — the screen is exactly what a lock is
+/// meant to hide. Painted through `paint_surface` rather than `fill_rect` so a
+/// translucent theme still shows its wallpaper (the standing rule for any new UI
+/// surface), and over the **physical** framebuffer including the status bar,
+/// because `${battery}`, the clock and the task-count chips are machine state a
+/// locked console should not narrate.
+///
+/// Call this **once** on entry, never on the caret blink: it is a multi-megabyte
+/// fill plus a KMS flush, and at 2 Hz that is a visible, pointless load.
+pub fn lock_cover() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.cursor_restore();
+            sc.cur_vis = false;
+            let bg = sc.theme.chat_bg;
+            // Physical first: this covers the status bar *and* the letterbox bars
+            // outside a smaller logical desktop, neither of which `paint_surface`
+            // reaches (it works in desktop coordinates).
+            sc.fill_phys(0, 0, sc.fb_w, sc.fb_h, bg);
+            // Then the desktop itself, through `paint_surface` so a translucent
+            // theme still shows its wallpaper.
+            let (w, h) = (sc.width, sc.height);
+            sc.paint_surface(0, 0, w, h, bg);
+        }
+    });
+    crate::kms::damage_all();
+}
+
 pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: bool) {
     MODAL_ON.store(true, core::sync::atomic::Ordering::Relaxed);
     SCREEN.with(|slot| {

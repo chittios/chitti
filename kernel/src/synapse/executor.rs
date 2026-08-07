@@ -142,6 +142,30 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     // touches must fall within it. Tasks with no scope ledger for the domain are
     // unconstrained (preserves primitive-granularity behaviour); a Scope::Any
     // grant covers everything. See `cap::scope_check`.
+    //
+    // Layered inside Gate 4 (not numbered as a fifth gate — see `GATE_COUNT`):
+    // the **login credential record** is unreachable from any primitive. Not
+    // writable (it is the gate), not deletable (deleting it removes the gate),
+    // not even readable — it is a salt plus a PBKDF2 digest, i.e. an offline
+    // cracking target.
+    //
+    // This has to be an *unconditional* deny rather than a `Scope` returned from
+    // `scope_target`, because `cap::scope_check` is deny-only-when-recorded: a
+    // task with no scope ledger for the domain — which the orchestrator has not —
+    // is unconstrained, so a scope rule here would refuse nothing.
+    //
+    // NB this is the policy, not the enforcement. `/cat`, `/rm`, `/cp`, `/mv`,
+    // `/grep` and `/glob` are shell-bound tools that reach the store without ever
+    // entering this function, so the refusal that actually holds is the facade
+    // guard in `synapse::fs`.
+    if is_credential_access(spec, &call.args) {
+        crate::ktrace::log_fmt(format_args!(
+            "synapse.scope: DENIED '{}' by task {caller} -- the login credential record",
+            spec.name
+        ));
+        audit::record(caller, spec.name, args_hash, audit::Outcome::DeniedScope, 0);
+        return Invocation::DeniedScope { primitive: spec.name };
+    }
     if let Some((domain, want, target)) = scope_target(spec, &call.args) {
         if !cap::scope_check(caller, domain, want, &target) {
             crate::ktrace::log_fmt(format_args!(
@@ -232,7 +256,12 @@ pub fn gate_prefix(caller: TaskId, raw: &str, justification: Justification, upto
         return 0;
     }
 
-    // Gate 3.5 ("4" here): scope.
+    // Gate 3.5 ("4" here): scope. The credential deny is layered inside it, in
+    // the same order as the real path — `gate_prefix_agrees_with_execute` fails
+    // if this copy drifts from that one.
+    if is_credential_access(spec, &call.args) {
+        return GATE_SCOPE;
+    }
     if let Some((domain, want, target)) = scope_target(spec, &call.args) {
         if !cap::scope_check(caller, domain, want, &target) {
             return GATE_SCOPE;
@@ -267,6 +296,73 @@ mod gate_contract_tests {
             0,
             "the approval check is not one of the four gates"
         );
+    }
+
+    /// No primitive may read, write, edit or delete the login credential record —
+    /// with a **fully-granted, trusted** caller, which is the worst case: if the
+    /// orchestrator (which holds everything and has no scope ledger) cannot reach
+    /// it, nothing can.
+    #[test_case]
+    fn a_primitive_cannot_touch_the_credential_record() {
+        let task = crate::sched::current_task_id();
+        for id in [
+            registry::MEM_FS_READ,
+            registry::MEM_FS_WRITE,
+            registry::MEM_FS_EDIT,
+            registry::MEM_FS_DELETE,
+        ] {
+            cap::grant(task, Right::InvokePrimitive(id));
+        }
+        // Plant a record so a permitted read would actually return bytes — a test
+        // against an absent file would pass even with the deny removed.
+        {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::write(crate::auth::PATH, b"{\"salt\":\"deadbeef\"}");
+        }
+
+        let calls = [
+            alloc::format!(r#"{{"name":"mem_fs_read","arguments":{{"path":"{}"}}}}"#, crate::auth::PATH),
+            alloc::format!(
+                r#"{{"name":"mem_fs_write","arguments":{{"path":"{}","text":"pwned"}}}}"#,
+                crate::auth::PATH
+            ),
+            alloc::format!(
+                r#"{{"name":"mem_fs_edit","arguments":{{"path":"{}","old":"a","new":"b"}}}}"#,
+                crate::auth::PATH
+            ),
+            alloc::format!(r#"{{"name":"mem_fs_delete","arguments":{{"path":"{}"}}}}"#, crate::auth::PATH),
+            // Normalisation must not be a way round it.
+            alloc::format!(r#"{{"name":"mem_fs_read","arguments":{{"path":"//configs//core/auth.json"}}}}"#),
+        ];
+        for raw in &calls {
+            let out = execute_with_justification(task, raw, Justification::trusted());
+            assert!(
+                matches!(out, Invocation::DeniedScope { .. }),
+                "the credential record was reachable via {raw}: {out:?}"
+            );
+        }
+
+        // The record survived every attempt, and its bytes never leaked.
+        let still = {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::read(crate::auth::PATH)
+        };
+        assert_eq!(still.as_deref(), Some(&b"{\"salt\":\"deadbeef\"}"[..]));
+
+        // Enumeration is an oracle too: neither `list` nor `search` may reveal it.
+        let listed = execute_with_justification(task, r#"{"name":"list","arguments":{}}"#, Justification::trusted());
+        if let Invocation::Executed { result, .. } = &listed {
+            assert!(!result.contains("auth.json"), "list enumerated the credential record: {result}");
+        }
+        assert!(
+            !crate::synapse::fs::list().iter().any(|p| crate::auth::is_credential_path(p)),
+            "fs::list leaked the credential record, so glob/grep/readable_paths do too"
+        );
+
+        {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::delete(crate::auth::PATH);
+        }
     }
 }
 
@@ -368,6 +464,22 @@ fn is_identity_file_mutation(spec: &PrimitiveSpec, args: &[ArgValue]) -> bool {
     match spec.id {
         registry::MEM_FS_WRITE | registry::MEM_FS_EDIT | registry::MEM_FS_DELETE => {
             is_identity_path(arg_str(args, 0))
+        }
+        _ => false,
+    }
+}
+
+/// Whether this call touches the login credential record in *any* way.
+///
+/// Unlike [`is_identity_file_mutation`] this includes **read**: the record is a
+/// salt plus a PBKDF2 digest, so handing it to an agent is handing over an
+/// offline cracking target. `MEM_FS_LIST` and `MEM_FS_SEARCH` are not listed
+/// because they take no path argument — they are covered at the source, by
+/// `synapse::fs::list` filtering the record out of every enumeration.
+fn is_credential_access(spec: &PrimitiveSpec, args: &[ArgValue]) -> bool {
+    match spec.id {
+        registry::MEM_FS_READ | registry::MEM_FS_WRITE | registry::MEM_FS_EDIT | registry::MEM_FS_DELETE => {
+            crate::auth::is_credential_path(arg_str(args, 0))
         }
         _ => false,
     }

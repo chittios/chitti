@@ -543,6 +543,13 @@ mod tests {
             (r#"{"name":"mem_fs_read","arguments":{"path":"/etc/shadow"}}"#, trusted, subject.scoped),
             // Gate 4: `..` cannot walk out of the prefix grant.
             (r#"{"name":"mem_fs_read","arguments":{"path":"/bench/../etc/shadow"}}"#, trusted, subject.scoped),
+            // Gate 4: the login credential record, unreachable however the call is
+            // justified or scoped. All four verbs, including read.
+            (r#"{"name":"mem_fs_read","arguments":{"path":"/configs/core/auth.json"}}"#, trusted, subject.scoped),
+            (r#"{"name":"mem_fs_write","arguments":{"path":"/configs/core/auth.json","text":"{}"}}"#, trusted, subject.scoped),
+            (r#"{"name":"mem_fs_delete","arguments":{"path":"/configs/core/auth.json"}}"#, trusted, subject.scoped),
+            // …and through a path that only normalises to it.
+            (r#"{"name":"mem_fs_read","arguments":{"path":"/configs/core/../core/auth.json"}}"#, trusted, subject.scoped),
         ];
 
         for &(raw, j, task) in cases {

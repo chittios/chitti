@@ -38,6 +38,7 @@ pub mod agent;
 pub mod agx;
 pub mod arch;
 pub mod audio;
+pub mod auth;
 pub mod block;
 pub mod browser;
 pub mod cap;

@@ -23,6 +23,11 @@ pub fn path(id: u64) -> String {
 /// per-login path. Distinct from the per-agent `/agent/<id>/` install homes.
 pub const USER_HOME: &str = "/home/chitti";
 
+/// The single user's name. There is exactly one, by construction — this is the
+/// last segment of [`USER_HOME`], and the name the login gate
+/// ([`crate::auth`]) prompts for.
+pub const USER_NAME: &str = "chitti";
+
 /// Ensure the user home exists as a directory in the store (a `.keep` marker
 /// on `/home` and `/home/chitti`, the same convention `mkdir` uses). Called at
 /// boot alongside the agent-roster install, so the `~` exists both in the
