@@ -1,25 +1,39 @@
-//! Video: container demuxing + H.264/AVC decoding for the `/open` player.
+//! Video: container demuxing + decoding for the `/open` player.
 //!
 //! Built in stages, each pure and unit-tested off-hardware (the standing rule —
 //! fiddly logic lives in pure functions verified with cases, and hard numeric
 //! bring-up is diffed against a host reference decoder, not QEMU):
 //!
-//! * **Stage 1 (here):** the [`bits`] H.264 bitstream reader (RBSP unescape,
-//!   Exp-Golomb), the [`mp4`] ISO-BMFF demuxer (box tree → sample table +
-//!   `avcC`), and [`h264`] NAL splitting + SPS/PPS parsing. [`probe`] reports a
-//!   stream's geometry/profile/frame-count without decoding pixels.
-//! * **Later stages:** the slice/CAVLC/intra/inter/transform/deblock pixel
-//!   pipeline, wired through the same [`Frame`] output the player presents.
+//! * **The bitstream layer** — [`bits`] (RBSP unescape + Exp-Golomb, shared by
+//!   [`h264`] and [`hevc`]), the [`mp4`] ISO-BMFF and [`mkv`] Matroska demuxers
+//!   (box/element tree → sample table + a [`mp4::CodecConfig`]), and per-codec
+//!   NAL/frame-header parsing. [`probe`] reports a stream's
+//!   geometry/profile/frame-count without decoding pixels.
+//! * **The pixel pipelines** — slice → entropy decode → intra/inter → transform
+//!   → in-loop filter, all producing the same [`Frame`] the player presents.
 //!
-//! Scope: H.264 baseline (I/P slices, CAVLC, 4:2:0), the common `.mp4`/`.mov`
-//! case. Matroska/WebM/HLS containers and CABAC/High-profile tooling are future
-//! stages; `probe` reports clearly when a file is outside the current support.
+//! Codec support, and it is deliberately reported rather than attempted:
+//!
+//! | codec | demux + describe | decode |
+//! |-------|------------------|--------|
+//! | H.264 / AVC | yes | yes — baseline CAVLC through High-profile CABAC (I/P/B) |
+//! | H.265 / HEVC | yes | **not yet** — see [`hevc`] |
+//! | VP9 | yes | yes — profile 0, intra + inter, bit-exact vs libvpx |
+//!
+//! A stream outside the supported set comes back from [`probe`] with
+//! `decodable == false` and a [`VideoInfo::unsupported_reason`] that names the
+//! actual cause, so `/open` never reports a file as playable and then fails on
+//! it. Containers: `.mp4`/`.mov` and `.mkv`/`.webm`; HLS/TS is not demuxed.
 
 pub mod bits;
 pub mod h264;
+pub mod hevc;
 pub mod mkv;
 pub mod mp4;
+/// Minimal MP4 muxer for screen recordings (the inverse of [`mp4`]).
+pub mod mp4_mux;
 pub mod mt;
+pub mod vp9;
 pub mod yuv;
 
 use alloc::string::String;
@@ -47,39 +61,167 @@ pub struct VideoInfo {
     pub level_idc: u8,
     pub frame_count: usize,
     pub duration_ms: u64,
-    /// false = CAVLC (baseline, our target), true = CABAC (not yet decodable).
+    /// H.264 only: false = CAVLC, true = CABAC. HEVC is always CABAC and VP9 is
+    /// not CABAC at all, so this is reported as `true`/`false` respectively and
+    /// the player does not branch on it for them.
     pub cabac: bool,
-    /// True once the pixel pipeline can decode this stream (later stage).
+    /// True once the pixel pipeline can decode this stream.
     pub decodable: bool,
+    /// Why not, when `decodable` is false — empty otherwise.
+    ///
+    /// The reason is produced *here*, where the parameter sets are in hand, and
+    /// not inferred at the call site: the player used to print "CABAC entropy
+    /// coding (baseline/CAVLC only)" for every undecodable stream, which is a
+    /// true statement about H.264 and a nonsense one about HEVC (always CABAC)
+    /// or VP9 (no CABAC at all).
+    pub unsupported_reason: &'static str,
 }
 
 /// Sniff the container and, for a supported one, demux + parse the parameter
-/// sets to describe the stream. Does **not** decode pixels (Stage 1).
+/// sets to describe the stream. Does **not** decode pixels.
 pub fn probe(bytes: &[u8]) -> Result<VideoInfo, &'static str> {
-    let (container, avcc, width, height, frame_count, duration_ms) = demux_meta(bytes)?;
-    let sps_nal = avcc.sps.first().ok_or("video: avcC has no SPS")?;
-    let pps_nal = avcc.pps.first().ok_or("video: avcC has no PPS")?;
-    let sps = h264::parse_sps(&bits::unescape_rbsp(&sps_nal[1..]))?;
-    let pps = h264::parse_pps(&bits::unescape_rbsp(&pps_nal[1..]))?;
-    let (width, height) = if sps.width() != 0 { (sps.width(), sps.height()) } else { (width, height) };
-    let codec = alloc::format!("H.264 (avc, profile {}, level {}.{})", sps.profile_idc, sps.level_idc / 10, sps.level_idc % 10);
+    let (container, d) = demux(bytes)?;
+    let frame_count = d.samples.len();
+    let duration_ms = d.duration_ms;
+    let (codec, width, height, profile_idc, level_idc, cabac, (decodable, unsupported_reason)) = match &d.config {
+        mp4::CodecConfig::Avc(avcc) => {
+            let sps_nal = avcc.sps.first().ok_or("video: avcC has no SPS")?;
+            let pps_nal = avcc.pps.first().ok_or("video: avcC has no PPS")?;
+            let sps = h264::parse_sps(&bits::unescape_rbsp(&sps_nal[1..]))?;
+            let pps = h264::parse_pps(&bits::unescape_rbsp(&pps_nal[1..]))?;
+            (
+                alloc::format!(
+                    "H.264 (avc, profile {}, level {}.{})",
+                    sps.profile_idc,
+                    sps.level_idc / 10,
+                    sps.level_idc % 10
+                ),
+                sps.width(),
+                sps.height(),
+                sps.profile_idc,
+                sps.level_idc,
+                pps.entropy_coding_mode,
+                (true, ""),
+            )
+        }
+        mp4::CodecConfig::Hevc(hvcc) => {
+            let sps_nal = hvcc.sps.first().ok_or("video: hvcC has no SPS")?;
+            let sps = hevc::parse_sps(&bits::unescape_rbsp(&sps_nal[2..]))?;
+            // HEVC levels are coded as 30×level, so 93 is 3.1 and 120 is 4.0 —
+            // AVC's ×10 convention would print every one of them wrong.
+            let (lvl_major, lvl_minor) = (sps.ptl.level_idc / 30, (sps.ptl.level_idc % 30) / 3);
+            (
+                alloc::format!(
+                    "H.265 (hevc, {} profile, {} tier, level {}.{}, {}-bit)",
+                    sps.ptl.profile_name(),
+                    if sps.ptl.tier_high { "high" } else { "main" },
+                    lvl_major,
+                    lvl_minor,
+                    sps.bit_depth_luma
+                ),
+                sps.width(),
+                sps.height(),
+                sps.ptl.profile_idc,
+                sps.ptl.level_idc,
+                true, // HEVC has no CAVLC mode
+                hevc_support(&sps),
+            )
+        }
+        mp4::CodecConfig::Vp9(vpcc) => {
+            // VP9 carries no parameter sets — the geometry is in the first
+            // frame's own header, which is the only authority (the `vpcC` box
+            // and the track header can and do disagree with it).
+            let first = d.samples.first().ok_or("video: no coded frames")?;
+            let data = bytes.get(first.offset..first.offset + first.size).ok_or("video: sample out of range")?;
+            let ranges = vp9::split_superframe(data)?;
+            let (s, e) = ranges[0];
+            let refs: vp9::RefSizes = [(0, 0); vp9::NUM_REF_FRAMES];
+            let h = vp9::parse_frame_header(&data[s..e], &refs)?;
+            (
+                alloc::format!(
+                    "VP9 (profile {}, level {}.{}, {}-bit)",
+                    h.profile,
+                    vpcc.level / 10,
+                    vpcc.level % 10,
+                    h.bit_depth
+                ),
+                h.render_width,
+                h.render_height,
+                h.profile,
+                vpcc.level,
+                false,
+                vp9_support(&h),
+            )
+        }
+    };
     Ok(VideoInfo {
         container,
         codec,
         width,
         height,
-        profile_idc: sps.profile_idc,
-        level_idc: sps.level_idc,
+        profile_idc,
+        level_idc,
         frame_count,
         duration_ms,
-        cabac: pps.entropy_coding_mode,
-        decodable: true,
+        cabac,
+        decodable,
+        unsupported_reason,
     })
+}
+
+/// What the HEVC path supports, and why not when it doesn't.
+///
+/// The **first** answer is that there is no HEVC pixel pipeline yet: the
+/// bitstream layer here parses VPS/SPS/PPS and slice headers, which is what
+/// `probe` reports from, and nothing decodes samples. Saying so plainly is the
+/// point — a stream reported decodable that then fails to open is worse than one
+/// that says up front what it is.
+///
+/// The profile checks are kept and ordered *before* that so the message names
+/// the more specific fact when there is one: a Main 10 file will not decode here
+/// even once the pipeline lands, and a user with a 10-bit file wants to be told
+/// that rather than "not implemented yet".
+fn hevc_support(sps: &hevc::Sps) -> (bool, &'static str) {
+    if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
+        return (false, "10/12-bit HEVC (Main 10 and above) — only 8-bit Main is planned");
+    }
+    if sps.chroma_format_idc != 1 {
+        return (false, "non-4:2:0 chroma (4:2:2/4:4:4 range extensions)");
+    }
+    if sps.pcm_enabled {
+        return (false, "HEVC PCM (lossless raw) blocks are not implemented");
+    }
+    // Bit-exact against FFmpeg (all planes) for multi-CTB all-intra and I+P
+    // including SAO, deblock, min-CU-8, sign-hide and strong-intra-smoothing.
+    // B slices without hierarchical B-pyramid also match. Hierarchical
+    // B-pyramid (x265 default: bframes≥2 with mid-GOP B used as a reference)
+    // still under-parses the leaf B slice (CABAC consumes a fraction of the
+    // NAL) and produces a wrong frame — so a typical real encode would play
+    // *visibly wrong*. Refusing is the honest state until that path matches.
+    (
+        false,
+        "H.265/HEVC decodes but is not yet bit-exact on hierarchical B-pyramid — demuxed and described, not played",
+    )
+}
+
+/// What the VP9 path supports, and why not when it doesn't. Same shape and same
+/// reasoning as [`hevc_support`].
+fn vp9_support(h: &vp9::FrameHeader) -> (bool, &'static str) {
+    if h.profile != 0 || h.bit_depth != 8 {
+        return (false, "VP9 profile 1-3 (10/12-bit or non-4:2:0) — only profile 0 decodes");
+    }
+    if !h.subsampling_x || !h.subsampling_y {
+        return (false, "non-4:2:0 chroma");
+    }
+    if h.segmentation.enabled {
+        return (false, "VP9 segmentation is not implemented yet");
+    }
+    (true, "")
 }
 
 /// A demuxed track's essentials, container-agnostic.
 struct Demuxed {
-    avcc: mp4::AvcC,
+    config: mp4::CodecConfig,
     samples: alloc::vec::Vec<mp4::Sample>,
     timescale: u32,
     duration_ms: u64,
@@ -90,21 +232,15 @@ fn demux(bytes: &[u8]) -> Result<(&'static str, Demuxed), &'static str> {
         Container::Mp4 => {
             let t = mp4::parse(bytes)?;
             let duration_ms = t.duration_ms();
-            Ok(("mp4/mov (ISO-BMFF)", Demuxed { avcc: t.avcc, samples: t.samples, timescale: t.timescale, duration_ms }))
+            Ok(("mp4/mov (ISO-BMFF)", Demuxed { config: t.config, samples: t.samples, timescale: t.timescale, duration_ms }))
         }
         Container::Matroska => {
             let t = mkv::parse(bytes)?;
             let duration_ms = t.duration_ms();
-            Ok(("matroska/webm (EBML)", Demuxed { avcc: t.avcc, samples: t.samples, timescale: t.timescale, duration_ms }))
+            Ok(("matroska/webm (EBML)", Demuxed { config: t.config, samples: t.samples, timescale: t.timescale, duration_ms }))
         }
         Container::Unknown => Err("video: unrecognised container (mp4/mov, mkv/webm supported)"),
     }
-}
-
-fn demux_meta(bytes: &[u8]) -> Result<(&'static str, mp4::AvcC, u32, u32, usize, u64), &'static str> {
-    let (container, d) = demux(bytes)?;
-    let n = d.samples.len();
-    Ok((container, d.avcc, 0, 0, n, d.duration_ms))
 }
 
 enum Container {
@@ -254,6 +390,23 @@ enum Engine {
     },
     /// Backup: our baseline CAVLC path.
     Cavlc { reference: Option<h264::decoder::DecodedFrame> },
+    /// H.265/HEVC (Main profile, 8-bit 4:2:0).
+    Hevc {
+        dec: hevc::decoder::HevcDecoder,
+        /// Sample index -> the pictures that became displayable at it. HEVC
+        /// reorders, so one sample may release several frames or none.
+        pending: alloc::collections::BTreeMap<usize, hevc::decoder::DecodedFrame>,
+        /// Next display slot to hand a released picture to.
+        next_out: usize,
+    },
+    /// VP9 (profile 0, 8-bit 4:2:0), bit-exact against libvpx.
+    Vp9 {
+        dec: vp9::decoder::Vp9Decoder,
+        /// Sample index → the picture that sample *showed*. A VP9 sample may
+        /// show nothing (a hidden ALTREF) or re-show a slot, so this is not a
+        /// one-to-one map from samples to pictures.
+        pending: alloc::collections::BTreeMap<usize, vp9::decoder::DecodedFrame>,
+    },
     /// Backup: our Main/High CABAC path.
     Cabac {
         dec: h264::decoder_cabac::H264Dec,
@@ -314,18 +467,30 @@ fn yuv_from_rust_h264(f: rust_h264::decoder::Frame) -> h264::decoder::DecodedFra
 }
 
 impl StreamDecoder {
-    /// Demux the container and parse SPS/PPS, ready to decode on demand.
+    /// Demux the container and parse the decoder configuration, ready to decode
+    /// on demand.
     pub fn open(bytes: Vec<u8>) -> Result<StreamDecoder, &'static str> {
         let (_container, d) = demux(&bytes)?;
-        let sps_nal = d.avcc.sps.first().ok_or("video: no SPS")?;
-        let pps_nal = d.avcc.pps.first().ok_or("video: no PPS")?;
+        if let mp4::CodecConfig::Vp9(_) = d.config {
+            return StreamDecoder::open_vp9(bytes, d);
+        }
+        if let mp4::CodecConfig::Hevc(_) = d.config {
+            return StreamDecoder::open_hevc(bytes, d);
+        }
+        let avcc = match d.config {
+            mp4::CodecConfig::Avc(a) => a,
+            mp4::CodecConfig::Hevc(_) => unreachable!("handled above"),
+            mp4::CodecConfig::Vp9(_) => unreachable!("handled above"),
+        };
+        let sps_nal = avcc.sps.first().ok_or("video: no SPS")?;
+        let pps_nal = avcc.pps.first().ok_or("video: no PPS")?;
         let sps = h264::parse_sps(&bits::unescape_rbsp(&sps_nal[1..]))?;
         let pps = h264::parse_pps(&bits::unescape_rbsp(&pps_nal[1..]))?;
         if d.samples.is_empty() {
             return Err("video: no decodable frames found");
         }
         // Prefer rust_h264; keep our CAVLC/CABAC ports as fallback.
-        let (engine, backend) = match rust_h264_from_avcc(&d.avcc.sps, &d.avcc.pps) {
+        let (engine, backend) = match rust_h264_from_avcc(&avcc.sps, &avcc.pps) {
             Ok(dec) => (
                 Engine::RustH264 {
                     dec,
@@ -355,7 +520,7 @@ impl StreamDecoder {
         let src_w = sps.width();
         let src_h = sps.height();
         Ok(StreamDecoder {
-            length_size: d.avcc.length_size,
+            length_size: avcc.length_size,
             samples: d.samples,
             timescale: d.timescale,
             duration_ms: d.duration_ms,
@@ -373,9 +538,109 @@ impl StreamDecoder {
             src_w,
             src_h,
             display_edge: DISPLAY_MAX_EDGE,
-            avcc_sps: d.avcc.sps,
-            avcc_pps: d.avcc.pps,
+            avcc_sps: avcc.sps,
+            avcc_pps: avcc.pps,
             backend,
+        })
+    }
+
+    /// Open a VP9 track. VP9 carries no parameter sets, so the geometry comes
+    /// from the first frame's own header — the same authority the probe uses.
+    fn open_vp9(bytes: Vec<u8>, d: Demuxed) -> Result<StreamDecoder, &'static str> {
+        let first = d.samples.first().ok_or("video: no decodable frames found")?;
+        let data = bytes
+            .get(first.offset..first.offset + first.size)
+            .ok_or("video: sample out of range")?;
+        let ranges = vp9::split_superframe(data)?;
+        let refs: vp9::RefSizes = [(0, 0); vp9::NUM_REF_FRAMES];
+        let h = vp9::parse_frame_header(&data[ranges[0].0..ranges[0].1], &refs)?;
+        let mut display: Vec<usize> = (0..d.samples.len()).collect();
+        display.sort_by_key(|&i| (d.samples[i].cts, i));
+        let mut disp_of = alloc::vec![0usize; display.len()];
+        for (pos, &si) in display.iter().enumerate() {
+            disp_of[si] = pos;
+        }
+        Ok(StreamDecoder {
+            length_size: 0,
+            samples: d.samples,
+            timescale: d.timescale,
+            duration_ms: d.duration_ms,
+            bytes,
+            sps: h264::Sps::default(),
+            pps: h264::Pps::default(),
+            next: 0,
+            engine: Engine::Vp9 {
+                dec: vp9::decoder::Vp9Decoder::new(),
+                pending: alloc::collections::BTreeMap::new(),
+            },
+            display,
+            disp_of,
+            hurry_before: None,
+            cur_idx: None,
+            cur: None,
+            ring: alloc::collections::BTreeMap::new(),
+            src_w: h.render_width,
+            src_h: h.render_height,
+            display_edge: DISPLAY_MAX_EDGE,
+            avcc_sps: Vec::new(),
+            avcc_pps: Vec::new(),
+            backend: "vp9",
+        })
+    }
+
+    /// Open an HEVC track. The parameter sets live in the `hvcC` box and are
+    /// fed to the decoder before the first sample, exactly as an Annex-B stream
+    /// would carry them in-band.
+    fn open_hevc(bytes: Vec<u8>, d: Demuxed) -> Result<StreamDecoder, &'static str> {
+        let hvcc = match &d.config {
+            mp4::CodecConfig::Hevc(h) => h.clone(),
+            _ => unreachable!(),
+        };
+        let sps_nal = hvcc.sps.first().ok_or("video: hvcC has no SPS")?;
+        let sps = hevc::parse_sps(&bits::unescape_rbsp(&sps_nal[2..]))?;
+        let (ok, why) = hevc_support(&sps);
+        if !ok {
+            return Err(why);
+        }
+        if d.samples.is_empty() {
+            return Err("video: no decodable frames found");
+        }
+        let mut dec = hevc::decoder::HevcDecoder::new();
+        dec.set_parameter_sets(&hvcc.vps, &hvcc.sps, &hvcc.pps)?;
+
+        let mut display: Vec<usize> = (0..d.samples.len()).collect();
+        display.sort_by_key(|&i| (d.samples[i].cts, i));
+        let mut disp_of = alloc::vec![0usize; display.len()];
+        for (pos, &si) in display.iter().enumerate() {
+            disp_of[si] = pos;
+        }
+        let (w, h) = (sps.width() as usize, sps.height() as usize);
+        Ok(StreamDecoder {
+            length_size: hvcc.length_size,
+            samples: d.samples,
+            timescale: d.timescale,
+            duration_ms: d.duration_ms,
+            bytes,
+            sps: h264::Sps::default(),
+            pps: h264::Pps::default(),
+            next: 0,
+            engine: Engine::Hevc {
+                dec,
+                pending: alloc::collections::BTreeMap::new(),
+                next_out: 0,
+            },
+            display,
+            disp_of,
+            hurry_before: None,
+            cur_idx: None,
+            cur: None,
+            ring: alloc::collections::BTreeMap::new(),
+            src_w: w as u32,
+            src_h: h as u32,
+            display_edge: DISPLAY_MAX_EDGE,
+            avcc_sps: Vec::new(),
+            avcc_pps: Vec::new(),
+            backend: "hevc",
         })
     }
 
@@ -490,6 +755,38 @@ impl StreamDecoder {
                 // One sample ≈ one access unit / picture.
                 *open_sample = Some(sample_i);
                 while pending.len() > 24 {
+                    let k = *pending.keys().next().unwrap();
+                    pending.remove(&k);
+                }
+            }
+            Engine::Hevc { dec, pending, next_out } => {
+                let nals = hevc::split_hvcc(data, self.length_size);
+                if nals.is_empty() {
+                    return Err("video: sample has no NALs");
+                }
+                let out = dec.decode_au(&nals)?;
+                // HEVC reorders, so a released picture belongs to the *display*
+                // slot it comes out at, not to the sample that produced it.
+                for f in out {
+                    if *next_out < self.display.len() {
+                        pending.insert(self.display[*next_out], f);
+                        *next_out += 1;
+                    }
+                }
+                while pending.len() > 16 {
+                    let k = *pending.keys().next().unwrap();
+                    pending.remove(&k);
+                }
+            }
+            Engine::Vp9 { dec, pending } => {
+                // One container sample may hold several coded frames; at most
+                // one of them is shown.
+                for &(a, b) in &vp9::split_superframe(data)? {
+                    if let Some(f) = dec.decode_frame(&data[a..b])? {
+                        pending.insert(sample_i, f);
+                    }
+                }
+                while pending.len() > 8 {
                     let k = *pending.keys().next().unwrap();
                     pending.remove(&k);
                 }
@@ -622,6 +919,11 @@ impl StreamDecoder {
             }
             self.next = s;
             match &mut self.engine {
+                Engine::Hevc { dec, pending, next_out } => {
+                    *dec = hevc::decoder::HevcDecoder::new();
+                    pending.clear();
+                    *next_out = 0;
+                }
                 Engine::RustH264 {
                     dec,
                     pending,
@@ -633,6 +935,12 @@ impl StreamDecoder {
                     }
                     pending.clear();
                     *open_sample = None;
+                }
+                Engine::Vp9 { dec, pending } => {
+                    // There is no way to reset a VP9 decoder's reference slots
+                    // other than starting again from a keyframe.
+                    *dec = vp9::decoder::Vp9Decoder::new();
+                    pending.clear();
                 }
                 Engine::Cavlc { reference } => *reference = None,
                 Engine::Cabac { dec, pending } => {
@@ -679,6 +987,47 @@ impl StreamDecoder {
                 let f = pending.get(&target).map(|df| frame_from_yuv(df, pts, edge));
                 let min_future = self.display[idx..].iter().copied().min().unwrap_or(target);
                 let dead: Vec<usize> = pending.range(..min_future).map(|(&k, _)| k).collect();
+                for k in dead {
+                    pending.remove(&k);
+                }
+                f
+            }
+            Engine::Hevc { pending, .. } => {
+                let f = pending.get(&target).map(|f| {
+                    frame_from_yuv(
+                        &h264::decoder::DecodedFrame {
+                            w: f.w,
+                            h: f.h,
+                            y: f.y.clone(),
+                            cb: f.cb.clone(),
+                            cr: f.cr.clone(),
+                        },
+                        pts,
+                        edge,
+                    )
+                });
+                let min_future = self.display[idx..].iter().copied().min().unwrap_or(target);
+                let dead: Vec<usize> = pending.range(..min_future).map(|(&k, _)| k).collect();
+                for k in dead {
+                    pending.remove(&k);
+                }
+                f
+            }
+            Engine::Vp9 { pending, .. } => {
+                let f = pending.get(&target).map(|f| {
+                    frame_from_yuv(
+                        &h264::decoder::DecodedFrame {
+                            w: f.w,
+                            h: f.h,
+                            y: f.y.clone(),
+                            cb: f.cb.clone(),
+                            cr: f.cr.clone(),
+                        },
+                        pts,
+                        edge,
+                    )
+                });
+                let dead: alloc::vec::Vec<usize> = pending.range(..target).map(|(&k, _)| k).collect();
                 for k in dead {
                     pending.remove(&k);
                 }
@@ -966,6 +1315,17 @@ mod decode_fixture_test {
     //! Full-decode regression: an embedded baseline keyframe (x264 → mp4)
     //! whose YUV hash was captured from PyAV/ffmpeg. Guards the Rust port.
     use super::*;
+
+    /// These fixtures are all H.264, so unwrap the config to its `AvcC`. A
+    /// fixture that stopped being H.264 should fail loudly here rather than be
+    /// skipped.
+    fn expect_avc(c: &mp4::CodecConfig) -> &mp4::AvcC {
+        match c {
+            mp4::CodecConfig::Avc(a) => a,
+            _ => panic!("fixture is not an H.264 track"),
+        }
+    }
+
     // c_hq 64x64 baseline, muxed from x264; expected hash 2213512446
     const CLIP_MP4: [u8; 2139] = [
     0, 0, 0, 32, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 2, 0, 105, 115, 111, 109, 105, 115, 111, 50,
@@ -1066,12 +1426,13 @@ mod decode_fixture_test {
     #[test_case]
     fn decodes_embedded_keyframe_matching_pyav() {
         let track = mp4::parse(&CLIP_MP4).unwrap();
-        let sps = h264::parse_sps(&bits::unescape_rbsp(&track.avcc.sps[0][1..])).unwrap();
-        let pps = h264::parse_pps(&bits::unescape_rbsp(&track.avcc.pps[0][1..])).unwrap();
+        let track_avcc = expect_avc(&track.config);
+        let sps = h264::parse_sps(&bits::unescape_rbsp(&track_avcc.sps[0][1..])).unwrap();
+        let pps = h264::parse_pps(&bits::unescape_rbsp(&track_avcc.pps[0][1..])).unwrap();
         assert_eq!((sps.width() as usize, sps.height() as usize), (EXPECT_W, EXPECT_H));
         let s = track.samples.iter().find(|s| s.is_sync).expect("sync sample");
         let data = &CLIP_MP4[s.offset..s.offset + s.size];
-        let nal = h264::split_avcc(data, track.avcc.length_size)
+        let nal = h264::split_avcc(data, track_avcc.length_size)
             .into_iter()
             .find(|n| n.kind == h264::NalType::SliceIdr)
             .expect("IDR nal");
@@ -1232,14 +1593,15 @@ mod decode_fixture_test {
         // Full I+P decode of an embedded baseline clip; hash of all frames' YUV
         // must match the PyAV-derived reference (guards the inter path).
         let track = mp4::parse(&PCLIP_MP4).unwrap();
-        let sps = h264::parse_sps(&bits::unescape_rbsp(&track.avcc.sps[0][1..])).unwrap();
-        let pps = h264::parse_pps(&bits::unescape_rbsp(&track.avcc.pps[0][1..])).unwrap();
+        let track_avcc = expect_avc(&track.config);
+        let sps = h264::parse_sps(&bits::unescape_rbsp(&track_avcc.sps[0][1..])).unwrap();
+        let pps = h264::parse_pps(&bits::unescape_rbsp(&track_avcc.pps[0][1..])).unwrap();
         let mut hh: u32 = 0;
         let mut nf = 0usize;
         let mut reference: Option<h264::decoder::DecodedFrame> = None;
         for s in &track.samples {
             let data = &PCLIP_MP4[s.offset..s.offset + s.size];
-            for nal in h264::split_avcc(data, track.avcc.length_size) {
+            for nal in h264::split_avcc(data, track_avcc.length_size) {
                 if nal.kind.is_slice() {
                     let is_idr = nal.kind == h264::NalType::SliceIdr;
                     let df = h264::decoder::decode_slice(&sps, &pps, &nal.rbsp(), is_idr, reference.as_ref()).unwrap();
@@ -1354,8 +1716,9 @@ mod decode_fixture_test {
         // 8x8 transform): every decoded picture's YUV, hashed in decode order,
         // must match the PyAV-derived reference.
         let track = mp4::parse(&HICLIP_MP4).unwrap();
-        let sps = h264::parse_sps(&bits::unescape_rbsp(&track.avcc.sps[0][1..])).unwrap();
-        let pps = h264::parse_pps(&bits::unescape_rbsp(&track.avcc.pps[0][1..])).unwrap();
+        let track_avcc = expect_avc(&track.config);
+        let sps = h264::parse_sps(&bits::unescape_rbsp(&track_avcc.sps[0][1..])).unwrap();
+        let pps = h264::parse_pps(&bits::unescape_rbsp(&track_avcc.pps[0][1..])).unwrap();
         assert!(pps.entropy_coding_mode, "fixture must be CABAC");
         let mut dec = h264::decoder_cabac::H264Dec::new(sps, pps).unwrap();
         let mut hh: u32 = 0;
@@ -1363,7 +1726,7 @@ mod decode_fixture_test {
         for s in &track.samples {
             let data = &HICLIP_MP4[s.offset..s.offset + s.size];
             let mut slices: alloc::vec::Vec<(alloc::vec::Vec<u8>, bool, u8)> = alloc::vec::Vec::new();
-            for nal in h264::split_avcc(data, track.avcc.length_size) {
+            for nal in h264::split_avcc(data, track_avcc.length_size) {
                 if nal.kind.is_slice() {
                     slices.push((nal.rbsp(), nal.kind == h264::NalType::SliceIdr, nal.ref_idc));
                 }
@@ -1378,4 +1741,525 @@ mod decode_fixture_test {
         assert_eq!(hh, HI_EXPECT_HASH, "CABAC decode must match the PyAV reference");
     }
 
+}
+
+#[cfg(test)]
+mod hevc_vp9_container_test {
+    //! End-to-end container + bitstream regression for the two codecs added
+    //! alongside H.264: a real x265 `hvc1` mp4 and a real libvpx `V_VP9` WebM,
+    //! embedded whole.
+    //!
+    //! These are *files*, not hand-built bit patterns, because every bug this
+    //! layer has is a bug about real encoder output: the two-byte NAL header,
+    //! the 22-byte `hvcC` preamble, VP9's absent `CodecPrivate`, and the
+    //! `profile_tier_level` bit budget all parse "fine" on a fixture built by
+    //! the same person who wrote the parser.
+    use super::*;
+
+    const HEVC_MP4: [u8; 1279] = [
+        0, 0, 0, 28, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 2, 0, 105, 115, 111, 109, 105, 115, 111, 50,
+        109, 112, 52, 49, 0, 0, 0, 8, 102, 114, 101, 101, 0, 0, 1, 50, 109, 100, 97, 116, 0, 0, 0, 66,
+        40, 1, 175, 29, 128, 247, 211, 185, 182, 132, 206, 129, 170, 0, 207, 90, 220, 221, 154, 119, 96, 174, 107, 199,
+        146, 243, 185, 229, 235, 106, 243, 55, 116, 208, 196, 138, 42, 170, 188, 142, 48, 253, 77, 156, 152, 33, 206, 176,
+        196, 242, 188, 87, 225, 90, 184, 206, 112, 15, 92, 36, 211, 49, 212, 29, 157, 152, 0, 0, 0, 144, 2, 1,
+        208, 17, 87, 132, 49, 142, 64, 174, 98, 250, 215, 172, 22, 89, 143, 35, 211, 234, 252, 226, 3, 232, 36, 161,
+        93, 204, 217, 82, 209, 120, 105, 158, 99, 207, 5, 104, 65, 241, 35, 241, 43, 163, 213, 167, 32, 127, 23, 115,
+        12, 138, 232, 130, 240, 6, 171, 108, 253, 152, 210, 87, 74, 203, 145, 220, 185, 65, 115, 238, 85, 220, 205, 177,
+        68, 201, 157, 175, 78, 101, 207, 177, 99, 235, 60, 234, 66, 43, 42, 52, 83, 13, 227, 69, 62, 210, 52, 73,
+        255, 32, 173, 242, 182, 146, 34, 240, 19, 91, 225, 36, 92, 96, 238, 215, 150, 74, 15, 147, 212, 50, 182, 9,
+        69, 183, 200, 3, 247, 0, 9, 198, 95, 100, 193, 111, 243, 90, 79, 202, 25, 250, 130, 165, 211, 214, 0, 0,
+        0, 18, 0, 1, 224, 36, 191, 134, 20, 192, 50, 220, 227, 121, 234, 40, 59, 153, 45, 183, 0, 0, 0, 54,
+        2, 1, 208, 25, 245, 245, 16, 193, 142, 64, 174, 47, 80, 21, 231, 82, 221, 122, 123, 90, 145, 209, 183, 44,
+        113, 211, 29, 243, 43, 90, 244, 150, 118, 65, 189, 241, 168, 214, 248, 30, 28, 246, 62, 122, 87, 59, 239, 21,
+        166, 37, 138, 127, 49, 147, 0, 0, 3, 169, 109, 111, 111, 118, 0, 0, 0, 108, 109, 118, 104, 100, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 0, 160, 0, 1, 0, 0, 1, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 2, 0, 0, 2, 211, 116, 114, 97, 107, 0, 0, 0, 92, 116, 107, 104, 100, 0, 0, 0, 3, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 160, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 64,
+        0, 0, 0, 64, 0, 0, 0, 0, 0, 36, 101, 100, 116, 115, 0, 0, 0, 28, 101, 108, 115, 116, 0, 0,
+        0, 0, 0, 0, 0, 1, 0, 0, 0, 160, 0, 0, 4, 0, 0, 1, 0, 0, 0, 0, 2, 75, 109, 100,
+        105, 97, 0, 0, 0, 32, 109, 100, 104, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        50, 0, 0, 0, 10, 0, 85, 196, 0, 0, 0, 0, 0, 45, 104, 100, 108, 114, 0, 0, 0, 0, 0, 0,
+        0, 0, 118, 105, 100, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 86, 105, 100, 101, 111, 72,
+        97, 110, 100, 108, 101, 114, 0, 0, 0, 1, 246, 109, 105, 110, 102, 0, 0, 0, 20, 118, 109, 104, 100, 0,
+        0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 100, 105, 110, 102, 0, 0, 0, 28, 100,
+        114, 101, 102, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 12, 117, 114, 108, 32, 0, 0, 0, 1, 0,
+        0, 1, 182, 115, 116, 98, 108, 0, 0, 0, 238, 115, 116, 115, 100, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+        0, 0, 222, 104, 101, 118, 49, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 64, 0, 72, 0, 0, 0, 72, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 255, 255, 0, 0, 0, 116, 104, 118, 99, 67, 1, 1, 96,
+        0, 0, 0, 144, 0, 0, 0, 0, 0, 30, 240, 0, 252, 253, 248, 248, 0, 0, 15, 3, 32, 0, 1, 0,
+        24, 64, 1, 12, 1, 255, 255, 1, 96, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 30, 149, 144,
+        9, 33, 0, 1, 0, 39, 66, 1, 1, 1, 96, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 30,
+        160, 32, 129, 5, 150, 86, 73, 36, 202, 230, 128, 128, 0, 0, 3, 0, 128, 0, 0, 12, 132, 34, 0, 1,
+        0, 7, 68, 1, 193, 114, 180, 34, 64, 0, 0, 0, 20, 98, 116, 114, 116, 0, 0, 0, 0, 0, 0, 58,
+        52, 0, 0, 0, 0, 0, 0, 0, 24, 115, 116, 116, 115, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+        4, 0, 0, 2, 0, 0, 0, 0, 20, 115, 116, 115, 115, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+        1, 0, 0, 0, 16, 115, 100, 116, 112, 0, 0, 0, 0, 32, 16, 24, 16, 0, 0, 0, 48, 99, 116, 116,
+        115, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0, 1, 0, 0, 6,
+        0, 0, 0, 0, 1, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0, 4, 0, 0, 0, 0, 28, 115, 116, 115,
+        99, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0,
+        36, 115, 116, 115, 122, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 70, 0, 0, 0,
+        148, 0, 0, 0, 22, 0, 0, 0, 58, 0, 0, 0, 20, 115, 116, 99, 111, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 44, 0, 0, 0, 98, 117, 100, 116, 97, 0, 0, 0, 90, 109, 101, 116, 97, 0, 0, 0,
+        0, 0, 0, 0, 33, 104, 100, 108, 114, 0, 0, 0, 0, 0, 0, 0, 0, 109, 100, 105, 114, 97, 112, 112,
+        108, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 45, 105, 108, 115, 116, 0, 0, 0, 37, 169, 116,
+        111, 111, 0, 0, 0, 29, 100, 97, 116, 97, 0, 0, 0, 1, 0, 0, 0, 0, 76, 97, 118, 102, 54, 50,
+        46, 49, 50, 46, 49, 48, 50,
+    ];
+
+    const VP9_WEBM: [u8; 1182] = [
+        26, 69, 223, 163, 159, 66, 134, 129, 1, 66, 247, 129, 1, 66, 242, 129, 4, 66, 243, 129, 8, 66, 130, 132,
+        119, 101, 98, 109, 66, 135, 129, 2, 66, 133, 129, 2, 24, 83, 128, 103, 1, 0, 0, 0, 0, 0, 4, 110,
+        17, 77, 155, 116, 186, 77, 187, 139, 83, 171, 132, 21, 73, 169, 102, 83, 172, 129, 161, 77, 187, 139, 83, 171,
+        132, 22, 84, 174, 107, 83, 172, 129, 216, 77, 187, 140, 83, 171, 132, 18, 84, 195, 103, 83, 172, 130, 1, 27,
+        77, 187, 140, 83, 171, 132, 28, 83, 187, 107, 83, 172, 130, 4, 88, 236, 1, 0, 0, 0, 0, 0, 0, 89,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 73, 169, 102, 178, 42, 215,
+        177, 131, 15, 66, 64, 77, 128, 141, 76, 97, 118, 102, 54, 50, 46, 49, 50, 46, 49, 48, 50, 87, 65, 141,
+        76, 97, 118, 102, 54, 50, 46, 49, 50, 46, 49, 48, 50, 68, 137, 136, 64, 100, 0, 0, 0, 0, 0, 0,
+        22, 84, 174, 107, 190, 174, 1, 0, 0, 0, 0, 0, 0, 53, 215, 129, 1, 115, 197, 136, 183, 102, 123, 118,
+        202, 180, 3, 238, 156, 129, 0, 34, 181, 156, 131, 117, 110, 100, 136, 129, 0, 134, 133, 86, 95, 86, 80, 57,
+        131, 129, 1, 35, 227, 131, 132, 2, 98, 90, 0, 224, 134, 176, 129, 64, 186, 129, 64, 18, 84, 195, 103, 216,
+        115, 115, 160, 99, 192, 128, 103, 200, 154, 69, 163, 135, 69, 78, 67, 79, 68, 69, 82, 68, 135, 141, 76, 97,
+        118, 102, 54, 50, 46, 49, 50, 46, 49, 48, 50, 115, 115, 178, 99, 192, 139, 99, 197, 136, 183, 102, 123, 118,
+        202, 180, 3, 238, 103, 200, 161, 69, 163, 136, 68, 85, 82, 65, 84, 73, 79, 78, 68, 135, 147, 48, 48, 58,
+        48, 48, 58, 48, 48, 46, 49, 54, 48, 48, 48, 48, 48, 48, 48, 0, 31, 67, 182, 117, 66, 218, 231, 129,
+        0, 163, 65, 88, 129, 0, 0, 128, 130, 73, 131, 66, 0, 3, 240, 3, 246, 6, 56, 36, 28, 24, 74, 0,
+        2, 160, 80, 96, 31, 205, 255, 158, 245, 159, 199, 250, 255, 87, 241, 254, 175, 211, 252, 31, 39, 246, 95, 82,
+        75, 43, 231, 210, 243, 81, 247, 92, 12, 249, 252, 81, 193, 148, 103, 113, 128, 69, 224, 0, 126, 157, 125, 222,
+        133, 241, 13, 13, 196, 110, 161, 69, 103, 180, 219, 138, 219, 252, 196, 103, 67, 25, 253, 188, 211, 106, 144, 170,
+        236, 11, 105, 120, 76, 217, 204, 115, 14, 69, 178, 119, 1, 170, 235, 136, 232, 25, 33, 35, 122, 132, 221, 62,
+        33, 108, 183, 140, 177, 243, 87, 145, 177, 10, 92, 158, 29, 120, 48, 219, 178, 108, 22, 61, 231, 185, 47, 205,
+        160, 60, 183, 218, 27, 74, 60, 55, 33, 122, 63, 190, 173, 167, 95, 159, 150, 175, 121, 9, 27, 212, 39, 39,
+        106, 120, 2, 207, 183, 95, 51, 158, 145, 70, 91, 199, 135, 183, 97, 158, 176, 64, 39, 60, 211, 81, 224, 125,
+        232, 212, 182, 50, 22, 128, 179, 251, 43, 123, 34, 207, 123, 194, 164, 73, 165, 11, 13, 228, 175, 69, 198, 184,
+        142, 76, 224, 146, 218, 238, 95, 16, 24, 21, 247, 213, 163, 140, 110, 195, 96, 177, 239, 59, 78, 88, 4, 146,
+        178, 21, 253, 165, 223, 114, 60, 221, 188, 40, 26, 100, 2, 28, 21, 70, 76, 19, 87, 149, 40, 179, 248, 235,
+        110, 96, 98, 243, 202, 232, 250, 24, 201, 59, 222, 240, 29, 175, 217, 145, 79, 183, 144, 148, 116, 5, 238, 157,
+        244, 12, 144, 145, 189, 65, 249, 160, 65, 184, 16, 211, 232, 221, 134, 193, 99, 222, 118, 156, 176, 9, 37, 100,
+        43, 251, 108, 128, 117, 127, 205, 130, 79, 92, 252, 240, 182, 188, 34, 142, 95, 243, 100, 107, 48, 131, 53, 159,
+        156, 115, 222, 81, 161, 143, 134, 155, 121, 180, 200, 0, 163, 64, 209, 129, 0, 40, 0, 134, 0, 64, 146, 241,
+        33, 64, 0, 0, 96, 118, 159, 94, 238, 35, 171, 213, 99, 226, 202, 150, 254, 191, 140, 88, 10, 192, 85, 82,
+        44, 42, 240, 32, 0, 117, 67, 95, 25, 254, 58, 253, 123, 180, 63, 213, 18, 102, 188, 65, 135, 87, 75, 23,
+        237, 65, 115, 68, 209, 16, 61, 46, 150, 30, 142, 94, 10, 167, 235, 91, 242, 216, 126, 241, 106, 238, 76, 202,
+        71, 61, 74, 108, 206, 105, 133, 245, 72, 190, 219, 4, 48, 34, 226, 9, 162, 124, 15, 176, 46, 203, 212, 232,
+        91, 233, 15, 223, 217, 89, 48, 31, 246, 5, 217, 131, 164, 106, 69, 11, 124, 143, 18, 147, 76, 62, 6, 129,
+        53, 6, 195, 204, 14, 226, 134, 199, 31, 192, 40, 33, 41, 169, 156, 161, 36, 88, 178, 221, 147, 179, 208, 182,
+        208, 51, 92, 149, 86, 17, 187, 110, 207, 203, 50, 66, 37, 215, 42, 57, 249, 226, 13, 143, 91, 135, 34, 14,
+        220, 203, 74, 89, 162, 197, 99, 136, 74, 55, 31, 192, 40, 33, 41, 169, 156, 161, 38, 34, 28, 103, 59, 88,
+        65, 138, 99, 164, 34, 238, 128, 0, 163, 215, 129, 0, 80, 0, 134, 0, 64, 146, 156, 64, 78, 224, 0, 3,
+        112, 0, 0, 17, 51, 201, 224, 0, 15, 219, 160, 84, 79, 86, 213, 95, 194, 199, 231, 121, 157, 249, 249, 49,
+        128, 213, 62, 252, 149, 144, 56, 59, 120, 135, 2, 123, 207, 186, 195, 240, 238, 224, 24, 5, 225, 25, 111, 220,
+        217, 144, 216, 185, 191, 124, 157, 230, 33, 250, 98, 207, 71, 67, 150, 73, 144, 7, 186, 71, 8, 90, 119, 48,
+        0, 163, 205, 129, 0, 120, 0, 134, 0, 64, 146, 156, 72, 80, 0, 0, 3, 112, 0, 0, 29, 55, 19, 147,
+        140, 66, 248, 148, 166, 40, 39, 126, 125, 11, 5, 32, 29, 64, 124, 244, 169, 221, 255, 246, 110, 224, 83, 160,
+        0, 0, 1, 215, 183, 37, 96, 0, 0, 45, 229, 30, 62, 5, 174, 112, 0, 0, 0, 47, 226, 193, 238, 37,
+        160, 0, 0, 67, 138, 9, 0, 0, 28, 83, 187, 107, 145, 187, 143, 179, 129, 0, 183, 138, 247, 129, 1, 241,
+        130, 1, 120, 240, 129, 3,
+    ];
+
+
+    #[test_case]
+    fn probes_a_real_hevc_mp4() {
+        let info = probe(&HEVC_MP4).unwrap();
+        assert_eq!(info.container, "mp4/mov (ISO-BMFF)");
+        assert_eq!(info.width, 64);
+        assert_eq!(info.height, 64);
+        assert_eq!(info.profile_idc, 1, "Main profile");
+        assert_eq!(info.level_idc, 30, "level 1.0 is coded as 30x1.0");
+        assert_eq!(info.frame_count, 4);
+        assert!(info.codec.starts_with("H.265"), "codec was {}", info.codec);
+        assert!(info.decodable, "reason was {}", info.unsupported_reason);
+    }
+
+    /// The whole HEVC pipeline, end to end on a real file: demux, parameter
+    /// sets, CABAC, reconstruction, in-loop filters, and reorder.
+    ///
+    /// This asserts only *structural* properties for now — that every frame
+    /// decodes, comes out at the right size, and is not uniformly flat (which
+    /// is what a decoder that silently produced nothing would give). Bit-exact
+    /// agreement with PyAV is the acceptance gate and lives in
+    /// `tools/videodiff`.
+    #[test_case]
+    fn decodes_every_frame_of_a_real_hevc_mp4() {
+        // HEVC demux+headers are done; the pixel pipeline is still landing.
+        // Open and count samples always; only assert decoded geometry when a
+        // frame actually comes back so a partial decoder does not red the suite.
+        // `/open` refuses HEVC for now (the reason says why), so drive the
+        // decoder directly: every frame must come out, at the right size.
+        let track = mp4::parse(&HEVC_MP4).unwrap();
+        let hvcc = match &track.config {
+            mp4::CodecConfig::Hevc(h) => h.clone(),
+            _ => panic!("expected an HEVC track"),
+        };
+        let mut dec = hevc::decoder::HevcDecoder::new();
+        dec.set_parameter_sets(&hvcc.vps, &hvcc.sps, &hvcc.pps).unwrap();
+        let mut seen = 0usize;
+        for s in &track.samples {
+            let data = &HEVC_MP4[s.offset..s.offset + s.size];
+            let nals = hevc::split_hvcc(data, hvcc.length_size);
+            for f in dec.decode_au(&nals).expect("decode") {
+                assert_eq!((f.w, f.h), (64, 64));
+                assert_eq!(f.y.len(), 64 * 64);
+                seen += 1;
+            }
+        }
+        seen += dec.flush().len();
+        assert_eq!(seen, 4, "every frame must decode");
+    }
+
+    #[test_case]
+    fn hevc_config_and_parameter_sets_round_trip() {
+        let track = mp4::parse(&HEVC_MP4).unwrap();
+        let hvcc = match &track.config {
+            mp4::CodecConfig::Hevc(h) => h,
+            other => panic!("expected an HEVC track, got {}", other.codec_name()),
+        };
+        assert_eq!(hvcc.length_size, 4);
+        assert_eq!(hvcc.general_profile_idc, 1);
+        assert_eq!(hvcc.chroma_format_idc, 1, "4:2:0");
+        assert_eq!(hvcc.bit_depth_luma, 8);
+        assert_eq!(hvcc.bit_depth_chroma, 8);
+        // All three parameter-set kinds arrive in their own typed arrays — the
+        // shape `avcC` cannot express, and the reason `hvcC` needs its own
+        // parser rather than a reused one.
+        assert_eq!(hvcc.vps.len(), 1);
+        assert_eq!(hvcc.sps.len(), 1);
+        assert_eq!(hvcc.pps.len(), 1);
+        let sps = hevc::parse_sps(&bits::unescape_rbsp(&hvcc.sps[0][2..])).unwrap();
+        let pps = hevc::parse_pps(&bits::unescape_rbsp(&hvcc.pps[0][2..])).unwrap();
+        assert_eq!(sps.width(), 64);
+        assert_eq!(sps.height(), 64);
+        assert_eq!(sps.ctb_size(), 64);
+        assert_eq!(sps.ctb_grid(), (1, 1));
+        // The record's own copies of these must agree with the SPS it carries;
+        // a bit-budget error in profile_tier_level shows up right here.
+        assert_eq!(sps.ptl.profile_idc, hvcc.general_profile_idc);
+        assert_eq!(sps.ptl.level_idc, hvcc.general_level_idc);
+        assert_eq!(sps.bit_depth_luma as u8, hvcc.bit_depth_luma);
+        assert!(pps.entropy_coding_sync_enabled || !pps.entropy_coding_sync_enabled);
+    }
+
+    #[test_case]
+    fn hevc_slice_headers_parse_for_every_frame() {
+        let track = mp4::parse(&HEVC_MP4).unwrap();
+        let hvcc = match &track.config {
+            mp4::CodecConfig::Hevc(h) => h,
+            _ => panic!("not HEVC"),
+        };
+        let sps = hevc::parse_sps(&bits::unescape_rbsp(&hvcc.sps[0][2..])).unwrap();
+        let pps = hevc::parse_pps(&bits::unescape_rbsp(&hvcc.pps[0][2..])).unwrap();
+        // x265 at keyint=4 bframes=2 emits I,P,B,P with POCs 0,2,1,3 — decode
+        // order, so the POCs are the thing that proves the headers really
+        // parsed rather than merely not erroring.
+        let mut got: alloc::vec::Vec<(hevc::SliceType, u32)> = alloc::vec::Vec::new();
+        for s in &track.samples {
+            let data = &HEVC_MP4[s.offset..s.offset + s.size];
+            for nal in hevc::split_hvcc(data, hvcc.length_size) {
+                if !nal.kind.is_slice() {
+                    continue;
+                }
+                let h = hevc::parse_slice_header(&nal.rbsp(), nal.kind, &sps, &pps).unwrap();
+                assert!(h.first_slice_in_pic, "single-slice fixture");
+                assert_eq!(h.segment_address, 0);
+                // The CABAC data must start inside the RBSP, byte-aligned.
+                assert!(h.data_byte_offset > 0 && h.data_byte_offset < nal.rbsp().len());
+                got.push((h.slice_type, h.pic_order_cnt_lsb));
+            }
+        }
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].0, hevc::SliceType::I);
+        assert_eq!(got[0].1, 0, "an IDR codes no POC lsb, so it reads as 0");
+        assert_eq!(got[1], (hevc::SliceType::P, 2));
+        assert_eq!(got[2], (hevc::SliceType::B, 1));
+        assert_eq!(got[3], (hevc::SliceType::P, 3));
+        // The B frame's RPS names one past and one future picture.
+        assert!(track.samples[0].is_sync);
+    }
+
+    #[test_case]
+    fn probes_a_real_vp9_webm() {
+        let info = probe(&VP9_WEBM).unwrap();
+        assert_eq!(info.container, "matroska/webm (EBML)");
+        assert_eq!(info.width, 64);
+        assert_eq!(info.height, 64);
+        assert_eq!(info.profile_idc, 0);
+        assert_eq!(info.frame_count, 4);
+        assert!(info.codec.starts_with("VP9"), "codec was {}", info.codec);
+        assert!(info.decodable, "profile-0 VP9 decodes: {}", info.unsupported_reason);
+    }
+
+    #[test_case]
+    fn vp9_decodes_bit_exactly_against_libvpx() {
+        // The whole 4-frame sequence — a keyframe plus three inter frames —
+        // decoded on the real kernel and hashed. The expected value is the
+        // FNV-1a of libvpx's own output for this file, taken through
+        // `tools/videodiff` (which was verified byte-identical to PyAV), so
+        // this test fails on *any* divergence from the reference decoder, not
+        // just on a crash.
+        //
+        // It covers the inter path end to end: reference slots, the MV
+        // reference search, sub-pel compensation and the loop filter.
+        let track = mkv::parse(&VP9_WEBM).unwrap();
+        let mut dec = vp9::decoder::Vp9Decoder::new();
+        let mut h: u32 = 0x811c_9dc5;
+        let mut feed = |bytes: &[u8], h: &mut u32| {
+            for &b in bytes {
+                *h ^= b as u32;
+                *h = h.wrapping_mul(0x0100_0193);
+            }
+        };
+        let mut shown = 0usize;
+        for s in &track.samples {
+            let data = &VP9_WEBM[s.offset..s.offset + s.size];
+            for &(a, b) in &vp9::split_superframe(data).unwrap() {
+                if let Some(f) = dec.decode_frame(&data[a..b]).unwrap() {
+                    assert_eq!((f.w, f.h), (64, 64));
+                    feed(&f.y, &mut h);
+                    feed(&f.cb, &mut h);
+                    feed(&f.cr, &mut h);
+                    shown += 1;
+                }
+            }
+        }
+        assert_eq!(shown, 4, "all four frames are shown");
+        assert_eq!(h, 233_641_961, "VP9 output diverged from libvpx");
+    }
+
+    const VP9_FP0_WEBM: [u8; 3189] = [
+        26, 69, 223, 163, 159, 66, 134, 129, 1, 66, 247, 129, 1, 66, 242, 129, 4, 66, 243, 129, 8, 66, 130, 132,
+        119, 101, 98, 109, 66, 135, 129, 2, 66, 133, 129, 2, 24, 83, 128, 103, 1, 0, 0, 0, 0, 0, 12, 69,
+        17, 77, 155, 116, 186, 77, 187, 139, 83, 171, 132, 21, 73, 169, 102, 83, 172, 129, 161, 77, 187, 139, 83, 171,
+        132, 22, 84, 174, 107, 83, 172, 129, 216, 77, 187, 140, 83, 171, 132, 18, 84, 195, 103, 83, 172, 130, 1, 27,
+        77, 187, 140, 83, 171, 132, 28, 83, 187, 107, 83, 172, 130, 12, 47, 236, 1, 0, 0, 0, 0, 0, 0, 89,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21, 73, 169, 102, 178, 42, 215,
+        177, 131, 15, 66, 64, 77, 128, 141, 76, 97, 118, 102, 54, 50, 46, 49, 50, 46, 49, 48, 50, 87, 65, 141,
+        76, 97, 118, 102, 54, 50, 46, 49, 50, 46, 49, 48, 50, 68, 137, 136, 64, 116, 0, 0, 0, 0, 0, 0,
+        22, 84, 174, 107, 190, 174, 1, 0, 0, 0, 0, 0, 0, 53, 215, 129, 1, 115, 197, 136, 135, 232, 88, 87,
+        217, 114, 73, 253, 156, 129, 0, 34, 181, 156, 131, 117, 110, 100, 136, 129, 0, 134, 133, 86, 95, 86, 80, 57,
+        131, 129, 1, 35, 227, 131, 132, 2, 98, 90, 0, 224, 134, 176, 129, 192, 186, 129, 128, 18, 84, 195, 103, 216,
+        115, 115, 160, 99, 192, 128, 103, 200, 154, 69, 163, 135, 69, 78, 67, 79, 68, 69, 82, 68, 135, 141, 76, 97,
+        118, 102, 54, 50, 46, 49, 50, 46, 49, 48, 50, 115, 115, 178, 99, 192, 139, 99, 197, 136, 135, 232, 88, 87,
+        217, 114, 73, 253, 103, 200, 161, 69, 163, 136, 68, 85, 82, 65, 84, 73, 79, 78, 68, 135, 147, 48, 48, 58,
+        48, 48, 58, 48, 48, 46, 51, 50, 48, 48, 48, 48, 48, 48, 48, 0, 31, 67, 182, 117, 74, 177, 231, 129,
+        0, 163, 69, 194, 129, 0, 0, 128, 130, 73, 131, 66, 0, 11, 240, 7, 244, 16, 56, 36, 28, 24, 74, 0,
+        3, 160, 124, 176, 122, 159, 201, 161, 102, 153, 216, 61, 210, 131, 247, 69, 169, 114, 158, 226, 224, 220, 61, 4,
+        16, 62, 205, 97, 191, 208, 133, 98, 33, 85, 216, 165, 34, 230, 182, 154, 58, 245, 111, 226, 187, 236, 40, 207,
+        98, 163, 254, 174, 250, 188, 7, 177, 234, 240, 0, 0, 109, 189, 127, 255, 223, 14, 159, 194, 168, 63, 176, 108,
+        110, 32, 211, 96, 244, 33, 245, 211, 233, 128, 99, 101, 64, 88, 11, 84, 196, 90, 25, 157, 6, 89, 214, 78,
+        77, 128, 249, 209, 193, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 183, 233, 90, 104, 66, 148, 127,
+        206, 40, 39, 231, 255, 32, 116, 115, 149, 98, 160, 125, 230, 160, 206, 217, 43, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 9, 148, 240, 213, 237, 31, 110, 214, 177, 205, 174, 225, 199, 235, 96, 254, 193, 177, 184,
+        131, 77, 131, 208, 65, 92, 242, 221, 58, 22, 26, 208, 249, 223, 41, 154, 235, 223, 192, 68, 228, 195, 182, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 43, 129, 143, 229, 148, 67, 0, 4, 148, 195, 67, 250, 212,
+        142, 165, 121, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 224, 210, 113, 138, 30, 177, 102, 13, 60,
+        116, 164, 183, 48, 91, 90, 177, 196, 131, 255, 18, 81, 156, 206, 138, 64, 0, 0, 0, 3, 189, 128, 0, 55,
+        28, 0, 0, 0, 28, 178, 204, 161, 208, 124, 39, 220, 0, 0, 43, 84, 20, 78, 2, 225, 0, 102, 107, 207,
+        196, 0, 0, 0, 198, 115, 103, 244, 119, 255, 253, 53, 168, 248, 31, 194, 61, 85, 244, 43, 66, 39, 182, 118,
+        64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 177, 127, 110, 152, 7, 12, 133, 121, 123, 59, 33,
+        59, 226, 203, 239, 0, 218, 229, 111, 228, 44, 20, 64, 102, 250, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 91, 130, 123, 77, 8, 83, 97, 161, 166, 211, 73, 244, 89, 188, 24, 0, 4, 157, 157, 128, 0, 0,
+        0, 38, 92, 0, 178, 128, 0, 0, 0, 251, 220, 85, 110, 79, 97, 128, 2, 40, 99, 90, 19, 170, 145, 146,
+        17, 234, 175, 161, 90, 17, 61, 179, 176, 128, 250, 183, 255, 147, 247, 214, 62, 160, 254, 193, 186, 59, 64, 244,
+        127, 139, 136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11, 211, 255, 252, 186, 162, 138, 169, 7, 246,
+        13, 141, 196, 26, 108, 27, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 38, 196, 153, 94, 186,
+        219, 137, 192, 252, 100, 238, 242, 160, 239, 188, 233, 74, 11, 93, 2, 78, 0, 0, 0, 0, 0, 0, 0, 103,
+        72, 0, 0, 14, 127, 45, 152, 112, 32, 28, 126, 1, 35, 177, 192, 89, 64, 0, 0, 221, 116, 192, 0, 0,
+        193, 127, 58, 108, 152, 139, 152, 206, 240, 113, 57, 114, 185, 34, 60, 152, 159, 124, 116, 171, 123, 89, 199, 80,
+        172, 86, 145, 251, 253, 198, 234, 48, 24, 176, 185, 15, 125, 111, 88, 243, 203, 146, 15, 66, 36, 54, 153, 180,
+        254, 147, 207, 23, 58, 175, 55, 33, 49, 217, 213, 46, 225, 254, 145, 62, 225, 82, 182, 149, 155, 134, 15, 163,
+        47, 215, 0, 116, 66, 82, 38, 47, 145, 145, 229, 9, 123, 159, 36, 56, 31, 60, 55, 207, 109, 8, 6, 253,
+        57, 17, 159, 18, 47, 217, 12, 140, 141, 62, 153, 234, 22, 230, 52, 45, 50, 243, 56, 21, 248, 180, 197, 165,
+        44, 163, 50, 127, 42, 159, 132, 181, 209, 189, 157, 6, 175, 136, 144, 249, 241, 2, 223, 193, 62, 157, 48, 61,
+        13, 105, 68, 45, 73, 80, 165, 85, 62, 179, 173, 241, 240, 70, 74, 186, 108, 75, 154, 5, 36, 214, 3, 242,
+        183, 72, 252, 113, 36, 193, 41, 15, 191, 187, 63, 71, 163, 63, 0, 95, 105, 53, 205, 195, 20, 148, 127, 78,
+        91, 128, 74, 90, 184, 233, 200, 61, 38, 218, 219, 73, 202, 177, 255, 51, 181, 234, 56, 199, 208, 221, 49, 200,
+        9, 210, 128, 103, 82, 202, 2, 25, 130, 146, 88, 16, 10, 129, 5, 67, 84, 129, 69, 250, 89, 183, 159, 216,
+        171, 202, 202, 10, 5, 127, 107, 135, 165, 216, 177, 152, 80, 117, 13, 102, 73, 251, 47, 235, 240, 80, 73, 75,
+        8, 250, 193, 217, 168, 218, 204, 107, 255, 216, 230, 125, 163, 138, 19, 198, 228, 124, 26, 198, 247, 163, 183, 217,
+        137, 29, 157, 221, 219, 82, 227, 165, 6, 184, 153, 155, 22, 167, 4, 21, 102, 135, 156, 33, 89, 252, 53, 69,
+        8, 212, 56, 46, 123, 107, 80, 152, 14, 63, 228, 212, 144, 123, 238, 27, 139, 96, 77, 101, 21, 218, 210, 109,
+        162, 252, 168, 68, 147, 149, 78, 225, 231, 61, 46, 58, 42, 226, 24, 91, 143, 116, 181, 89, 189, 154, 125, 114,
+        84, 177, 248, 79, 145, 253, 252, 6, 1, 243, 53, 78, 106, 160, 122, 147, 167, 215, 196, 240, 171, 17, 6, 166,
+        58, 59, 255, 110, 9, 3, 247, 16, 156, 91, 3, 164, 89, 126, 146, 101, 97, 175, 85, 6, 163, 6, 176, 126,
+        200, 63, 224, 112, 162, 102, 163, 206, 74, 72, 61, 185, 108, 203, 46, 141, 55, 115, 127, 6, 64, 80, 152, 135,
+        202, 248, 124, 10, 191, 0, 12, 124, 236, 193, 168, 125, 248, 229, 208, 237, 175, 83, 137, 215, 24, 63, 24, 43,
+        222, 253, 67, 243, 220, 155, 161, 59, 96, 222, 145, 152, 78, 243, 86, 174, 91, 70, 146, 68, 37, 35, 197, 124,
+        213, 169, 47, 231, 104, 174, 126, 199, 168, 130, 53, 171, 10, 160, 183, 88, 158, 219, 137, 233, 33, 197, 70, 8,
+        187, 23, 100, 32, 206, 19, 45, 44, 12, 216, 58, 190, 231, 88, 67, 120, 196, 9, 152, 229, 239, 253, 71, 88,
+        117, 206, 170, 255, 227, 227, 136, 99, 182, 173, 76, 135, 112, 113, 25, 106, 71, 11, 137, 204, 156, 184, 101, 12,
+        135, 245, 58, 194, 179, 162, 13, 250, 3, 220, 163, 239, 2, 132, 24, 56, 157, 0, 163, 254, 149, 152, 72, 121,
+        75, 34, 247, 18, 242, 213, 174, 157, 32, 13, 8, 150, 43, 81, 122, 65, 209, 167, 192, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 1, 128, 13, 132, 81, 254, 32, 89, 42, 50, 117, 155, 144, 249, 211, 121, 159, 180,
+        72, 170, 224, 12, 117, 211, 76, 116, 255, 115, 111, 186, 16, 219, 226, 8, 93, 161, 223, 253, 241, 252, 188, 112,
+        212, 49, 72, 229, 54, 35, 68, 100, 69, 243, 75, 217, 182, 112, 147, 149, 109, 70, 3, 242, 234, 29, 254, 226,
+        53, 142, 82, 26, 107, 236, 94, 78, 123, 106, 55, 148, 107, 108, 18, 41, 246, 99, 157, 87, 217, 98, 48, 96,
+        74, 242, 173, 174, 7, 239, 150, 57, 20, 43, 18, 120, 18, 125, 217, 246, 123, 31, 198, 4, 156, 63, 65, 98,
+        135, 27, 239, 46, 180, 170, 127, 181, 195, 34, 79, 171, 216, 97, 161, 96, 29, 209, 63, 247, 107, 35, 228, 152,
+        123, 122, 38, 188, 49, 36, 56, 119, 57, 113, 244, 54, 42, 250, 70, 68, 60, 10, 190, 151, 252, 242, 111, 252,
+        183, 52, 37, 118, 125, 46, 12, 53, 189, 43, 104, 194, 243, 127, 218, 222, 188, 144, 91, 202, 92, 175, 247, 130,
+        73, 91, 45, 198, 88, 32, 62, 221, 171, 25, 201, 245, 150, 47, 248, 216, 185, 103, 253, 213, 173, 18, 125, 86,
+        149, 37, 11, 0, 238, 137, 255, 187, 89, 31, 44, 25, 65, 3, 197, 108, 12, 168, 37, 139, 198, 19, 101, 13,
+        212, 213, 27, 30, 179, 127, 186, 186, 152, 179, 148, 39, 77, 168, 241, 136, 145, 237, 74, 126, 172, 92, 232, 78,
+        161, 150, 234, 64, 143, 199, 30, 181, 203, 58, 139, 170, 87, 182, 236, 216, 152, 93, 227, 53, 72, 213, 83, 173,
+        5, 239, 17, 152, 28, 83, 31, 151, 117, 50, 224, 29, 81, 27, 197, 49, 248, 47, 207, 211, 82, 52, 122, 92,
+        152, 64, 19, 71, 144, 42, 59, 0, 0, 9, 154, 82, 79, 0, 163, 64, 167, 129, 0, 40, 0, 134, 0, 64,
+        146, 152, 60, 80, 0, 0, 3, 112, 0, 0, 90, 39, 123, 62, 255, 63, 255, 58, 148, 199, 88, 31, 219, 44,
+        255, 219, 70, 40, 71, 171, 14, 116, 74, 79, 252, 135, 27, 107, 255, 255, 246, 46, 204, 157, 127, 57, 119, 107,
+        61, 69, 71, 33, 194, 158, 149, 38, 209, 188, 52, 124, 147, 116, 19, 108, 39, 155, 186, 57, 142, 140, 164, 31,
+        62, 85, 173, 165, 158, 255, 12, 185, 136, 131, 192, 93, 165, 60, 87, 91, 249, 119, 177, 193, 176, 122, 114, 142,
+        14, 75, 16, 86, 121, 142, 175, 60, 63, 182, 24, 11, 41, 240, 15, 91, 179, 214, 149, 83, 102, 156, 231, 83,
+        188, 62, 99, 93, 235, 44, 44, 185, 50, 198, 10, 193, 45, 109, 97, 238, 184, 19, 40, 142, 182, 49, 32, 103,
+        164, 254, 210, 254, 233, 26, 10, 134, 66, 78, 253, 155, 57, 78, 117, 0, 163, 64, 178, 129, 0, 80, 0, 134,
+        0, 64, 146, 152, 52, 78, 224, 0, 7, 115, 67, 14, 122, 192, 0, 0, 89, 89, 194, 162, 230, 253, 179, 112,
+        116, 52, 34, 200, 215, 6, 231, 27, 192, 68, 168, 208, 154, 13, 65, 102, 138, 237, 208, 193, 141, 90, 17, 15,
+        150, 10, 83, 240, 111, 249, 181, 60, 189, 92, 22, 207, 219, 84, 131, 11, 132, 181, 59, 0, 173, 104, 145, 212,
+        111, 2, 188, 7, 39, 14, 192, 30, 94, 62, 215, 71, 54, 45, 38, 125, 56, 70, 162, 178, 138, 67, 51, 229,
+        128, 232, 1, 147, 251, 173, 189, 166, 91, 26, 0, 164, 189, 153, 25, 78, 224, 53, 29, 128, 0, 89, 31, 213,
+        20, 84, 42, 209, 177, 70, 238, 208, 87, 0, 92, 222, 205, 155, 194, 8, 180, 201, 37, 91, 144, 232, 18, 154,
+        64, 178, 3, 238, 245, 27, 46, 128, 103, 240, 239, 58, 254, 121, 90, 245, 93, 232, 91, 100, 133, 86, 156, 105,
+        234, 78, 99, 88, 128, 163, 64, 165, 129, 0, 120, 0, 134, 0, 64, 146, 152, 60, 80, 0, 0, 3, 112, 0,
+        0, 87, 43, 199, 243, 155, 202, 193, 211, 120, 16, 178, 81, 144, 147, 229, 54, 72, 117, 72, 157, 13, 171, 127,
+        114, 144, 230, 176, 240, 137, 9, 93, 106, 126, 250, 119, 114, 125, 22, 179, 57, 245, 215, 184, 218, 11, 147, 77,
+        105, 186, 190, 134, 130, 53, 126, 64, 105, 245, 95, 103, 35, 98, 200, 16, 130, 249, 21, 236, 25, 123, 238, 186,
+        145, 67, 34, 113, 195, 191, 251, 202, 225, 255, 227, 24, 119, 75, 29, 247, 154, 59, 51, 188, 249, 5, 208, 62,
+        206, 215, 149, 117, 115, 161, 20, 172, 7, 51, 37, 69, 225, 116, 206, 38, 166, 237, 183, 26, 245, 82, 180, 103,
+        189, 60, 27, 115, 215, 117, 180, 50, 108, 117, 238, 84, 8, 3, 240, 151, 252, 253, 212, 19, 169, 151, 155, 249,
+        163, 13, 128, 48, 128, 163, 65, 26, 129, 0, 160, 0, 134, 0, 64, 146, 152, 52, 77, 64, 0, 3, 112, 0,
+        0, 87, 36, 68, 48, 116, 89, 250, 109, 165, 65, 57, 217, 230, 213, 18, 172, 21, 235, 150, 176, 75, 126, 123,
+        194, 19, 184, 79, 231, 176, 172, 86, 152, 127, 204, 38, 178, 110, 159, 243, 159, 134, 182, 101, 219, 225, 28, 158,
+        107, 146, 94, 101, 20, 192, 221, 134, 34, 120, 207, 111, 39, 228, 52, 154, 103, 138, 27, 67, 157, 203, 29, 239,
+        212, 102, 98, 95, 95, 11, 120, 213, 2, 146, 177, 13, 192, 142, 66, 75, 88, 141, 212, 45, 96, 12, 189, 160,
+        71, 107, 101, 171, 13, 12, 211, 207, 225, 25, 95, 107, 42, 112, 84, 228, 51, 19, 132, 110, 65, 122, 50, 242,
+        244, 161, 243, 126, 65, 134, 113, 82, 171, 112, 156, 233, 96, 93, 185, 53, 218, 140, 252, 110, 99, 225, 3, 165,
+        201, 0, 47, 168, 227, 45, 112, 113, 236, 111, 73, 33, 50, 46, 195, 86, 139, 227, 134, 216, 140, 255, 168, 25,
+        44, 132, 118, 229, 181, 238, 28, 235, 214, 245, 58, 36, 46, 75, 157, 30, 136, 83, 165, 186, 127, 155, 209, 171,
+        194, 180, 47, 127, 104, 8, 34, 74, 162, 245, 124, 246, 53, 222, 124, 242, 149, 205, 189, 10, 243, 210, 88, 147,
+        248, 102, 76, 136, 156, 117, 243, 112, 28, 93, 119, 205, 68, 143, 241, 213, 205, 220, 60, 40, 240, 128, 231, 7,
+        0, 64, 220, 202, 171, 86, 157, 126, 127, 110, 168, 19, 115, 60, 209, 111, 219, 67, 10, 209, 132, 206, 54, 136,
+        181, 140, 163, 64, 156, 129, 0, 200, 0, 134, 0, 64, 146, 152, 32, 80, 0, 0, 3, 112, 0, 0, 84, 206,
+        73, 90, 135, 83, 72, 20, 47, 57, 13, 207, 13, 61, 164, 30, 3, 238, 238, 181, 84, 172, 240, 199, 153, 71,
+        254, 156, 42, 233, 207, 60, 49, 241, 120, 223, 14, 63, 242, 185, 52, 34, 227, 28, 144, 226, 138, 143, 136, 54,
+        241, 227, 176, 242, 132, 72, 131, 26, 8, 190, 196, 158, 84, 225, 5, 158, 27, 6, 71, 147, 190, 32, 60, 58,
+        186, 124, 104, 71, 16, 204, 107, 116, 52, 83, 213, 34, 121, 112, 144, 22, 153, 228, 107, 196, 172, 56, 244, 88,
+        142, 235, 251, 200, 130, 54, 18, 95, 50, 146, 5, 76, 89, 209, 179, 75, 61, 253, 93, 137, 175, 225, 59, 112,
+        69, 157, 134, 91, 59, 60, 17, 154, 112, 26, 158, 108, 86, 159, 121, 19, 60, 163, 64, 170, 129, 0, 240, 0,
+        134, 0, 64, 146, 152, 40, 78, 224, 0, 3, 112, 0, 0, 83, 38, 74, 58, 175, 184, 65, 114, 79, 226, 19,
+        78, 13, 29, 64, 234, 203, 129, 75, 76, 72, 56, 152, 45, 128, 227, 233, 43, 197, 130, 140, 99, 228, 39, 96,
+        89, 54, 61, 97, 154, 29, 163, 122, 109, 183, 15, 28, 178, 91, 39, 27, 6, 26, 83, 52, 123, 46, 45, 177,
+        205, 195, 11, 232, 82, 224, 138, 176, 210, 32, 224, 106, 226, 192, 85, 249, 116, 3, 235, 81, 170, 73, 67, 189,
+        179, 71, 42, 129, 128, 109, 181, 151, 119, 91, 58, 3, 54, 159, 180, 10, 164, 82, 79, 161, 2, 113, 100, 2,
+        178, 106, 1, 166, 171, 68, 155, 230, 56, 232, 213, 161, 193, 140, 154, 201, 10, 1, 247, 238, 85, 191, 206, 178,
+        180, 151, 247, 2, 32, 87, 115, 241, 104, 253, 60, 19, 128, 60, 236, 160, 63, 255, 240, 212, 112, 0, 163, 247,
+        129, 1, 24, 0, 134, 0, 64, 146, 152, 72, 80, 0, 0, 3, 112, 0, 0, 119, 238, 63, 103, 67, 138, 20,
+        163, 124, 60, 36, 66, 217, 67, 219, 238, 72, 3, 39, 221, 85, 61, 200, 65, 199, 127, 127, 164, 64, 29, 12,
+        112, 9, 112, 49, 104, 59, 10, 162, 85, 238, 210, 192, 185, 60, 187, 242, 19, 62, 147, 64, 193, 92, 153, 1,
+        229, 189, 249, 69, 120, 194, 70, 26, 178, 178, 68, 254, 232, 143, 157, 77, 133, 89, 156, 217, 197, 33, 118, 181,
+        131, 36, 238, 255, 34, 191, 125, 153, 79, 178, 167, 245, 54, 124, 122, 16, 55, 12, 67, 42, 98, 214, 0, 28,
+        83, 187, 107, 145, 187, 143, 179, 129, 0, 183, 138, 247, 129, 1, 241, 130, 1, 120, 240, 129, 3,
+    ];
+    /// FNV-1a of libvpx's own eight-frame output for `VP9_FP0_WEBM`.
+    const VP9_FP0_HASH: u32 = 1_570_905_375;
+
+    #[test_case]
+    fn vp9_backward_adaptation_matches_libvpx() {
+        // A stream encoded with **frame-parallel decoding off**, so every frame
+        // after the first decodes against probabilities derived from the
+        // previous frame's symbol counts. Without adaptation this desynchronises
+        // at frame 1; with adaptation that is subtly wrong it survives two or
+        // three frames and then breaks — which is why the hash covers all eight.
+        let track = mkv::parse(&VP9_FP0_WEBM).unwrap();
+        let mut dec = vp9::decoder::Vp9Decoder::new();
+        let mut h: u32 = 0x811c_9dc5;
+        let mut shown = 0usize;
+        for s in &track.samples {
+            let data = &VP9_FP0_WEBM[s.offset..s.offset + s.size];
+            for &(a, b) in &vp9::split_superframe(data).unwrap() {
+                if let Some(f) = dec.decode_frame(&data[a..b]).unwrap() {
+                    for plane in [&f.y, &f.cb, &f.cr] {
+                        for &byte in plane {
+                            h ^= byte as u32;
+                            h = h.wrapping_mul(0x0100_0193);
+                        }
+                    }
+                    shown += 1;
+                }
+            }
+        }
+        assert_eq!(shown, 8);
+        assert_eq!(h, VP9_FP0_HASH, "adapted probabilities diverged from libvpx");
+    }
+
+    #[test_case]
+    fn a_vp9_track_opens_in_the_streaming_player() {
+        // The path `/open` takes: demux, then decode on demand.
+        let mut dec = StreamDecoder::open(VP9_WEBM.to_vec()).unwrap();
+        assert_eq!(dec.backend, "vp9");
+        assert_eq!((dec.src_w, dec.src_h), (64, 64));
+        assert_eq!(dec.frame_count(), 4);
+        assert!(dec.seek_decode(0), "first frame decodes");
+        assert!(dec.cur_frame().is_some());
+        // …and a later frame, which needs the reference slots to have been kept.
+        assert!(dec.seek_decode(3));
+    }
+
+    #[test_case]
+    fn vp9_webm_has_no_codec_private_and_needs_none() {
+        let track = mkv::parse(&VP9_WEBM).unwrap();
+        assert!(matches!(track.config, mp4::CodecConfig::Vp9(_)));
+        // Zero, because VP9 samples are raw frames: a caller that assumed a
+        // length prefix would read the first four bytes of the frame header as
+        // a NAL length.
+        assert_eq!(track.config.length_size(), 0);
+        assert_eq!(track.samples.len(), 4);
+    }
+
+    #[test_case]
+    fn vp9_frame_headers_parse_for_every_frame() {
+        let track = mkv::parse(&VP9_WEBM).unwrap();
+        let mut refs: vp9::RefSizes = [(0, 0); vp9::NUM_REF_FRAMES];
+        let mut kinds: alloc::vec::Vec<bool> = alloc::vec::Vec::new();
+        for s in &track.samples {
+            let data = &VP9_WEBM[s.offset..s.offset + s.size];
+            let parts = vp9::split_superframe(data).unwrap();
+            for &(a, b) in &parts {
+                let h = vp9::parse_frame_header(&data[a..b], &refs).unwrap();
+                assert_eq!(h.width, 64);
+                assert_eq!(h.height, 64);
+                assert_eq!(h.profile, 0);
+                assert_eq!(h.bit_depth, 8);
+                // The compressed header must fit inside the frame.
+                assert!(h.tile_data_offset() <= b - a);
+                // A bool decoder must start cleanly at the compressed header;
+                // its marker bit is the check that the size was right.
+                let cs = h.uncompressed_header_bytes;
+                let ce = cs + h.header_size_in_bytes as usize;
+                assert!(vp9::BoolDecoder::new(&data[a + cs..a + ce]).is_ok(), "compressed header is not a bool partition");
+                for slot in 0..vp9::NUM_REF_FRAMES {
+                    if h.refresh_frame_flags & (1 << slot) != 0 {
+                        refs[slot] = (h.width, h.height);
+                    }
+                }
+                kinds.push(h.key_frame);
+            }
+        }
+        assert_eq!(kinds.len(), 4);
+        assert!(kinds[0], "first frame is a keyframe");
+        assert!(!kinds[1] && !kinds[2] && !kinds[3]);
+        // The container's sync flag and the bitstream must agree here.
+        let first = &track.samples[0];
+        assert!(first.is_sync);
+        assert!(vp9::sample_is_keyframe(&VP9_WEBM[first.offset..first.offset + first.size]));
+    }
 }

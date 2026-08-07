@@ -177,6 +177,128 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Big-endian bit writer for H.264 RBSPs (the inverse of [`BitReader`]).
+///
+/// Pure and allocation-light: bits accumulate into a `Vec<u8>`. Call
+/// [`BitWriter::finish`] to pad with the `rbsp_stop_one_bit` + zero-alignment
+/// the spec requires, then pass the bytes through [`escape_rbsp`] before
+/// wrapping in a NAL header.
+pub struct BitWriter {
+    bytes: Vec<u8>,
+    /// Bits buffered in the incomplete last byte (0..7).
+    acc: u8,
+    /// How many bits of `acc` are valid (0..7); 0 means `acc` is empty.
+    nbits: u8,
+}
+
+impl BitWriter {
+    pub fn new() -> Self {
+        BitWriter { bytes: Vec::new(), acc: 0, nbits: 0 }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        BitWriter { bytes: Vec::with_capacity(cap), acc: 0, nbits: 0 }
+    }
+
+    /// Write the low `n` bits of `v` MSB-first (`u(n)`).
+    pub fn u(&mut self, n: u32, v: u32) {
+        debug_assert!(n <= 32);
+        if n == 0 {
+            return;
+        }
+        for i in (0..n).rev() {
+            self.bit(((v >> i) & 1) as u8);
+        }
+    }
+
+    pub fn bit(&mut self, b: u8) {
+        self.acc = (self.acc << 1) | (b & 1);
+        self.nbits += 1;
+        if self.nbits == 8 {
+            self.bytes.push(self.acc);
+            self.acc = 0;
+            self.nbits = 0;
+        }
+    }
+
+    pub fn flag(&mut self, v: bool) {
+        self.bit(if v { 1 } else { 0 });
+    }
+
+    /// Unsigned Exp-Golomb `ue(v)`.
+    pub fn ue(&mut self, v: u32) {
+        // codeNum v → (zeros || 1 || binary of v+1 without leading 1)
+        // equivalent: write (v+1) in binary with floor(log2(v+1)) leading zeros.
+        let x = v as u64 + 1;
+        let bits = 64 - x.leading_zeros(); // width of x
+        let zeros = bits - 1;
+        for _ in 0..zeros {
+            self.bit(0);
+        }
+        self.u(bits, x as u32);
+    }
+
+    /// Signed Exp-Golomb `se(v)`.
+    pub fn se(&mut self, v: i32) {
+        // 0 → 0; +n → 2n-1; -n → 2n
+        let code = if v <= 0 {
+            ((-v) as u32) << 1
+        } else {
+            ((v as u32) << 1) - 1
+        };
+        self.ue(code);
+    }
+
+    /// Append `rbsp_stop_one_bit` and zero-pad to a byte boundary, returning
+    /// the RBSP bytes (not yet emulation-prevention escaped).
+    pub fn finish(mut self) -> Vec<u8> {
+        self.bit(1); // rbsp_stop_one_bit
+        while self.nbits != 0 {
+            self.bit(0); // rbsp_alignment_zero_bit
+        }
+        self.bytes
+    }
+
+    /// Byte-align with zeros (no stop bit) — for mid-stream alignment if needed.
+    pub fn byte_align_zeros(&mut self) {
+        while self.nbits != 0 {
+            self.bit(0);
+        }
+    }
+
+    /// Align and take the bytes **without** an RBSP stop bit (test helper and
+    /// mid-NAL raw dumps). Production NAL bodies use [`finish`].
+    pub fn into_bytes_aligned(mut self) -> Vec<u8> {
+        self.byte_align_zeros();
+        self.bytes
+    }
+}
+
+/// Insert H.264 emulation-prevention `0x03` bytes so the RBSP never contains a
+/// start-code pattern. Inverse of [`unescape_rbsp`].
+pub fn escape_rbsp(rbsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 128 + 8);
+    let mut zeros = 0usize;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 0x03 {
+            out.push(0x03);
+            zeros = 0;
+        }
+        out.push(b);
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
+/// Wrap an escaped RBSP in a one-byte NAL header (`forbidden_zero_bit=0`).
+pub fn make_nal(nal_ref_idc: u8, nal_unit_type: u8, rbsp: &[u8]) -> Vec<u8> {
+    let escaped = escape_rbsp(rbsp);
+    let mut out = Vec::with_capacity(1 + escaped.len());
+    out.push(((nal_ref_idc & 3) << 5) | (nal_unit_type & 0x1f));
+    out.extend_from_slice(&escaped);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +360,39 @@ mod tests {
         assert_eq!(r.se().unwrap(), -1);
         assert_eq!(r.se().unwrap(), 2);
         assert_eq!(r.se().unwrap(), -2);
+    }
+
+    #[test_case]
+    fn bitwriter_round_trips_ue_and_se() {
+        let ues = [0u32, 1, 2, 3, 6, 42, 1000];
+        let ses = [0i32, 1, -1, 2, -2, 17, -99];
+        let mut w = BitWriter::new();
+        for &v in &ues {
+            w.ue(v);
+        }
+        for &v in &ses {
+            w.se(v);
+        }
+        let raw = w.into_bytes_aligned();
+        let mut r = BitReader::new(&raw);
+        for &v in &ues {
+            assert_eq!(r.ue().unwrap(), v);
+        }
+        for &v in &ses {
+            assert_eq!(r.se().unwrap(), v);
+        }
+    }
+
+    #[test_case]
+    fn escape_round_trips_through_unescape() {
+        let raw = [0x00u8, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0xff];
+        let esc = escape_rbsp(&raw);
+        // After escape, no unescaped start-code triplet may remain.
+        assert!(
+            !esc.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 2),
+            "start-code pattern leaked: {esc:?}"
+        );
+        assert_eq!(unescape_rbsp(&esc), raw);
     }
 
     #[test_case]

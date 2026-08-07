@@ -1,8 +1,14 @@
 //! ISO base media file format (ISO/IEC 14496-12) demuxer — the container for
-//! `.mp4` and `.mov`. Walks the box tree, finds the H.264 video track, reads
-//! its `avcC` decoder config (SPS/PPS + NAL length size), and assembles the
-//! per-sample table (offset/size/DTS/sync) from `stsz`/`stsc`/`stco`/`stts`/
-//! `stss`, so the decoder can pull one access unit (AVCC-framed) at a time.
+//! `.mp4` and `.mov`. Walks the box tree, finds the first video track it
+//! recognises, reads its decoder configuration box (`avcC` / `hvcC` / `vpcC` →
+//! [`CodecConfig`]), and assembles the per-sample table (offset/size/DTS/sync)
+//! from `stsz`/`stsc`/`stco`/`stts`/`stss`, so the decoder can pull one access
+//! unit at a time.
+//!
+//! It also owns the configuration-record parsers themselves, because those are
+//! ISO-BMFF structures wherever they appear — Matroska's `CodecPrivate` carries
+//! the very same records, so [`super::mkv`] parses them through here rather than
+//! growing a second copy that can drift.
 //!
 //! Pure over an in-memory `&[u8]` (the file is loaded whole, like the image
 //! decoders) — no I/O, no panics on malformed input.
@@ -136,6 +142,153 @@ pub fn parse_avcc(body: &[u8]) -> Result<AvcC, &'static str> {
         a.pps.push(r.take(len)?.to_vec());
     }
     Ok(a)
+}
+
+/// The H.265 decoder config from an `hvcC` box.
+///
+/// Structurally an AVCC record with the parameter sets moved into a
+/// *typed array* list — HEVC has three kinds (VPS/SPS/PPS) plus SEI, so a
+/// record cannot use AVCC's fixed "SPS list then PPS list" shape.
+#[derive(Clone, Debug, Default)]
+pub struct HvcC {
+    /// NAL length prefix size in bytes (1..=4) for HVCC sample framing.
+    pub length_size: u8,
+    pub general_profile_idc: u8,
+    pub general_tier_high: bool,
+    pub general_level_idc: u8,
+    pub chroma_format_idc: u8,
+    pub bit_depth_luma: u8,
+    pub bit_depth_chroma: u8,
+    pub vps: Vec<Vec<u8>>, // each entry includes the 2-byte NAL header
+    pub sps: Vec<Vec<u8>>,
+    pub pps: Vec<Vec<u8>>,
+}
+
+/// Parse an `HEVCDecoderConfigurationRecord` (ISO 14496-15 §8.3.3.1.2). Public
+/// so the Matroska demuxer can parse its `CodecPrivate`, which is the same
+/// record.
+///
+/// The trap versus `avcC` is that the fixed part is **22 bytes** before the
+/// array count — it carries the whole `profile_tier_level` (12 bytes of profile
+/// space/compatibility/constraint flags) plus parallelism, chroma format and bit
+/// depths. Reading it with `avcC`'s 5-byte preamble lands the NAL arrays inside
+/// the constraint flags, where the length fields are large plausible numbers.
+pub fn parse_hvcc(body: &[u8]) -> Result<HvcC, &'static str> {
+    let mut r = Reader::new(body);
+    let version = r.u8()?; // configurationVersion (1)
+    if version != 1 {
+        return Err("mp4: unsupported hvcC version");
+    }
+    let b = r.u8()?;
+    let mut h = HvcC {
+        general_tier_high: b & 0x20 != 0,
+        general_profile_idc: b & 0x1f,
+        ..Default::default()
+    };
+    let _general_profile_compatibility = r.u32()?;
+    let _general_constraint_hi = r.u32()?; // 48 constraint bits
+    let _general_constraint_lo = r.u16()?;
+    h.general_level_idc = r.u8()?;
+    let _min_spatial_segmentation = r.u16()?; // 4 reserved + 12
+    let _parallelism_type = r.u8()?; // 6 reserved + 2
+    h.chroma_format_idc = r.u8()? & 0x03;
+    h.bit_depth_luma = (r.u8()? & 0x07) + 8;
+    h.bit_depth_chroma = (r.u8()? & 0x07) + 8;
+    let _avg_frame_rate = r.u16()?;
+    let flags = r.u8()?; // constantFrameRate(2) numTemporalLayers(3) nested(1) lengthSizeMinusOne(2)
+    h.length_size = (flags & 0x03) + 1;
+    let num_arrays = r.u8()?;
+    for _ in 0..num_arrays {
+        let nal_type = r.u8()? & 0x3f;
+        let count = r.u16()?;
+        for _ in 0..count {
+            let len = r.u16()? as usize;
+            let nal = r.take(len)?.to_vec();
+            match nal_type {
+                32 => h.vps.push(nal),
+                33 => h.sps.push(nal),
+                34 => h.pps.push(nal),
+                _ => {} // SEI and reserved arrays are carried, not needed
+            }
+        }
+    }
+    if h.sps.is_empty() {
+        return Err("mp4: hvcC has no SPS");
+    }
+    Ok(h)
+}
+
+/// The VP9 decoder config from a `vpcC` box (VP Codec ISO Media File Format
+/// Binding). Unlike `avcC`/`hvcC` it carries **no parameter sets** — VP9 has
+/// none; every frame's header is self-describing — so this is metadata only and
+/// the decoder never depends on it.
+#[derive(Clone, Debug, Default)]
+pub struct VpcC {
+    pub profile: u8,
+    /// 10× the level, i.e. 10 = level 1.0, 51 = level 5.1.
+    pub level: u8,
+    pub bit_depth: u8,
+    /// 0 = 4:2:0 vertically co-sited, 1 = 4:2:0 co-located, 2 = 4:2:2, 3 = 4:4:4.
+    pub chroma_subsampling: u8,
+    pub full_range: bool,
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+}
+
+/// Parse a `vpcC` box (a *full* box: 1 version byte + 3 flag bytes first).
+pub fn parse_vpcc(body: &[u8]) -> Result<VpcC, &'static str> {
+    let mut r = Reader::new(body);
+    let _ver_flags = r.u32()?;
+    let mut v = VpcC { profile: r.u8()?, level: r.u8()?, ..Default::default() };
+    let b = r.u8()?;
+    v.bit_depth = b >> 4;
+    v.chroma_subsampling = (b >> 1) & 0x07;
+    v.full_range = b & 1 != 0;
+    v.colour_primaries = r.u8()?;
+    v.transfer_characteristics = r.u8()?;
+    v.matrix_coefficients = r.u8()?;
+    Ok(v)
+}
+
+/// Which codec a demuxed video track carries, with its decoder configuration.
+///
+/// This is the seam that keeps the demuxers codec-agnostic: `mp4`/`mkv` decide
+/// *what* the track is, and [`super::StreamDecoder`] decides what to do with it.
+#[derive(Clone, Debug)]
+pub enum CodecConfig {
+    Avc(AvcC),
+    Hevc(HvcC),
+    /// VP9 (and VP8, which shares the container binding but is not decoded).
+    Vp9(VpcC),
+}
+
+impl CodecConfig {
+    /// NAL length-prefix size for length-framed codecs. **Zero for VP9**, whose
+    /// samples are raw frames with no framing at all — a caller that assumes a
+    /// prefix reads the first four bytes of the frame header as a length.
+    pub fn length_size(&self) -> u8 {
+        match self {
+            CodecConfig::Avc(a) => a.length_size,
+            CodecConfig::Hevc(h) => h.length_size,
+            CodecConfig::Vp9(_) => 0,
+        }
+    }
+
+    /// Short name for the probe line and the player HUD.
+    pub fn codec_name(&self) -> &'static str {
+        match self {
+            CodecConfig::Avc(_) => "H.264",
+            CodecConfig::Hevc(_) => "H.265",
+            CodecConfig::Vp9(_) => "VP9",
+        }
+    }
+}
+
+impl Default for CodecConfig {
+    fn default() -> Self {
+        CodecConfig::Avc(AvcC::default())
+    }
 }
 
 /// One coded sample (access unit) in the file: byte range + timing + keyframe.
@@ -337,13 +490,13 @@ fn parse_stss(body: &[u8]) -> Result<Vec<u32>, &'static str> {
     Ok(v)
 }
 
-/// A demuxed H.264 video track: geometry, timing, decoder config, and samples.
+/// A demuxed video track: geometry, timing, decoder config, and samples.
 pub struct VideoTrack {
     pub width: u32,
     pub height: u32,
     pub timescale: u32,
     pub duration: u64,
-    pub avcc: AvcC,
+    pub config: CodecConfig,
     pub samples: Vec<Sample>,
 }
 
@@ -361,7 +514,7 @@ impl VideoTrack {
     }
 }
 
-/// Parse the whole file and return its first H.264 video track, if any.
+/// Parse the whole file and return its first decodable video track, if any.
 pub fn parse(data: &[u8]) -> Result<VideoTrack, &'static str> {
     let top = boxes(data);
     let moov = find(&top, b"moov").ok_or("mp4: no moov box")?;
@@ -371,7 +524,7 @@ pub fn parse(data: &[u8]) -> Result<VideoTrack, &'static str> {
             return Ok(t);
         }
     }
-    Err("mp4: no H.264 video track found")
+    Err("mp4: no video track found")
 }
 
 fn parse_trak(trak_body: &[u8]) -> Result<Option<VideoTrack>, &'static str> {
@@ -431,9 +584,9 @@ fn parse_trak(trak_body: &[u8]) -> Result<Option<VideoTrack>, &'static str> {
         Some(s) => boxes(s.body),
         None => return Ok(None),
     };
-    // stsd → avc1/avc3 sample entry → avcC.
+    // stsd → the video sample entry → its decoder configuration box.
     let stsd = find(&stbl, b"stsd").ok_or("mp4: no stsd")?;
-    let (avcc, (sw, sh)) = parse_stsd(stsd.body)?;
+    let (config, (sw, sh)) = parse_stsd(stsd.body)?;
 
     let sizes = parse_stsz(find(&stbl, b"stsz").ok_or("mp4: no stsz")?.body)?;
     let chunk_offsets = if let Some(co64) = find(&stbl, b"co64") {
@@ -455,11 +608,23 @@ fn parse_trak(trak_body: &[u8]) -> Result<Option<VideoTrack>, &'static str> {
 
     let width = if sw != 0 { sw } else { tk_w };
     let height = if sh != 0 { sh } else { tk_h };
-    Ok(Some(VideoTrack { width, height, timescale, duration, avcc, samples }))
+    Ok(Some(VideoTrack { width, height, timescale, duration, config, samples }))
 }
 
-/// Parse `stsd` → the first `avc1`/`avc3` entry's dimensions + `avcC`.
-fn parse_stsd(body: &[u8]) -> Result<(AvcC, (u32, u32)), &'static str> {
+/// Parse `stsd` → the first video sample entry's dimensions + decoder config.
+///
+/// The recognised four-character codes and their configuration boxes:
+///
+/// | entry            | config | codec |
+/// |------------------|--------|-------|
+/// | `avc1` / `avc3`  | `avcC` | H.264 |
+/// | `hvc1` / `hev1`  | `hvcC` | H.265 |
+/// | `vp09`           | `vpcC` | VP9   |
+///
+/// `hvc1` vs `hev1` and `avc1` vs `avc3` differ only in whether parameter sets
+/// may also appear in the samples; both carry them in the config box, so both
+/// are read the same way here and in-band sets simply override later.
+fn parse_stsd(body: &[u8]) -> Result<(CodecConfig, (u32, u32)), &'static str> {
     let mut r = Reader::new(body);
     r.u32()?; // version/flags
     let entry_count = r.u32()?;
@@ -469,24 +634,37 @@ fn parse_stsd(body: &[u8]) -> Result<(AvcC, (u32, u32)), &'static str> {
     // Each entry begins with a box header (size, type).
     let rest = &body[8..];
     for b in boxes(rest) {
-        if &b.typ == b"avc1" || &b.typ == b"avc3" {
-            // VisualSampleEntry: 6 reserved + 2 data_ref_idx + 16 predefined/
-            // reserved, then width(16) height(16) at offset 24.
-            let mut vr = Reader::new(b.body);
-            vr.skip(24)?;
-            let w = vr.u16()? as u32;
-            let h = vr.u16()? as u32;
-            // Skip to the child boxes: 14 fixed fields (horiz/vert res, reserved,
-            // frame_count) + 32-byte compressorname + depth(2) + predefined(2).
-            vr.skip(14 + 32 + 2 + 2)?;
-            let children = &b.body[vr.p..];
-            let child_boxes = boxes(children);
-            let avcc_box = find(&child_boxes, b"avcC").ok_or("mp4: no avcC in avc1")?;
-            let avcc = parse_avcc(avcc_box.body)?;
-            return Ok((avcc, (w, h)));
-        }
+        let want: Option<(&[u8; 4], u8)> = match &b.typ {
+            b"avc1" | b"avc3" => Some((b"avcC", 0)),
+            b"hvc1" | b"hev1" => Some((b"hvcC", 1)),
+            b"vp09" => Some((b"vpcC", 2)),
+            _ => None,
+        };
+        let Some((cfg_type, which)) = want else { continue };
+        // VisualSampleEntry: 6 reserved + 2 data_ref_idx + 16 predefined/
+        // reserved, then width(16) height(16) at offset 24.
+        let mut vr = Reader::new(b.body);
+        vr.skip(24)?;
+        let w = vr.u16()? as u32;
+        let h = vr.u16()? as u32;
+        // Skip to the child boxes: 14 fixed fields (horiz/vert res, reserved,
+        // frame_count) + 32-byte compressorname + depth(2) + predefined(2).
+        vr.skip(14 + 32 + 2 + 2)?;
+        let child_boxes = boxes(&b.body[vr.p..]);
+        let cfg = find(&child_boxes, cfg_type);
+        let config = match (which, cfg) {
+            (0, Some(c)) => CodecConfig::Avc(parse_avcc(c.body)?),
+            (1, Some(c)) => CodecConfig::Hevc(parse_hvcc(c.body)?),
+            (2, Some(c)) => CodecConfig::Vp9(parse_vpcc(c.body)?),
+            // A `vp09` entry without `vpcC` is still decodable — VP9 frames are
+            // self-describing, so the box is metadata. The H.26x entries are
+            // not: without their parameter sets there is nothing to decode.
+            (2, None) => CodecConfig::Vp9(VpcC::default()),
+            _ => return Err("mp4: video sample entry has no decoder config box"),
+        };
+        return Ok((config, (w, h)));
     }
-    Err("mp4: no avc1/avc3 sample entry (unsupported video codec)")
+    Err("mp4: no supported video sample entry (avc1/avc3, hvc1/hev1, vp09)")
 }
 
 /// A demuxed audio track: the AAC `AudioSpecificConfig` plus the sample table

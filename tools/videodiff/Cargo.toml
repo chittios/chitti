@@ -1,0 +1,20 @@
+[package]
+name = "videodiff"
+version = "0.1.0"
+edition = "2021"
+
+# Host-side bring-up harness for the kernel's video stack, covering **every**
+# codec it demuxes (H.264, H.265/HEVC, VP9) rather than one — the
+# onnxdiff/cortexdiff/h264diff pattern. It mounts `kernel/src/video/*` natively
+# via #[path], so it runs in seconds on the host instead of a QEMU round trip,
+# and its output is diffed bit-for-bit against PyAV/ffmpeg by `diff.py`.
+#
+# Standalone crate: not a member of the repo-root workspace.
+
+[workspace]
+
+[profile.release]
+debug = true
+
+[dependencies]
+rust_h264 = { path = "../../third_party/rust_h264", default-features = false }

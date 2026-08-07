@@ -104,6 +104,57 @@ impl<'a> Cabac<'a> {
         (self.bits >> self.nbits) & 1
     }
 
+    /// Initialise for an **HEVC** slice (H.265 §9.3.2.2). The arithmetic engine
+    /// and its tables are identical to H.264's — only the context
+    /// initialisation differs, so this shares everything below it rather than
+    /// growing a second copy of a bit-exact decoder.
+    ///
+    /// The derivation is a different shape from AVC's: one `initValue` byte per
+    /// context yields the slope and offset (`m = (v >> 4) * 5 - 45`,
+    /// `n = ((v & 15) << 3) - 16`) instead of a stored `(m, n)` pair.
+    ///
+    /// `init_type` is `2 - slice_type` (so 2 for I, 1 for P, 0 for B), **XORed
+    /// with 3** on a non-I slice when the slice header set `cabac_init_flag` —
+    /// which swaps the P and B tables, and is the whole purpose of that flag.
+    pub fn new_hevc(
+        data: &'a [u8],
+        qp: i32,
+        init_type: usize,
+        init_values: &[[u8; super::super::hevc::cabac_tables::HEVC_CONTEXTS]; 3],
+    ) -> Result<Cabac<'a>, &'static str> {
+        let table = init_values.get(init_type).ok_or("hevc: bad cabac init type")?;
+        let qp = qp.clamp(0, 51);
+        let mut ctx = [0u8; 1024];
+        for (i, &v) in table.iter().enumerate() {
+            let m = (v as i32 >> 4) * 5 - 45;
+            let n = ((v as i32 & 15) << 3) - 16;
+            let pre = (((m * qp) >> 4) + n).clamp(1, 126);
+            ctx[i] = if pre <= 63 {
+                ((63 - pre) as u8) << 1
+            } else {
+                (((pre - 64) as u8) << 1) | 1
+            };
+        }
+        let mut c = Cabac { data, byte_pos: 0, bits: 0, nbits: 0, range: 510, offset: 0, ctx };
+        c.refill();
+        c.refill();
+        c.offset = 0;
+        for _ in 0..9 {
+            if c.nbits == 0 {
+                c.refill();
+            }
+            c.offset = (c.offset << 1) | c.take_bit();
+        }
+        Ok(c)
+    }
+
+    /// How many bytes of the slice the reservoir has pulled in. Bring-up only:
+    /// a parse that ends far from the slice's length has desynchronised, which
+    /// distinguishes "read the wrong bins" from "reconstructed them wrongly".
+    pub fn byte_pos(&self) -> usize {
+        self.byte_pos
+    }
+
     /// DecodeDecision (§9.3.3.2.1) for the context at `ctx_idx`.
     #[inline]
     pub fn decision(&mut self, ctx_idx: usize) -> u32 {
