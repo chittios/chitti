@@ -37,33 +37,15 @@ pub fn insecure() -> bool {
     TLS_INSECURE.load(Ordering::Relaxed)
 }
 use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
 use smoltcp::socket::tcp;
 
-/// Seed a ChaCha20 CSPRNG for the TLS handshake. Mixes several hardware-random
-/// words (`RDRAND`/`RNDR`, 0 when absent) with cycle-counter samples taken
-/// across cooperative yields (timing jitter) via a SplitMix64 diffuser, so the
-/// seed is unpredictable even when no hardware RNG exists.
-pub fn seed_rng() -> ChaCha20Rng {
-    let mut state: u64 = 0x9e37_79b9_7f4a_7c15 ^ crate::arch::now_ms().wrapping_mul(0xff51_afd7_ed55_8ccd);
-    let mut seed = [0u8; 32];
-    for chunk in seed.chunks_mut(8) {
-        // Fold in a fresh hardware-random word + the live cycle counter, then
-        // yield so the next counter sample reflects real scheduling jitter.
-        state ^= crate::arch::hw_rand();
-        state = state.wrapping_add(crate::arch::cycle_count());
-        crate::sched::yield_now();
-        state ^= crate::arch::cycle_count().rotate_left(17);
-        // SplitMix64 finaliser.
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        chunk.copy_from_slice(&z.to_le_bytes());
-    }
-    ChaCha20Rng::from_seed(seed)
-}
+/// Seed a ChaCha20 CSPRNG for the TLS handshake.
+///
+/// Re-exported from [`crate::security::rng`], which is the kernel's single
+/// seeding path — the volume-encryption salt and the login salt draw from the
+/// same function, so there is one implementation to get right and one place that
+/// documents what the entropy actually is.
+pub use crate::security::rng::seed_rng;
 
 /// A blocking [`embedded_io`] view over one cooperative smoltcp TCP socket:
 /// `read`/`write` pump the stack (and the UI, via `shell::upkeep`) until the

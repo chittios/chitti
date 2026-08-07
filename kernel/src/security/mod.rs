@@ -16,8 +16,14 @@
 //! the policy is measured where it is actually enforced rather than where it is
 //! defined.
 
+//! [`rng`] is the third piece: one seeding path for every byte of key material
+//! in the kernel, because the obvious two-line version silently degrades to all
+//! zeros on any machine without `RDRAND`/`RNDR` -- which is every emulator we
+//! develop and test on.
+
 pub mod citation;
 pub mod redteam;
+pub mod rng;
 pub mod taint;
 
 pub use taint::{Justification, Provenance};

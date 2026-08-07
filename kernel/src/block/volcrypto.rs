@@ -135,8 +135,36 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     r
 }
 
+/// How many PBKDF2 rounds run between `pump()` calls in
+/// [`pbkdf2_hmac_sha256_pumped`]. Small enough that a 200k-round derivation
+/// pumps the UI ~200 times (well inside the ~50 ms standing rule), large enough
+/// that the pump is not measurable against the hashing.
+const PUMP_EVERY: u32 = 1024;
+
 /// PBKDF2-HMAC-SHA256 into `out` (any length).
 pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+    pbkdf2_hmac_sha256_pumped(password, salt, iterations, out, &mut || {});
+}
+
+/// PBKDF2-HMAC-SHA256, calling `pump` every [`PUMP_EVERY`] rounds.
+///
+/// **Byte-identical to [`pbkdf2_hmac_sha256`]** — that one is this one with a
+/// no-op pump, so there is a single implementation and the two cannot drift
+/// (`pbkdf2_pumped_agrees_with_the_plain_form` pins it).
+///
+/// The pump exists because a deliberately-slow KDF is exactly the kind of loop
+/// the standing UI rule is about: at the login iteration count this runs for a
+/// noticeable fraction of a second, and without pumping it freezes the clock,
+/// the caret, the mouse and the net stack while it does. Callers pass
+/// `crate::shell::status_tick` (a loop that owns the console) or
+/// `crate::shell::upkeep`.
+pub fn pbkdf2_hmac_sha256_pumped(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    out: &mut [u8],
+    pump: &mut dyn FnMut(),
+) {
     assert!(iterations >= 1);
     let mut block_index = 1u32;
     let mut offset = 0usize;
@@ -147,10 +175,13 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &m
         msg.extend_from_slice(&block_index.to_be_bytes());
         let mut u = hmac_sha256(password, &msg);
         let mut t = u;
-        for _ in 1..iterations {
+        for round in 1..iterations {
             u = hmac_sha256(password, &u);
             for i in 0..32 {
                 t[i] ^= u[i];
+            }
+            if round % PUMP_EVERY == 0 {
+                pump();
             }
         }
         let n = (out.len() - offset).min(32);
@@ -225,14 +256,16 @@ pub fn aes128_xts_decrypt(key: &[u8; 32], tweak_le: u64, sector: &mut [u8]) {
     }
 }
 
+/// Draw the salt and the master key.
+///
+/// This **must** go through [`crate::security::rng`] and not `arch::hw_rand()`.
+/// It used to copy `hw_rand()` straight out, which returns 0 when the CPU has no
+/// `RDRAND`/`RNDR` — true of QEMU and HVF's default models — so every volume
+/// formatted on a development machine got an **all-zero salt and an all-zero
+/// master key**. Nothing detects that: an all-zero key encrypts, decrypts and
+/// mounts perfectly, and the passphrase still works.
 fn fill_random(buf: &mut [u8]) {
-    let mut i = 0;
-    while i < buf.len() {
-        let r = crate::arch::hw_rand().to_le_bytes();
-        let n = (buf.len() - i).min(8);
-        buf[i..i + n].copy_from_slice(&r[..n]);
-        i += n;
-    }
+    crate::security::rng::fill_random(buf);
 }
 
 fn mk_check(master: &[u8; MK_LEN]) -> [u8; CHECK_LEN] {
@@ -243,9 +276,15 @@ fn mk_check(master: &[u8; MK_LEN]) -> [u8; CHECK_LEN] {
 }
 
 /// Derive KEK (16 bytes for AES-KW) from passphrase.
+///
+/// Pumps the UI: at `DEFAULT_ITERATIONS` this is a visible fraction of a second
+/// spent in a tight hashing loop, and both callers run it somewhere a frozen
+/// console is user-visible — `format` behind the `/encrypt` modal, `unlock` at
+/// boot before the shell exists. `status_tick` rather than `upkeep` because the
+/// modal owns the console and `upkeep`'s `mouse::tick()` would steal its clicks.
 fn derive_kek(passphrase: &[u8], salt: &[u8], iterations: u32) -> [u8; 16] {
     let mut out = [0u8; 32];
-    pbkdf2_hmac_sha256(passphrase, salt, iterations, &mut out);
+    pbkdf2_hmac_sha256_pumped(passphrase, salt, iterations, &mut out, &mut crate::shell::status_tick);
     let mut kek = [0u8; 16];
     kek.copy_from_slice(&out[..16]);
     kek
@@ -477,6 +516,38 @@ mod tests {
         assert_ne!(a, b);
         // Non-zero output.
         assert!(a.iter().any(|&x| x != 0));
+    }
+
+    /// The pumped form must produce **the same bytes** as the plain one, and must
+    /// actually have pumped. Without the first half a pumped KDF silently derives
+    /// a different key and the only symptom is "the passphrase stopped working";
+    /// without the second half the pump could be dead code and the UI would still
+    /// freeze.
+    #[test_case]
+    fn pbkdf2_pumped_agrees_with_the_plain_form() {
+        let mut plain = [0u8; 32];
+        let mut pumped = [0u8; 32];
+        // Above PUMP_EVERY, so the pump really fires.
+        let iters = super::PUMP_EVERY * 3;
+        pbkdf2_hmac_sha256(b"correct horse", b"a-salt", iters, &mut plain);
+        let mut pumps = 0usize;
+        pbkdf2_hmac_sha256_pumped(b"correct horse", b"a-salt", iters, &mut pumped, &mut || pumps += 1);
+        assert_eq!(plain, pumped, "the pumped PBKDF2 derived different bytes");
+        assert!(pumps >= 2, "the pump never fired (got {pumps})");
+
+        // A derivation shorter than one pump interval must still be correct.
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        pbkdf2_hmac_sha256(b"pw", b"s", 4, &mut a);
+        pbkdf2_hmac_sha256_pumped(b"pw", b"s", 4, &mut b, &mut || {});
+        assert_eq!(a, b);
+
+        // Multi-block output (> 32 bytes) exercises the block_index loop.
+        let mut la = [0u8; 48];
+        let mut lb = [0u8; 48];
+        pbkdf2_hmac_sha256(b"pw", b"s", super::PUMP_EVERY + 5, &mut la);
+        pbkdf2_hmac_sha256_pumped(b"pw", b"s", super::PUMP_EVERY + 5, &mut lb, &mut || {});
+        assert_eq!(la, lb);
     }
 
     #[test_case]
