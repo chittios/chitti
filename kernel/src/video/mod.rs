@@ -17,7 +17,7 @@
 //! | codec | demux + describe | decode |
 //! |-------|------------------|--------|
 //! | H.264 / AVC | yes | yes — baseline CAVLC through High-profile CABAC (I/P/B) |
-//! | H.265 / HEVC | yes | Main/RExt 8/10/12-bit 4:2:0/4:2:2/4:4:4, tiles, PCM |
+//! | H.265 / HEVC | yes | Main/RExt mono+4:2:0/4:2:2/4:4:4, 8–12-bit, tiles, PCM |
 //! | VP9 | yes | yes — profile 0, intra + inter, bit-exact vs libvpx |
 //!
 //! A stream outside the supported set comes back from [`probe`] with
@@ -182,16 +182,21 @@ pub fn probe(bytes: &[u8]) -> Result<VideoInfo, &'static str> {
 /// even once the pipeline lands, and a user with a 10-bit file wants to be told
 /// that rather than "not implemented yet".
 fn hevc_support(sps: &hevc::Sps) -> (bool, &'static str) {
-    if !(8..=12).contains(&sps.bit_depth_luma) || sps.bit_depth_luma != sps.bit_depth_chroma {
-        return (false, "HEVC bit depth must be 8–12 and equal for luma/chroma");
+    if !(8..=12).contains(&sps.bit_depth_luma) {
+        return (false, "HEVC bit depth must be 8–12");
     }
-    // 0 = monochrome (no chroma plane we present), 1/2/3 = 4:2:0 / 4:2:2 / 4:4:4.
-    if sps.chroma_format_idc == 0 || sps.chroma_format_idc > 3 {
-        return (false, "monochrome or unknown HEVC chroma_format_idc");
+    // Chroma bit depth is signalled even for monochrome; when chroma exists it
+    // must match luma (we do not implement dual bit-depth).
+    if sps.chroma_format_idc != 0 && sps.bit_depth_luma != sps.bit_depth_chroma {
+        return (false, "HEVC dual bit-depth (luma ≠ chroma) is not supported");
     }
-    // Main / RExt 4:2:0, 4:2:2 and 4:4:4 at 8–12 bit. Samples are u16
-    // internally; the player downshifts and (if needed) 4:2:0-sub-samples for
-    // the RGB converter. Tiles and PCM are decoded when present.
+    // 0 = monochrome, 1/2/3 = 4:2:0 / 4:2:2 / 4:4:4.
+    if sps.chroma_format_idc > 3 {
+        return (false, "unknown HEVC chroma_format_idc");
+    }
+    // Main / RExt monochrome and 4:2:0/4:2:2/4:4:4 at 8–12 bit. Samples are
+    // u16 internally; the player downshifts and (if needed) 4:2:0-sub-samples
+    // for the RGB converter. Tiles and PCM are decoded when present.
     (true, "")
 }
 
@@ -466,6 +471,7 @@ fn hevc_frame_to_8bit(f: &hevc::decoder::DecodedFrame) -> h264::decoder::Decoded
     let shift = f.bit_depth.saturating_sub(8);
     let y: alloc::vec::Vec<u8> = f.y.iter().map(|&s| (s >> shift) as u8).collect();
     let (cw, ch) = (f.w / 2, f.h / 2);
+    // Mid-grey chroma for monochrome and as the base for 4:2:0 conversion.
     let mut cb = alloc::vec![128u8; cw * ch];
     let mut cr = alloc::vec![128u8; cw * ch];
     if f.chroma_format_idc != 0 && f.cw > 0 && f.ch > 0 {

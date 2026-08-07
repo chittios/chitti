@@ -74,24 +74,19 @@ mod video;
 // Kernel `video::frame_from_yuv` optionally fans out over aarch64 SMP. The
 // host harness is a single-process std binary — provide a no-op arch facade
 // so the path compiles and always takes the single-threaded convert.
-#[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 mod arch {
-    pub mod aarch64 {
-        pub mod smp {
-            pub fn online_cpus() -> usize {
-                1
-            }
-            /// # Safety
-            /// Never called when `online_cpus() == 1`.
-            pub unsafe fn parallel_for(
-                _n: usize,
-                _chunk: usize,
-                _f: unsafe fn(usize, usize, *mut u8),
-                _ctx: *mut u8,
-            ) {
-            }
-        }
+    pub fn online_cpus() -> usize {
+        1
+    }
+    /// # Safety
+    /// Never called when `online_cpus() == 1`.
+    pub unsafe fn parallel_for(
+        _n: usize,
+        _chunk: usize,
+        _f: unsafe fn(usize, usize, *mut u8),
+        _ctx: *mut u8,
+    ) {
     }
 }
 
@@ -193,12 +188,16 @@ fn main() {
         return;
     }
     // Demux either container → (avcc, samples).
-    let (avcc, samples): (video::mp4::AvcC, Vec<video::mp4::Sample>) = if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+    let (config, samples): (video::mp4::CodecConfig, Vec<video::mp4::Sample>) = if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
         let t = video::mkv::parse(&bytes).expect("demux mkv");
-        (t.avcc, t.samples)
+        (t.config, t.samples)
     } else {
         let t = video::mp4::parse(&bytes).expect("demux mp4");
-        (t.avcc, t.samples)
+        (t.config, t.samples)
+    };
+    let avcc = match config {
+        video::mp4::CodecConfig::Avc(a) => a,
+        other => panic!("h264diff: not an H.264 track ({}) — use videodiff", other.codec_name()),
     };
     let sps = h264::parse_sps(&video::bits::unescape_rbsp(&avcc.sps[0][1..])).expect("sps");
     let pps = h264::parse_pps(&video::bits::unescape_rbsp(&avcc.pps[0][1..])).expect("pps");

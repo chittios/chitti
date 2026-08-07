@@ -6,6 +6,7 @@ and lets a test feed shell commands and wait for expected output. Reuses
 xtask's QEMU invocation so the harness doesn't have to reconstruct it.
 """
 
+import codecs
 import os
 import re
 import signal
@@ -33,6 +34,21 @@ class Guest:
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
+        # Incremental decode of `buf` into ANSI-stripped text.
+        #
+        # `text()` used to decode and regex-strip the WHOLE buffer on every
+        # call, and `wait_for` calls it ten times a second. Over a full sweep
+        # the buffer reaches several MiB, so each poll spent ~17 ms re-doing
+        # work it had already done — and, worse, held `self.lock` for a
+        # multi-MiB copy while the reader thread was trying to take it. The
+        # reader then starved, guest output arrived late, and scenarios that
+        # pass in 3 s standing alone timed out at 12 s in a sweep. Sixteen
+        # scenarios failed that way, scattered through the run, looking exactly
+        # like a kernel regression.
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._decoded = ""
+        self._consumed = 0
+        self._pending = ""
         env = dict(os.environ)
         # Headless: no display window. `audio="none"` gives the guest a
         # virtio-snd device on a silent backend (so /voice has a sound device to
@@ -100,8 +116,16 @@ class Guest:
         self.reader.start()
 
     def _read(self):
+        # `os.read` returns whatever is available rather than blocking for a
+        # full buffer, so this stays responsive while taking the lock once per
+        # chunk instead of once per byte. `stdout.read(1)` meant one lock
+        # acquisition per character of guest output.
+        fd = self.proc.stdout.fileno()
         while True:
-            chunk = self.proc.stdout.read(1)
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
             if not chunk:
                 break
             with self.lock:
@@ -113,9 +137,30 @@ class Guest:
                     pass
 
     def text(self):
+        """Everything the guest has printed, decoded and ANSI-stripped.
+
+        Only the bytes that arrived since the last call are decoded; the rest
+        is cached. A trailing partial escape sequence is held back rather than
+        stripped, since `ANSI.sub` on half a sequence would emit the tail as
+        literal text and the pattern the caller is waiting for might straddle
+        it.
+        """
         with self.lock:
-            raw = bytes(self.buf)
-        return ANSI.sub("", raw.decode(errors="replace"))
+            if len(self.buf) == self._consumed:
+                return self._decoded
+            fresh = bytes(self.buf[self._consumed:])
+            self._consumed = len(self.buf)
+        chunk = self._pending + self._decoder.decode(fresh)
+        self._pending = ""
+        # Hold back an unterminated escape so it can be stripped once its final
+        # byte arrives: `ANSI.sub` on half a sequence emits the tail as literal
+        # text, and the pattern a caller is waiting for might straddle it.
+        cut = chunk.rfind("\x1b")
+        if cut != -1 and not ANSI.match(chunk, cut):
+            self._pending = chunk[cut:]
+            chunk = chunk[:cut]
+        self._decoded += ANSI.sub("", chunk)
+        return self._decoded
 
     def mark(self):
         """A cursor into the output stream, so `wait_for` ignores prior text."""

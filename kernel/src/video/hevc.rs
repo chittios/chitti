@@ -650,12 +650,16 @@ pub struct Sps {
 
 impl Sps {
     /// (SubWidthC, SubHeightC) per `chroma_format_idc` (H.265 Table 6-1).
+    /// Monochrome is `(1, 1)` so the conformance window is still in *sample*
+    /// units; the chroma *planes* themselves have size zero (see
+    /// [`Self::chroma_width`]).
     pub fn chroma_subsampling(&self) -> (u32, u32) {
         match self.chroma_format_idc {
+            0 => (1, 1), // monochrome
             1 => (2, 2), // 4:2:0
             2 => (2, 1), // 4:2:2
             3 => (1, 1), // 4:4:4
-            _ => (1, 1), // monochrome (no chroma plane)
+            _ => (1, 1),
         }
     }
 
@@ -666,18 +670,24 @@ impl Sps {
             1 => (1, 1),
             2 => (1, 0),
             3 => (0, 0),
-            _ => (0, 0),
+            _ => (0, 0), // monochrome / unknown
         }
     }
 
-    /// Chroma plane width in samples.
+    /// Chroma plane width in samples (`0` for monochrome — no Cb/Cr arrays).
     pub fn chroma_width(&self) -> u32 {
+        if self.chroma_format_idc == 0 {
+            return 0;
+        }
         let (sw, _) = self.chroma_subsampling();
         self.pic_width_in_luma_samples / sw.max(1)
     }
 
-    /// Chroma plane height in samples.
+    /// Chroma plane height in samples (`0` for monochrome).
     pub fn chroma_height(&self) -> u32 {
+        if self.chroma_format_idc == 0 {
+            return 0;
+        }
         let (_, sh) = self.chroma_subsampling();
         self.pic_height_in_luma_samples / sh.max(1)
     }
@@ -1040,6 +1050,9 @@ pub struct SliceHeader {
     pub beta_offset_div2: i32,
     pub tc_offset_div2: i32,
     pub loop_filter_across_slices_enabled: bool,
+    /// Explicit weighted prediction table, when the PPS enables it for this
+    /// slice type. Absent means unweighted sample prediction.
+    pub pred_weight: Option<PredWeightTable>,
     /// Byte offset in the RBSP at which the CABAC-coded slice data starts.
     pub data_byte_offset: usize,
     /// Entry-point offsets for tiles / WPP substreams (already `+1`-resolved).
@@ -1052,11 +1065,46 @@ impl SliceHeader {
     }
 }
 
+/// Explicit weighted prediction table (`pred_weight_table`, §7.3.6.3).
+///
+/// Weights and offsets are the *final* values applied in §8.5.3.3.4.3 —
+/// `weight = 1 << denom + delta`, `offset` as signalled (chroma offsets are
+/// already de-delta'd from the mid-grey centering formula).
+#[derive(Clone, Debug)]
+pub struct PredWeightTable {
+    pub luma_log2_weight_denom: u32,
+    pub chroma_log2_weight_denom: u32,
+    /// `[list][ref_idx]` — true when that reference carries a non-default weight.
+    pub luma_weight_flag: [[bool; 16]; 2],
+    pub chroma_weight_flag: [[bool; 16]; 2],
+    pub luma_weight: [[i32; 16]; 2],
+    pub luma_offset: [[i32; 16]; 2],
+    /// `[list][ref_idx][cb|cr]`
+    pub chroma_weight: [[[i32; 2]; 16]; 2],
+    pub chroma_offset: [[[i32; 2]; 16]; 2],
+}
+
+impl Default for PredWeightTable {
+    fn default() -> Self {
+        // Identity: weight = 1 << denom with denom 0 → weight 1, offset 0.
+        Self {
+            luma_log2_weight_denom: 0,
+            chroma_log2_weight_denom: 0,
+            luma_weight_flag: [[false; 16]; 2],
+            chroma_weight_flag: [[false; 16]; 2],
+            luma_weight: [[1; 16]; 2],
+            luma_offset: [[0; 16]; 2],
+            chroma_weight: [[[1; 2]; 16]; 2],
+            chroma_offset: [[[0; 2]; 16]; 2],
+        }
+    }
+}
+
 /// Parse a slice segment header. `nal` is the NAL type (IRAP-ness changes the
 /// syntax) and `sps`/`pps` are the active parameter sets.
 ///
-/// Weighted-prediction tables are still consumed for bit length only (weights
-/// are not applied). Reference-list modification is parsed **and applied**.
+/// Weighted-prediction tables are parsed and applied when the PPS enables
+/// them. Reference-list modification is parsed **and applied**.
 /// Read just the PPS id out of a slice segment header.
 ///
 /// The header cannot be parsed without its PPS (and the PPS's SPS), and the
@@ -1113,6 +1161,7 @@ pub fn parse_slice_header(
         beta_offset_div2: pps.beta_offset_div2,
         tc_offset_div2: pps.tc_offset_div2,
         loop_filter_across_slices_enabled: pps.loop_filter_across_slices_enabled,
+        pred_weight: None,
         data_byte_offset: 0,
         entry_point_offsets: Vec::new(),
     };
@@ -1238,7 +1287,7 @@ pub fn parse_slice_header(
             if (pps.weighted_pred && h.slice_type == SliceType::P)
                 || (pps.weighted_bipred && h.slice_type == SliceType::B)
             {
-                skip_pred_weight_table(&mut r, sps, &h)?;
+                h.pred_weight = Some(parse_pred_weight_table(&mut r, sps, &h)?);
             }
             h.five_minus_max_num_merge_cand = r.ue()?;
             if h.five_minus_max_num_merge_cand > 4 {
@@ -1308,45 +1357,73 @@ fn num_pic_total_curr(rps: &ShortTermRps, sps: &Sps) -> usize {
     n
 }
 
-/// Consume `pred_weight_table()` (§7.3.6.3) without keeping the values.
+/// Parse `pred_weight_table()` (§7.3.6.3) into the values the MC path applies.
 ///
-/// It is *consumed*, not skipped by a guessed length: the table's size depends
-/// on the chroma format and on a per-entry flag, so there is no constant to skip
-/// by, and getting here wrong moves the CABAC start offset.
-fn skip_pred_weight_table(r: &mut BitReader, sps: &Sps, h: &SliceHeader) -> Result<(), &'static str> {
-    let _luma_log2_weight_denom = r.ue()?;
+/// Size depends on chroma format and per-entry flags, so there is no constant
+/// to skip by — getting the length wrong moves the CABAC start offset.
+fn parse_pred_weight_table(
+    r: &mut BitReader,
+    sps: &Sps,
+    h: &SliceHeader,
+) -> Result<PredWeightTable, &'static str> {
+    let mut t = PredWeightTable::default();
+    t.luma_log2_weight_denom = r.ue()?;
+    if t.luma_log2_weight_denom > 7 {
+        return Err("hevc slice: bad luma_log2_weight_denom");
+    }
+    let mut chroma_denom = t.luma_log2_weight_denom as i32;
     if sps.chroma_format_idc != 0 {
-        let _delta_chroma_log2_weight_denom = r.se()?;
+        chroma_denom += r.se()?;
+        if !(0..=7).contains(&chroma_denom) {
+            return Err("hevc slice: bad chroma_log2_weight_denom");
+        }
+    }
+    t.chroma_log2_weight_denom = chroma_denom as u32;
+    let luma_one = 1i32 << t.luma_log2_weight_denom;
+    let chroma_one = 1i32 << t.chroma_log2_weight_denom;
+    // Seed identity defaults for every slot (weight = 1 << denom).
+    for list in 0..2 {
+        for i in 0..16 {
+            t.luma_weight[list][i] = luma_one;
+            t.chroma_weight[list][i] = [chroma_one, chroma_one];
+        }
     }
     for list in 0..2 {
         if list == 1 && h.slice_type != SliceType::B {
             break;
         }
         let n = if list == 0 { h.num_ref_idx_l0 } else { h.num_ref_idx_l1 };
-        let mut luma_flags = [false; 16];
-        let mut chroma_flags = [false; 16];
-        for i in 0..n as usize {
-            luma_flags[i.min(15)] = r.flag()?;
+        let n = n.min(16) as usize;
+        for i in 0..n {
+            t.luma_weight_flag[list][i] = r.flag()?;
         }
         if sps.chroma_format_idc != 0 {
-            for i in 0..n as usize {
-                chroma_flags[i.min(15)] = r.flag()?;
+            for i in 0..n {
+                t.chroma_weight_flag[list][i] = r.flag()?;
             }
         }
-        for i in 0..n as usize {
-            if luma_flags[i.min(15)] {
-                let _delta_luma_weight = r.se()?;
-                let _luma_offset = r.se()?;
+        for i in 0..n {
+            if t.luma_weight_flag[list][i] {
+                let delta = r.se()?;
+                t.luma_weight[list][i] = luma_one + delta;
+                t.luma_offset[list][i] = r.se()?;
             }
-            if chroma_flags[i.min(15)] {
-                for _ in 0..2 {
-                    let _delta_chroma_weight = r.se()?;
-                    let _delta_chroma_offset = r.se()?;
+            if t.chroma_weight_flag[list][i] {
+                for c in 0..2 {
+                    let delta_w = r.se()?;
+                    t.chroma_weight[list][i][c] = chroma_one + delta_w;
+                    // delta_chroma_offset is relative to the mid-grey centering
+                    // term (H.265 §7.4.7.3):
+                    //   offset = Clip(delta - ((128*weight) >> denom) + 128)
+                    let delta_o = r.se()?;
+                    let mid = 128i32;
+                    let o = delta_o - ((mid * t.chroma_weight[list][i][c]) >> t.chroma_log2_weight_denom) + mid;
+                    t.chroma_offset[list][i][c] = o.clamp(-128, 127);
                 }
             }
         }
     }
-    Ok(())
+    Ok(t)
 }
 
 /// `Ceil(Log2(v))` — the width in bits of an index into `v` values.

@@ -17,8 +17,7 @@
 //!   from a *copy* — an in-place SAO would classify each sample against its
 //!   already-offset neighbour.
 //!
-//! Scope: 4:2:0 / 4:2:2 / 4:4:4, 8/10/12-bit, tiles and PCM. Monochrome
-//! (`chroma_format_idc == 0`) is refused by name.
+//! Scope: monochrome / 4:2:0 / 4:2:2 / 4:4:4, 8/10/12-bit, tiles and PCM.
 
 use alloc::rc::Rc;
 use alloc::vec;
@@ -30,7 +29,7 @@ use super::inter::{AmvpNeighbour, MergeNeighbours, MvField, Plane, MAX_PB};
 use super::syntax::{self as syn, Bin, BinSource};
 use super::{
     cabac_tables as ct, ctu, dpb, inter, intra, residual, sao, tiles, transform, NalType, Pps,
-    SliceHeader, SliceType, Sps,
+    ScalingLists, SliceHeader, SliceType, Sps,
 };
 
 /// A decoded picture, in the shape the player consumes.
@@ -39,7 +38,7 @@ pub struct DecodedFrame {
     pub h: usize,
     /// Bit depth of the sample arrays (8, 10 or 12).
     pub bit_depth: u32,
-    /// `chroma_format_idc`: 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4.
+    /// `chroma_format_idc`: 0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4.
     pub chroma_format_idc: u32,
     /// Chroma plane width / height in samples.
     pub cw: usize,
@@ -187,6 +186,9 @@ pub struct HevcDecoder {
     pub trace_on: bool,
     pub trace: Vec<(u16, u16, u8, u8, u8, u8)>,
     pub ctus: usize,
+    /// Host-harness only: skip deblock + SAO so residual/prediction can be
+    /// compared without the loop filter.
+    pub skip_loop_filter: bool,
 }
 
 impl Default for HevcDecoder {
@@ -207,6 +209,7 @@ impl HevcDecoder {
             trace_on: false,
             trace: Vec::new(),
             ctus: 0,
+            skip_loop_filter: false,
         }
     }
 
@@ -292,8 +295,10 @@ impl HevcDecoder {
         // The in-loop filters run over the whole picture, after every CTU is
         // reconstructed — deblocking first, then SAO over a *copy* of the
         // deblocked result.
-        deblock_picture(&mut p);
-        sao_picture(&mut p);
+        if !self.skip_loop_filter {
+            deblock_picture(&mut p);
+            sao_picture(&mut p);
+        }
         // Sub-sample the motion field to 16x16 as the specification stores it.
         let mw = p.w.div_ceil(16);
         let mh = p.h.div_ceil(16);
@@ -338,8 +343,8 @@ impl HevcDecoder {
         let sps = self.spss.get(&pps.sps_id).ok_or("hevc: PPS names an unknown SPS")?.clone();
         let sh = super::parse_slice_header(rbsp, nal, &sps, &pps)?;
 
-        if sps.chroma_format_idc == 0 || sps.chroma_format_idc > 3 {
-            return Err("hevc: monochrome or unknown chroma_format_idc");
+        if sps.chroma_format_idc > 3 {
+            return Err("hevc: unknown chroma_format_idc");
         }
         // 8/10/12-bit Main family; tiles and PCM handled in the walk.
 
@@ -530,8 +535,17 @@ impl Pic {
             cw,
             ch,
             y: vec![0u16; w * h],
-            cb: vec![1u16 << (sps.bit_depth_chroma - 1); cw * ch],
-            cr: vec![1u16 << (sps.bit_depth_chroma - 1); cw * ch],
+            // Monochrome: empty chroma planes (cw/ch are 0).
+            cb: if cw * ch == 0 {
+                Vec::new()
+            } else {
+                vec![1u16 << (sps.bit_depth_chroma - 1); cw * ch]
+            },
+            cr: if cw * ch == 0 {
+                Vec::new()
+            } else {
+                vec![1u16 << (sps.bit_depth_chroma - 1); cw * ch]
+            },
             pu: vec![PuInfo::default(); pu_w * pu_h],
             ipm: vec![intra::DC; pu_w * pu_h],
             pu_w,
@@ -714,7 +728,16 @@ impl<'a> SliceDecoder<'a> {
             self.qp_pred = self.qp_y;
 
             self.sao_param(rx, ry);
-            self.coding_quadtree(rx * ctb, ry * ctb, log2_ctb, 0)?;
+            // A corrupt `cu_qp_delta_abs` is almost always a CABAC desync that
+            // started earlier; aborting the walk (rather than the whole AU)
+            // keeps any prefix of the picture that was reconstructed correctly
+            // so a bit-exact harness can measure it. The error still surfaces
+            // if *nothing* was decoded.
+            match self.coding_quadtree(rx * ctb, ry * ctb, log2_ctb, 0) {
+                Err("hevc: corrupt cu_qp_delta_abs") => break,
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
 
             if wpp && rx == save_col {
                 saved = Some((self.c.ctx, self.stat_coeff));
@@ -1313,8 +1336,13 @@ impl<'a> SliceDecoder<'a> {
                 self.set_ipm(px, py, pb, mode);
             }
         }
-        // 4:2:0 / 4:2:2: one chroma mode per CU. 4:4:4: one per partition
-        // when the CU is NxN (H.265 §7.3.8.5).
+        // 4:2:0 / 4:2:2: **one** chroma mode per CU, always derived from the
+        // top-left luma mode (DM) — never per NxN partition. Using partition
+        // k's luma mode for DM picks a different angular scan for the chroma
+        // residual and desynchronises CABAC after the first 8x8 that splits
+        // to 4x4 (real Main streams do this constantly; quiet synthetic clips
+        // often stay on 8x8 2Nx2N and hide it). 4:4:4 PART_NxN is the only
+        // case with a chroma mode per partition (H.265 §7.3.8.5 / §8.4.3).
         let cf = self.sps.chroma_format_idc;
         if cf == 3 && split {
             for k in 0..side * side {
@@ -1328,21 +1356,7 @@ impl<'a> SliceDecoder<'a> {
                 m = ctu::chroma_mode_422(m);
             }
             for k in 0..4 {
-                self.cu.ipm_c[k] = if k < side * side {
-                    let mut mk = ctu::chroma_intra_mode(sig, self.cu.ipm[k]);
-                    if cf == 2 {
-                        mk = ctu::chroma_mode_422(mk);
-                    }
-                    mk
-                } else {
-                    m
-                };
-            }
-            // For non-split, all partitions share partition 0's mode.
-            if !split {
-                for k in 1..4 {
-                    self.cu.ipm_c[k] = self.cu.ipm_c[0];
-                }
+                self.cu.ipm_c[k] = m;
             }
         }
         if !split {
@@ -1665,11 +1679,14 @@ impl<'a> SliceDecoder<'a> {
     fn motion_compensate(&mut self, x0: usize, y0: usize, w: usize, h: usize, info: &PuInfo) {
         let mut mid: [Vec<i16>; 2] = [Vec::new(), Vec::new()];
         let mut used = [false; 2];
+        let mut ref_i = [0i8; 2];
         for l in 0..2usize {
             if !info.mvf.uses(l) {
                 continue;
             }
-            let Some(f) = self.lists[l].get(info.mvf.ref_idx[l].max(0) as usize).cloned() else {
+            let ri = info.mvf.ref_idx[l].max(0);
+            ref_i[l] = ri;
+            let Some(f) = self.lists[l].get(ri as usize).cloned() else {
                 continue;
             };
             let mv = info.mvf.mv[l];
@@ -1691,27 +1708,59 @@ impl<'a> SliceDecoder<'a> {
         }
         let stride = self.pic.w;
         let bd = self.bd_luma();
+        let wp = self.sh.pred_weight.as_ref();
         match (used[0], used[1]) {
             (true, true) => {
                 let a = core::mem::take(&mut mid[0]);
                 let b = core::mem::take(&mut mid[1]);
-                inter::bi_pred(
-                    &mut self.pic.y[y0 * stride + x0..],
-                    stride,
-                    &a,
-                    &b,
-                    w,
-                    h,
-                    bd,
-                );
+                if let Some(t) = wp {
+                    let r0 = (ref_i[0] as usize).min(15);
+                    let r1 = (ref_i[1] as usize).min(15);
+                    inter::bi_pred_weighted(
+                        &mut self.pic.y[y0 * stride + x0..],
+                        stride,
+                        &a,
+                        &b,
+                        w,
+                        h,
+                        t.luma_log2_weight_denom,
+                        t.luma_weight[0][r0],
+                        t.luma_weight[1][r1],
+                        t.luma_offset[0][r0],
+                        t.luma_offset[1][r1],
+                        bd,
+                    );
+                } else {
+                    inter::bi_pred(
+                        &mut self.pic.y[y0 * stride + x0..],
+                        stride,
+                        &a,
+                        &b,
+                        w,
+                        h,
+                        bd,
+                    );
+                }
             }
-            (true, false) => {
-                let a = core::mem::take(&mut mid[0]);
-                inter::uni_pred(&mut self.pic.y[y0 * stride + x0..], stride, &a, w, h, bd);
-            }
-            (false, true) => {
-                let b = core::mem::take(&mut mid[1]);
-                inter::uni_pred(&mut self.pic.y[y0 * stride + x0..], stride, &b, w, h, bd);
+            (true, false) | (false, true) => {
+                let l = if used[0] { 0 } else { 1 };
+                let src = core::mem::take(&mut mid[l]);
+                if let Some(t) = wp {
+                    let r = (ref_i[l] as usize).min(15);
+                    inter::uni_pred_weighted(
+                        &mut self.pic.y[y0 * stride + x0..],
+                        stride,
+                        &src,
+                        w,
+                        h,
+                        t.luma_log2_weight_denom,
+                        t.luma_weight[l][r],
+                        t.luma_offset[l][r],
+                        bd,
+                    );
+                } else {
+                    inter::uni_pred(&mut self.pic.y[y0 * stride + x0..], stride, &src, w, h, bd);
+                }
             }
             (false, false) => {}
         }
@@ -1719,7 +1768,7 @@ impl<'a> SliceDecoder<'a> {
         // Chroma: geometry follows SubWidthC / SubHeightC. MV fractional bits
         // and the integer shift are `2 + hshift` / `2 + vshift` (FFmpeg's
         // `chroma_mc_*`); the phase is then left-shifted into 1/8-pel for the
-        // shared 4-tap epel kernel.
+        // shared 4-tap epel kernel. Monochrome has no chroma planes.
         if self.pic.chroma_format_idc == 0 {
             return;
         }
@@ -1772,10 +1821,48 @@ impl<'a> SliceDecoder<'a> {
             let off = cy * cstride + cx;
             match (cused[0], cused[1]) {
                 (true, true) => {
-                    inter::bi_pred(&mut dst[off..], cstride, &cmid[0], &cmid[1], cw, chh, bd)
+                    if let Some(t) = wp {
+                        let r0 = (ref_i[0] as usize).min(15);
+                        let r1 = (ref_i[1] as usize).min(15);
+                        inter::bi_pred_weighted(
+                            &mut dst[off..],
+                            cstride,
+                            &cmid[0],
+                            &cmid[1],
+                            cw,
+                            chh,
+                            t.chroma_log2_weight_denom,
+                            t.chroma_weight[0][r0][plane],
+                            t.chroma_weight[1][r1][plane],
+                            t.chroma_offset[0][r0][plane],
+                            t.chroma_offset[1][r1][plane],
+                            bd,
+                        );
+                    } else {
+                        inter::bi_pred(&mut dst[off..], cstride, &cmid[0], &cmid[1], cw, chh, bd);
+                    }
                 }
-                (true, false) => inter::uni_pred(&mut dst[off..], cstride, &cmid[0], cw, chh, bd),
-                (false, true) => inter::uni_pred(&mut dst[off..], cstride, &cmid[1], cw, chh, bd),
+                (true, false) | (false, true) => {
+                    let l = if cused[0] { 0 } else { 1 };
+                    if let Some(t) = wp {
+                        let r = (ref_i[l] as usize).min(15);
+                        inter::uni_pred_weighted(
+                            &mut dst[off..],
+                            cstride,
+                            &cmid[l],
+                            cw,
+                            chh,
+                            t.chroma_log2_weight_denom,
+                            t.chroma_weight[l][r][plane],
+                            t.chroma_offset[l][r][plane],
+                            bd,
+                        );
+                    } else if cused[0] {
+                        inter::uni_pred(&mut dst[off..], cstride, &cmid[0], cw, chh, bd);
+                    } else {
+                        inter::uni_pred(&mut dst[off..], cstride, &cmid[1], cw, chh, bd);
+                    }
+                }
                 (false, false) => {}
             }
         }
@@ -1898,7 +1985,9 @@ impl<'a> SliceDecoder<'a> {
         cbf_cr: [bool; 2],
     ) -> Result<(), &'static str> {
         let mode = if self.cu.intra_split { self.cu.ipm[blk_idx] } else { self.cu.ipm[0] };
-        let mode_c = if self.cu.intra_split {
+        // Chroma mode: per-partition only for 4:4:4 NxN; otherwise one CU mode
+        // lives in ipm_c[0] (and is mirrored to [1..3] at parse time).
+        let mode_c = if self.cu.intra_split && self.pic.chroma_format_idc == 3 {
             self.cu.ipm_c[blk_idx]
         } else {
             self.cu.ipm_c[0]
@@ -2045,6 +2134,15 @@ impl<'a> SliceDecoder<'a> {
         };
         // Dequant uses the bit-depth-offset QP (H.265 §8.6.1).
         let qp_bd = qp + 6 * (bd as i32 - 8);
+        // Scaling lists: PPS overrides SPS when present. Matrix id is
+        // inter-offset by 3; sizeId 0 = 4x4 … 3 = 32x32.
+        let sl_src = if self.pps.scaling_lists.is_some() {
+            self.pps.scaling_lists.as_ref()
+        } else {
+            self.sps.scaling_lists.as_ref()
+        };
+        let (scale_matrix, dc_scale) =
+            scaling_list_for(sl_src, log2_size, c_idx, self.cu.intra);
         let p = residual::ResidualParams {
             log2_size,
             c_idx,
@@ -2061,8 +2159,8 @@ impl<'a> SliceDecoder<'a> {
             transform_skip_context: false,
             qp: qp_bd,
             bit_depth: bd,
-            scale_matrix: None,
-            dc_scale: 16,
+            scale_matrix,
+            dc_scale,
         };
         let mut coeffs = [0i16; 32 * 32];
         let r = residual::residual_coding(
@@ -2253,6 +2351,44 @@ fn side_at(p: &Pic, x: usize, y: usize) -> EdgeSide {
         ],
         mvs: pu.mvf.mv,
     }
+}
+
+/// Resolve the scaling-list slice for one transform block.
+///
+/// Returns `(scale_matrix, dc_scale)`. `None` for the matrix means flat 16 —
+/// which is both "scaling lists disabled" and the correct identity for a
+/// stream that never enabled them. `sizeId` is `log2_size - 2` (4x4 → 0 …
+/// 32x32 → 3); `matrixId` is `c_idx` for intra and `c_idx + 3` for inter.
+fn scaling_list_for(
+    lists: Option<&ScalingLists>,
+    log2_size: u32,
+    c_idx: usize,
+    intra: bool,
+) -> (Option<&[u8]>, u8) {
+    let Some(sl) = lists else {
+        return (None, 16);
+    };
+    if !(2..=5).contains(&log2_size) {
+        return (None, 16);
+    }
+    let size_id = (log2_size - 2) as usize;
+    // 32x32 only has matrixId 0 (intra Y) and 3 (inter Y); chroma reuses Y.
+    let matrix_id = if size_id == 3 {
+        if intra { 0 } else { 3 }
+    } else if intra {
+        c_idx.min(2)
+    } else {
+        (c_idx.min(2)) + 3
+    };
+    let mat = &sl.lists[size_id][matrix_id];
+    // Residual indexes 16 entries for 4x4 and 64 (with sub-sampling) for larger.
+    let slice: &[u8] = if log2_size == 2 { &mat[..16] } else { mat };
+    let dc = if size_id >= 2 {
+        sl.dc[size_id - 2][matrix_id]
+    } else {
+        16
+    };
+    (Some(slice), dc)
 }
 
 /// Pull `n` big-endian bits from a raw PCM payload.

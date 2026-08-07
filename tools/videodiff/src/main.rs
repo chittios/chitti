@@ -97,7 +97,7 @@ fn main() {
     let path = match args.get(2) {
         Some(p) => p,
         None => {
-            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq> <file> [frames]");
+            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq|hevcsh> <file> [frames]");
             std::process::exit(2);
         }
     };
@@ -111,8 +111,9 @@ fn main() {
         "vp9frame" => vp9frame(&bytes, n),
         "vp9seq" => vp9seq(&bytes, n),
         "hevcseq" => hevcseq(&bytes, n),
+        "hevcsh" => hevcsh(&bytes, n),
         _ => {
-            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq> <file> [frames]");
+            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq|hevcsh> <file> [frames]");
             std::process::exit(2);
         }
     }
@@ -465,6 +466,7 @@ fn hevcseq(bytes: &[u8], limit: usize) {
     };
     let mut dec = video::hevc::decoder::HevcDecoder::new();
     dec.trace_on = std::env::var("HEVC_TRACE").is_ok();
+    dec.skip_loop_filter = std::env::var("HEVC_NO_FILTER").is_ok();
     if let Err(e) = dec.set_parameter_sets(&hvcc.vps, &hvcc.sps, &hvcc.pps) {
         eprintln!("parameter sets: {}", e);
         std::process::exit(1);
@@ -492,6 +494,18 @@ fn hevcseq(bytes: &[u8], limit: usize) {
             }
             Err(e) => {
                 eprintln!("sample {}: {}", i, e);
+                if dec.trace_on {
+                    eprintln!("--- last {} trace entries ---", dec.trace.len().min(20));
+                    for (x, y, l2, c, mode, cbf) in dec.trace.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+                        if *x == 0xFFFC {
+                            eprintln!("CU ({:2},{:2}) {}x{} d{} @byte {}", l2, c, 1u32 << mode, 1u32 << mode, cbf, y);
+                        } else if *x == 0xFFF0 {
+                            eprintln!("QP_FAIL @byte {} cu=({},{}) log2={}", y, l2, c, mode);
+                        } else {
+                            eprintln!("tu ({:3},{:3}) {}x{} c{} mode {:2} cbf {:03b}", x, y, 1 << l2, 1 << l2, c, mode, cbf);
+                        }
+                    }
+                }
                 std::process::exit(1);
             }
         }
@@ -534,8 +548,96 @@ fn hevcseq(bytes: &[u8], limit: usize) {
                 eprintln!("  pu ({:2},{:2}) flag={} mv=({},{}) merge={}", y & 0xff, y >> 8, l2, *c as i8, *mode as i8, cbf);
             } else if *x == 0xFFFF {
                 eprintln!("  coef dc={} maxxy={} c{} qp={} skip={}", *y as i16, l2, c, mode, cbf);
+            } else if *x == 0xFFA0 {
+                eprintln!("  mode@({},{}) mode={} candL={} candA={} prev={}", y&0xff, y>>8, l2, c, mode, cbf);
             } else {
                 eprintln!("tu ({:3},{:3}) {}x{} c{} mode {:2} cbf {:03b}", x, y, 1 << l2, 1 << l2, c, mode, cbf);
+            }
+        }
+    }
+}
+
+/// Dump parsed HEVC slice headers with entry points and data offset.
+fn hevcsh(bytes: &[u8], limit: usize) {
+    let (config, samples) = demux(bytes);
+    let hvcc = match &config {
+        CodecConfig::Hevc(h) => h.clone(),
+        _ => { eprintln!("not HEVC"); std::process::exit(1); }
+    };
+    let sps_rbsp = video::bits::unescape_rbsp(&hvcc.sps[0][2..]);
+    let sps = video::hevc::parse_sps(&sps_rbsp).expect("sps");
+    let pps_rbsp = video::bits::unescape_rbsp(&hvcc.pps[0][2..]);
+    let pps = video::hevc::parse_pps(&pps_rbsp).expect("pps");
+    eprintln!(
+        "SPS {}x{} mincb={} ctb={} mintb={} maxtb={} h_i={} h_p={} amp={} sao={} pcm={} sis={} scal={} tmvp={} lt={} st_rps={} max_sub={}",
+        sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples,
+        sps.log2_min_cb_size, sps.log2_ctb_size, sps.log2_min_tb_size, sps.log2_max_tb_size,
+        sps.max_transform_hierarchy_depth_intra, sps.max_transform_hierarchy_depth_inter,
+        sps.amp_enabled as u8, sps.sao_enabled as u8, sps.pcm_enabled as u8,
+        sps.strong_intra_smoothing as u8, sps.scaling_list_enabled as u8,
+        sps.temporal_mvp_enabled as u8, sps.long_term_ref_pics_present as u8,
+        sps.st_rps.len(), sps.max_sub_layers
+    );
+    eprintln!(
+        "PPS id={} extra_bits={} dep={} wpp={} tiles={} wp={} wbp={} lists_mod={} cuqp={} qpdepth={} init_qp={} sdh={} tskip={} cbo={} cro={} deblock_off={} beta={} tc={} ext={} lmpl={}",
+        pps.id, pps.num_extra_slice_header_bits, pps.dependent_slice_segments_enabled as u8,
+        pps.entropy_coding_sync_enabled as u8, pps.tiles_enabled as u8,
+        pps.weighted_pred as u8, pps.weighted_bipred as u8, pps.lists_modification_present as u8,
+        pps.cu_qp_delta_enabled as u8, pps.diff_cu_qp_delta_depth, pps.init_qp,
+        pps.sign_data_hiding_enabled as u8, pps.transform_skip_enabled as u8,
+        pps.cb_qp_offset, pps.cr_qp_offset, pps.deblocking_filter_disabled as u8,
+        pps.beta_offset_div2, pps.tc_offset_div2, pps.slice_segment_header_extension_present as u8,
+        pps.log2_parallel_merge_level
+    );
+    for (i, s) in samples.iter().enumerate().take(limit) {
+        let data = &bytes[s.offset..s.offset + s.size];
+        let nals = video::hevc::split_hvcc(data, hvcc.length_size);
+        for nal in nals {
+            if !nal.kind.is_slice() { continue; }
+            let rbsp = nal.rbsp();
+            match video::hevc::parse_slice_header(&rbsp, nal.kind, &sps, &pps) {
+                Ok(h) => {
+                    let eps: Vec<u32> = h.entry_point_offsets.clone();
+                    let sum: u32 = eps.iter().sum();
+                    eprintln!(
+                        "sample{} nal={} type={:?} first={} dep={} addr={} poc_lsb={} qp={} sao={}{} tmvp={} merge={} data@{} eps={} sum_eps={} rbsp={} cabac_bytes={} mvd1z={} col_l0={} col_idx={} l0={} l1={} list_l0={:?} list_l1={:?} st_rps_s0={:?} st_rps_s1={:?} used0={:?} used1={:?} cabac_init={}",
+                        i, nal.kind.code(), h.slice_type, h.first_slice_in_pic as u8,
+                        h.dependent_slice_segment as u8, h.segment_address,
+                        h.pic_order_cnt_lsb, h.qp, h.sao_luma as u8, h.sao_chroma as u8,
+                        h.temporal_mvp_enabled as u8, h.max_num_merge_cand(),
+                        h.data_byte_offset, eps.len(), sum, rbsp.len(),
+                        rbsp.len().saturating_sub(h.data_byte_offset),
+                        h.mvd_l1_zero as u8, h.collocated_from_l0 as u8, h.collocated_ref_idx,
+                        h.num_ref_idx_l0, h.num_ref_idx_l1,
+                        h.list_entry_l0, h.list_entry_l1,
+                        h.st_rps.delta_poc_s0, h.st_rps.delta_poc_s1,
+                        h.st_rps.used_s0, h.st_rps.used_s1,
+                        h.cabac_init as u8
+                    );
+                    if !eps.is_empty() {
+                        let mut starts = vec![0u32];
+                        for &o in &eps { starts.push(starts.last().unwrap() + o); }
+                        eprintln!("  entry_starts={:?}", starts);
+                        // first few cabac data bytes
+                        if h.data_byte_offset < rbsp.len() {
+                            let d = &rbsp[h.data_byte_offset..];
+                            let n = d.len().min(16);
+                            eprint!("  cabac_head=");
+                            for b in &d[..n] { eprint!("{:02x}", b); }
+                            eprintln!();
+                            for (k, &st) in starts.iter().enumerate().take(4) {
+                                let off = st as usize;
+                                if off < d.len() {
+                                    let n = (d.len()-off).min(8);
+                                    eprint!("  sub{}@{}=", k, off);
+                                    for b in &d[off..off+n] { eprint!("{:02x}", b); }
+                                    eprintln!();
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("sample{}: {}", i, e),
             }
         }
     }
