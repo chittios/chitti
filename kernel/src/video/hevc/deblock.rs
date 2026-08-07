@@ -53,18 +53,18 @@ pub fn beta(qp: i32, beta_offset: i32) -> i32 {
 /// alternative is two transposed copies of every filter, which is two places
 /// for the same bug.
 #[inline]
-fn at(pix: &[u8], base: isize, xs: isize, ys: isize, dx: isize, dy: isize) -> i32 {
+fn at(pix: &[u16], base: isize, xs: isize, ys: isize, dx: isize, dy: isize) -> i32 {
     pix[(base + dx * xs + dy * ys) as usize] as i32
 }
 
 #[inline]
-fn put(pix: &mut [u8], base: isize, xs: isize, ys: isize, dx: isize, dy: isize, v: i32) {
-    pix[(base + dx * xs + dy * ys) as usize] = v.clamp(0, 255) as u8;
+fn put(pix: &mut [u16], base: isize, xs: isize, ys: isize, dx: isize, dy: isize, v: i32, max: i32) {
+    pix[(base + dx * xs + dy * ys) as usize] = v.clamp(0, max) as u16;
 }
 
 /// The strong luma filter: three samples each side, from a 4- and 5-tap blend.
 fn luma_strong(
-    pix: &mut [u8],
+    pix: &mut [u16],
     base: isize,
     xs: isize,
     ys: isize,
@@ -73,6 +73,7 @@ fn luma_strong(
     tc3: i32,
     no_p: bool,
     no_q: bool,
+    max: i32,
 ) {
     for d in 0..4isize {
         // Snapshot: every output below is a function of the *input* samples.
@@ -86,19 +87,19 @@ fn luma_strong(
         let q3 = at(pix, base, xs, ys, 3, d);
         if !no_p {
             let v = p0 + (((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) - p0).clamp(-tc3, tc3);
-            put(pix, base, xs, ys, -1, d, v);
+            put(pix, base, xs, ys, -1, d, v, max);
             let v = p1 + (((p2 + p1 + p0 + q0 + 2) >> 2) - p1).clamp(-tc2, tc2);
-            put(pix, base, xs, ys, -2, d, v);
+            put(pix, base, xs, ys, -2, d, v, max);
             let v = p2 + (((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) - p2).clamp(-tc1, tc1);
-            put(pix, base, xs, ys, -3, d, v);
+            put(pix, base, xs, ys, -3, d, v, max);
         }
         if !no_q {
             let v = q0 + (((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) - q0).clamp(-tc3, tc3);
-            put(pix, base, xs, ys, 0, d, v);
+            put(pix, base, xs, ys, 0, d, v, max);
             let v = q1 + (((p0 + q0 + q1 + q2 + 2) >> 2) - q1).clamp(-tc2, tc2);
-            put(pix, base, xs, ys, 1, d, v);
+            put(pix, base, xs, ys, 1, d, v, max);
             let v = q2 + (((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) - q2).clamp(-tc1, tc1);
-            put(pix, base, xs, ys, 2, d, v);
+            put(pix, base, xs, ys, 2, d, v, max);
         }
     }
 }
@@ -106,7 +107,7 @@ fn luma_strong(
 /// The weak luma filter: `p0`/`q0` always, `p1`/`q1` only when that side is
 /// flat enough (`nd_p`/`nd_q`).
 fn luma_weak(
-    pix: &mut [u8],
+    pix: &mut [u16],
     base: isize,
     xs: isize,
     ys: isize,
@@ -115,6 +116,7 @@ fn luma_weak(
     no_q: bool,
     nd_p: i32,
     nd_q: i32,
+    max: i32,
 ) {
     let tc_2 = tc >> 1;
     for d in 0..4isize {
@@ -131,18 +133,18 @@ fn luma_weak(
         if delta0.abs() < 10 * tc {
             delta0 = delta0.clamp(-tc, tc);
             if !no_p {
-                put(pix, base, xs, ys, -1, d, p0 + delta0);
+                put(pix, base, xs, ys, -1, d, p0 + delta0, max);
             }
             if !no_q {
-                put(pix, base, xs, ys, 0, d, q0 - delta0);
+                put(pix, base, xs, ys, 0, d, q0 - delta0, max);
             }
             if !no_p && nd_p > 1 {
                 let dp1 = ((((p2 + p0 + 1) >> 1) - p1 + delta0) >> 1).clamp(-tc_2, tc_2);
-                put(pix, base, xs, ys, -2, d, p1 + dp1);
+                put(pix, base, xs, ys, -2, d, p1 + dp1, max);
             }
             if !no_q && nd_q > 1 {
                 let dq1 = ((((q2 + q0 + 1) >> 1) - q1 - delta0) >> 1).clamp(-tc_2, tc_2);
-                put(pix, base, xs, ys, 1, d, q1 + dq1);
+                put(pix, base, xs, ys, 1, d, q1 + dq1, max);
             }
         }
     }
@@ -152,7 +154,7 @@ fn luma_weak(
 ///
 /// `tcs`/`no_p`/`no_q` are per half. `beta` and `tc` arrive already looked up.
 pub fn filter_luma_edge(
-    pix: &mut [u8],
+    pix: &mut [u16],
     base: isize,
     xs: isize,
     ys: isize,
@@ -160,6 +162,7 @@ pub fn filter_luma_edge(
     tcs: [i32; 2],
     no_p: [bool; 2],
     no_q: [bool; 2],
+    max: i32,
 ) {
     for j in 0..2usize {
         let b = base + (j as isize) * 4 * ys;
@@ -197,11 +200,11 @@ pub fn filter_luma_edge(
             && (d3 << 1) < beta_2;
         if strong {
             let tc2 = tc << 1;
-            luma_strong(pix, b, xs, ys, tc2, tc2, tc2, no_p[j], no_q[j]);
+            luma_strong(pix, b, xs, ys, tc2, tc2, tc2, no_p[j], no_q[j], max);
         } else {
             let nd_p = if dp0 + dp3 < ((beta + (beta >> 1)) >> 3) { 2 } else { 1 };
             let nd_q = if dq0 + dq3 < ((beta + (beta >> 1)) >> 3) { 2 } else { 1 };
-            luma_weak(pix, b, xs, ys, tc, no_p[j], no_q[j], nd_p, nd_q);
+            luma_weak(pix, b, xs, ys, tc, no_p[j], no_q[j], nd_p, nd_q, max);
         }
     }
 }
@@ -210,13 +213,14 @@ pub fn filter_luma_edge(
 /// strong/weak decision at all** — chroma is filtered whenever `tc > 0`, which
 /// in practice means only across intra edges (`bS == 2`).
 pub fn filter_chroma_edge(
-    pix: &mut [u8],
+    pix: &mut [u16],
     base: isize,
     xs: isize,
     ys: isize,
     tcs: [i32; 2],
     no_p: [bool; 2],
     no_q: [bool; 2],
+    max: i32,
 ) {
     for j in 0..2usize {
         let tc = tcs[j];
@@ -231,10 +235,10 @@ pub fn filter_chroma_edge(
             let q1 = at(pix, b, xs, ys, 1, d);
             let delta0 = ((((q0 - p0) * 4) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
             if !no_p[j] {
-                put(pix, b, xs, ys, -1, d, p0 + delta0);
+                put(pix, b, xs, ys, -1, d, p0 + delta0, max);
             }
             if !no_q[j] {
-                put(pix, b, xs, ys, 0, d, q0 - delta0);
+                put(pix, b, xs, ys, 0, d, q0 - delta0, max);
             }
         }
     }
@@ -247,8 +251,8 @@ mod tests {
 
     /// Build an 8-wide, 8-tall plane where each row is `p3 p2 p1 p0 | q0 q1 q2 q3`
     /// so a vertical edge sits at column 4.
-    fn plane(rows: &[[u8; 8]]) -> alloc::vec::Vec<u8> {
-        let mut v = vec![0u8; 8 * 8];
+    fn plane(rows: &[[u16; 8]]) -> alloc::vec::Vec<u16> {
+        let mut v = vec![0u16; 8 * 8];
         for (y, r) in rows.iter().enumerate() {
             v[y * 8..y * 8 + 8].copy_from_slice(r);
         }
@@ -264,7 +268,7 @@ mod tests {
         filter_luma_edge(&mut p, 4, 1, 8, beta(30, 0), [tc(30, 2, 0); 2], [false; 2], [false; 2]);
         assert_eq!(p, before);
         let mut p = plane(&[[128; 8]; 8]);
-        filter_chroma_edge(&mut p, 4, 1, 8, [tc(30, 2, 0); 2], [false; 2], [false; 2]);
+        filter_chroma_edge(&mut p, 4, 1, 8, [tc(30, 2, 0, 255); 2], [false; 2], [false; 2]);
         assert_eq!(p, before);
     }
 
@@ -274,7 +278,7 @@ mod tests {
     /// happens to land on the 8x8 grid.
     #[test_case]
     fn a_genuine_hard_edge_is_not_filtered() {
-        let mut rows = [[0u8; 8]; 8];
+        let mut rows = [[0u16; 8]; 8];
         for r in rows.iter_mut() {
             *r = [20, 20, 20, 20, 230, 230, 230, 230];
         }
@@ -289,7 +293,7 @@ mod tests {
     /// side into a ramp.
     #[test_case]
     fn a_small_step_across_a_flat_block_is_smoothed_by_the_strong_filter() {
-        let mut rows = [[0u8; 8]; 8];
+        let mut rows = [[0u16; 8]; 8];
         for r in rows.iter_mut() {
             *r = [100, 100, 100, 100, 108, 108, 108, 108];
         }
@@ -316,7 +320,7 @@ mod tests {
     /// them silently breaks the one guarantee lossless coding makes.
     #[test_case]
     fn no_p_and_no_q_leave_that_side_untouched() {
-        let mut rows = [[0u8; 8]; 8];
+        let mut rows = [[0u16; 8]; 8];
         for r in rows.iter_mut() {
             *r = [100, 100, 100, 100, 108, 108, 108, 108];
         }
@@ -335,7 +339,7 @@ mod tests {
     /// implementation detail.
     #[test_case]
     fn the_two_halves_of_an_edge_are_decided_separately() {
-        let mut rows = [[0u8; 8]; 8];
+        let mut rows = [[0u16; 8]; 8];
         for (y, r) in rows.iter_mut().enumerate() {
             *r = if y < 4 {
                 [100, 100, 100, 100, 108, 108, 108, 108] // blocking
@@ -360,10 +364,10 @@ mod tests {
     /// artefact, not like a deblocking bug.
     #[test_case]
     fn a_horizontal_edge_is_the_transpose_of_a_vertical_one() {
-        let mut rows = [[0u8; 8]; 8];
+        let mut rows = [[0u16; 8]; 8];
         for (y, r) in rows.iter_mut().enumerate() {
             for x in 0..8 {
-                r[x] = (100 + x * 2 + y) as u8;
+                r[x] = (100 + x * 2 + y) as u16;
             }
             r[4] = r[4].wrapping_add(6);
             r[5] = r[5].wrapping_add(6);
@@ -375,7 +379,7 @@ mod tests {
         filter_luma_edge(&mut a, 4, 1, 8, beta(35, 0), [tc(35, 2, 0); 2], [false; 2], [false; 2]);
 
         // Transpose the input, filter as a horizontal edge (across = stride).
-        let mut b = vec![0u8; 64];
+        let mut b = vec![0u16; 64];
         for y in 0..8 {
             for x in 0..8 {
                 b[x * 8 + y] = vert[y * 8 + x];
@@ -392,12 +396,12 @@ mod tests {
     /// Chroma touches exactly one sample each side and never `p1`/`q1`.
     #[test_case]
     fn chroma_filters_only_the_innermost_sample() {
-        let mut rows = [[0u8; 8]; 8];
+        let mut rows = [[0u16; 8]; 8];
         for r in rows.iter_mut() {
             *r = [100, 100, 100, 100, 120, 120, 120, 120];
         }
         let mut p = plane(&rows);
-        filter_chroma_edge(&mut p, 4, 1, 8, [tc(40, 2, 0); 2], [false; 2], [false; 2]);
+        filter_chroma_edge(&mut p, 4, 1, 8, [tc(40, 2, 0, 255); 2], [false; 2], [false; 2]);
         for y in 0..8 {
             let row = &p[y * 8..y * 8 + 8];
             assert_eq!(&row[..3], &[100, 100, 100], "chroma wrote p1 or beyond");
@@ -408,7 +412,7 @@ mod tests {
         // reaches chroma.
         let mut p = plane(&rows);
         let before = p.clone();
-        filter_chroma_edge(&mut p, 4, 1, 8, [0; 2], [false; 2], [false; 2]);
+        filter_chroma_edge(&mut p, 4, 1, 8, [0; 2], [false; 2], [false; 2], 255);
         assert_eq!(p, before);
     }
 

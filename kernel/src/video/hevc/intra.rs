@@ -35,8 +35,8 @@ pub const DC: u8 = 1;
 /// is the sample above column `i`, `left[1+i]` the sample left of row `i`.
 #[derive(Clone)]
 pub struct Refs {
-    pub top: [u8; REF_LEN],
-    pub left: [u8; REF_LEN],
+    pub top: [u16; REF_LEN],
+    pub left: [u16; REF_LEN],
 }
 
 impl Default for Refs {
@@ -80,7 +80,7 @@ pub fn substitute(refs: &mut Refs, n: usize, avail: &[bool], bit_depth: u32) {
     debug_assert_eq!(avail.len(), total);
 
     // Linear view in scan order, so the rule is written once.
-    let get = |r: &Refs, i: usize| -> u8 {
+    let get = |r: &Refs, i: usize| -> u16 {
         if i < 2 * n {
             r.left[2 * n - i] // p[-1][2N-1-i]
         } else if i == 2 * n {
@@ -89,7 +89,7 @@ pub fn substitute(refs: &mut Refs, n: usize, avail: &[bool], bit_depth: u32) {
             r.top[i - 2 * n]
         }
     };
-    let set = |r: &mut Refs, i: usize, v: u8| {
+    let set = |r: &mut Refs, i: usize, v: u16| {
         if i < 2 * n {
             r.left[2 * n - i] = v;
         } else if i == 2 * n {
@@ -102,7 +102,7 @@ pub fn substitute(refs: &mut Refs, n: usize, avail: &[bool], bit_depth: u32) {
 
     let first = avail.iter().position(|&a| a);
     let Some(first) = first else {
-        let mid = (1u16 << (bit_depth - 1)) as u8;
+        let mid = (1u16 << (bit_depth - 1));
         refs.top[..2 * n + 1].fill(mid);
         refs.left[..2 * n + 1].fill(mid);
         return;
@@ -165,8 +165,8 @@ pub fn filter_refs(
             let (t63, l63) = (refs.t(63), refs.l(63));
             for i in 0..63usize {
                 let k = i as i32 + 1;
-                refs.top[i + 1] = (((64 - k) * c + k * t63 + 32) >> 6) as u8;
-                refs.left[i + 1] = (((64 - k) * c + k * l63 + 32) >> 6) as u8;
+                refs.top[i + 1] = (((64 - k) * c + k * t63 + 32) >> 6) as u16;
+                refs.left[i + 1] = (((64 - k) * c + k * l63 + 32) >> 6) as u16;
             }
             return true;
         }
@@ -178,20 +178,20 @@ pub fn filter_refs(
     let old = refs.clone();
     for i in (0..two_n - 1).rev() {
         let prev = if i == 0 { old.corner() } else { old.l(i - 1) };
-        refs.left[i + 1] = ((old.l(i + 1) + 2 * old.l(i) + prev + 2) >> 2) as u8;
+        refs.left[i + 1] = ((old.l(i + 1) + 2 * old.l(i) + prev + 2) >> 2) as u16;
     }
     for i in (0..two_n - 1).rev() {
         let prev = if i == 0 { old.corner() } else { old.t(i - 1) };
-        refs.top[i + 1] = ((old.t(i + 1) + 2 * old.t(i) + prev + 2) >> 2) as u8;
+        refs.top[i + 1] = ((old.t(i + 1) + 2 * old.t(i) + prev + 2) >> 2) as u16;
     }
-    let c = ((old.l(0) + 2 * old.corner() + old.t(0) + 2) >> 2) as u8;
+    let c = ((old.l(0) + 2 * old.corner() + old.t(0) + 2) >> 2 ) as u16;
     refs.top[0] = c;
     refs.left[0] = c;
     false
 }
 
 /// Planar prediction (mode 0): a bilinear blend of the four edge samples.
-pub fn pred_planar(dst: &mut [u8], stride: usize, refs: &Refs, log2_size: u32) {
+pub fn pred_planar(dst: &mut [u16], stride: usize, refs: &Refs, log2_size: u32) {
     let n = 1usize << log2_size;
     let (tr, bl) = (refs.t(n), refs.l(n));
     for y in 0..n {
@@ -202,7 +202,7 @@ pub fn pred_planar(dst: &mut [u8], stride: usize, refs: &Refs, log2_size: u32) {
                 + (y + 1) as i32 * bl
                 + n as i32)
                 >> (log2_size + 1);
-            dst[y * stride + x] = v as u8;
+            dst[y * stride + x] = v as u16;
         }
     }
 }
@@ -210,7 +210,7 @@ pub fn pred_planar(dst: &mut [u8], stride: usize, refs: &Refs, log2_size: u32) {
 /// DC prediction (mode 1), with the luma edge smoothing that applies below
 /// 32x32 — three extra lines that are easy to omit and produce a visible
 /// blocking seam exactly where DC blocks meet.
-pub fn pred_dc(dst: &mut [u8], stride: usize, refs: &Refs, log2_size: u32, c_idx: usize) {
+pub fn pred_dc(dst: &mut [u16], stride: usize, refs: &Refs, log2_size: u32, c_idx: usize) {
     let n = 1usize << log2_size;
     let mut dc = n as i32;
     for i in 0..n {
@@ -219,16 +219,16 @@ pub fn pred_dc(dst: &mut [u8], stride: usize, refs: &Refs, log2_size: u32, c_idx
     dc >>= log2_size + 1;
     for y in 0..n {
         for x in 0..n {
-            dst[y * stride + x] = dc as u8;
+            dst[y * stride + x] = dc as u16;
         }
     }
     if c_idx == 0 && n < 32 {
-        dst[0] = ((refs.l(0) + 2 * dc + refs.t(0) + 2) >> 2) as u8;
+        dst[0] = ((refs.l(0) + 2 * dc + refs.t(0) + 2) >> 2) as u16;
         for x in 1..n {
-            dst[x] = ((refs.t(x) + 3 * dc + 2) >> 2) as u8;
+            dst[x] = ((refs.t(x) + 3 * dc + 2) >> 2) as u16;
         }
         for y in 1..n {
-            dst[y * stride] = ((refs.l(y) + 3 * dc + 2) >> 2) as u8;
+            dst[y * stride] = ((refs.l(y) + 3 * dc + 2) >> 2) as u16;
         }
     }
 }
@@ -241,7 +241,7 @@ pub fn pred_dc(dst: &mut [u8], stride: usize, refs: &Refs, log2_size: u32, c_idx
 /// array indexed from `-n`, because the reference genuinely is consulted at
 /// negative offsets.
 pub fn pred_angular(
-    dst: &mut [u8],
+    dst: &mut [u16],
     stride: usize,
     refs: &Refs,
     mode: u8,
@@ -255,12 +255,12 @@ pub fn pred_angular(
 
     // `scratch` is indexed by `OFF + i` for i in -(n) ..= 2n.
     const OFF: usize = MAX_TB;
-    let mut scratch = [0u8; 3 * MAX_TB + 4];
+    let mut scratch = [0u16; 3 * MAX_TB + 4];
     let vertical = mode >= 18;
 
     // `refp(i)` is FFmpeg's `ref[i]`, i.e. the edge shifted so index 0 is the
     // corner: `ref = top - 1`.
-    let base = |i: i32| -> u8 {
+    let base = |i: i32| -> u16 {
         let v = if vertical {
             if i == 0 {
                 refs.top[0]
@@ -309,9 +309,9 @@ pub fn pred_angular(
             for x in 0..n {
                 let xi = x as i32 + idx + 1;
                 dst[y * stride + x] = if fact != 0 {
-                    (((32 - fact) * rd(xi) + fact * rd(xi + 1) + 16) >> 5) as u8
+                    (((32 - fact) * rd(xi) + fact * rd(xi + 1) + 16) >> 5) as u16
                 } else {
-                    rd(xi) as u8
+                    rd(xi) as u16
                 };
             }
         }
@@ -320,7 +320,7 @@ pub fn pred_angular(
         if mode == 26 && c_idx == 0 && n < 32 {
             for y in 0..n {
                 let v = refs.t(0) + ((refs.l(y) - refs.corner()) >> 1);
-                dst[y * stride] = v.clamp(0, max) as u8;
+                dst[y * stride] = v.clamp(0, max) as u16;
             }
         }
     } else {
@@ -330,16 +330,16 @@ pub fn pred_angular(
             for y in 0..n {
                 let yi = y as i32 + idx + 1;
                 dst[y * stride + x] = if fact != 0 {
-                    (((32 - fact) * rd(yi) + fact * rd(yi + 1) + 16) >> 5) as u8
+                    (((32 - fact) * rd(yi) + fact * rd(yi + 1) + 16) >> 5) as u16
                 } else {
-                    rd(yi) as u8
+                    rd(yi) as u16
                 };
             }
         }
         if mode == 10 && c_idx == 0 && n < 32 {
             for x in 0..n {
                 let v = refs.l(0) + ((refs.t(x) - refs.corner()) >> 1);
-                dst[x] = v.clamp(0, max) as u8;
+                dst[x] = v.clamp(0, max) as u16;
             }
         }
     }
@@ -347,7 +347,7 @@ pub fn pred_angular(
 
 /// Predict one block by mode.
 pub fn predict(
-    dst: &mut [u8],
+    dst: &mut [u16],
     stride: usize,
     refs: &Refs,
     mode: u8,
@@ -367,7 +367,7 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn flat(v: u8) -> Refs {
+    fn flat(v: u16) -> Refs {
         Refs { top: [v; REF_LEN], left: [v; REF_LEN] }
     }
 
@@ -381,12 +381,12 @@ mod tests {
     /// **boundary cases are tested separately below**.
     #[test_case]
     fn a_constant_neighbourhood_predicts_that_constant_in_every_mode() {
-        for &v in &[0u8, 1, 128, 254, 255] {
+        for &v in &[0u16, 1, 128, 254, 255] {
             let refs = flat(v);
             for log2 in 2..=5u32 {
                 let n = 1usize << log2;
                 for mode in 0..=34u8 {
-                    let mut dst = vec![0u8; n * n];
+                    let mut dst = vec![0u16; n * n];
                     predict(&mut dst, n, &refs, mode, log2, 0, 8);
                     assert!(
                         dst.iter().all(|&p| p == v),
@@ -407,22 +407,22 @@ mod tests {
         let n = 8usize;
         let mut refs = flat(100);
         for i in 0..2 * n {
-            refs.top[i + 1] = (10 + i * 3) as u8;
-            refs.left[i + 1] = (200 - i * 3) as u8;
+            refs.top[i + 1] = (10 + i * 3) as u16;
+            refs.left[i + 1] = (200 - i * 3) as u16;
         }
         refs.top[0] = 100;
         refs.left[0] = 100;
 
         // Chroma, so the luma-only gradient correction on column/row 0 is off
         // and the copy is exact everywhere.
-        let mut dst = vec![0u8; n * n];
+        let mut dst = vec![0u16; n * n];
         predict(&mut dst, n, &refs, 26, 3, 1, 8);
         for y in 0..n {
             for x in 0..n {
                 assert_eq!(dst[y * n + x], refs.top[x + 1], "mode 26 at ({x},{y})");
             }
         }
-        let mut dst = vec![0u8; n * n];
+        let mut dst = vec![0u16; n * n];
         predict(&mut dst, n, &refs, 10, 3, 1, 8);
         for y in 0..n {
             for x in 0..n {
@@ -439,11 +439,11 @@ mod tests {
         let n = 8usize;
         let mut refs = flat(0);
         for i in 0..2 * n {
-            refs.top[i + 1] = (i * 7 + 3) as u8;
-            refs.left[i + 1] = (i * 5 + 11) as u8;
+            refs.top[i + 1] = (i * 7 + 3) as u16;
+            refs.left[i + 1] = (i * 5 + 11) as u16;
         }
         // Mode 34: angle +32, from the top edge — row y reads top[x + y + 1].
-        let mut dst = vec![0u8; n * n];
+        let mut dst = vec![0u16; n * n];
         predict(&mut dst, n, &refs, 34, 3, 1, 8);
         for y in 0..n {
             for x in 0..n {
@@ -451,7 +451,7 @@ mod tests {
             }
         }
         // Mode 2: angle +32, from the left edge — column x reads left[y + x + 1].
-        let mut dst = vec![0u8; n * n];
+        let mut dst = vec![0u16; n * n];
         predict(&mut dst, n, &refs, 2, 3, 1, 8);
         for y in 0..n {
             for x in 0..n {
@@ -478,13 +478,13 @@ mod tests {
         let n = 8usize;
         let mut refs = Refs::default();
         for i in 0..2 * n {
-            let v = (30 + i * 6) as u8;
+            let v = (30 + i * 6) as u16;
             refs.top[i + 1] = v;
             refs.left[i + 1] = v;
         }
         refs.top[0] = 24;
         refs.left[0] = 24;
-        let mut dst = vec![0u8; n * n];
+        let mut dst = vec![0u16; n * n];
         predict(&mut dst, n, &refs, PLANAR, 3, 0, 8);
         for y in 0..n {
             for x in 0..n {
@@ -499,12 +499,12 @@ mod tests {
         //    four terms is separately observable.
         let mut refs = Refs::default();
         for i in 0..8usize {
-            refs.top[i + 1] = (10 + i * 10) as u8; // 10..80, so p[4][-1] = 50
-            refs.left[i + 1] = (100 + i * 10) as u8; // 100..170, p[-1][4] = 140
+            refs.top[i + 1] = (10 + i * 10) as u16; // 10..80, so p[4][-1] = 50
+            refs.left[i + 1] = (100 + i * 10) as u16; // 100..170, p[-1][4] = 140
         }
         refs.top[0] = 0;
         refs.left[0] = 0;
-        let mut dst = vec![0u8; 16];
+        let mut dst = vec![0u16; 16];
         predict(&mut dst, 4, &refs, PLANAR, 2, 0, 8);
         // (0,0): (3*100 + 1*50 + 3*10  + 1*140 + 4) >> 3 = 524 >> 3 = 65
         // (3,0): (0*100 + 4*50 + 3*40  + 1*140 + 4) >> 3 = 464 >> 3 = 58
@@ -529,13 +529,13 @@ mod tests {
         let n = 8usize;
         let mut refs = Refs::default();
         for i in 0..2 * n {
-            let v = (30 + i * 3) as u8; // 30..75; anchors p[8][-1] = p[-1][8] = 54
+            let v = (30 + i * 3) as u16; // 30..75; anchors p[8][-1] = p[-1][8] = 54
             refs.top[i + 1] = v;
             refs.left[i + 1] = v;
         }
         refs.top[0] = 27;
         refs.left[0] = 27;
-        let mut dst = vec![0u8; n * n];
+        let mut dst = vec![0u16; n * n];
         predict(&mut dst, n, &refs, PLANAR, 3, 0, 8);
         for y in 0..n {
             for x in 0..n - 1 {
@@ -593,18 +593,18 @@ mod tests {
         for i in 0..total {
             // scan index -> value
             if i < 2 * n {
-                refs.left[2 * n - i] = i as u8;
+                refs.left[2 * n - i] = i as u16;
             } else if i == 2 * n {
-                refs.top[0] = i as u8;
-                refs.left[0] = i as u8;
+                refs.top[0] = i as u16;
+                refs.left[0] = i as u16;
             } else {
-                refs.top[i - 2 * n] = i as u8;
+                refs.top[i - 2 * n] = i as u16;
             }
         }
         avail[2 * n + 2] = false;
         substitute(&mut refs, n, &avail, 8);
         assert_eq!(refs.top[2], refs.top[1]);
-        assert_eq!(refs.top[3], (2 * n + 3) as u8, "the gap must not cascade");
+        assert_eq!(refs.top[3], (2 * n + 3) as u16, "the gap must not cascade");
     }
 
     /// The filter decision table. 4x4 is never filtered, DC is never filtered,
@@ -673,7 +673,7 @@ mod tests {
         // line" and "not near-linear by this test" are different things.
         let mut refs = Refs::default();
         for i in 0..2 * n {
-            let v = if i < 32 { 10u8 } else { 200 };
+            let v = if i < 32 { 10u16 } else { 200 };
             refs.top[i + 1] = v;
             refs.left[i + 1] = v;
         }
@@ -688,8 +688,8 @@ mod tests {
         // A true straight line: corner + top[63] - 2 * top[31] == 0.
         let mut refs = Refs::default();
         for i in 0..2 * n {
-            refs.top[i + 1] = (2 + i * 2) as u8;
-            refs.left[i + 1] = (2 + i * 2) as u8;
+            refs.top[i + 1] = (2 + i * 2) as u16;
+            refs.left[i + 1] = (2 + i * 2) as u16;
         }
         refs.top[0] = 0;
         refs.left[0] = 0;

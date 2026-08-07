@@ -437,8 +437,23 @@ fn demux(bytes: &[u8]) -> (CodecConfig, Vec<video::mp4::Sample>) {
     }
 }
 
-/// Decode an HEVC track and write raw I420 to stdout, so `diff.py` can compare
-/// it sample-for-sample against PyAV's libx265-decoded output.
+/// Write one plane: for 8-bit, raw bytes; for 10/12-bit, little-endian u16
+/// samples (yuv420p10le / yuv420p12le layout).
+fn write_hevc_plane(w: &mut impl Write, plane: &[u16], bit_depth: u32) {
+    if bit_depth <= 8 {
+        let bytes: Vec<u8> = plane.iter().map(|&s| s as u8).collect();
+        w.write_all(&bytes).unwrap();
+    } else {
+        let mut bytes = Vec::with_capacity(plane.len() * 2);
+        for &s in plane {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        w.write_all(&bytes).unwrap();
+    }
+}
+
+/// Decode an HEVC track and write raw I420 (or 10/12-bit LE) to stdout, so
+/// a host harness can compare it sample-for-sample against PyAV.
 fn hevcseq(bytes: &[u8], limit: usize) {
     let (config, samples) = demux(bytes);
     let hvcc = match &config {
@@ -466,9 +481,9 @@ fn hevcseq(bytes: &[u8], limit: usize) {
         match dec.decode_au(&nals) {
             Ok(frames) => {
                 for f in frames {
-                    w.write_all(&f.y).unwrap();
-                    w.write_all(&f.cb).unwrap();
-                    w.write_all(&f.cr).unwrap();
+                    write_hevc_plane(&mut w, &f.y, f.bit_depth);
+                    write_hevc_plane(&mut w, &f.cb, f.bit_depth);
+                    write_hevc_plane(&mut w, &f.cr, f.bit_depth);
                     shown += 1;
                     if shown >= limit {
                         break;
@@ -485,9 +500,9 @@ fn hevcseq(bytes: &[u8], limit: usize) {
         if shown >= limit {
             break;
         }
-        w.write_all(&f.y).unwrap();
-        w.write_all(&f.cb).unwrap();
-        w.write_all(&f.cr).unwrap();
+        write_hevc_plane(&mut w, &f.y, f.bit_depth);
+        write_hevc_plane(&mut w, &f.cb, f.bit_depth);
+        write_hevc_plane(&mut w, &f.cr, f.bit_depth);
         shown += 1;
     }
     eprintln!("hevcseq: wrote {} frame(s), {} CTU(s)", shown, dec.ctus);
@@ -507,6 +522,7 @@ fn hevcseq(bytes: &[u8], limit: usize) {
             pp.transquant_bypass_enabled as u8, pp.cu_qp_delta_enabled as u8, pp.diff_cu_qp_delta_depth,
             pp.cb_qp_offset, pp.cr_qp_offset, pp.weighted_pred as u8, pp.weighted_bipred as u8,
             pp.sign_data_hiding_enabled as u8, pp.log2_parallel_merge_level, pp.dependent_slice_segments_enabled as u8);
+
     }
     if dec.trace_on {
         for (x, y, l2, c, mode, cbf) in dec.trace.iter().take(4000) {

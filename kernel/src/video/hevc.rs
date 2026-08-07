@@ -30,6 +30,7 @@ pub mod intra;
 pub mod residual;
 pub mod sao;
 pub mod syntax;
+pub mod tiles;
 #[cfg(test)]
 pub mod testutil;
 pub mod transform;

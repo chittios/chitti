@@ -17,7 +17,7 @@
 //! | codec | demux + describe | decode |
 //! |-------|------------------|--------|
 //! | H.264 / AVC | yes | yes — baseline CAVLC through High-profile CABAC (I/P/B) |
-//! | H.265 / HEVC | yes | Main 8-bit 4:2:0 (see [`hevc`]) |
+//! | H.265 / HEVC | yes | Main 8/10/12-bit 4:2:0, tiles, PCM (see [`hevc`]) |
 //! | VP9 | yes | yes — profile 0, intra + inter, bit-exact vs libvpx |
 //!
 //! A stream outside the supported set comes back from [`probe`] with
@@ -182,20 +182,14 @@ pub fn probe(bytes: &[u8]) -> Result<VideoInfo, &'static str> {
 /// even once the pipeline lands, and a user with a 10-bit file wants to be told
 /// that rather than "not implemented yet".
 fn hevc_support(sps: &hevc::Sps) -> (bool, &'static str) {
-    if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
-        return (false, "10/12-bit HEVC (Main 10 and above) — only 8-bit Main is planned");
+    if !(8..=12).contains(&sps.bit_depth_luma) || sps.bit_depth_luma != sps.bit_depth_chroma {
+        return (false, "HEVC bit depth must be 8–12 and equal for luma/chroma");
     }
     if sps.chroma_format_idc != 1 {
         return (false, "non-4:2:0 chroma (4:2:2/4:4:4 range extensions)");
     }
-    if sps.pcm_enabled {
-        return (false, "HEVC PCM (lossless raw) blocks are not implemented");
-    }
-    // Main-profile 8-bit 4:2:0 is bit-exact against FFmpeg/libx265 on the
-    // videodiff suite: multi-CTB all-intra, I+P, hierarchical B-pyramid,
-    // WPP, SAO, deblock, TMVP, sign-hide, mid-stream CRA with RASL leading
-    // pictures, and realish default-x265 GOPs. Tiles / PCM / 10-bit stay
-    // refused above.
+    // Main / Main 10 / Main 12, 4:2:0. Samples are u16 internally; the player
+    // downshifts to 8-bit for display. Tiles and PCM are decoded when present.
     (true, "")
 }
 
@@ -458,6 +452,21 @@ fn yuv_from_rust_h264(f: rust_h264::decoder::Frame) -> h264::decoder::DecodedFra
         y: f.y,
         cb: f.u,
         cr: f.v,
+    }
+}
+
+/// Downshift an HEVC frame to 8-bit planes for the RGB converter / player.
+fn hevc_frame_to_8bit(f: &hevc::decoder::DecodedFrame) -> h264::decoder::DecodedFrame {
+    let shift = f.bit_depth.saturating_sub(8);
+    let down = |p: &[u16]| -> alloc::vec::Vec<u8> {
+        p.iter().map(|&s| (s >> shift) as u8).collect()
+    };
+    h264::decoder::DecodedFrame {
+        w: f.w,
+        h: f.h,
+        y: down(&f.y),
+        cb: down(&f.cb),
+        cr: down(&f.cr),
     }
 }
 
@@ -989,17 +998,7 @@ impl StreamDecoder {
             }
             Engine::Hevc { pending, .. } => {
                 let f = pending.get(&target).map(|f| {
-                    frame_from_yuv(
-                        &h264::decoder::DecodedFrame {
-                            w: f.w,
-                            h: f.h,
-                            y: f.y.clone(),
-                            cb: f.cb.clone(),
-                            cr: f.cr.clone(),
-                        },
-                        pts,
-                        edge,
-                    )
+                    frame_from_yuv(&hevc_frame_to_8bit(f), pts, edge)
                 });
                 let min_future = self.display[idx..].iter().copied().min().unwrap_or(target);
                 let dead: Vec<usize> = pending.range(..min_future).map(|(&k, _)| k).collect();

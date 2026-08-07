@@ -330,7 +330,7 @@ pub fn amvp_candidates(
 /// vector may point outside the picture, and the samples it names are the
 /// nearest real ones.
 pub struct Plane<'a> {
-    pub data: &'a [u8],
+    pub data: &'a [u16],
     pub stride: usize,
     pub width: usize,
     pub height: usize,
@@ -493,7 +493,7 @@ pub fn put_chroma(
 
 /// Round one prediction down to samples (§8.5.3.3.4.2, uni-prediction).
 pub fn uni_pred(
-    dst: &mut [u8],
+    dst: &mut [u16],
     dst_stride: usize,
     src: &[i16],
     w: usize,
@@ -506,7 +506,7 @@ pub fn uni_pred(
     for y in 0..h {
         for x in 0..w {
             let v = (src[y * MAX_PB + x] as i32 + offset) >> shift;
-            dst[y * dst_stride + x] = v.clamp(0, max) as u8;
+            dst[y * dst_stride + x] = v.clamp(0, max) as u16;
         }
     }
 }
@@ -516,7 +516,7 @@ pub fn uni_pred(
 /// sum — and note both inputs are still at 14 bits, so this is the only
 /// rounding either of them ever sees.
 pub fn bi_pred(
-    dst: &mut [u8],
+    dst: &mut [u16],
     dst_stride: usize,
     a: &[i16],
     b: &[i16],
@@ -530,14 +530,14 @@ pub fn bi_pred(
     for y in 0..h {
         for x in 0..w {
             let v = (a[y * MAX_PB + x] as i32 + b[y * MAX_PB + x] as i32 + offset) >> shift;
-            dst[y * dst_stride + x] = v.clamp(0, max) as u8;
+            dst[y * dst_stride + x] = v.clamp(0, max) as u16;
         }
     }
 }
 
 /// Explicit weighted uni-prediction (§8.5.3.3.4.3).
 pub fn uni_pred_weighted(
-    dst: &mut [u8],
+    dst: &mut [u16],
     dst_stride: usize,
     src: &[i16],
     w: usize,
@@ -554,7 +554,7 @@ pub fn uni_pred_weighted(
     for y in 0..h {
         for x in 0..w {
             let v = (((src[y * MAX_PB + x] as i32 * wx + offset) >> shift) + ox).clamp(0, max);
-            dst[y * dst_stride + x] = v as u8;
+            dst[y * dst_stride + x] = v as u16;
         }
     }
 }
@@ -566,7 +566,7 @@ pub fn uni_pred_weighted(
 /// not two separate roundings — applying each list's offset separately double
 /// counts the rounding and shifts the picture by a level.
 pub fn bi_pred_weighted(
-    dst: &mut [u8],
+    dst: &mut [u16],
     dst_stride: usize,
     a: &[i16],
     b: &[i16],
@@ -589,7 +589,7 @@ pub fn bi_pred_weighted(
                 + b[y * MAX_PB + x] as i32 * w1
                 + o * (1 << log2_wd))
                 >> (log2_wd + 1);
-            dst[y * dst_stride + x] = v.clamp(0, max) as u8;
+            dst[y * dst_stride + x] = v.clamp(0, max) as u16;
         }
     }
 }
@@ -599,7 +599,7 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn flat_plane(v: u8, w: usize, h: usize) -> alloc::vec::Vec<u8> {
+    fn flat_plane(v: u16, w: usize, h: usize) -> alloc::vec::Vec<u16> {
         vec![v; w * h]
     }
 
@@ -610,14 +610,14 @@ mod tests {
     /// and the rounding offsets show up as an off-by-one.
     #[test_case]
     fn a_flat_reference_survives_every_fractional_position_exactly() {
-        for &v in &[0u8, 1, 37, 128, 254, 255] {
+        for &v in &[0u16, 1, 37, 128, 254, 255] {
             let buf = flat_plane(v, 32, 32);
             let p = Plane { data: &buf, stride: 32, width: 32, height: 32 };
             for my in 0..4 {
                 for mx in 0..4 {
                     let mut mid = vec![0i16; MAX_PB * MAX_PB];
                     put_luma(&mut mid, &p, 8, 8, 8, 8, mx, my, 8);
-                    let mut out = vec![0u8; 64];
+                    let mut out = vec![0u16; 64];
                     uni_pred(&mut out, 8, &mid, 8, 8, 8);
                     assert!(
                         out.iter().all(|&s| s == v),
@@ -627,7 +627,7 @@ mod tests {
                     // Bi-prediction of the same prediction twice must give the
                     // same answer as uni — that is what makes the extra shift
                     // an average and not a doubling.
-                    let mut out2 = vec![0u8; 64];
+                    let mut out2 = vec![0u16; 64];
                     bi_pred(&mut out2, 8, &mid, &mid, 8, 8, 8);
                     assert_eq!(out, out2, "bi != uni for luma ({mx},{my}) value {v}");
                 }
@@ -636,7 +636,7 @@ mod tests {
                 for mx in 0..8 {
                     let mut mid = vec![0i16; MAX_PB * MAX_PB];
                     put_chroma(&mut mid, &p, 8, 8, 8, 8, mx, my, 8);
-                    let mut out = vec![0u8; 64];
+                    let mut out = vec![0u16; 64];
                     uni_pred(&mut out, 8, &mid, 8, 8, 8);
                     assert!(out.iter().all(|&s| s == v), "chroma ({mx},{my}) value {v}");
                 }
@@ -650,17 +650,17 @@ mod tests {
     /// creeping in from the border.
     #[test_case]
     fn a_vector_outside_the_picture_clamps_to_the_edge() {
-        let mut buf = vec![0u8; 8 * 8];
+        let mut buf = vec![0u16; 8 * 8];
         for y in 0..8 {
             for x in 0..8 {
-                buf[y * 8 + x] = (10 + x) as u8;
+                buf[y * 8 + x] = (10 + x) as u16;
             }
         }
         let p = Plane { data: &buf, stride: 8, width: 8, height: 8 };
         // Far off the left edge: every sample is column 0's value.
         let mut mid = vec![0i16; MAX_PB * MAX_PB];
         put_luma(&mut mid, &p, -40, 2, 4, 4, 0, 0, 8);
-        let mut out = vec![0u8; 16];
+        let mut out = vec![0u16; 16];
         uni_pred(&mut out, 4, &mid, 4, 4, 8);
         assert!(out.iter().all(|&s| s == 10), "left clamp: {out:?}");
         // Far off the right and bottom: column 7, row 7.
@@ -673,16 +673,16 @@ mod tests {
     /// to have a 1 in the middle — phase 0 has no filter at all.
     #[test_case]
     fn the_integer_position_is_an_exact_copy() {
-        let mut buf = vec![0u8; 16 * 16];
+        let mut buf = vec![0u16; 16 * 16];
         for y in 0..16 {
             for x in 0..16 {
-                buf[y * 16 + x] = ((x * 13 + y * 7) & 0xff) as u8;
+                buf[y * 16 + x] = ((x * 13 + y * 7) & 0xff) as u16;
             }
         }
         let p = Plane { data: &buf, stride: 16, width: 16, height: 16 };
         let mut mid = vec![0i16; MAX_PB * MAX_PB];
         put_luma(&mut mid, &p, 4, 4, 8, 8, 0, 0, 8);
-        let mut out = vec![0u8; 64];
+        let mut out = vec![0u16; 64];
         uni_pred(&mut out, 8, &mid, 8, 8, 8);
         for y in 0..8 {
             for x in 0..8 {
@@ -697,26 +697,26 @@ mod tests {
     /// off by a fraction of a level everywhere.
     #[test_case]
     fn unit_weights_reduce_to_the_unweighted_prediction() {
-        let mut buf = vec![0u8; 24 * 24];
+        let mut buf = vec![0u16; 24 * 24];
         for y in 0..24 {
             for x in 0..24 {
-                buf[y * 24 + x] = ((x * 5 + y * 11) & 0xff) as u8;
+                buf[y * 24 + x] = ((x * 5 + y * 11) & 0xff) as u16;
             }
         }
         let p = Plane { data: &buf, stride: 24, width: 24, height: 24 };
         let mut mid = vec![0i16; MAX_PB * MAX_PB];
         put_luma(&mut mid, &p, 6, 6, 8, 8, 2, 1, 8);
 
-        let mut plain = vec![0u8; 64];
+        let mut plain = vec![0u16; 64];
         uni_pred(&mut plain, 8, &mid, 8, 8, 8);
-        let mut weighted = vec![0u8; 64];
+        let mut weighted = vec![0u16; 64];
         // denom 0, weight 1, offset 0 is the identity weighting.
         uni_pred_weighted(&mut weighted, 8, &mid, 8, 8, 0, 1, 0, 8);
         assert_eq!(plain, weighted, "uni weighting is not the identity at w=1");
 
-        let mut plain_bi = vec![0u8; 64];
+        let mut plain_bi = vec![0u16; 64];
         bi_pred(&mut plain_bi, 8, &mid, &mid, 8, 8, 8);
-        let mut w_bi = vec![0u8; 64];
+        let mut w_bi = vec![0u16; 64];
         bi_pred_weighted(&mut w_bi, 8, &mid, &mid, 8, 8, 0, 1, 1, 0, 0, 8);
         assert_eq!(plain_bi, w_bi, "bi weighting is not the identity at w=1");
     }
@@ -730,7 +730,7 @@ mod tests {
         let p = Plane { data: &buf, stride: 16, width: 16, height: 16 };
         let mut mid = vec![0i16; MAX_PB * MAX_PB];
         put_luma(&mut mid, &p, 4, 4, 4, 4, 0, 0, 8);
-        let mut out = vec![0u8; 16];
+        let mut out = vec![0u16; 16];
         // denom 1, weight 2 == a gain of 1.0; weight 4 == 2.0.
         uni_pred_weighted(&mut out, 4, &mid, 4, 4, 1, 2, 0, 8);
         assert!(out.iter().all(|&s| s == 60), "gain 1.0 changed the value: {out:?}");

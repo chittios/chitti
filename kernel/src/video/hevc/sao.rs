@@ -55,9 +55,9 @@ fn cmp(a: i32, b: i32) -> i32 {
 /// The band index wraps modulo 32, which is deliberate — an encoder can put
 /// the four bands across the top of the range and round to the bottom.
 pub fn band_filter(
-    dst: &mut [u8],
+    dst: &mut [u16],
     dst_stride: usize,
-    src: &[u8],
+    src: &[u16],
     src_stride: usize,
     offsets: &SaoOffsets,
     left_class: usize,
@@ -75,7 +75,7 @@ pub fn band_filter(
         for x in 0..width {
             let s = src[y * src_stride + x] as i32;
             let v = s + table[((s >> shift) & 31) as usize] as i32;
-            dst[y * dst_stride + x] = v.clamp(0, max) as u8;
+            dst[y * dst_stride + x] = v.clamp(0, max) as u16;
         }
     }
 }
@@ -98,9 +98,9 @@ pub struct Borders {
 }
 
 pub fn edge_filter(
-    dst: &mut [u8],
+    dst: &mut [u16],
     dst_stride: usize,
-    src: &[u8],
+    src: &[u16],
     src_stride: usize,
     src_origin: usize,
     offsets: &SaoOffsets,
@@ -126,7 +126,7 @@ pub fn edge_filter(
             let b = src[(i + bx as isize + by as isize * src_stride as isize) as usize] as i32;
             let idx = EDGE_IDX[(2 + cmp(s, a) + cmp(s, b)) as usize];
             let v = s + offsets[idx] as i32;
-            dst[y * dst_stride + x] = v.clamp(0, max) as u8;
+            dst[y * dst_stride + x] = v.clamp(0, max) as u16;
         }
     }
 }
@@ -139,8 +139,8 @@ mod tests {
     #[test_case]
     fn band_offset_moves_only_its_four_bands() {
         // 8-bit: each band is 8 sample values. left_class 4 covers 32..=63.
-        let src: alloc::vec::Vec<u8> = (0..64u8).collect();
-        let mut dst = vec![0u8; 64];
+        let src: alloc::vec::Vec<u16> = (0..64u16).collect();
+        let mut dst = vec![0u16; 64];
         let offs: SaoOffsets = [0, 3, -3, 5, -5];
         band_filter(&mut dst, 64, &src, 64, &offs, 4, 64, 1, 8);
         for v in 0..64usize {
@@ -160,8 +160,8 @@ mod tests {
     fn band_classes_wrap_around_thirty_two() {
         // Starting at class 30 the four bands are 30, 31, 0, 1 — the wrap is
         // deliberate: an encoder can straddle the top of the range.
-        let src = [8u8, 248, 0, 255];
-        let mut dst = [0u8; 4];
+        let src = [8u16, 248, 0, 255];
+        let mut dst = [0u16; 4];
         let offs: SaoOffsets = [0, 1, 2, 3, 4];
         band_filter(&mut dst, 4, &src, 4, &offs, 30, 4, 1, 8);
         assert_eq!(dst[0], 8 + 4, "8 is class 1, the fourth band after wrapping");
@@ -172,8 +172,8 @@ mod tests {
 
     #[test_case]
     fn band_offsets_saturate_rather_than_wrap() {
-        let src = [255u8, 0];
-        let mut dst = [0u8; 2];
+        let src = [255u16, 0];
+        let mut dst = [0u16; 2];
         let offs: SaoOffsets = [0, 7, 0, 0, 0];
         band_filter(&mut dst, 2, &src, 2, &offs, 31, 1, 1, 8);
         assert_eq!(dst[0], 255, "must clamp, not wrap to 6");
@@ -188,9 +188,9 @@ mod tests {
     /// through `EDGE_IDX`.
     #[test_case]
     fn edge_offset_leaves_a_flat_region_untouched() {
-        let src = vec![100u8; 6 * 6];
+        let src = vec![100u16; 6 * 6];
         for eo in 0..4 {
-            let mut dst = vec![0u8; 4 * 4];
+            let mut dst = vec![0u16; 4 * 4];
             // Entry 0 is the specification's always-zero category. The other
             // four are large, so reaching any of them would be obvious.
             let offs: SaoOffsets = [0, 7, -7, 7, -7];
@@ -205,12 +205,12 @@ mod tests {
     #[test_case]
     fn edge_offset_classifies_peaks_and_valleys() {
         // 3x1 region inside a 5x3 source: low, high, low along the horizontal.
-        let mut src = vec![100u8; 5 * 3];
+        let mut src = vec![100u16; 5 * 3];
         src[5 + 1] = 90; // valley
         src[5 + 2] = 110; // peak
         src[5 + 3] = 100; // flat between two 100s? neighbours are 110 and 100
         let offs: SaoOffsets = [0, 1, 2, 3, 4];
-        let mut dst = vec![0u8; 3];
+        let mut dst = vec![0u16; 3];
         let b = Borders { left: true, right: true, above: true, below: true };
         edge_filter(&mut dst, 3, &src, 5, 5 + 1, &offs, EO_HORIZONTAL, 3, 1, &b, 8);
         // x=0: 90 vs left 100 and right 110 -> below both -> valley -> offs[1]
@@ -226,20 +226,20 @@ mod tests {
     #[test_case]
     fn the_four_edge_classes_look_in_different_directions() {
         // A vertical bright line down the middle of a 3x3 region.
-        let mut src = vec![100u8; 5 * 5];
+        let mut src = vec![100u16; 5 * 5];
         for y in 0..5 {
             src[y * 5 + 2] = 150;
         }
         let offs: SaoOffsets = [0, 0, 0, 0, 9]; // only the peak category
         let b = Borders { left: true, right: true, above: true, below: true };
 
-        let mut dst = vec![0u8; 9];
+        let mut dst = vec![0u16; 9];
         edge_filter(&mut dst, 3, &src, 5, 5 + 1, &offs, EO_HORIZONTAL, 3, 3, &b, 8);
         for y in 0..3 {
             assert_eq!(dst[y * 3 + 1], 159, "horizontal: the line is a peak");
         }
 
-        let mut dst = vec![0u8; 9];
+        let mut dst = vec![0u16; 9];
         edge_filter(&mut dst, 3, &src, 5, 5 + 1, &offs, EO_VERTICAL, 3, 3, &b, 8);
         for y in 0..3 {
             assert_eq!(dst[y * 3 + 1], 150, "vertical: the line is flat along itself");
@@ -251,10 +251,10 @@ mod tests {
     /// the decoder is the deblocked sample.
     #[test_case]
     fn unavailable_borders_exclude_their_samples_from_filtering() {
-        let mut src = vec![100u8; 5 * 5];
+        let mut src = vec![100u16; 5 * 5];
         src[2 * 5 + 2] = 150;
         let offs: SaoOffsets = [0, 5, 5, 5, 5];
-        let mut dst = vec![7u8; 9]; // sentinel
+        let mut dst = vec![7u16; 9]; // sentinel
         let b = Borders { left: false, right: true, above: false, below: true };
         edge_filter(&mut dst, 3, &src, 5, 5 + 1, &offs, EO_DIAG_135, 3, 3, &b, 8);
         // Row 0 and column 0 need the above/left neighbours, so they are skipped.
@@ -275,13 +275,13 @@ mod tests {
     #[test_case]
     fn classification_reads_unfiltered_neighbours() {
         // A staircase: each sample above its left neighbour and below its right.
-        let mut src = vec![0u8; 5 * 3];
+        let mut src = vec![0u16; 5 * 3];
         for x in 0..5 {
-            src[5 + x] = (100 + x * 4) as u8;
+            src[5 + x] = (100 + x * 4) as u16;
         }
         let offs: SaoOffsets = [0, 0, 20, 0, 0]; // only the half-valley category
         let b = Borders { left: true, right: true, above: true, below: true };
-        let mut dst = vec![0u8; 3];
+        let mut dst = vec![0u16; 3];
         edge_filter(&mut dst, 3, &src, 5, 5 + 1, &offs, EO_HORIZONTAL, 3, 1, &b, 8);
         // Every interior sample of a monotone ramp is above one neighbour and
         // below the other: category 0, no change. If the filter read its own

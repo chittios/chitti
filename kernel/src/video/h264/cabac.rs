@@ -230,6 +230,56 @@ impl<'a> Cabac<'a> {
             mag
         }
     }
+
+    /// After `terminate()` returned 1 for a PCM escape: locate the next
+    /// byte-aligned raw payload of `n` bytes, return it, and re-arm the
+    /// arithmetic engine on the remainder **keeping the context states**.
+    ///
+    /// Mirrors FFmpeg's `skip_bytes` (contexts persist; only low/range/stream
+    /// restart). The reservoir may have prefetched past the terminate bit, so
+    /// the start position rewinds unread buffered bytes.
+    pub fn take_raw_after_terminate(
+        &mut self,
+        n: usize,
+    ) -> Result<&'a [u8], &'static str> {
+        // Bytes still sitting in the reservoir that were never arithmetically
+        // consumed (terminate-1 does not renorm).
+        let unread = (self.nbits as usize) / 8;
+        let mut start = self.byte_pos.saturating_sub(unread);
+        // Partial residual bits mean the current byte was only half-used —
+        // back up one, matching FFmpeg's `if (low & 1) ptr--`.
+        if self.nbits % 8 != 0 || (self.offset & 1) != 0 {
+            start = start.saturating_sub(1);
+        }
+        let end = start.checked_add(n).ok_or("hevc pcm: overflow")?;
+        if end > self.data.len() {
+            return Err("hevc pcm: sample payload past end of slice");
+        }
+        let raw = &self.data[start..end];
+        let rest = &self.data[end..];
+        let ctx = self.ctx;
+        // Re-init arithmetic only (same shape as new_hevc's engine half).
+        let mut c = Cabac {
+            data: rest,
+            byte_pos: 0,
+            bits: 0,
+            nbits: 0,
+            range: 510,
+            offset: 0,
+            ctx,
+        };
+        c.refill();
+        c.refill();
+        c.offset = 0;
+        for _ in 0..9 {
+            if c.nbits == 0 {
+                c.refill();
+            }
+            c.offset = (c.offset << 1) | c.take_bit();
+        }
+        *self = c;
+        Ok(raw)
+    }
 }
 
 #[cfg(test)]

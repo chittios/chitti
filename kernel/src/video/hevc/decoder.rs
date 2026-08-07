@@ -17,8 +17,8 @@
 //!   from a *copy* — an in-place SAO would classify each sample against its
 //!   already-offset neighbour.
 //!
-//! Scope: 4:2:0, 8-bit, one tile. PCM, tiles and the range extensions are
-//! refused by name rather than mis-decoded.
+//! Scope: 4:2:0, 8/10/12-bit, tiles and PCM supported. Range extensions
+//! (4:2:2/4:4:4) are refused by name rather than mis-decoded.
 
 use alloc::rc::Rc;
 use alloc::vec;
@@ -29,7 +29,7 @@ use super::ctu::{PartMode, EdgeSide};
 use super::inter::{AmvpNeighbour, MergeNeighbours, MvField, Plane, MAX_PB};
 use super::syntax::{self as syn, Bin, BinSource};
 use super::{
-    cabac_tables as ct, ctu, dpb, inter, intra, residual, sao, transform, NalType, Pps,
+    cabac_tables as ct, ctu, dpb, inter, intra, residual, sao, tiles, transform, NalType, Pps,
     SliceHeader, SliceType, Sps,
 };
 
@@ -37,9 +37,11 @@ use super::{
 pub struct DecodedFrame {
     pub w: usize,
     pub h: usize,
-    pub y: Vec<u8>,
-    pub cb: Vec<u8>,
-    pub cr: Vec<u8>,
+    /// Bit depth of the sample arrays (8, 10 or 12).
+    pub bit_depth: u32,
+    pub y: Vec<u16>,
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
 }
 
 /// A reconstructed reference picture.
@@ -55,9 +57,10 @@ pub struct RefFrame {
     pub h: usize,
     pub cw: usize,
     pub chh: usize,
-    pub y: Vec<u8>,
-    pub cb: Vec<u8>,
-    pub cr: Vec<u8>,
+    pub bit_depth: u32,
+    pub y: Vec<u16>,
+    pub cb: Vec<u16>,
+    pub cr: Vec<u16>,
 }
 
 /// Per-4x4 motion and prediction record — what every neighbour derivation
@@ -94,9 +97,9 @@ struct Pic {
     h: usize,
     cw: usize,
     ch: usize,
-    y: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+    y: Vec<u16>,
+    cb: Vec<u16>,
+    cr: Vec<u16>,
 
     // --- neighbour grids ---
     /// Per min-PU (4x4).
@@ -135,6 +138,8 @@ struct Pic {
     db_off: Vec<bool>,
     log2_min_tb: u32,
     log2_ctb: u32,
+    bit_depth_luma: u32,
+    bit_depth_chroma: u32,
 }
 
 impl Pic {
@@ -244,6 +249,7 @@ impl HevcDecoder {
             out.push(DecodedFrame {
                 w: f.w,
                 h: f.h,
+                bit_depth: f.bit_depth,
                 y: f.y.clone(),
                 cb: f.cb.clone(),
                 cr: f.cr.clone(),
@@ -262,6 +268,7 @@ impl HevcDecoder {
             out.push(DecodedFrame {
                 w: f.w,
                 h: f.h,
+                bit_depth: f.bit_depth,
                 y: f.y.clone(),
                 cb: f.cb.clone(),
                 cr: f.cr.clone(),
@@ -294,6 +301,7 @@ impl HevcDecoder {
             h: p.h,
             cw: p.cw,
             chh: p.ch,
+            bit_depth: p.bit_depth_luma,
             y: p.y,
             cb: p.cb,
             cr: p.cr,
@@ -322,15 +330,7 @@ impl HevcDecoder {
         if sps.chroma_format_idc != 1 {
             return Err("hevc: only 4:2:0 is supported");
         }
-        if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
-            return Err("hevc: only 8-bit is supported");
-        }
-        if pps.tiles_enabled {
-            return Err("hevc: tiles are not supported");
-        }
-        if sps.pcm_enabled {
-            return Err("hevc: PCM blocks are not supported");
-        }
+        // 8/10/12-bit Main family; tiles and PCM handled in the walk.
 
         if sh.first_slice_in_pic {
             self.finish_picture();
@@ -452,6 +452,7 @@ impl HevcDecoder {
             trace_on: self.trace_on,
             trace: Vec::new(),
             ctus: 0,
+            tile_map: None,
         };
         let dlen = data.len();
         let r = sd.run();
@@ -516,9 +517,9 @@ impl Pic {
             h,
             cw,
             ch,
-            y: vec![0u8; w * h],
-            cb: vec![128u8; cw * ch],
-            cr: vec![128u8; cw * ch],
+            y: vec![0u16; w * h],
+            cb: vec![1u16 << (sps.bit_depth_chroma - 1); cw * ch],
+            cr: vec![1u16 << (sps.bit_depth_chroma - 1); cw * ch],
             pu: vec![PuInfo::default(); pu_w * pu_h],
             ipm: vec![intra::DC; pu_w * pu_h],
             pu_w,
@@ -542,6 +543,8 @@ impl Pic {
             db_off: vec![false; ctb_w * ctb_h],
             log2_min_tb: sps.log2_min_tb_size,
             log2_ctb: sps.log2_ctb_size,
+            bit_depth_luma: sps.bit_depth_luma,
+            bit_depth_chroma: sps.bit_depth_chroma,
         }
     }
 }
@@ -593,65 +596,106 @@ struct SliceDecoder<'a> {
     trace_on: bool,
     trace: Vec<(u16, u16, u8, u8, u8, u8)>,
     ctus: usize,
+    tile_map: Option<tiles::TileMap>,
 }
 
 impl<'a> SliceDecoder<'a> {
+    #[inline]
+    fn bd_luma(&self) -> u32 { self.sps.bit_depth_luma }
+    #[inline]
+    fn bd_chroma(&self) -> u32 { self.sps.bit_depth_chroma }
+    #[inline]
+    fn bd_for(&self, c_idx: usize) -> u32 {
+        if c_idx == 0 { self.bd_luma() } else { self.bd_chroma() }
+    }
+    #[inline]
+    fn sample_max(&self, c_idx: usize) -> i32 {
+        (1i32 << self.bd_for(c_idx)) - 1
+    }
+
     fn run(&mut self) -> Result<(), &'static str> {
         let log2_ctb = self.sps.log2_ctb_size;
         let ctb = 1usize << log2_ctb;
         let total = self.pic.ctb_w * self.pic.ctb_h;
         let ctb_w = self.pic.ctb_w;
+        let ctb_h = self.pic.ctb_h;
 
-        // **Wavefront parallel processing splits the slice into one substream
-        // per CTB row**, and x265 turns it on by default for anything wider
-        // than a single CTB row — so ignoring it does not degrade a corner
-        // case, it corrupts almost every real file from the second row down.
-        //
-        // Each row restarts the arithmetic coder at its own byte offset (from
-        // the entry-point list) but **inherits the context states saved after
-        // the second CTB of the row above** — that snapshot is the whole point:
-        // it is what lets a parallel decoder start a row once its predecessor
-        // is two CTBs in, and it means the states are *not* re-initialised.
-        let wpp = self.pps.entropy_coding_sync_enabled;
+        // Tile map: single-tile is the identity (rs == ts). Multi-tile walks
+        // CTBs in tile-scan order and restarts CABAC at every tile boundary.
+        let tile_map = if self.pps.tiles_enabled {
+            tiles::TileMap::from_pps(
+                ctb_w,
+                ctb_h,
+                self.pps.num_tile_columns as usize,
+                self.pps.num_tile_rows as usize,
+                self.pps.uniform_spacing,
+                &self.pps.column_width,
+                &self.pps.row_height,
+            )?
+        } else {
+            tiles::TileMap::single(ctb_w, ctb_h)
+        };
+        self.tile_map = Some(tile_map.clone());
+
+        // WPP: each CTB row is a substream that inherits contexts saved after
+        // the second CTB of the row above (x265 default for multi-row pictures).
+        let wpp = self.pps.entropy_coding_sync_enabled && !self.pps.tiles_enabled;
+        let tiles_on = self.pps.tiles_enabled;
         let save_col = if ctb_w > 1 { 1usize } else { 0 };
         let mut saved: Option<([u8; 1024], [u8; 4])> = None;
-        // Substream k begins after the first k entry-point offsets.
         let mut starts: Vec<usize> = alloc::vec![0usize];
         for &o in self.sh.entry_point_offsets.iter() {
             let last = *starts.last().unwrap();
             starts.push(last + o as usize);
         }
+        let mut entry_i = 0usize;
+
+        let start_rs = self.sh.segment_address as usize;
+        let mut ts = tile_map.rs_to_ts.get(start_rs).copied().unwrap_or(start_rs);
 
         loop {
-            if self.ctb_addr >= total {
+            if ts >= total {
                 break;
             }
-            let rx = self.ctb_addr % ctb_w;
-            let ry = self.ctb_addr / ctb_w;
+            let rs = tile_map.ts_to_rs[ts];
+            let rx = rs % ctb_w;
+            let ry = rs / ctb_w;
+            self.ctb_addr = rs;
 
-            if wpp && rx == 0 && self.ctb_addr != self.sh.segment_address as usize {
-                let sub = ry - (self.sh.segment_address as usize) / ctb_w;
-                let off = starts.get(sub).copied().unwrap_or(0);
+            let is_first = ts == tile_map.rs_to_ts[start_rs];
+            let new_tile = tiles_on
+                && !is_first
+                && tile_map.tile_id[ts] != tile_map.tile_id[ts - 1];
+            let new_wpp_row = wpp && rx == 0 && !is_first;
+
+            if new_tile || new_wpp_row {
+                entry_i += 1;
+                let off = starts.get(entry_i).copied().unwrap_or(0);
                 let Some(rest) = self.data.get(off..) else {
                     break;
                 };
                 let mut nc =
                     Cabac::new_hevc(rest, self.qp_init, self.init_type, &ct::INIT_VALUES)?;
-                if let Some((ctx, st)) = saved {
-                    nc.ctx = ctx;
-                    self.stat_coeff = st;
+                if new_wpp_row {
+                    // WPP inherits the previous row's context snapshot.
+                    if let Some((ctx, st)) = saved {
+                        nc.ctx = ctx;
+                        self.stat_coeff = st;
+                    }
+                } else {
+                    // Tile boundary: contexts re-initialised (already done by
+                    // new_hevc) and rice stats reset.
+                    self.stat_coeff = [0; 4];
                 }
                 self.c = nc;
-                // A new substream also restarts the QP prediction chain.
                 self.qp_y = self.qp_init;
                 self.qp_y_prev = self.qp_init;
             }
-            self.pic.slice_idx[self.ctb_addr] = self.slice_index;
-            // Deblocking parameters are signalled per *slice* but the filter
-            // runs over the whole picture, so each CTB carries its slice's.
-            self.pic.db_beta[self.ctb_addr] = self.sh.beta_offset_div2 as i8;
-            self.pic.db_tc[self.ctb_addr] = self.sh.tc_offset_div2 as i8;
-            self.pic.db_off[self.ctb_addr] = self.sh.deblocking_filter_disabled;
+
+            self.pic.slice_idx[rs] = self.slice_index;
+            self.pic.db_beta[rs] = self.sh.beta_offset_div2 as i8;
+            self.pic.db_tc[rs] = self.sh.tc_offset_div2 as i8;
+            self.pic.db_off[rs] = self.sh.deblocking_filter_disabled;
             self.qp_pred = self.qp_y;
 
             self.sao_param(rx, ry);
@@ -660,9 +704,8 @@ impl<'a> SliceDecoder<'a> {
             if wpp && rx == save_col {
                 saved = Some((self.c.ctx, self.stat_coeff));
             }
-            self.ctb_addr += 1;
+            ts += 1;
             self.ctus += 1;
-            // `end_of_slice_segment_flag` is a terminate bin, not a decision.
             if self.c.terminate() != 0 {
                 break;
             }
@@ -689,7 +732,16 @@ impl<'a> SliceDecoder<'a> {
         }
         let lc = self.sps.log2_ctb_size as usize;
         let cn = (yn >> lc) * self.pic.ctb_w + (xn >> lc);
-        self.pic.slice_idx[cn] == self.slice_index
+        if self.pic.slice_idx[cn] != self.slice_index {
+            return false;
+        }
+        // Neighbours in a different tile are unavailable (H.265 §6.4.1).
+        if let Some(ref tm) = self.tile_map {
+            if tm.tile_id_rs(cn) != tm.tile_id_rs(self.ctb_addr) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The same, additionally requiring the neighbour to be inter-coded — what
@@ -928,6 +980,24 @@ impl<'a> SliceDecoder<'a> {
         self.cu.part_mode = Some(part);
         self.cu.intra_split = part == PartMode::PartNxN && self.cu.intra;
 
+        // PCM: only on an intra 2Nx2N CU whose size is in the SPS PCM range.
+        // The flag is a terminate bin (not a regular decision).
+        if self.cu.intra
+            && part == PartMode::Part2Nx2N
+            && self.sps.pcm_enabled
+            && log2_cb_size >= self.sps.log2_min_pcm_cb_size
+            && log2_cb_size <= self.sps.log2_max_pcm_cb_size
+            && self.c.terminate() != 0
+        {
+            self.pcm_sample(x0, y0, log2_cb_size)?;
+            self.mark_intra_default(x0, y0, size);
+            if self.sps.pcm_loop_filter_disabled {
+                self.cu.transquant_bypass = true;
+            }
+            self.set_qp(x0, y0, size);
+            return Ok(());
+        }
+
         if self.cu.intra {
             self.intra_modes(x0, y0, log2_cb_size, part)?;
         } else {
@@ -958,6 +1028,75 @@ impl<'a> SliceDecoder<'a> {
         }
         self.set_qp(x0, y0, size);
         Ok(())
+    }
+
+    fn pcm_sample(&mut self, x0: usize, y0: usize, log2_cb_size: u32) -> Result<(), &'static str> {
+        let size = 1usize << log2_cb_size;
+        let bd_y = self.sps.pcm_bit_depth_luma;
+        let bd_c = self.sps.pcm_bit_depth_chroma;
+        let n_y = size * size * bd_y as usize;
+        let n_c = if self.sps.chroma_format_idc != 0 {
+            2 * (size / 2) * (size / 2) * bd_c as usize
+        } else {
+            0
+        };
+        let n_bits = n_y + n_c;
+        let n_bytes = (n_bits + 7) / 8;
+        let raw = self.c.take_raw_after_terminate(n_bytes)?;
+        // Big-endian bit pack into samples, left-aligned into the picture bit depth.
+        let mut bit = 0usize;
+        let shift_y = self.sps.bit_depth_luma.saturating_sub(bd_y);
+        let shift_c = self.sps.bit_depth_chroma.saturating_sub(bd_c);
+        for j in 0..size {
+            if y0 + j >= self.pic.h {
+                break;
+            }
+            for i in 0..size {
+                if x0 + i >= self.pic.w {
+                    break;
+                }
+                let s = pcm_take_bits(raw, &mut bit, bd_y);
+                self.pic.y[(y0 + j) * self.pic.w + x0 + i] = s << shift_y;
+            }
+        }
+        if self.sps.chroma_format_idc != 0 {
+            let (cx, cy, cw, ch) = (x0 / 2, y0 / 2, size / 2, size / 2);
+            for plane in 0..2usize {
+                let dst = if plane == 0 {
+                    &mut self.pic.cb
+                } else {
+                    &mut self.pic.cr
+                };
+                let stride = self.pic.cw;
+                for j in 0..ch {
+                    if cy + j >= self.pic.ch {
+                        break;
+                    }
+                    for i in 0..cw {
+                        if cx + i >= self.pic.cw {
+                            break;
+                        }
+                        let s = pcm_take_bits(raw, &mut bit, bd_c);
+                        dst[(cy + j) * stride + cx + i] = s << shift_c;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_intra_default(&mut self, x0: usize, y0: usize, size: usize) {
+        let n = (size / 4).max(1);
+        for j in 0..n {
+            for i in 0..n {
+                let yy = y0 / 4 + j;
+                let xx = x0 / 4 + i;
+                if yy * self.pic.pu_w + xx < self.pic.pu.len() && xx < self.pic.pu_w {
+                    self.pic.pu[yy * self.pic.pu_w + xx].intra = true;
+                    self.pic.ipm[yy * self.pic.pu_w + xx] = intra::DC;
+                }
+            }
+        }
     }
 
     fn mark_cb(&mut self, x0: usize, y0: usize, size: usize, skip: bool, depth: u8) {
@@ -1500,12 +1639,13 @@ impl<'a> SliceDecoder<'a> {
                 h,
                 (mv.0 & 3) as usize,
                 (mv.1 & 3) as usize,
-                8,
+                self.bd_luma(),
             );
             mid[l] = buf;
             used[l] = true;
         }
         let stride = self.pic.w;
+        let bd = self.bd_luma();
         match (used[0], used[1]) {
             (true, true) => {
                 let a = core::mem::take(&mut mid[0]);
@@ -1517,16 +1657,16 @@ impl<'a> SliceDecoder<'a> {
                     &b,
                     w,
                     h,
-                    8,
+                    bd,
                 );
             }
             (true, false) => {
                 let a = core::mem::take(&mut mid[0]);
-                inter::uni_pred(&mut self.pic.y[y0 * stride + x0..], stride, &a, w, h, 8);
+                inter::uni_pred(&mut self.pic.y[y0 * stride + x0..], stride, &a, w, h, bd);
             }
             (false, true) => {
                 let b = core::mem::take(&mut mid[1]);
-                inter::uni_pred(&mut self.pic.y[y0 * stride + x0..], stride, &b, w, h, 8);
+                inter::uni_pred(&mut self.pic.y[y0 * stride + x0..], stride, &b, w, h, bd);
             }
             (false, false) => {}
         }
@@ -1559,20 +1699,21 @@ impl<'a> SliceDecoder<'a> {
                     chh,
                     (mv.0 & 7) as usize,
                     (mv.1 & 7) as usize,
-                    8,
+                    self.bd_chroma(),
                 );
                 cmid[l] = buf;
                 cused[l] = true;
             }
             let cstride = self.pic.cw;
+            let bd = self.bd_chroma();
             let dst = if plane == 0 { &mut self.pic.cb } else { &mut self.pic.cr };
             let off = cy * cstride + cx;
             match (cused[0], cused[1]) {
                 (true, true) => {
-                    inter::bi_pred(&mut dst[off..], cstride, &cmid[0], &cmid[1], cw, chh, 8)
+                    inter::bi_pred(&mut dst[off..], cstride, &cmid[0], &cmid[1], cw, chh, bd)
                 }
-                (true, false) => inter::uni_pred(&mut dst[off..], cstride, &cmid[0], cw, chh, 8),
-                (false, true) => inter::uni_pred(&mut dst[off..], cstride, &cmid[1], cw, chh, 8),
+                (true, false) => inter::uni_pred(&mut dst[off..], cstride, &cmid[0], cw, chh, bd),
+                (false, true) => inter::uni_pred(&mut dst[off..], cstride, &cmid[1], cw, chh, bd),
                 (false, false) => {}
             }
         }
@@ -1791,6 +1932,13 @@ impl<'a> SliceDecoder<'a> {
             transform::chroma_qp((self.qp_y + off).clamp(0, 57), 1)
         };
 
+        let bd = if c_idx == 0 {
+            self.sps.bit_depth_luma
+        } else {
+            self.sps.bit_depth_chroma
+        };
+        // Dequant uses the bit-depth-offset QP (H.265 §8.6.1).
+        let qp_bd = qp + 6 * (bd as i32 - 8);
         let p = residual::ResidualParams {
             log2_size,
             c_idx,
@@ -1805,8 +1953,8 @@ impl<'a> SliceDecoder<'a> {
             sign_data_hiding: self.pps.sign_data_hiding_enabled,
             persistent_rice: false,
             transform_skip_context: false,
-            qp,
-            bit_depth: 8,
+            qp: qp_bd,
+            bit_depth: bd,
             scale_matrix: None,
             dc_scale: 16,
         };
@@ -1830,16 +1978,17 @@ impl<'a> SliceDecoder<'a> {
 
         if !self.cu.transquant_bypass {
             if r.transform_skip {
-                transform::transform_skip_scale(&mut coeffs[..size * size], log2_size, 8);
+                transform::transform_skip_scale(&mut coeffs[..size * size], log2_size, bd);
             } else if self.cu.intra && c_idx == 0 && log2_size == 2 {
-                transform::inverse_transform(&mut coeffs[..size * size], log2_size, 8, true);
+                transform::inverse_transform(&mut coeffs[..size * size], log2_size, bd, true);
             } else if r.max_xy == 0 {
-                transform::inverse_transform_dc(&mut coeffs[..size * size], log2_size, 8);
+                transform::inverse_transform_dc(&mut coeffs[..size * size], log2_size, bd);
             } else {
-                transform::inverse_transform(&mut coeffs[..size * size], log2_size, 8, false);
+                transform::inverse_transform(&mut coeffs[..size * size], log2_size, bd, false);
             }
         }
 
+        let max = self.sample_max(c_idx);
         let (dst, stride, pw, ph) = match c_idx {
             0 => (&mut self.pic.y, self.pic.w, self.pic.w, self.pic.h),
             1 => (&mut self.pic.cb, self.pic.cw, self.pic.cw, self.pic.ch),
@@ -1855,7 +2004,7 @@ impl<'a> SliceDecoder<'a> {
                 }
                 let k = (y0 + j) * stride + x0 + i;
                 let v = dst[k] as i32 + coeffs[j * size + i] as i32;
-                dst[k] = v.clamp(0, 255) as u8;
+                dst[k] = v.clamp(0, max) as u16;
             }
         }
         Ok(())
@@ -1933,7 +2082,7 @@ impl<'a> SliceDecoder<'a> {
             put(2 * n + 1 + i, x0 as isize + i as isize, y0 as isize - 1, &mut refs, &mut avail);
         }
 
-        intra::substitute(&mut refs, n, &avail, 8);
+        intra::substitute(&mut refs, n, &avail, self.bd_for(c_idx));
         intra::filter_refs(
             &mut refs,
             n,
@@ -1941,11 +2090,11 @@ impl<'a> SliceDecoder<'a> {
             log2_size,
             c_idx,
             self.sps.strong_intra_smoothing,
-            8,
+            self.bd_for(c_idx),
         );
 
-        let mut block = [0u8; 32 * 32];
-        intra::predict(&mut block[..n * n], n, &refs, mode, log2_size, c_idx, 8);
+        let mut block = [0u16; 32 * 32];
+        intra::predict(&mut block[..n * n], n, &refs, mode, log2_size, c_idx, self.bd_for(c_idx));
 
         let dst = match c_idx {
             0 => &mut self.pic.y,
@@ -1984,6 +2133,23 @@ fn side_at(p: &Pic, x: usize, y: usize) -> EdgeSide {
         ],
         mvs: pu.mvf.mv,
     }
+}
+
+/// Pull `n` big-endian bits from a raw PCM payload.
+fn pcm_take_bits(raw: &[u8], bit: &mut usize, n: u32) -> u16 {
+    let mut v = 0u16;
+    for _ in 0..n {
+        let b = *bit / 8;
+        let s = 7 - (*bit % 8);
+        let bitv = if b < raw.len() {
+            (raw[b] >> s) & 1
+        } else {
+            0
+        };
+        v = (v << 1) | bitv as u16;
+        *bit += 1;
+    }
+    v
 }
 
 /// Deblock the whole picture: vertical edges first, then horizontal.
@@ -2064,6 +2230,10 @@ fn deblock_picture(p: &mut Pic) {
                 if b + 8 > inner {
                     continue;
                 }
+                let shift = p.bit_depth_luma.saturating_sub(8);
+                let beta = beta << shift;
+                let tcs = [tcs[0] << shift, tcs[1] << shift];
+                let max = (1i32 << p.bit_depth_luma) - 1;
                 super::deblock::filter_luma_edge(
                     &mut p.y,
                     base,
@@ -2073,6 +2243,7 @@ fn deblock_picture(p: &mut Pic) {
                     tcs,
                     [false; 2],
                     [false; 2],
+                    max,
                 );
             }
         }
@@ -2130,9 +2301,14 @@ fn deblock_picture(p: &mut Pic) {
                 } else {
                     ((ca * p.cw + cb_) as isize, p.cw as isize, 1isize)
                 };
+                let shift = p.bit_depth_chroma.saturating_sub(8);
+                let tcs = [tcs[0] << shift, tcs[1] << shift];
+                let max = (1i32 << p.bit_depth_chroma) - 1;
                 for plane in 0..2usize {
                     let dst = if plane == 0 { &mut p.cb } else { &mut p.cr };
-                    super::deblock::filter_chroma_edge(dst, base, xs, ys, tcs, [false; 2], [false; 2]);
+                    super::deblock::filter_chroma_edge(
+                        dst, base, xs, ys, tcs, [false; 2], [false; 2], max,
+                    );
                 }
             }
         }
@@ -2175,12 +2351,12 @@ fn sao_picture(p: &mut Pic) {
                 }
                 let w = bs.min(pw - x0);
                 let h = bs.min(ph - y0);
-                let src: &[u8] = match c_idx {
+                let src: &[u16] = match c_idx {
                     0 => &src_y,
                     1 => &src_cb,
                     _ => &src_cr,
                 };
-                let mut tmp = vec![0u8; w * h];
+                let mut tmp = vec![0u16; w * h];
                 if s.type_idx[c_idx] == 1 {
                     sao::band_filter(
                         &mut tmp,
@@ -2191,7 +2367,7 @@ fn sao_picture(p: &mut Pic) {
                         s.band_position[c_idx] as usize,
                         w,
                         h,
-                        8,
+                        if c_idx == 0 { p.bit_depth_luma } else { p.bit_depth_chroma },
                     );
                 } else {
                     // Seed with the deblocked samples so the border rows the
@@ -2217,10 +2393,10 @@ fn sao_picture(p: &mut Pic) {
                         w,
                         h,
                         &borders,
-                        8,
+                        if c_idx == 0 { p.bit_depth_luma } else { p.bit_depth_chroma },
                     );
                 }
-                let dst: &mut [u8] = match c_idx {
+                let dst: &mut [u16] = match c_idx {
                     0 => &mut p.y,
                     1 => &mut p.cb,
                     _ => &mut p.cr,
