@@ -614,6 +614,10 @@ const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Ctrl+C", "stop", "stop the model, or interrupt a running command (/http, /ping, /ws…)"),
     ("Ctrl+D", "exit", "power off on an empty line (EOF)"),
     ("Ctrl+W", "close-pane", "close the action (right) pane; chat full-width"),
+    ("F1", "help", "open the Commands browser (same as /help)"),
+    // Print Screen has no terminal encoding, so it is folded onto F12's — one
+    // handler, and the shortcut is reachable from a serial console too.
+    ("PrtSc / F12", "screenshot", "capture the screen to a PNG in /downloads (same as /screenshot)"),
     ("Ctrl+V", "paste", "paste the clipboard into the shell line"),
     ("Backspace", "erase", "delete the character before the cursor"),
     ("/ktrace", "toggle-ktrace", "show/hide the ktrace stream in the action pane"),

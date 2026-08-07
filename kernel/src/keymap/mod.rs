@@ -334,6 +334,29 @@ fn nav_sequence(u: Usage, mods: Mods) -> Option<&'static str> {
         0x4b => "\x1b[5~", // PgUp
         0x4e => "\x1b[6~", // PgDn
         0x4c => "\x1b[3~", // Delete
+        // Function keys, in the VT220/xterm encodings.
+        //
+        // Standard forms on purpose: a serial terminal sends exactly these, so a
+        // shortcut bound to F1 works from a host terminal and from the e2e harness
+        // as well as from a physical keyboard. Before this, F-keys were decoded by
+        // no driver and produced nothing at all on any transport.
+        0x3a => "\x1b[11~", // F1
+        0x3b => "\x1b[12~", // F2
+        0x3c => "\x1b[13~", // F3
+        0x3d => "\x1b[14~", // F4
+        0x3e => "\x1b[15~", // F5
+        0x3f => "\x1b[17~", // F6  (16 is skipped by the VT220 encoding)
+        0x40 => "\x1b[18~", // F7
+        0x41 => "\x1b[19~", // F8
+        0x42 => "\x1b[20~", // F9
+        0x43 => "\x1b[21~", // F10
+        0x44 => "\x1b[23~", // F11 (22 is skipped)
+        // F12 **and** Print Screen produce the same sequence. Print Screen is the
+        // key a human reaches for to take a screenshot and has no terminal
+        // encoding at all; F12 is the one a serial terminal can send. Folding them
+        // into one code means the shortcut has a single handler and works from
+        // both, rather than a physical-only binding nothing can test.
+        0x45 | 0x46 => "\x1b[24~",
         // Ctrl+Tab / Ctrl+Shift+Tab: cycle pane focus.
         0x2b if mods.has(Mods::CTRL) && mods.has(Mods::SHIFT) => "\x1b[Z",
         0x2b if mods.has(Mods::CTRL) => "\x1b[T",
@@ -1123,6 +1146,59 @@ mod tests {
         // Plain Tab and Space are still characters.
         assert_eq!(tr(us, 0x2b, 0), "\t");
         assert_eq!(tr(us, 0x2c, 0), " ");
+    }
+
+    /// F-keys produced **nothing** on every transport before the keymap existed,
+    /// which is why they were available to bind shortcuts to.
+    #[test_case]
+    fn function_keys_use_the_standard_vt220_encodings() {
+        let us = &layouts::US;
+        for &(u, want) in &[
+            (0x3au8, "\x1b[11~"), // F1
+            (0x3b, "\x1b[12~"),
+            (0x3c, "\x1b[13~"),
+            (0x3d, "\x1b[14~"),
+            (0x3e, "\x1b[15~"),
+            (0x3f, "\x1b[17~"), // F6 — the encoding skips 16
+            (0x40, "\x1b[18~"),
+            (0x41, "\x1b[19~"),
+            (0x42, "\x1b[20~"),
+            (0x43, "\x1b[21~"),
+            (0x44, "\x1b[23~"), // F11 — and 22
+            (0x45, "\x1b[24~"), // F12
+        ] {
+            assert_eq!(tr(us, u, 0), want, "usage {u:#04x}");
+        }
+        // Print Screen folds onto F12's code: it has no terminal encoding of its
+        // own, so sharing one means the shortcut has a single handler and is
+        // reachable from a serial console too.
+        assert_eq!(tr(us, 0x46, 0), "\x1b[24~", "Print Screen");
+        // They are layout-independent — an F-key has no character on any layout.
+        for l in layouts::LAYOUTS {
+            assert_eq!(tr(l, 0x3a, 0), "\x1b[11~", "F1 on layout '{}'", l.id);
+        }
+    }
+
+    /// All three transports must decode the function-key block, or a shortcut
+    /// bound to F1 works on one keyboard and not another.
+    #[test_case]
+    fn every_transport_decodes_the_function_keys_and_print_screen() {
+        for &(s1, s2, ev, want) in &[
+            (0x3bu8, 0x05u8, 59u16, 0x3au8), // F1
+            (0x3c, 0x06, 60, 0x3b),          // F2
+            (0x3d, 0x04, 61, 0x3c),          // F3
+            (0x44, 0x09, 68, 0x43),          // F10
+            (0x57, 0x78, 87, 0x44),          // F11
+            (0x58, 0x07, 88, 0x45),          // F12
+        ] {
+            assert_eq!(usage_from_set1(s1, false), Some(want), "set-1 {s1:#04x}");
+            assert_eq!(usage_from_set2(s2, false), Some(want), "set-2 {s2:#04x}");
+            assert_eq!(usage_from_evdev(ev), Some(want), "evdev {ev}");
+        }
+        // Print Screen: evdev calls it SysRq (99). PS/2 sends it as a multi-byte
+        // dance that this driver does not reassemble, which is exactly why the
+        // shortcut also answers to F12.
+        assert_eq!(usage_from_evdev(99), Some(0x46));
     }
 
     #[test_case]

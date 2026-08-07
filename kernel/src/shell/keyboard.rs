@@ -52,6 +52,8 @@ fn usage() {
     serial_println!("  /keyboard ime <mode>         off|hiragana|katakana|hangul (pinyin is refused)");
     serial_println!("  /keyboard type <ascii>       feed text through the live IME");
     serial_println!("  /keyboard echo <text>        echo it back with char/byte/column counts");
+    serial_println!("  key names: space enter tab esc bs up down left right home end pgup pgdn del");
+    serial_println!("             iso f1..f12 prtsc, or any US base character");
 }
 
 fn status() {
@@ -185,6 +187,20 @@ fn parse_spec(tok: &str) -> Option<(keymap::Usage, Mods)> {
         // The ISO key left of Z/Y, which has no US character at all — the whole
         // reason a usage-based canonical space was needed.
         "iso" | "102nd" => Some(0x64),
+        // Function keys, and Print Screen (which folds onto F12's sequence).
+        "f1" => Some(0x3a),
+        "f2" => Some(0x3b),
+        "f3" => Some(0x3c),
+        "f4" => Some(0x3d),
+        "f5" => Some(0x3e),
+        "f6" => Some(0x3f),
+        "f7" => Some(0x40),
+        "f8" => Some(0x41),
+        "f9" => Some(0x42),
+        "f10" => Some(0x43),
+        "f11" => Some(0x44),
+        "f12" => Some(0x45),
+        "prtsc" | "printscreen" | "sysrq" => Some(0x46),
         _ => None,
     };
     if let Some(u) = named {
@@ -475,6 +491,10 @@ mod tests {
         assert_eq!(parse_spec("space").map(|(u, _)| u), Some(0x2c));
         assert_eq!(parse_spec("up").map(|(u, _)| u), Some(0x52));
         assert_eq!(parse_spec("iso").map(|(u, _)| u), Some(0x64));
+        // The function keys, which carry the two global shortcuts.
+        assert_eq!(parse_spec("f1").map(|(u, _)| u), Some(0x3a));
+        assert_eq!(parse_spec("f12").map(|(u, _)| u), Some(0x45));
+        assert_eq!(parse_spec("prtsc").map(|(u, _)| u), Some(0x46));
         // Nonsense is refused rather than guessed at.
         assert!(parse_spec("nonsense").is_none());
         assert!(parse_spec("hyper+a").is_none());

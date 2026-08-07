@@ -2921,6 +2921,81 @@ def s_keyboard_unicode(g):
         return False, f"exception: {e}"
 
 
+def s_keyboard_shortcuts(g):
+    """F1 opens help and F12 / Print Screen takes a screenshot — pressed for real.
+
+    The keys are sent as the **VT220 sequences a terminal actually emits**
+    (`ESC[11~`, `ESC[24~`), which is the same byte stream `keymap::translate`
+    produces for a physical F1/F12/PrtSc — so this asserts the whole path, not a
+    command alias. Print Screen has no terminal encoding of its own, which is
+    exactly why it folds onto F12's code.
+
+    Also asserts they work **mid-line**: a global shortcut that only fires at an
+    empty prompt is not a global shortcut, and the draft must survive."""
+    try:
+        # Both shortcuts are documented where a human would look for them.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send("/shortcuts")
+        if not g.wait_for("F1", 10, m):
+            return False, "F1 is not listed in /shortcuts"
+        g.wait_quiet(0.3, 10)
+        if "PrtSc" not in g.since(m):
+            return False, "the screenshot shortcut is not listed in /shortcuts"
+
+        # The keymap really produces those sequences, on every layout.
+        for cmd, want in [
+            ("/keyboard test us f1", "U+001B U+005B U+0031 U+0031 U+007E"),
+            ("/keyboard test us f12", "U+001B U+005B U+0032 U+0034 U+007E"),
+            ("/keyboard test us prtsc", "U+001B U+005B U+0032 U+0034 U+007E"),
+            ("/keyboard test de f1", "U+001B U+005B U+0031 U+0031 U+007E"),
+        ]:
+            g.wait_quiet(0.3, 10)
+            m = g.mark()
+            g.send(cmd)
+            if not g.wait_for(want, 10, m):
+                return False, f"'{cmd}' did not emit the VT220 sequence: {g.since(m)[-200:]}"
+
+        # Press F12 **while a draft is on the line**: the shortcut must fire and
+        # the draft must still be there afterwards.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send_raw(b"/pw")            # a partial command, deliberately unsubmitted
+        g.wait_quiet(0.3, 10)
+        g.send_raw(b"\x1b[24~")       # F12 / Print Screen
+        if not g.wait_for("screenshot>", 30, m):
+            return False, "F12 did not take a screenshot"
+        g.wait_quiet(0.5, 20)
+        out = g.since(m)
+        if "no framebuffer" not in out and "saved /downloads/screenshot-" not in out:
+            return False, f"F12 produced no capture: {out[-300:]}"
+        # Finish the draft: if the shortcut ate it, this is not a valid command.
+        g.send_raw(b"d\r")
+        if not g.wait_for("/home/chitti", 10, m):
+            return False, "the draft did not survive the shortcut"
+
+        # F1 opens the Commands browser. With a framebuffer that is a **blocking
+        # modal**, which prints only the announce line to serial; without one it
+        # falls back to the flat list. Either way it must say something — a
+        # shortcut with no feedback is indistinguishable from a dead key, which is
+        # why the announce line exists.
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send_raw(b"\x1b[11~")
+        if not g.wait_for("help>", 15, m) and not g.wait_for("Chitti commands:", 5, m):
+            return False, "F1 did not open help"
+        # Dismiss the modal and confirm the shell still takes commands.
+        g.send_raw(b"\x1b")
+        g.wait_quiet(0.5, 10)
+        m = g.mark()
+        g.send("/pwd")
+        if not g.wait_for("/home/chitti", 10, m):
+            return False, "the shell did not survive the help shortcut"
+        return True, "F1 opens help, F12/PrtSc captures, both mid-line, draft intact"
+    except Exception as e:
+        return False, f"exception: {e}"
+
+
 def s_keyboard_ime(g):
     """romaji -> kana, and the two refusals that keep the feature honest."""
     try:
@@ -3614,6 +3689,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_layouts", s_keyboard_layouts),
     ("keyboard_unicode", s_keyboard_unicode),
     ("keyboard_ime", s_keyboard_ime),
+    ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
 NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]

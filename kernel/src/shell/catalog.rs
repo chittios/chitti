@@ -169,7 +169,7 @@ pub const ENTRIES: &[Entry] = &[
         name: "camera",
         shortcut: "",
     },
-    Entry { category: "System & UI", title: "Screenshot", name: "screenshot", shortcut: "" },
+    Entry { category: "System & UI", title: "Screenshot", name: "screenshot", shortcut: "PrtSc / F12" },
     Entry { category: "System & UI", title: "Keyboard Layout & IME", name: "keyboard", shortcut: "" },
     Entry { category: "System & UI", title: "Notifications", name: "notify", shortcut: "" },
     Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },
@@ -183,7 +183,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Clipboard", name: "clip", shortcut: "" },
     Entry { category: "System & UI", title: "Close Action Pane", name: "close", shortcut: "Ctrl+W" },
     Entry { category: "System & UI", title: "About ChittiOS", name: "about", shortcut: "" },
-    Entry { category: "System & UI", title: "Commands Help", name: "help", shortcut: "" },
+    Entry { category: "System & UI", title: "Commands Help", name: "help", shortcut: "F1" },
     // Media
     Entry { category: "Media", title: "Voice", name: "voice", shortcut: "" },
     Entry { category: "Media", title: "PDF Viewer", name: "pdf", shortcut: "" },

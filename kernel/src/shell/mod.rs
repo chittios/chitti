@@ -1682,6 +1682,12 @@ fn print_help(arg: &str) {
     #[cfg(not(test))]
     {
         if !force_text && crate::framebuffer::composer_available() {
+            // Announce on serial before blocking. The browser is a framebuffer
+            // modal, so a serial console — a host terminal, `make e2e`, an
+            // attached debugger — otherwise sees *nothing* and the shell appears
+            // to have wedged. That matters more now that F1 opens this: a
+            // shortcut with no feedback is indistinguishable from a dead key.
+            serial_println!("help> Commands browser open (type to search, Esc to close, /help text for a flat list)");
             match crate::modal::browse_commands() {
                 Some(name) => {
                     // Prefill composer: `/ping ` not `help> /ping` in the log.
@@ -7193,6 +7199,37 @@ fn read_line(buf: &mut String) -> ReadOutcome {
                         print_agents_text();
                     }
                     continue;
+                }
+                // **Function-key shortcuts, handled before anything else claims
+                // the sequence** — including the editor, because F1 must open help
+                // while you are editing and F12 must photograph the screen you are
+                // looking at. That is the whole point of a global shortcut, and it
+                // is why these sit above the editor forwarding rather than below
+                // it with the arrow keys.
+                //
+                // Both run the ordinary command, so there is one implementation
+                // and the key is a shorthand rather than a second code path. A
+                // human pressed this, so `in_tool_call()` is false and
+                // `/screenshot` captures the whole screen regardless of which
+                // agent the chat is homed to.
+                if fin == Some(b'~') {
+                    match param {
+                        11 => {
+                            // F1 — the universal help key.
+                            serial_println!();
+                            print_help("");
+                            composer_sync(buf, cur);
+                            continue;
+                        }
+                        24 => {
+                            // F12 / Print Screen.
+                            serial_println!();
+                            run_screenshot("");
+                            composer_sync(buf, cur);
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
                 // Editor tab active: forward arrow/nav sequences to the editor.
                 if fb_editor_active() {
