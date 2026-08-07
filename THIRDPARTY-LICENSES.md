@@ -235,6 +235,33 @@ SOFTWARE.
 
 ---
 
+## Codec constant tables — generated from reference sources
+
+Several codec tables in `kernel/src/video/` are **generated**, never
+hand-transcribed, by scripts under `tools/`. What they emit are the tables that
+ITU-T H.264 / H.265 and the VP9 bitstream specification define; the reference
+implementations are used as machine-readable copies of those specifications,
+which is also why the generators are checked in and the outputs carry a
+"generated, do not edit" header.
+
+- `tools/gen_cabac_tables.py`, `tools/gen_hevc_tables.py` -> H.264 and H.265
+  CABAC contexts, the HEVC DCT basis, interpolation filters, scan orders,
+  deblocking curves and default scaling lists. Parsed from **FFmpeg**
+  (`libavcodec/hevc/`, `libavcodec/h26x/`), **LGPL-2.1-or-later** —
+  https://ffmpeg.org
+- `tools/gen_vp9_tables.py`, `tools/gen_vp9_idct.py` -> VP9 probability trees,
+  default contexts and the inverse-transform kernels. Parsed from **libvpx**,
+  **BSD-3-Clause** — https://chromium.googlesource.com/webm/libvpx
+- `tools/gen_iq_tables.py`, `tools/gen_mp3_tables.py` -> ggml i-quant tables and
+  the MP3 Huffman/requantisation tables (see the minimp3 entry above).
+
+No FFmpeg or libvpx *code* is vendored or linked; the decoders in
+`kernel/src/video/hevc/` and `kernel/src/video/vp9/` are written against the
+specifications, with these tables and the straight-line transform kernels
+generated so a transcription slip cannot become a silently wrong picture.
+
+---
+
 ## rust_h264 — `third_party/rust_h264/`
 
 Pure-Rust H.264/AVC decoder (Baseline/Main/High, CAVLC + CABAC) used as the

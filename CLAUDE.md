@@ -1956,14 +1956,13 @@ FDT claims a GICv3 but carries no readable `reg`.
   mp4 (stdlib muxer) and asserts the on-kernel probe + streaming decode ("N
   frame(s), ready in …") + transport controls; it auto-skips where x264 is absent.
 
-  **H.265/HEVC and VP9: the bitstream and container layers exist; the pixel
-  pipelines do not.** This is the same staging the H.264 work used, and the split
-  is deliberate — `/open` **demuxes and describes** an HEVC or VP9 file correctly
-  and then says it cannot play it, rather than reporting a codec it will fail on.
-  `probe` carries the reason (`VideoInfo::unsupported_reason`), because the player
-  used to *infer* one at the call site and printed "CABAC entropy coding
-  (baseline/CAVLC only)" for every undecodable stream — true of H.264, nonsense
-  about HEVC (always CABAC) and VP9 (no CABAC at all). What is done:
+  **H.265/HEVC and VP9 both play.** Main-profile 8-bit 4:2:0 HEVC and profile-0
+  VP9 are bit-exact against FFmpeg/libx265 and libvpx respectively; `/open`
+  streams them. Tiles, PCM, 10-bit and VP9 segmentation still refuse with a
+  named reason (`VideoInfo::unsupported_reason`) rather than a wrong H.264-shaped
+  message — the player used to print "CABAC entropy coding (baseline/CAVLC only)"
+  for every undecodable stream, which is true of H.264 and nonsense about HEVC
+  (always CABAC) and VP9 (no CABAC). What landed:
 
   - **The demuxers are codec-agnostic.** `mp4::CodecConfig` is `Avc(AvcC) |
     Hevc(HvcC) | Vp9(VpcC)`; mp4 reads `avc1/avc3`, `hvc1/hev1` and `vp09`, mkv
@@ -2237,15 +2236,118 @@ FDT claims a GICv3 but carries no readable `reg`.
   FFmpeg's context-init `pre ^= pre >> 31` reads as an absolute value but is
   `-x - 1`, which *is* the specification's `63 - p` / `p - 64` asymmetry.
 
-  **What is still missing is the part that turns those into a frame**: the CTU
-  quadtree *walk* that calls all of the above in bitstream order (the split,
-  skip, part-mode and CBF flags plus the transform tree), AMVP, the temporal
-  merge candidate's collocated lookup, and DPB/POC/RPS management. Those are the
-  stages that can only be validated end-to-end, so the order stays: build, then
-  diff whole frames against PyAV via `tools/videodiff`, and claim nothing before
-  that. The tooling pattern VP9 established transfers directly — fetch the
-  reference, generate the tables, transpile the straight-line kernels, diff
-  against PyAV.
+  - **AMVP** (`hevc/inter.rs`) — two predictor candidates per list. Each
+    position is tried in list `lx` **then the other list**, because a neighbour
+    predicting the same *picture* through the opposite slot is still a valid
+    predictor. And `isScaledFlag` gates a whole second pass: when neither left
+    neighbour exists, B is promoted into A's place and B is re-derived with
+    scaling allowed. Missing that rearrangement yields the right *number* of
+    predictors and the wrong ones, at every prediction unit on the left edge of
+    a CTB row. Long-term and short-term references are never mixed — a
+    long-term reference has no meaningful temporal distance, so the candidate is
+    refused rather than scaled by a nonsense ratio.
+  - **POC, RPS, reference lists and the DPB** (`hevc/dpb.rs`) — nothing here
+    touches a pixel, so every mistake is a whole frame that is right in
+    isolation and wrong in sequence. Four rules carry the risk. **The POC wrap
+    test is asymmetric** (`<` pairs with `>=`, `>` pairs with `>`), so a
+    half-range difference wraps forwards and not backwards; writing both
+    comparisons the same way misplaces exactly one picture per wrap. **L0 is
+    before-then-after and L1 after-then-before** — that single swap is the whole
+    structure of bidirectional prediction, and reversing it decodes fine with
+    every B-frame's two predictions exchanged. **A reference list is filled
+    cyclically**, so a slice activating more references than the RPS holds
+    repeats the concatenation rather than getting a short list. And
+    `used_by_curr_pic` decides Curr vs Foll while *position* decides Before vs
+    After, so a picture kept only for a later frame is in the RPS and in no
+    list. Bumping releases the **lowest pending POC**, which is what turns
+    decode order back into display order for a B-pyramid.
+
+  - **CU/PU syntax elements** (`hevc/syntax.rs`) — everything above the residual
+    coder: the split, skip, part-mode, CBF, intra-mode, merge, reference-index,
+    MVD and QP-delta codes. **The binarizations are pure functions over a `Bin`
+    source**, not over the CABAC engine, and that is what makes them testable —
+    a context-coded bin cannot be forced from outside the arithmetic coder, so a
+    test that had to code its way to a given branch would be testing the coder.
+    With a canned bin source, `part_mode` can be checked for what actually
+    matters: that its code is **prefix-free and complete** in each of the five
+    configurations. Four traps it pins: an 8x8 inter CU codes `Nx2N` in **two**
+    bins, not three (NxN there would be 4x4 inter prediction, which HEVC
+    forbids), and consuming the third steals a bin from the next element; an
+    8x4 or 4x8 prediction unit skips its bi-prediction bin entirely for the same
+    bandwidth reason; the MVD's four context-coded flags are **interleaved
+    x, y, x, y** before either remainder, so decoding component-by-component
+    reads a valid vector from the wrong bins whenever both components are
+    non-zero; and `cbf_luma`'s context index runs the *opposite* way from every
+    other depth-indexed context here (1 at the top of the tree, 0 below).
+
+    `cu_qp_delta_abs` **cannot express more than 131** — its suffix's own unary
+    prefix is capped at 7 — and that ceiling has to be reported rather than
+    absorbed: FFmpeg returns an error there, and the obvious alternative of
+    returning the prefix is the plausible small delta `5`, so a corrupt stream
+    would quietly shift the quantiser for the rest of the CU instead of being
+    rejected. It returns `Option<u32>`. (Found by a round-trip test that ran
+    past the representable range, which is the only reason the cap was noticed
+    at all.)
+
+  - **The walk** (`hevc/decoder.rs`) — the CTU quadtree, reconstruction, and the
+    picture-level in-loop filters. It owns what a *picture* has and a block does
+    not: the neighbour grids (motion, intra modes, skip, depth, QP, coefficient
+    presence, each at the granularity the specification indexes it by), and
+    **availability**, which for a quadtree is not "above or left" but a **z-scan
+    order comparison** — a block above you can be one that has not been decoded.
+
+  **HEVC intra is bit-exact against FFmpeg.** `tools/videodiff hevcseq` decodes a
+  real `hvc1` mp4 and the IDR frame matches PyAV with **zero differing samples in
+  all three planes** — CABAC, the quadtree, MPM derivation, reference
+  substitution and filtering, all 35 prediction modes, residual coding, dequant,
+  both transforms, deblocking and SAO. Two bugs stood between "decodes" and
+  "bit-exact", and both are the silent kind:
+
+  - **A leftover context-coded `decision()` in the QP-delta path** consumed one
+    bin belonging to the residual right after it. `cu_qp_delta_sign_flag` is a
+    **bypass** bin, present only when the magnitude is non-zero. The symptom was
+    a picture that decoded, terminated its slice at exactly the right CTU, and
+    had plausible intra modes throughout — while every coefficient block came
+    from one bit too late.
+  - **`qPY_PRED` is the average of the left and above neighbours *inside the
+    current CTB*** (H.265 §8.6.1), falling back to the previous CU's QP where
+    either is absent — not the running QP. Using the running QP drifts toward the
+    bottom-right of every picture, because the error compounds through each
+    quantisation group's predictor and then again through intra prediction from
+    the blocks it mis-quantised. It read as a gentle gradient error, maximum 34
+    of 255, with the top-left 32x32 already exact.
+
+  **How to debug it, because the harness is most of the work.** `tools/videodiff
+  hevcseq <file>` decodes with our decoder and writes raw I420; a PyAV venv
+  (`python3 -m venv /tmp/avenv && /tmp/avenv/bin/pip install av numpy`) decodes
+  the same file as the reference. **PyAV ships libx265, so targeted clips can be
+  generated to bisect the feature space** — that is what found WPP, and it turns
+  a guess into a measurement. Set `dec.trace_on` for a per-CU/TU trace with the
+  CABAC byte position, which distinguishes a *syntax desync* (bytes consumed far
+  from the slice length) from a *reconstruction* error (bytes right, pixels
+  wrong). Two traps in reading that trace: `byte_pos` includes up to 4 bytes of
+  reservoir look-ahead and saturates at the slice end, so "61 of 61" is only
+  accurate to +-4; and the CTU loop exits on the CTB count, so
+  `end_of_slice_segment_flag` returning 1 proves nothing about sync.
+
+  **HEVC Main plays, bit-exact against FFmpeg.** Zero differing samples on the
+  videodiff suite: multi-CTB all-intra, I+P, hierarchical B-pyramid, WPP, SAO,
+  deblock, TMVP, sign-hide, mid-stream CRA with RASL leading pictures, and
+  realish default-x265 GOPs (including 320x240). Two late silent bugs that made
+  "almost every clip" match while a typical real encode did not:
+
+  - **`ref_idx_l0` and `ref_idx_l1` share the L0 CABAC contexts** in every
+    production encoder/decoder (x265's `OFF_REF_NO_CTX` is list-agnostic;
+    FFmpeg hard-codes `REF_IDX_L0_OFFSET`). The specification's table has a
+    separate L1 pair; using it desynchronises the first bi-predicted AMVP block
+    that has more than one L1 reference — the hierarchical B-pyramid leaf case.
+  - **A mid-stream CRA must not empty the DPB.** IDR/BLA set NoRaslOutputFlag
+    and clear references; a continuous CRA keeps them so RASL leading pictures
+    can still predict from the previous GOP. Clearing on every IRAP made three
+    frames before each keyint CRA pure noise while everything else stayed exact.
+
+  Still refused rather than guessed: tiles, PCM, 10/12-bit. The rule stands —
+  diff whole frames against PyAV before claiming anything works.
 - **Switchable engines, and the rule for adding another.** Two subsystems run an
   alternative implementation **alongside** ours on the `/decoder ring3|kernel`
   pattern — a `bench` subcommand compares them:
