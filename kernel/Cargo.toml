@@ -158,6 +158,12 @@ brotli-decompressor = { version = "4", default-features = false }
 # THIRDPARTY-LICENSES.md. hashbrown is already pulled by fontdue.
 just-engine = { path = "../third_party/just-ref", default-features = false }
 
+# `tl` — an ALTERNATIVE HTML tree builder to `browser::html`, switchable at
+# runtime with `/html ours|tl`. Vendored in-tree at `third_party/tl` (upstream
+# 0.7.8, MIT) and converted to no_std + alloc; see its DIVERGENCES.md and
+# THIRDPARTY-LICENSES.md. Zero dependencies of its own beyond hashbrown, which
+# fontdue already pulls.
+tl = { path = "../third_party/tl", default-features = false }
 # `just`'s Pest parser (pest / pest_consume 2.1) predates no_std support, so the
 # whole pest stack is vendored + patched under third_party/ and repointed here
 # for the kernel build only. The host webcompat harness keeps the crates.io

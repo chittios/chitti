@@ -1,0 +1,31 @@
+# Vendored from crates.io `tl` 0.7.8 (MIT, y21) and converted to `no_std` +
+# `alloc` so the kernel can run it as an ALTERNATIVE HTML parser to
+# `browser::html` — switch with `/html ours|tl`.
+#
+# Upstream is `std`-only, but only shallowly: the whole conversion is
+# `std::` -> `core::`/`alloc::` plus `HashMap` -> `hashbrown` (already in the
+# tree via fontdue) and dropping the `std::error::Error` impl. Nothing
+# algorithmic changed, so upstream fixes still apply cleanly.
+#
+# Divergences from upstream are listed in DIVERGENCES.md. See
+# THIRDPARTY-LICENSES.md.
+# Not a member of the root workspace: the kernel targets a custom no_std triple
+# built with -Z build-std and must not be unified with the host workspace. Same
+# opt-out `third_party/just-ref` uses.
+[workspace]
+
+[package]
+name = "tl"
+version = "0.7.8"
+edition = "2021"
+license = "MIT"
+description = "Fast HTML parser (vendored, no_std)"
+
+[dependencies]
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+
+[features]
+default = []
+# Upstream's portable-simd path needs nightly `core::simd`; the kernel builds
+# on nightly but the scalar fallback is what is measured, so this stays off.
+simd = []

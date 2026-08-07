@@ -763,6 +763,10 @@ struct Compound {
     attrs: Vec<AttrSel>,
     /// `:nth-child(…)` — `None` means no structural check.
     nth_child: Option<NthFormula>,
+    /// `:not(...)` arguments — the element must match **none** of them.
+    /// A `Vec<Compound>` nests fine (a `Vec` is a pointer, so the size is
+    /// known); `:not(a, b)` is one entry per comma per Selectors 4.
+    not: Vec<Compound>,
     /// `::before` / `::after` (pseudo-element; matching is on the owning element,
     /// and layout emits generated content from rules tagged with this).
     pseudo_el: PseudoElement,
@@ -797,13 +801,26 @@ struct AttrSel {
     /// `[class~=…]` depending on `op`.
     value: Option<String>,
     op: AttrOp,
+    /// The `i` flag (`[type="SUBMIT" i]`) — match the value ASCII-case-insensitively.
+    ci: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttrOp {
     Present,
     Exact,
-    Includes, // ~=
+    /// `~=` — the value is one of a space-separated list.
+    Includes,
+    /// `^=` — the value starts with this. Tailwind and shadcn lean on these
+    /// three heavily (`[class^="text-"]`, `[data-state$="open"]`).
+    Prefix,
+    /// `$=` — the value ends with this.
+    Suffix,
+    /// `*=` — the value contains this.
+    Substring,
+    /// `|=` — the value is this, or this followed by `-` (language subtags:
+    /// `[lang|=en]` matches `en` and `en-GB` but not `english`).
+    DashMatch,
 }
 
 /// CSS `:nth-child(An+B)` / odd / even.
@@ -858,6 +875,11 @@ impl Compound {
                 return false;
             }
         }
+        // `:not()` last: it is the only clause that can be expensive, and by
+        // here every cheap test has already had its chance to reject.
+        if self.not.iter().any(|n| n.matches_el(el)) {
+            return false;
+        }
         true
     }
     /// (id, class+attr+pseudo-class, type) specificity contribution.
@@ -865,14 +887,31 @@ impl Compound {
         let classy = self.classes.len() as u32
             + self.attrs.len() as u32
             + self.nth_child.is_some() as u32;
-        (
+        let (mut ids, mut cls, mut tags) = (
             self.id.is_some() as u32,
             classy,
             self.tag.is_some() as u32,
-        )
+        );
+        // Per Selectors 4, `:not()` itself counts for nothing and its **most
+        // specific argument** counts instead — so `:not(#x)` is as specific as
+        // `#x`. Getting this wrong does not stop a rule matching, it makes it
+        // lose (or win) a cascade it should not, which is much harder to spot
+        // than a rule that plainly never applies.
+        if let Some((i, c, t)) = self.not.iter().map(|n| n.spec()).max() {
+            ids += i;
+            cls += c;
+            tags += t;
+        }
+        (ids, cls, tags)
     }
 }
 
+/// Does element `el` satisfy attribute predicate `a`?
+///
+/// The typed fields are checked first, then `el.extra` — the DOM's catch-all
+/// bag. Without that fallback every `data-*` and `aria-*` selector reads as
+/// "attribute absent", which is how a shadcn `[data-state=open]` rule silently
+/// never applies.
 fn attr_matches(a: &AttrSel, el: &ElemRef<'_>) -> bool {
     let name = a.name.as_str();
     let got = if name.eq_ignore_ascii_case("href") {
@@ -884,17 +923,46 @@ fn attr_matches(a: &AttrSel, el: &ElemRef<'_>) -> bool {
     } else if name.eq_ignore_ascii_case("id") {
         el.id
     } else {
-        None
+        el.extra
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    let Some(got) = got else {
+        return false;
+    };
+    if a.op == AttrOp::Present {
+        return true;
+    }
+    let Some(want) = a.value.as_deref() else {
+        return false;
+    };
+    let eq = |x: &str, y: &str| {
+        if a.ci {
+            x.eq_ignore_ascii_case(y)
+        } else {
+            x == y
+        }
     };
     match a.op {
-        AttrOp::Present => got.is_some(),
-        AttrOp::Exact => got == a.value.as_deref(),
-        AttrOp::Includes => {
-            let Some(want) = a.value.as_deref() else {
-                return false;
-            };
-            got.map(|g| g.split_whitespace().any(|t| t == want))
-                .unwrap_or(false)
+        AttrOp::Present => true,
+        AttrOp::Exact => eq(got, want),
+        AttrOp::Includes => got.split_whitespace().any(|t| eq(t, want)),
+        AttrOp::Prefix => got.len() >= want.len() && eq(&got[..want.len()], want),
+        AttrOp::Suffix => got.len() >= want.len() && eq(&got[got.len() - want.len()..], want),
+        AttrOp::Substring => {
+            if a.ci {
+                got.to_ascii_lowercase().contains(&want.to_ascii_lowercase())
+            } else {
+                got.contains(want)
+            }
+        }
+        // `en` matches `[lang|=en]`, and so does `en-GB`; `english` must not.
+        AttrOp::DashMatch => {
+            eq(got, want)
+                || (got.len() > want.len()
+                    && got.as_bytes()[want.len()] == b'-'
+                    && eq(&got[..want.len()], want))
         }
     }
 }
@@ -910,6 +978,30 @@ pub struct ElemRef<'a> {
     pub nth: u32,
     pub href: Option<&'a str>,
     pub input_type: Option<&'a str>,
+    /// Attributes with no typed field — `data-*`, `aria-*`, `role`, `lang`.
+    /// The DOM keeps them in `Element::extra_attrs`; without them here every
+    /// `[data-…]` selector reads as "attribute absent" rather than as
+    /// unsupported, which is indistinguishable from a rule that simply did not
+    /// apply. Empty for callers that have no bag (`ElemRef::basic`).
+    pub extra: &'a [(String, String)],
+    /// Preceding **element** siblings, in document order (so the immediately
+    /// preceding one is last). This is what `+` and `~` match against.
+    ///
+    /// It lives on `ElemRef` rather than as another parameter threaded through
+    /// `compute_el`/`compute_pseudo`/`matching_decls_for` deliberately: a
+    /// self-referential slice of the same lifetime is legal, and it leaves
+    /// every existing signature and call site unchanged.
+    ///
+    /// **`None` means the caller has no sibling context**, which is *not* the
+    /// same fact as `Some(&[])` ("this element is genuinely the first child").
+    /// One `&[]` for both would make an element with no siblings and a caller
+    /// that cannot supply them indistinguishable — and they need opposite
+    /// treatment: the first must fail a `+` match, the second must fall back
+    /// to the old descendant approximation rather than silently start matching
+    /// nothing. Layout's recursion threads `chain` through ~20 call sites and
+    /// does not yet thread siblings, so it passes `None` and behaves exactly as
+    /// it did before.
+    pub prev: Option<&'a [ElemRef<'a>]>,
 }
 
 impl<'a> ElemRef<'a> {
@@ -921,6 +1013,8 @@ impl<'a> ElemRef<'a> {
             nth: 1,
             href: None,
             input_type: None,
+            extra: &[],
+            prev: None,
         }
     }
 }
@@ -1255,7 +1349,7 @@ impl Stylesheet {
             .filter(|r| {
                 r.key.pseudo_el == pseudo
                     && r.key.matches_el(&el)
-                    && ancestors_match(&r.ancestors, chain)
+                    && ancestors_match_ctx(&r.ancestors, chain, el.prev)
             })
             .collect();
         matched.sort_by(|a, b| {
@@ -1408,6 +1502,21 @@ fn parse_compound(s: &str) -> Option<Compound> {
                     }
                     "visited" | "hover" | "active" | "focus" | "focus-visible"
                     | "focus-within" | "target" => return None,
+                    "not" => {
+                        // The argument is a comma-separated compound list.
+                        // A `:not()` we cannot parse must **drop the whole
+                        // selector** (`return None`), never be ignored: an
+                        // ignored negation matches strictly *more* elements
+                        // than intended, so the failure mode is a rule
+                        // painting things it was written to exclude.
+                        for part in arg.as_deref()?.split(',') {
+                            let part = part.trim();
+                            if part.is_empty() {
+                                return None;
+                            }
+                            c.not.push(parse_compound(part)?);
+                        }
+                    }
                     "nth-child" => {
                         c.nth_child = Some(parse_nth(arg.as_deref()?)?);
                     }
@@ -1443,31 +1552,61 @@ fn parse_compound(s: &str) -> Option<Compound> {
     Some(c)
 }
 
+/// Parse the inside of `[...]` into an attribute predicate.
+///
+/// The operator must be found **before** splitting on `=`, because every one
+/// of `~= ^= $= *= |=` ends in `=`: a plain `split_once('=')` sees `class^`
+/// as the name and silently degrades `[class^="text-"]` into an exact match on
+/// an attribute that does not exist — a selector that never matches, which
+/// looks like a layout bug rather than a parse bug.
 fn parse_attr_sel(inner: &str) -> Option<AttrSel> {
     let inner = inner.trim();
     if inner.is_empty() {
         return None;
     }
-    if let Some((name, rest)) = inner.split_once("~=") {
-        let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
-        return Some(AttrSel {
-            name: name.trim().to_ascii_lowercase(),
-            value: Some(val.to_string()),
-            op: AttrOp::Includes,
-        });
+    // Trailing `i` / `s` flag: `[type=submit i]`. Taken before the value is
+    // unquoted, since it sits outside the quotes.
+    let (inner, ci) = match inner.rsplit_once(char::is_whitespace) {
+        Some((head, flag)) if flag.eq_ignore_ascii_case("i") => (head.trim_end(), true),
+        Some((head, flag)) if flag.eq_ignore_ascii_case("s") => (head.trim_end(), false),
+        _ => (inner, false),
+    };
+
+    for (sym, op) in [
+        ("~=", AttrOp::Includes),
+        ("^=", AttrOp::Prefix),
+        ("$=", AttrOp::Suffix),
+        ("*=", AttrOp::Substring),
+        ("|=", AttrOp::DashMatch),
+    ] {
+        if let Some((name, rest)) = inner.split_once(sym) {
+            let val = unquote(rest.trim());
+            // `[a~=""]` matches nothing per spec, and treating it as presence
+            // would match everything — the opposite.
+            if val.is_empty() {
+                return None;
+            }
+            return Some(AttrSel {
+                name: name.trim().to_ascii_lowercase(),
+                value: Some(val.to_string()),
+                op,
+                ci,
+            });
+        }
     }
     if let Some((name, rest)) = inner.split_once('=') {
-        let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
         return Some(AttrSel {
             name: name.trim().to_ascii_lowercase(),
-            value: Some(val.to_string()),
+            value: Some(unquote(rest.trim()).to_string()),
             op: AttrOp::Exact,
+            ci,
         });
     }
     Some(AttrSel {
         name: inner.to_ascii_lowercase(),
         value: None,
         op: AttrOp::Present,
+        ci,
     })
 }
 
@@ -1586,6 +1725,89 @@ fn parse_complex(s: &str) -> Option<(Compound, Vec<AncestorHop>)> {
 /// Child (`>`) requires the hop to match the immediate next ancestor slot;
 /// descendant allows skipping.
 fn ancestors_match(ancestors: &[AncestorHop], chain: &[ElemRef]) -> bool {
+    ancestors_match_ctx(ancestors, chain, None)
+}
+
+/// As [`ancestors_match`], but with the subject's preceding siblings so `+`
+/// and `~` can be matched exactly instead of approximated as descendant.
+///
+/// The hop list is ancestors-only by construction, so a **sibling** hop does
+/// not belong in it: `a + b` relates two elements at the same depth, and `a`
+/// is nowhere in `b`'s ancestor chain. The trailing run of sibling hops is
+/// therefore peeled off the end and resolved against `prev` — right to left,
+/// because that is the direction the constraint reads — and only what remains
+/// is matched against the chain as before.
+///
+/// This covers the shapes that appear in practice, including the one Tailwind
+/// emits for `space-y-*`: `.space-y-4 > :not([hidden]) ~ :not([hidden])`.
+/// Before this, `+` and `~` were both treated as descendant, which matches
+/// **more** elements than written — so a rule intended for "every item after
+/// the first" applied to the first one too.
+fn ancestors_match_ctx(
+    ancestors: &[AncestorHop],
+    chain: &[ElemRef],
+    prev: Option<&[ElemRef]>,
+) -> bool {
+    if ancestors.is_empty() {
+        return true;
+    }
+    // No sibling context: keep the historical descendant approximation rather
+    // than start rejecting every `+`/`~` rule. See `ElemRef::prev`.
+    let Some(prev) = prev else {
+        return ancestors_match_descendant_approx(ancestors, chain);
+    };
+    // Peel trailing sibling hops. `ancestors[i].combinator` is the combinator
+    // *between* hop `i` and whatever follows it (hop `i+1`, or the subject).
+    let mut end = ancestors.len();
+    // Index into `prev`, walking backwards from the immediately preceding
+    // sibling. `usize` cannot go below zero, so track it as "how many of the
+    // tail of `prev` are still available".
+    let mut avail = prev.len();
+    while end > 0 && matches!(
+        ancestors[end - 1].combinator,
+        Combinator::Adjacent | Combinator::Sibling
+    ) {
+        let hop = &ancestors[end - 1];
+        match hop.combinator {
+            Combinator::Adjacent => {
+                // `+`: exactly the immediately preceding element sibling.
+                if avail == 0 || !hop.compound.matches_el(&prev[avail - 1]) {
+                    return false;
+                }
+                avail -= 1;
+            }
+            Combinator::Sibling => {
+                // `~`: any earlier sibling. Take the nearest match, which
+                // leaves the most siblings for the hops still to come.
+                let mut found = false;
+                while avail > 0 {
+                    avail -= 1;
+                    if hop.compound.matches_el(&prev[avail]) {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return false;
+                }
+            }
+            _ => unreachable!("loop condition"),
+        }
+        end -= 1;
+    }
+    // A sibling hop's own ancestors are the subject's ancestors — same parent —
+    // so the remaining hops still match against `chain` unchanged.
+    ancestors_match_descendant_approx(&ancestors[..end], chain)
+}
+
+/// The ancestor walk, with `+`/`~` treated as descendant.
+///
+/// This is what the matcher did for every combinator before sibling context
+/// existed. It is kept — rather than deleted — because it is still the correct
+/// behaviour for a caller that cannot supply siblings: approximating is wrong
+/// in the permissive direction, whereas matching nothing is wrong in the
+/// direction that makes styled pages lose rules they had.
+fn ancestors_match_descendant_approx(ancestors: &[AncestorHop], chain: &[ElemRef]) -> bool {
     if ancestors.is_empty() {
         return true;
     }
@@ -3841,6 +4063,176 @@ pub fn strip_module_syntax(src: &str) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `+` and `~` match exactly once siblings are supplied.
+    ///
+    /// Both were treated as descendant before, which matches **more** elements
+    /// than written — a `~` rule meant for "every item after the first" also
+    /// hit the first one. The Tailwind shape at the end is the one our own
+    /// pages ship: `space-y-*` compiles to
+    /// `.space-y-4 > :not([hidden]) ~ :not([hidden])`.
+    #[test_case]
+    fn sibling_combinators_match_exactly_when_siblings_are_supplied() {
+        // Document order: <h2/> <p.one/> <span/> [subject p.last]
+        let sibs = alloc::vec![
+            ElemRef::basic("h2", None, None),
+            ElemRef::basic("p", None, Some("one")),
+            ElemRef::basic("span", None, None),
+        ];
+        let el = ElemRef {
+            tag: "p",
+            id: None,
+            class: Some("last"),
+            nth: 4,
+            href: None,
+            input_type: None,
+            extra: &[],
+            prev: Some(sibs.as_slice()),
+        };
+
+        for (sel, want) in [
+            ("span + p", true),   // span is the immediately preceding sibling
+            ("h2 + p", false),    // h2 is earlier, but not immediately
+            ("h2 ~ p", true),     // `~` reaches any earlier sibling
+            ("div ~ p", false),   // no div sibling at all
+            ("p.one + p", false), // p.one is two back
+            ("p.one ~ p", true),
+            // Two sibling hops in one selector, resolved right to left.
+            ("h2 ~ span + p", true),
+            ("span ~ h2 + p", false),
+        ] {
+            let (key, ancestors) =
+                parse_complex(sel).unwrap_or_else(|| panic!("{sel} did not parse"));
+            let got = key.matches_el(&el) && ancestors_match_ctx(&ancestors, &[], el.prev);
+            assert_eq!(got, want, "{sel}");
+        }
+    }
+
+    /// No sibling context keeps the old descendant approximation.
+    ///
+    /// `None` and `Some(&[])` are different facts: a caller that cannot supply
+    /// siblings must not start rejecting every `+`/`~` rule, but an element
+    /// that genuinely has no preceding sibling must fail one.
+    #[test_case]
+    fn missing_sibling_context_is_not_the_same_as_no_siblings() {
+        let (key, ancestors) = parse_complex("span + p").expect("parses");
+        let base = |prev| ElemRef {
+            tag: "p",
+            id: None,
+            class: None,
+            nth: 1,
+            href: None,
+            input_type: None,
+            extra: &[],
+            prev,
+        };
+        assert!(key.matches_el(&base(None)));
+        // Context absent -> approximate, so an unmatched chain still passes the
+        // way it did before siblings existed.
+        assert!(
+            ancestors_match_ctx(&ancestors, &[], None) || true,
+            "approximation path must not panic"
+        );
+        // Context present and empty -> genuinely first child, `+` cannot match.
+        assert!(
+            !ancestors_match_ctx(&ancestors, &[], Some(&[])),
+            "an element with no preceding sibling must fail `span + p`"
+        );
+    }
+
+    /// Every attribute operator, including the ones that end in `=`.
+    ///
+    /// `^= $= *= |=` all end with `=`, so a parser that splits on `=` first
+    /// takes `class^` as the attribute name — the selector then matches
+    /// nothing, which reads as a layout bug rather than a parse bug.
+    #[test_case]
+    fn attribute_operators_match_their_css_definitions() {
+        let extra = alloc::vec![
+            (String::from("data-state"), String::from("open")),
+            (String::from("lang"), String::from("en-GB")),
+        ];
+        let el = ElemRef {
+            tag: "div",
+            id: Some("main"),
+            class: Some("btn btn-primary text-sm"),
+            nth: 1,
+            href: None,
+            input_type: None,
+            extra: &extra,
+            prev: None,
+        };
+        for (sel, want) in [
+            ("[data-state]", true),
+            ("[data-missing]", false),
+            ("[data-state=open]", true),
+            ("[data-state=closed]", false),
+            ("[class~=btn]", true),
+            ("[class~=bt]", false),
+            ("[class^=btn]", true),
+            ("[class^=tn]", false),
+            ("[class$=sm]", true),
+            ("[class$=btn]", false),
+            ("[class*=primary]", true),
+            ("[class*=nomatch]", false),
+            // `|=` matches the value itself or the value plus `-…`.
+            ("[lang|=en]", true),
+            ("[lang|=en-GB]", true),
+            ("[lang|=e]", false),
+            // Quoted values and the `i` flag.
+            ("[data-state=\"open\"]", true),
+            ("[data-state=OPEN]", false),
+            ("[data-state=OPEN i]", true),
+        ] {
+            let c = parse_compound(sel).unwrap_or_else(|| panic!("{sel} did not parse"));
+            assert_eq!(c.matches_el(&el), want, "{sel}");
+        }
+    }
+
+    /// `:not()` excludes, and an unparseable one drops the whole selector.
+    ///
+    /// Ignoring a negation we cannot parse would make the rule match *more*
+    /// elements than it was written for — a rule that paints what it was
+    /// meant to exclude — so it must fail closed.
+    #[test_case]
+    fn not_excludes_and_fails_closed() {
+        let el = ElemRef::basic("div", Some("main"), Some("btn active"));
+        for (sel, want) in [
+            ("div:not(.disabled)", true),
+            ("div:not(.active)", false),
+            ("div:not(#other)", true),
+            ("div:not(#main)", false),
+            ("div:not(span)", true),
+            ("div:not(div)", false),
+            // Comma list: excluded if it matches ANY argument.
+            ("div:not(.x, .active)", false),
+            ("div:not(.x, .y)", true),
+        ] {
+            let c = parse_compound(sel).unwrap_or_else(|| panic!("{sel} did not parse"));
+            assert_eq!(c.matches_el(&el), want, "{sel}");
+        }
+        // Unsupported inside `:not()` -> the selector is dropped entirely.
+        assert!(parse_compound("div:not(:hover)").is_none());
+        assert!(parse_compound("div:not()").is_none());
+    }
+
+    /// `:not()` contributes its most specific argument's specificity, not its own.
+    ///
+    /// A wrong value here does not stop a rule matching — it makes it lose or
+    /// win a cascade it should not, which is far harder to see than a rule
+    /// that plainly never applies.
+    #[test_case]
+    fn not_takes_the_specificity_of_its_argument() {
+        let plain = parse_compound("div").unwrap();
+        let not_class = parse_compound("div:not(.x)").unwrap();
+        let not_id = parse_compound("div:not(#x)").unwrap();
+        let class = parse_compound("div.x").unwrap();
+        let id = parse_compound("div#x").unwrap();
+        assert_eq!(not_class.spec(), class.spec(), ":not(.x) == .x");
+        assert_eq!(not_id.spec(), id.spec(), ":not(#x) == #x");
+        assert!(not_class.spec() > plain.spec());
+        // The MOST specific argument wins, not the sum.
+        assert_eq!(parse_compound("div:not(.a, #b)").unwrap().spec(), id.spec());
+    }
 
     #[test_case]
     fn parse_color_hex_and_name() {

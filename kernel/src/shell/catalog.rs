@@ -131,6 +131,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Files", title: "Open / Edit / Play", name: "open", shortcut: "" },
     Entry { category: "Files", title: "Image Decoder (ring 3)", name: "decoder", shortcut: "" },
     Entry { category: "System", title: "Heap Allocator (A/B)", name: "heap", shortcut: "" },
+    Entry { category: "Web", title: "HTML Engine (A/B)", name: "html", shortcut: "" },
     Entry {
         category: "Files",
         title: "JavaScript (Node-style -e / file)",

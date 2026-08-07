@@ -463,6 +463,7 @@ pub fn layout_document_ex(
         vw,
         false, // in_head
         &[],   // ancestor chain (root)
+        &[],   // preceding siblings — the document root has none
     );
     cur.content_bottom = cur.content_bottom.max(cur.y + cur.line_h);
     Layout {
@@ -600,6 +601,37 @@ pub fn layout_reader(title: &str, plain: &str, vw: i32, vh: i32) -> Layout {
 /// Build the ancestor chain for the children of an element: the element's own
 /// chain plus itself, appended (outermost→innermost). Borrows from `chain` and
 /// the element's own strings, both of which outlive the child walk.
+/// An [`css::ElemRef`] for `n` if it is an element, for the sibling list.
+///
+/// Only the fields a selector can test on a *sibling* are filled: `+`/`~`
+/// compounds are matched with `Compound::matches_el`, which reads tag, id,
+/// class, attributes and `:nth-child`. A sibling's own siblings are never
+/// consulted (that would be a selector matching two hops sideways, which the
+/// grammar cannot express), so `prev: None` here is correct and not a gap.
+fn elem_ref_for<'a>(n: &'a Node) -> Option<css::ElemRef<'a>> {
+    match &n.kind {
+        NodeKind::Element {
+            tag,
+            id,
+            class,
+            href,
+            input_type,
+            extra_attrs,
+            ..
+        } => Some(css::ElemRef {
+            tag: tag.as_str(),
+            id: id.as_deref(),
+            class: class.as_deref(),
+            nth: 1,
+            href: href.as_deref(),
+            input_type: input_type.as_deref(),
+            extra: extra_attrs.as_slice(),
+            prev: None,
+        }),
+        _ => None,
+    }
+}
+
 fn push_chain<'a>(
     chain: &[css::ElemRef<'a>],
     tag: &'a str,
@@ -664,14 +696,23 @@ fn walk<'a>(
     vw: i32,
     in_head: bool,
     chain: &[css::ElemRef<'a>],
+    // `n`'s preceding **element** siblings, in document order — what `+` and
+    // `~` match against. Built by each `&n.children` loop below rather than
+    // derived here, because `walk` receives a node and not its position among
+    // its parent's children.
+    prev: &[css::ElemRef<'a>],
 ) {
     match &n.kind {
         NodeKind::Document => {
+            let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
             for c in &n.children {
                 walk(
                     c, sheet, parent_st, cur, runs, links, rects, images, controls, frames, aux, link,
-                    form, next_form_id, page_bg, vw, in_head, chain,
+                    form, next_form_id, page_bg, vw, in_head, chain, &sibs,
                 );
+                if let Some(r) = elem_ref_for(c) {
+                    sibs.push(r);
+                }
             }
         }
         NodeKind::Text(t) => {
@@ -702,6 +743,9 @@ fn walk<'a>(
             bgcolor_attr,
             width_pct,
             srcset,
+            // The catch-all bag, so `[data-state=open]`-style selectors can be
+            // matched at all (see `css::ElemRef::extra`).
+            extra_attrs,
             // rel/on_attrs and future attrs are read where needed.
             ..
         } => {
@@ -721,6 +765,12 @@ fn walk<'a>(
                 nth: 1,
                 href: href.as_deref(),
                 input_type: input_type.as_deref(),
+                extra: extra_attrs.as_slice(),
+                // Supplied now, so `+` and `~` match exactly rather than being
+                // approximated as descendant. `Some(&[])` is the real answer
+                // for a first child, and is deliberately not `None` — see
+                // `css::ElemRef::prev`.
+                prev: Some(prev),
             };
             let mut st = css::compute_el(sheet, el_ref, style_attr.as_deref(), parent_st, chain);
             // Presentational attrs (bgcolor / width%) — also applied in
@@ -809,11 +859,15 @@ fn walk<'a>(
                     float_r_w: 0,
                     float_r_bottom: 0,
                 };
+                let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                 for c in &n.children {
                     walk(
                         c, sheet, &st, &mut fcur, runs, links, rects, images, controls,
-                        frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                        frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                     );
+                    if let Some(r) = elem_ref_for(c) {
+                        sibs.push(r);
+                    }
                 }
                 let (x0, y0, x1, y1) = frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
                 let fw = st.width.unwrap_or((x1 - x0).max(1));
@@ -878,11 +932,15 @@ fn walk<'a>(
                     float_r_w: 0,
                     float_r_bottom: 0,
                 };
+                let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                 for c in &n.children {
                     walk(
                         c, sheet, &st, &mut child_cur, runs, links, rects, images,
-                        controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                        controls, frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                     );
+                    if let Some(r) = elem_ref_for(c) {
+                        sibs.push(r);
+                    }
                 }
                 let (x0, y0, x1, y1) =
                     frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
@@ -970,11 +1028,15 @@ fn walk<'a>(
                 } else {
                     None
                 };
+                let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                 for c in &n.children {
                     walk(
                         c, sheet, &st_i, cur, runs, links, rects, images, controls,
-                        frames, aux, link_here, form, next_form_id, page_bg, vw, in_head, child_chain,
+                        frames, aux, link_here, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                     );
+                    if let Some(r) = elem_ref_for(c) {
+                        sibs.push(r);
+                    }
                 }
                 if let Some(bg) = inline_bg {
                     cur.x += st_i.padding_right.max(0);
@@ -1171,11 +1233,15 @@ fn walk<'a>(
                             .to_ascii_lowercase(),
                     };
                     *next_form_id = next_form_id.saturating_add(1);
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            Some(&ctx), next_form_id, page_bg, vw, in_head, child_chain,
+                            Some(&ctx), next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                     block_after(cur, st.margin_bottom.max(6));
                 }
@@ -1211,32 +1277,44 @@ fn walk<'a>(
                         );
                     } else {
                         block_before(cur, st.margin_top.max(4));
+                        let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                         for c in &n.children {
                             walk(
                                 c, sheet, &st, cur, runs, links, rects, images, controls, frames,
-                                aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                                aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                             );
+                            if let Some(r) = elem_ref_for(c) {
+                                sibs.push(r);
+                            }
                         }
                         block_after(cur, st.margin_bottom.max(4));
                     }
                 }
                 "thead" | "tbody" | "tfoot" => {
                     block_before(cur, st.margin_top.max(4));
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head, child_chain,
+                            form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                     block_after(cur, st.margin_bottom.max(4));
                 }
                 "tr" => {
                     block_before(cur, 0);
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head, child_chain,
+                            form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                     if cur.x > cur.margin_x {
                         new_line(cur);
@@ -1246,11 +1324,15 @@ fn walk<'a>(
                     // Cell as padded inline-block-ish block child.
                     let old_max = cur.max_w;
                     cur.max_w = (old_max / 2).max(40);
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head, child_chain,
+                            form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                     cur.max_w = old_max;
                     // Inter-cell gap: `border-spacing` (inherited from the table)
@@ -1359,11 +1441,15 @@ fn walk<'a>(
                     } else {
                         None
                     };
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head, child_chain,
+                            form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                     if cur.x > content_start_x {
                         new_line(cur);
@@ -1534,11 +1620,15 @@ fn walk<'a>(
                         cur.x += st_a.padding_left.max(0);
                     }
                     let br0 = runs.len();
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st_a, cur, runs, links, rects, images, controls, frames,
-                            aux, href_s.or(link), form, next_form_id, page_bg, vw, in_head, child_chain,
+                            aux, href_s.or(link), form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                     if let Some(bg) = inline_bg {
                         cur.x += st_a.padding_right.max(0);
@@ -1572,22 +1662,30 @@ fn walk<'a>(
                     cur.line_h = line_h.max(cur.line_h);
                     let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
                     cur.x += st_i.padding_left.max(0) + st_i.border_left_width.max(0);
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st_i, cur, runs, links, rects, images, controls, frames,
-                            aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                            aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                     cur.x += st_i.padding_right.max(0) + st_i.border_right_width.max(0);
                     paint_inline_box(mark, &st_i, runs, rects);
                 }
                 "ul" | "ol" | "body" | "html" => {
                     cur.line_h = line_h;
+                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                     for c in &n.children {
                         walk(
                             c, sheet, &st, cur, runs, links, rects, images, controls, frames, aux, link,
-                            form, next_form_id, page_bg, vw, in_head, child_chain,
+                            form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                         );
+                        if let Some(r) = elem_ref_for(c) {
+                            sibs.push(r);
+                        }
                     }
                 }
                 _ => {
@@ -1598,11 +1696,15 @@ fn walk<'a>(
                             let mark =
                                 mark_frag(runs, links, rects, images, controls, frames, aux);
                             cur.x += st.padding_left.max(0) + st.border_left_width.max(0);
+                            let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                                 );
+                                if let Some(r) = elem_ref_for(c) {
+                                    sibs.push(r);
+                                }
                             }
                             cur.x += st.padding_right.max(0) + st.border_right_width.max(0);
                             paint_inline_box(mark, &st, runs, rects);
@@ -1613,21 +1715,29 @@ fn walk<'a>(
                         let marker = list_marker(&st);
                         if !marker.is_empty() { emit_text(marker, cur, runs, links, link, &st); }
                     }
+                            let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                                 );
+                                if let Some(r) = elem_ref_for(c) {
+                                    sibs.push(r);
+                                }
                             }
                             block_after(cur, st.margin_bottom);
                         }
                         _ => {
                             block_before(cur, st.margin_top);
+                            let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
                             for c in &n.children {
                                 walk(
                                     c, sheet, &st, cur, runs, links, rects, images, controls,
-                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                                    frames, aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
                                 );
+                                if let Some(r) = elem_ref_for(c) {
+                                    sibs.push(r);
+                                }
                             }
                             if cur.x > cur.margin_x {
                                 new_line(cur);
@@ -2134,11 +2244,15 @@ fn layout_cell_isolated<'a>(
         float_r_w: 0,
         float_r_bottom: 0,
     };
+    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
     for c in &cell.children {
         walk(
             c, sheet, &cst, &mut ccur, runs, links, rects, images, controls, frames, aux, link,
-            form, next_form_id, page_bg, vw, in_head, child_chain,
+            form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
         );
+        if let Some(r) = elem_ref_for(c) {
+            sibs.push(r);
+        }
     }
     // Measure first (intrinsic), then optionally align for final paint.
     let (x0, _y0, x1, y1) = frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
@@ -2594,6 +2708,12 @@ fn layout_flex_grid_container<'a>(
     }
     let mut items: Vec<Item> = Vec::with_capacity(children.len());
 
+    // Flex items are each other's siblings, and this is the loop Tailwind's
+    // `space-y-*` depends on — it compiles to
+    // `.space-y-4 > :not([hidden]) ~ :not([hidden])`, i.e. "every item after the
+    // first". Without the accumulator the `~` was approximated as descendant and
+    // the margin landed on the first item too.
+    let mut item_sibs: Vec<css::ElemRef<'a>> = Vec::new();
     for child in &children {
         // Child style for preferred width / flex-grow.
         let (ctag, cid, cclass, cstyle) = match &child.kind {
@@ -2671,7 +2791,11 @@ fn layout_flex_grid_container<'a>(
             vw,
             in_head,
             item_chain,
+            &item_sibs,
         );
+        if let Some(r) = elem_ref_for(child) {
+            item_sibs.push(r);
+        }
         let (x0, y0, x1, y1) =
             frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
         let mut w = (x1 - x0).max(1);
@@ -4839,6 +4963,61 @@ mod tests {
             "custom element text should layout; runs={:?}",
             lay.runs
         );
+    }
+
+    /// `~` and `+` reach real siblings once layout supplies them.
+    ///
+    /// Both used to be approximated as descendant, which matches **more**
+    /// elements than written — a rule meant for "every item after the first"
+    /// also hit the first one. The `.stack > * ~ *` shape here is what
+    /// Tailwind's `space-y-*` compiles to
+    /// (`.space-y-4 > :not([hidden]) ~ :not([hidden])`), so it is on our own
+    /// shipped pages.
+    #[test_case]
+    fn sibling_combinators_reach_real_siblings_through_layout() {
+        let doc = html::parse(
+            r#"<html><head><style>
+              .stack > p { color: #000000 }
+              .stack > p ~ p { color: #ff0000 }
+            </style></head><body>
+            <div class="stack"><p>first</p><p>second</p><p>third</p></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, 400, 200);
+        let colour_of = |needle: &str| {
+            lay.runs
+                .iter()
+                .find(|r| r.text.contains(needle))
+                .map(|r| r.color)
+        };
+        // The first child has no preceding sibling, so `p ~ p` must not match.
+        assert_eq!(colour_of("first"), Some(0x000000), "first child");
+        assert_eq!(colour_of("second"), Some(0xff0000), "second child");
+        assert_eq!(colour_of("third"), Some(0xff0000), "third child");
+    }
+
+    /// `+` is the *immediately* preceding sibling, not any earlier one.
+    #[test_case]
+    fn adjacent_combinator_is_immediate_through_layout() {
+        let doc = html::parse(
+            r#"<html><head><style>
+              p { color: #000000 }
+              h2 + p { color: #00ff00 }
+            </style></head><body>
+            <div><h2>H</h2><p>adjacent</p><p>later</p></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse(&doc.stylesheets);
+        let lay = layout_document(&doc.root, &sheet, 400, 200);
+        let colour_of = |needle: &str| {
+            lay.runs
+                .iter()
+                .find(|r| r.text.contains(needle))
+                .map(|r| r.color)
+        };
+        assert_eq!(colour_of("adjacent"), Some(0x00ff00), "immediately after h2");
+        assert_eq!(colour_of("later"), Some(0x000000), "two after h2");
     }
 
     #[test_case]

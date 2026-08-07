@@ -194,6 +194,7 @@ dependencies = [
  "serde",
  "sha2",
  "smoltcp",
+ "tl",
  "wasmi",
  "wasmi_core",
  "x509-cert",
@@ -1069,6 +1070,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "tl"
+version = "0.7.8"
+dependencies = [
+ "hashbrown 0.15.5",
 ]
 
 [[package]]

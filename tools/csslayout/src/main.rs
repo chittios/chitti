@@ -86,6 +86,7 @@ fn main() {
     let mut width = 590i32;
     let mut height = 693i32;
     let mut only_rects = false;
+    let mut only_tree = false;
     let mut only_runs = false;
     let mut filter: Option<String> = None;
     let mut it = args.iter();
@@ -94,6 +95,7 @@ fn main() {
             "--width" => width = it.next().and_then(|v| v.parse().ok()).unwrap_or(width),
             "--height" => height = it.next().and_then(|v| v.parse().ok()).unwrap_or(height),
             "--rects" => only_rects = true,
+            "--tree" => only_tree = true,
             "--runs" => only_runs = true,
             "--filter" => filter = it.next().cloned(),
             other => page = Some(PathBuf::from(other)),
@@ -136,6 +138,36 @@ fn main() {
                 }
             }
         }
+    }
+
+    // `--tree`: the parse result itself, before any style or layout. This is
+    // where a hand-rolled HTML parser diverges from the spec's tree
+    // construction (implied `<tbody>`, auto-closed `<p>`/`<li>`, misnested
+    // formatting elements), and those differences are invisible in a rects/runs
+    // dump — they show up as content in the wrong place, or missing.
+    if only_tree {
+        fn dump(n: &html::Node, depth: usize) {
+            let pad = "  ".repeat(depth);
+            match &n.kind {
+                html::NodeKind::Document => println!("{pad}#document"),
+                html::NodeKind::Element { tag, id, class, .. } => {
+                    let id = id.as_ref().map(|v| format!(" id={v}")).unwrap_or_default();
+                    let cl = class.as_ref().map(|v| format!(" class={v}")).unwrap_or_default();
+                    println!("{pad}<{tag}>{id}{cl}");
+                }
+                html::NodeKind::Text(t) => {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        println!("{pad}#text {:?}", t);
+                    }
+                }
+            }
+            for c in &n.children {
+                dump(c, depth + 1);
+            }
+        }
+        dump(&doc.root, 0);
+        return;
     }
 
     let sheet = Stylesheet::parse_with_viewport(&css_text, width);

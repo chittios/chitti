@@ -53,6 +53,7 @@ pub mod events;
 pub mod flex;
 pub mod form;
 pub mod html;
+pub mod html_tl;
 pub mod httpdate;
 pub mod js;
 pub mod js_bc;
@@ -106,7 +107,7 @@ pub fn layout_html_ex(
     vh: i32,
     location_href: &str,
 ) -> (html::Document, layout::Layout, ScriptEffects) {
-    let mut doc = html::parse(html_src);
+    let mut doc = parse_html(html_src);
     let mut dom = js::JsDom::from_document(&doc);
     dom.location_href = if location_href.is_empty() {
         String::from("about:blank")
@@ -187,7 +188,7 @@ pub fn layout_session(
     url: &str,
     assets: &SessionAssets<'_>,
 ) -> (html::Document, layout::Layout, Vec<String>) {
-    let mut doc = html::parse(html_src);
+    let mut doc = parse_html(html_src);
 
     // Merge stylesheets in exact document order (inline bodies verbatim,
     // external hrefs resolved against the document URL and looked up in the
@@ -265,7 +266,7 @@ pub fn layout_static(
     url: &str,
     css_external: &BTreeMap<String, String>,
 ) -> (html::Document, layout::Layout) {
-    let mut doc = html::parse(html_src);
+    let mut doc = parse_html(html_src);
     let mut css_all = String::new();
     for s in &doc.styles_ordered {
         match s {
@@ -376,7 +377,7 @@ pub fn decode_image_or_svg(
         .unwrap_or(false);
     if is_svg {
         let text = core::str::from_utf8(bytes).ok()?;
-        let doc = html::parse(text);
+        let doc = parse_html(text);
         let node = find_svg_node(&doc.root)?;
         let vw = if hint_w > 0 { hint_w as f32 } else { 64.0 };
         let vh = if hint_h > 0 { hint_h as f32 } else { 64.0 };
@@ -521,7 +522,7 @@ fn is_dark(rgb: u32) -> bool {
 
 /// Plain text for the agent (`browser_text`) — after JS mutations.
 pub fn page_text(html_src: &str) -> String {
-    let mut doc = html::parse(html_src);
+    let mut doc = parse_html(html_src);
     let mut dom = js::JsDom::from_document(&doc);
     let scripts = doc.scripts.clone();
     let _ = js::run_scripts(&mut dom, &scripts);
@@ -531,7 +532,7 @@ pub fn page_text(html_src: &str) -> String {
 
 /// Links as `(href, text)`.
 pub fn page_links(html_src: &str) -> Vec<(String, String)> {
-    let doc = html::parse(html_src);
+    let doc = parse_html(html_src);
     let mut out = Vec::new();
     html::collect_links(&doc.root, &mut out);
     out
@@ -574,7 +575,7 @@ mod tests {
               console.log("ran");
             </script>
             </head><body><p id="msg">Hello</p></body></html>"##;
-        let doc = html::parse(html);
+        let doc = parse_html(html);
         assert!(
             doc.stylesheets.contains("112233"),
             "extracted css: {:?}",
@@ -672,5 +673,52 @@ mod tests {
             .expect("video frame");
         assert_eq!(vid.src, "clip.mp4");
         assert!(lay.frames.iter().any(|f| f.kind == layout::EmbedKind::Canvas));
+    }
+}
+
+/// Which HTML tree builder [`parse_html`] uses.
+///
+/// The `/decoder ring3|kernel` pattern — the incumbent keeps the default and
+/// the challenger is opt-in, so a switch is always a deliberate act and never
+/// a silent change to what a page renders as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HtmlEngine {
+    /// `browser::html` — our tokenizer-driven tree builder. The default.
+    Ours,
+    /// The vendored `tl` crate (`browser::html_tl`).
+    Tl,
+}
+
+/// `0` = ours, `1` = tl.
+static HTML_ENGINE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub fn html_engine() -> HtmlEngine {
+    if core::sync::atomic::AtomicU8::load(&HTML_ENGINE, core::sync::atomic::Ordering::Relaxed) == 1 {
+        HtmlEngine::Tl
+    } else {
+        HtmlEngine::Ours
+    }
+}
+
+pub fn set_html_engine(e: HtmlEngine) {
+    core::sync::atomic::AtomicU8::store(
+        &HTML_ENGINE,
+        match e {
+            HtmlEngine::Ours => 0,
+            HtmlEngine::Tl => 1,
+        },
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Parse HTML with whichever engine is selected.
+///
+/// **Every page load must go through here**, never `html::parse` directly, or
+/// the switch silently applies to some paths and not others — which makes an
+/// A/B measure a mixture rather than an engine.
+pub fn parse_html(source: &str) -> html::Document {
+    match html_engine() {
+        HtmlEngine::Ours => html::parse(source),
+        HtmlEngine::Tl => html_tl::parse(source),
     }
 }

@@ -813,7 +813,7 @@ fn browser_load_method_hops(
     // --- Subresource discovery: parse once to enumerate external scripts /
     // stylesheets / fonts / background images (the layout parse comes later,
     // via the session path).
-    let pre = crate::browser::html::parse(&body_html);
+    let pre = crate::browser::parse_html(&body_html);
     let is_fetchable = |u: &str| crate::browser::url::is_browse_url(u);
 
     // DNS prefetch: resolve the cross-origin hosts of this page's scripts +
@@ -1777,7 +1777,7 @@ pub(super) fn browser_play_video_url(abs: &str, page_url: &str) -> alloc::string
             }
         }
     };
-    play_video_bytes(abs, bytes);
+    let _ = play_video_bytes(abs, bytes);
     alloc::format!("ok:playing video {abs}")
 }
 

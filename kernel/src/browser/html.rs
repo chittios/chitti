@@ -531,6 +531,114 @@ pub fn pick_srcset_candidate(srcset: &str, vw: i32) -> Option<String> {
     cands.first().map(|c| c.url.clone())
 }
 
+/// Apply one parsed attribute to an element node.
+///
+/// Factored out of the tokenizer loop so the **alternative** `tl` tree builder
+/// (`browser::html_tl`) sets attributes through the exact same code. Two
+/// parsers that each decide for themselves what `width=` or `on*` means would
+/// diverge silently — and the A/B between them would then be measuring the
+/// divergence rather than the parser.
+///
+/// `key` must already be lowercased and `val` already entity-decoded.
+pub(crate) fn set_attribute(node: &mut Node, key: String, val: String) {
+    if let NodeKind::Element {
+        href,
+        alt,
+        src,
+        id,
+        class,
+        style_attr,
+        name,
+        value,
+        input_type,
+        action,
+        method,
+        placeholder,
+        srcdoc,
+        target,
+        sandbox,
+        width_attr,
+        height_attr,
+        colspan_attr,
+        rowspan_attr,
+        bgcolor_attr,
+        width_pct,
+        align_attr,
+        rel,
+        srcset,
+        on_attrs,
+        extra_attrs,
+        tag,
+    } = &mut node.kind
+    {
+        match key.as_str() {
+            "href" if tag == "a" || tag == "area" || tag == "link" || tag == "base" => {
+                *href = Some(val)
+            }
+            "alt" if tag == "img" || tag == "area" => *alt = Some(val),
+            "src"
+                if matches!(
+                    tag.as_str(),
+                    "img"
+                        | "iframe"
+                        | "script"
+                        | "video"
+                        | "audio"
+                        | "source"
+                        | "embed"
+                        | "frame"
+                        | "track"
+                ) =>
+            {
+                if tag == "img" && alt.is_none() {
+                    *alt = Some(format!("[{val}]"));
+                }
+                *src = Some(val);
+            }
+            "id" => *id = Some(val),
+            "class" => *class = Some(val),
+            "style" => *style_attr = Some(val),
+            "name" => *name = Some(val),
+            "value" => *value = Some(val),
+            "type" => *input_type = Some(val.to_ascii_lowercase()),
+            "action" => *action = Some(val),
+            "method" => *method = Some(val.to_ascii_lowercase()),
+            "placeholder" => *placeholder = Some(val),
+            "srcdoc" => *srcdoc = Some(val),
+            "target" => *target = Some(val),
+            "sandbox" => *sandbox = Some(val),
+            "width" => {
+                // `width="85%"` → percentage; bare number → px.
+                let t = val.trim();
+                if let Some(p) = t.strip_suffix('%') {
+                    *width_pct = p.parse().ok().filter(|&n: &u8| n > 0 && n <= 100);
+                    *width_attr = None;
+                } else {
+                    *width_attr = t.parse().ok();
+                    *width_pct = None;
+                }
+            }
+            "height" => *height_attr = val.parse().ok(),
+            "colspan" => {
+                *colspan_attr = val.parse().ok().filter(|&n| n >= 1);
+            }
+            "rowspan" => {
+                *rowspan_attr = val.parse().ok().filter(|&n| n >= 1);
+            }
+            "bgcolor" => *bgcolor_attr = Some(val),
+            "align" => *align_attr = Some(val.to_ascii_lowercase()),
+            "rel" => *rel = Some(val),
+            "srcset" => *srcset = Some(val),
+            k if k.starts_with("on") => {
+                on_attrs.push((k.to_string(), val))
+            }
+            _ => {
+                extra_attrs.push((key, val));
+            }
+        }
+    }
+}
+
 /// Parse HTML into a [`Document`] (styles/scripts extracted, not in the tree).
 pub fn parse(html: &str) -> Document {
     let slice = if html.len() > MAX_HTML_BYTES {
@@ -583,102 +691,7 @@ pub fn parse(html: &str) -> Document {
                 if let Some(top) = stack.last().copied() {
                     // SAFETY: stack pointers into root for this function.
                     let n = unsafe { &mut *top };
-                    if let NodeKind::Element {
-                        href,
-                        alt,
-                        src,
-                        id,
-                        class,
-                        style_attr,
-                        name,
-                        value,
-                        input_type,
-                        action,
-                        method,
-                        placeholder,
-                        srcdoc,
-                        target,
-                        sandbox,
-                        width_attr,
-                        height_attr,
-                        colspan_attr,
-                        rowspan_attr,
-                        bgcolor_attr,
-                        width_pct,
-                        align_attr,
-                        rel,
-                        srcset,
-                        on_attrs,
-                        extra_attrs,
-                        tag,
-                    } = &mut n.kind
-                    {
-                        match key.as_str() {
-                            "href" if tag == "a" || tag == "area" || tag == "link" || tag == "base" => {
-                                *href = Some(val)
-                            }
-                            "alt" if tag == "img" || tag == "area" => *alt = Some(val),
-                            "src"
-                                if matches!(
-                                    tag.as_str(),
-                                    "img"
-                                        | "iframe"
-                                        | "script"
-                                        | "video"
-                                        | "audio"
-                                        | "source"
-                                        | "embed"
-                                        | "frame"
-                                        | "track"
-                                ) =>
-                            {
-                                if tag == "img" && alt.is_none() {
-                                    *alt = Some(format!("[{val}]"));
-                                }
-                                *src = Some(val);
-                            }
-                            "id" => *id = Some(val),
-                            "class" => *class = Some(val),
-                            "style" => *style_attr = Some(val),
-                            "name" => *name = Some(val),
-                            "value" => *value = Some(val),
-                            "type" => *input_type = Some(val.to_ascii_lowercase()),
-                            "action" => *action = Some(val),
-                            "method" => *method = Some(val.to_ascii_lowercase()),
-                            "placeholder" => *placeholder = Some(val),
-                            "srcdoc" => *srcdoc = Some(val),
-                            "target" => *target = Some(val),
-                            "sandbox" => *sandbox = Some(val),
-                            "width" => {
-                                // `width="85%"` → percentage; bare number → px.
-                                let t = val.trim();
-                                if let Some(p) = t.strip_suffix('%') {
-                                    *width_pct = p.parse().ok().filter(|&n: &u8| n > 0 && n <= 100);
-                                    *width_attr = None;
-                                } else {
-                                    *width_attr = t.parse().ok();
-                                    *width_pct = None;
-                                }
-                            }
-                            "height" => *height_attr = val.parse().ok(),
-                            "colspan" => {
-                                *colspan_attr = val.parse().ok().filter(|&n| n >= 1);
-                            }
-                            "rowspan" => {
-                                *rowspan_attr = val.parse().ok().filter(|&n| n >= 1);
-                            }
-                            "bgcolor" => *bgcolor_attr = Some(val),
-                            "align" => *align_attr = Some(val.to_ascii_lowercase()),
-                            "rel" => *rel = Some(val),
-                            "srcset" => *srcset = Some(val),
-                            k if k.starts_with("on") => {
-                                on_attrs.push((k.to_string(), val))
-                            }
-                            _ => {
-                                extra_attrs.push((key, val));
-                            }
-                        }
-                    }
+                    set_attribute(n, key, val);
                 }
             }
             Token::ElementEnd { end, .. } => match end {
@@ -741,13 +754,7 @@ pub fn parse(html: &str) -> Document {
         }
     }
 
-    if title.is_empty() {
-        title = first_heading_text(&root).unwrap_or_else(|| String::from("Untitled"));
-    }
-    if root.children.is_empty() {
-        root.children.push(Node::element("body"));
-        node_count += 1;
-    }
+    finalize_document(&mut root, &mut title, &mut node_count);
 
     Document {
         title,
@@ -757,6 +764,28 @@ pub fn parse(html: &str) -> Document {
         scripts,
         script_tags,
         styles_ordered,
+    }
+}
+
+/// The post-parse fixups that belong to a [`Document`], not to a tokenizer.
+///
+/// Shared with the alternative `tl` tree builder (`browser::html_tl`) because
+/// they are decisions about what a *document* is, not about how markup is
+/// scanned: a page with no `<title>` is named after its first heading (and
+/// "Untitled" failing that), and a page whose body produced nothing still gets
+/// a `<body>` so layout and the JS DOM have a mount point.
+///
+/// Leaving these in one parser is exactly the kind of divergence that makes an
+/// engine A/B meaningless — it was caught here by
+/// `both_engines_build_the_same_tree_for_our_pages`, which compared a title of
+/// "Untitled" against "".
+pub(crate) fn finalize_document(root: &mut Node, title: &mut String, node_count: &mut usize) {
+    if title.is_empty() {
+        *title = first_heading_text(root).unwrap_or_else(|| String::from("Untitled"));
+    }
+    if root.children.is_empty() {
+        root.children.push(Node::element("body"));
+        *node_count += 1;
     }
 }
 
@@ -805,7 +834,7 @@ fn is_void(tag: &str) -> bool {
     super::elements::is_void(tag)
 }
 
-fn preprocess(html: &str) -> String {
+pub(crate) fn preprocess(html: &str) -> String {
     let mut out = String::with_capacity(html.len() + 64);
     let bytes = html.as_bytes();
     let mut i = 0;

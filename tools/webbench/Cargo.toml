@@ -1,0 +1,38 @@
+[package]
+name = "chitti-webbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host benchmark: OUR engines against the candidate crates, on the same real
+# inputs. Same pattern as tools/pngbench (which priced wasmi at 47-67x native
+# and killed the wasm-decoder idea) and tools/pdfbench — a candidate gets
+# measured before it gets vendored.
+
+[dependencies]
+# ours (mounted by #[path], so this is the code that ships)
+htmlparser = { version = "0.2", default-features = false }
+just-engine = { path = "../../third_party/just-ref" }
+# candidates
+# The VENDORED tl, not crates.io: this bench must measure what the kernel
+# actually runs, and ours carries a fix for an upstream bug (`<br/>` parsing as
+# a tag named `br/`). Benching upstream would price a different parser.
+tl = { path = "../../third_party/tl" }
+boa_engine = "0.21"
+boa_parser = "0.21"
+boa_ast = "0.21"
+boa_interner = "0.21"
+
+[[bin]]
+name = "chitti-webbench"
+path = "src/main.rs"
+
+[workspace]
+
+[patch.crates-io]
+pest = { path = "../../third_party/pest" }
+pest_derive = { path = "../../third_party/pest_derive" }
+pest_generator = { path = "../../third_party/pest_generator" }
+pest_meta = { path = "../../third_party/pest_meta" }
+pest_consume = { path = "../../third_party/pest_consume" }
+pest_consume_macros = { path = "../../third_party/pest_consume_macros" }

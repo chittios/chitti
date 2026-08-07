@@ -301,6 +301,23 @@ come from the crate. Zero transitive dependencies.
 Licensed under **MIT OR Apache-2.0**. Upstream:
 https://github.com/jdrouet/htmlparser
 
+## tl — `third_party/tl/` (alternative HTML parser)
+
+[`tl`](https://crates.io/crates/tl) 0.7.8, vendored in-tree and converted to
+`no_std` + `alloc`, as an **alternative** HTML tree builder to
+`kernel/src/browser/html.rs` — selected at runtime with `/html ours|tl`. Ours
+is not removed and remains the default; the two are compared with
+`/html bench`, which reports whether they built the same tree as well as how
+long each took.
+
+Vendored rather than taken from crates.io because it needed patching: the
+`no_std` conversion, and a fix for an upstream bug where `<br/>` parses as a tag
+*named* `br/` (so every following element nests inside it). Both are documented
+in `third_party/tl/DIVERGENCES.md`. Its only dependency here is `hashbrown`,
+already pulled by fontdue.
+
+Licensed under **MIT** (© y21). Upstream: https://github.com/y21/tl
+
 ### React, Tailwind CSS, shadcn/ui, Radix UI, lucide — `/samples/html/` test pages
 
 Two sample pages exist to prove the browser runs *real* front-end code rather
