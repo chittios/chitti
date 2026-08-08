@@ -1748,20 +1748,45 @@ pub(super) fn browser_click(x: i32, y: i32) -> alloc::string::String {
 /// Fetch (or open local path) video and start the full video player tab.
 #[cfg(not(feature = "server"))]
 pub(super) fn browser_play_video_url(abs: &str, page_url: &str) -> alloc::string::String {
-    let bytes = if crate::browser::url::is_http_url(abs) {
+    // A `<video>` in a page loads through the **browser's own loader** — memory
+    // cache, redirects, referrer, `browser:loader` ktrace — and an HLS playlist
+    // keeps using it for every segment it names. Handing the URL to the plain
+    // player instead would fetch the playlist and its segments outside all of
+    // that, a per-request policy split invisible from the page's side.
+    if crate::browser::url::is_http_url(abs) {
+        let mut fetch = |url: &str| -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+            let req = crate::browser::loader::LoadRequest::get(url)
+                .with_source(page_url)
+                .with_timeout(120_000);
+            match crate::browser::loader::load(&req) {
+                Ok(res) if res.status < 400 => Ok(res.body),
+                Ok(res) => Err(alloc::format!("HTTP {}", res.status)),
+                Err(e) => Err(e),
+            }
+        };
+        // The first load is done directly rather than through `fetch` so the
+        // **final** URL after redirects is available: a playlist's segment URIs
+        // resolve against where it actually came from, and CDNs redirect these
+        // constantly.
         let req = crate::browser::loader::LoadRequest::get(abs)
             .with_source(page_url)
             .with_timeout(120_000);
-        match crate::browser::loader::load(&req) {
-            Ok(res) if res.status < 400 => res.body,
-            Ok(res) => {
-                return alloc::format!("error: video HTTP {}", res.status);
-            }
-            Err(e) => {
-                return alloc::format!("error: video load: {e}");
-            }
-        }
-    } else if crate::browser::url::is_file_url(abs) {
+        let (base, bytes) = match crate::browser::loader::load(&req) {
+            Ok(res) if res.status < 400 => (res.url, res.body),
+            Ok(res) => return alloc::format!("error: video HTTP {}", res.status),
+            Err(e) => return alloc::format!("error: video load: {e}"),
+        };
+        let played = if crate::video::hls::looks_like_playlist(&bytes) {
+            play_hls_with(&base, &bytes, &mut fetch)
+        } else {
+            play_video_bytes(&base, bytes)
+        };
+        return match played {
+            Ok(()) => alloc::format!("ok:playing video {abs}"),
+            Err(e) => alloc::format!("error:cannot play {abs}: {e}"),
+        };
+    }
+    let bytes = if crate::browser::url::is_file_url(abs) {
         match read_file_url(abs) {
             Some(b) => b,
             None => {
@@ -1777,8 +1802,11 @@ pub(super) fn browser_play_video_url(abs: &str, page_url: &str) -> alloc::string
             }
         }
     };
-    let _ = play_video_bytes(abs, bytes);
-    alloc::format!("ok:playing video {abs}")
+    let _ = page_url;
+    match play_video_bytes(abs, bytes) {
+        Ok(()) => alloc::format!("ok:playing video {abs}"),
+        Err(e) => alloc::format!("error:cannot play {abs}: {e}"),
+    }
 }
 
 #[cfg(feature = "server")]

@@ -112,8 +112,9 @@ model from ever directly touching hardware.
   evolving).
 - **Sound & voice.** virtio-snd / HDA (and legacy paths); `/voice` (VAD → STT →
   LLM → TTS) with ONNX models (silero, parakeet, KittenTTS).
-- **Media.** In-kernel PNG/JPEG; WAV/MP3/AAC player; H.264 baseline video player
-  (`/open .mp4|.mov`) with streaming decode and transport controls.
+- **Media.** In-kernel PNG/JPEG; WAV/MP3/AAC player; H.264 / H.265 / VP9 video
+  player (`/open .mp4|.mov|.mkv|.webm|.ts|.m3u8`, including HLS VOD over the
+  network) with streaming decode and transport controls.
 - **Networking.** Full TCP/IP (smoltcp): DHCP, DNS, ping, loopback, HTTP(S)
   client, WebSocket client, downloads to `/downloads/`.
 

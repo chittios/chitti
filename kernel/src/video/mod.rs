@@ -19,20 +19,28 @@
 //! | H.264 / AVC | yes | yes — baseline CAVLC through High-profile CABAC (I/P/B) |
 //! | H.265 / HEVC | yes | Main/RExt mono+4:2:0/4:2:2/4:4:4, 8–12-bit, tiles, PCM |
 //! | VP9 | yes | yes — profile 0, intra + inter, bit-exact vs libvpx |
+//! | HLS | yes (VOD m3u8) | yes — MPEG-TS H.264/HEVC segments assembled into the same sample table |
 //!
 //! A stream outside the supported set comes back from [`probe`] with
 //! `decodable == false` and a [`VideoInfo::unsupported_reason`] that names the
 //! actual cause, so `/open` never reports a file as playable and then fails on
-//! it. Containers: `.mp4`/`.mov` and `.mkv`/`.webm`; HLS/TS is not demuxed.
+//! it. Containers: `.mp4`/`.mov`, `.mkv`/`.webm`, bare MPEG-TS (`.ts`), and HLS
+//! (`.m3u8` VOD). HLS is *fetched*, so [`probe`] describes a playlist without
+//! downloading anything and [`hls::load_vod`] does the segment fetching behind a
+//! caller-supplied closure — see [`hls`]. Encrypted playlists, live ones (no
+//! `#EXT-X-ENDLIST`) and multi-fragment fMP4/CMAF are refused with a reason.
 
 pub mod bits;
 pub mod h264;
 pub mod hevc;
+pub mod hls;
+pub mod m3u8;
 pub mod mkv;
 pub mod mp4;
 /// Minimal MP4 muxer for screen recordings (the inverse of [`mp4`]).
 pub mod mp4_mux;
 pub mod mt;
+pub mod ts;
 pub mod vp9;
 pub mod yuv;
 
@@ -80,6 +88,11 @@ pub struct VideoInfo {
 /// Sniff the container and, for a supported one, demux + parse the parameter
 /// sets to describe the stream. Does **not** decode pixels.
 pub fn probe(bytes: &[u8]) -> Result<VideoInfo, &'static str> {
+    // HLS playlists are text: describe them without fetching segments so
+    // `/open x.m3u8` can say "HLS VOD, N segments" before the download starts.
+    if hls::looks_like_playlist(bytes) {
+        return probe_hls_playlist(bytes);
+    }
     let (container, d) = demux(bytes)?;
     let frame_count = d.samples.len();
     let duration_ms = d.duration_ms;
@@ -235,17 +248,127 @@ fn demux(bytes: &[u8]) -> Result<(&'static str, Demuxed), &'static str> {
             let duration_ms = t.duration_ms();
             Ok(("matroska/webm (EBML)", Demuxed { config: t.config, samples: t.samples, timescale: t.timescale, duration_ms }))
         }
-        Container::Unknown => Err("video: unrecognised container (mp4/mov, mkv/webm supported)"),
+        Container::MpegTs => {
+            // Probe path: demux into a sample table. Note the returned
+            // `Demuxed` points sample offsets into a *re-framed* buffer that
+            // is not `bytes` — `StreamDecoder::open` re-runs assemble and
+            // keeps that buffer.
+            let track = ts::demux_video(bytes)?;
+            let (_buf, config, samples, timescale) = ts::assemble_samples(&[track])?;
+            let duration_ms = ts_duration_ms(&samples, timescale);
+            Ok((
+                "mpegts",
+                Demuxed {
+                    config,
+                    samples,
+                    timescale,
+                    duration_ms,
+                },
+            ))
+        }
+        Container::HlsPlaylist => Err(
+            "video: HLS playlist needs segment fetch — use StreamDecoder::open_hls",
+        ),
+        Container::Unknown => {
+            Err("video: unrecognised container (mp4/mov, mkv/webm, m3u8, ts supported)")
+        }
+    }
+}
+
+/// A transport stream carries no duration field, so the clip's length is the
+/// last picture's presentation time plus one frame. The trailing frame is
+/// assumed at 30 fps: without it a clip's final picture is never "due" and the
+/// player reports it finished a frame early.
+fn ts_duration_ms(samples: &[mp4::Sample], timescale: u32) -> u64 {
+    const ONE_FRAME_90K: u64 = 3000;
+    match samples.last() {
+        Some(last) if timescale > 0 => {
+            last.cts.saturating_add(ONE_FRAME_90K) * 1000 / timescale as u64
+        }
+        _ => 0,
+    }
+}
+
+fn probe_hls_playlist(bytes: &[u8]) -> Result<VideoInfo, &'static str> {
+    let text = core::str::from_utf8(bytes).map_err(|_| "video: m3u8 is not UTF-8")?;
+    let pl = m3u8::parse(text)?;
+    match pl {
+        m3u8::Playlist::Master { variants } => {
+            let v = m3u8::pick_variant(&variants);
+            let (w, h) = v.and_then(|x| x.resolution).unwrap_or((0, 0));
+            let bw = v.map(|x| x.bandwidth).unwrap_or(0);
+            Ok(VideoInfo {
+                container: "hls (master)",
+                codec: alloc::format!(
+                    "HLS master, {} variant(s), best {} bit/s",
+                    variants.len(),
+                    bw
+                ),
+                width: w,
+                height: h,
+                profile_idc: 0,
+                level_idc: 0,
+                frame_count: 0,
+                duration_ms: 0,
+                cabac: true,
+                decodable: true,
+                unsupported_reason: "",
+            })
+        }
+        m3u8::Playlist::Media {
+            segments,
+            end_list,
+            encrypted,
+            target_duration_ms,
+            ..
+        } => {
+            let duration_ms: u64 = segments.iter().map(|s| s.duration_ms).sum();
+            let (decodable, why) = if encrypted {
+                (false, "HLS encrypted segments (#EXT-X-KEY) are not supported")
+            } else if !end_list {
+                (false, "HLS live playlists (no #EXT-X-ENDLIST) are not supported yet")
+            } else if segments.is_empty() {
+                (false, "HLS media playlist has no segments")
+            } else {
+                (true, "")
+            };
+            Ok(VideoInfo {
+                container: "hls (media)",
+                codec: alloc::format!(
+                    "HLS VOD, {} segment(s), target {} ms",
+                    segments.len(),
+                    target_duration_ms
+                ),
+                width: 0,
+                height: 0,
+                profile_idc: 0,
+                level_idc: 0,
+                // Not the segment count: a playlist says nothing about how many
+                // *pictures* its segments hold, and reporting segments as frames
+                // makes a two-segment VOD print "2 frames". Geometry is unknown
+                // for the same reason — both arrive with the first segment.
+                frame_count: 0,
+                duration_ms,
+                cabac: true,
+                decodable,
+                unsupported_reason: why,
+            })
+        }
     }
 }
 
 enum Container {
     Mp4,
     Matroska,
+    MpegTs,
+    HlsPlaylist,
     Unknown,
 }
 
 fn sniff(bytes: &[u8]) -> Container {
+    if hls::looks_like_playlist(bytes) {
+        return Container::HlsPlaylist;
+    }
     // ISO-BMFF: a top-level `ftyp` (or `moov`/`mdat`) box — the 4 bytes at
     // offset 4 are the type.
     if bytes.len() >= 12 {
@@ -257,6 +380,20 @@ fn sniff(bytes: &[u8]) -> Container {
     // Matroska/WebM: the EBML magic 0x1A45DFA3.
     if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
         return Container::Matroska;
+    }
+    // MPEG-TS: the sync byte 0x47 repeating every 188 bytes. The **stride** is
+    // what identifies it — 0x47 is ASCII 'G', so a lone leading sync byte would
+    // claim every text file starting with that letter. Confirm as many packet
+    // boundaries as the buffer holds (up to three), and require at least one
+    // whole packet.
+    if bytes.len() >= 188 && bytes[0] == 0x47 {
+        let confirmed = (1..4)
+            .map(|i| i * 188)
+            .take_while(|&at| at < bytes.len())
+            .all(|at| bytes[at] == 0x47);
+        if confirmed {
+            return Container::MpegTs;
+        }
     }
     Container::Unknown
 }
@@ -536,6 +673,29 @@ impl StreamDecoder {
     /// Demux the container and parse the decoder configuration, ready to decode
     /// on demand.
     pub fn open(bytes: Vec<u8>) -> Result<StreamDecoder, &'static str> {
+        match sniff(&bytes) {
+            Container::HlsPlaylist => {
+                return Err(
+                    "video: HLS playlist — open via play_video / open_hls (needs segment fetch)",
+                );
+            }
+            Container::MpegTs => {
+                // Re-frame TS into length-prefixed samples; keep the assembled
+                // buffer (not the original TS) as `bytes`.
+                let track = ts::demux_video(&bytes)?;
+                let (buf, config, samples, timescale) = ts::assemble_samples(&[track])?;
+                let duration_ms = ts_duration_ms(&samples, timescale);
+                return StreamDecoder::open_assembled(
+                    buf,
+                    config,
+                    samples,
+                    timescale,
+                    duration_ms,
+                    "mpegts",
+                );
+            }
+            _ => {}
+        }
         let (_container, d) = demux(&bytes)?;
         if let mp4::CodecConfig::Vp9(_) = d.config {
             return StreamDecoder::open_vp9(bytes, d);
@@ -577,6 +737,124 @@ impl StreamDecoder {
         // Display order: sort sample indices by composition timestamp (stable,
         // so equal timestamps keep decode order). Baseline streams have
         // cts == dts and this is the identity.
+        let mut display: Vec<usize> = (0..d.samples.len()).collect();
+        display.sort_by_key(|&i| (d.samples[i].cts, i));
+        let mut disp_of = alloc::vec![0usize; display.len()];
+        for (pos, &si) in display.iter().enumerate() {
+            disp_of[si] = pos;
+        }
+        let src_w = sps.width();
+        let src_h = sps.height();
+        Ok(StreamDecoder {
+            length_size: avcc.length_size,
+            samples: d.samples,
+            timescale: d.timescale,
+            duration_ms: d.duration_ms,
+            bytes,
+            sps,
+            pps,
+            next: 0,
+            engine,
+            display,
+            disp_of,
+            hurry_before: None,
+            cur_idx: None,
+            cur: None,
+            ring: alloc::collections::BTreeMap::new(),
+            src_w,
+            src_h,
+            display_edge: DISPLAY_MAX_EDGE,
+            avcc_sps: avcc.sps,
+            avcc_pps: avcc.pps,
+            hevc_vps: Vec::new(),
+            hevc_sps: Vec::new(),
+            hevc_pps: Vec::new(),
+            backend,
+        })
+    }
+
+    /// Open a pre-assembled sample table (HLS / bare MPEG-TS after demux).
+    /// `bytes` must be the length-prefixed AU buffer the sample offsets index.
+    pub fn open_assembled(
+        bytes: Vec<u8>,
+        config: mp4::CodecConfig,
+        samples: Vec<mp4::Sample>,
+        timescale: u32,
+        duration_ms: u64,
+        backend_label: &'static str,
+    ) -> Result<StreamDecoder, &'static str> {
+        if samples.is_empty() {
+            return Err("video: no decodable frames found");
+        }
+        let d = Demuxed {
+            config,
+            samples,
+            timescale,
+            duration_ms,
+        };
+        match &d.config {
+            mp4::CodecConfig::Vp9(_) => StreamDecoder::open_vp9(bytes, d),
+            mp4::CodecConfig::Hevc(_) => {
+                let mut dec = StreamDecoder::open_hevc(bytes, d)?;
+                // Tag the backend so the HUD shows hls/mpegts, not plain hevc.
+                if backend_label != "hevc" {
+                    dec.backend = backend_label;
+                }
+                Ok(dec)
+            }
+            mp4::CodecConfig::Avc(_) => {
+                StreamDecoder::open_avc_demuxed(bytes, d, backend_label)
+            }
+        }
+    }
+
+    /// Open an HLS VOD load produced by [`hls::load_vod`].
+    pub fn open_hls(loaded: hls::LoadedHls) -> Result<StreamDecoder, &'static str> {
+        StreamDecoder::open_assembled(
+            loaded.bytes,
+            loaded.config,
+            loaded.samples,
+            loaded.timescale,
+            loaded.duration_ms,
+            loaded.container,
+        )
+    }
+
+    fn open_avc_demuxed(
+        bytes: Vec<u8>,
+        d: Demuxed,
+        backend_label: &'static str,
+    ) -> Result<StreamDecoder, &'static str> {
+        let avcc = match d.config {
+            mp4::CodecConfig::Avc(a) => a,
+            _ => return Err("video: open_avc_demuxed needs AVC"),
+        };
+        let sps_nal = avcc.sps.first().ok_or("video: no SPS")?;
+        let pps_nal = avcc.pps.first().ok_or("video: no PPS")?;
+        let sps = h264::parse_sps(&bits::unescape_rbsp(&sps_nal[1..]))?;
+        let pps = h264::parse_pps(&bits::unescape_rbsp(&pps_nal[1..]))?;
+        let (engine, backend) = match rust_h264_from_avcc(&avcc.sps, &avcc.pps) {
+            Ok(dec) => (
+                Engine::RustH264 {
+                    dec,
+                    pending: alloc::collections::BTreeMap::new(),
+                    open_sample: None,
+                },
+                if backend_label == "mpegts" || backend_label.starts_with("hls") {
+                    backend_label
+                } else {
+                    "rust_h264"
+                },
+            ),
+            Err(_) if pps.entropy_coding_mode => (
+                Engine::Cabac {
+                    dec: h264::decoder_cabac::H264Dec::new(sps.clone(), pps.clone())?,
+                    pending: alloc::collections::BTreeMap::new(),
+                },
+                "native-cabac",
+            ),
+            Err(_) => (Engine::Cavlc { reference: None }, "native-cavlc"),
+        };
         let mut display: Vec<usize> = (0..d.samples.len()).collect();
         display.sort_by_key(|&i| (d.samples[i].cts, i));
         let mut disp_of = alloc::vec![0usize; display.len()];
@@ -1397,6 +1675,25 @@ mod tests {
         assert!(matches!(sniff(&mp4), Container::Mp4));
         assert!(matches!(sniff(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0]), Container::Matroska));
         assert!(matches!(sniff(b"not a video"), Container::Unknown));
+
+        // MPEG-TS is identified by the 188-byte sync *stride*, not by a leading
+        // 0x47 — which is ASCII 'G', so text starting with that letter would
+        // otherwise be demuxed as a transport stream.
+        let mut ts = alloc::vec![0u8; 188 * 3];
+        for p in (0..ts.len()).step_by(188) {
+            ts[p] = 0x47;
+        }
+        assert!(matches!(sniff(&ts), Container::MpegTs));
+        let mut g_text = alloc::vec![b'x'; 188 * 3];
+        g_text[0] = b'G';
+        assert!(matches!(sniff(&g_text), Container::Unknown), "'G...' is not a TS");
+        // One short packet is still a transport stream (nothing to confirm it
+        // against), but a partial packet is not.
+        assert!(matches!(sniff(&ts[..188]), Container::MpegTs));
+        assert!(matches!(sniff(&ts[..187]), Container::Unknown));
+
+        // A playlist is text, sniffed ahead of every binary container.
+        assert!(matches!(sniff(b"#EXTM3U\n#EXT-X-ENDLIST\n"), Container::HlsPlaylist));
     }
 
     #[test_case]

@@ -55,21 +55,184 @@ pub(super) struct VideoPlayer {
 #[cfg(not(feature = "server"))]
 pub(super) static VIDEO: crate::mm::Locked<Option<VideoPlayer>> = crate::mm::Locked::new(None);
 
-/// `/open <path>.mp4|.mov` — demux + decode H.264 keyframes and play them in a
-/// "video" action-pane tab. Non-blocking: `pump_video` advances frames from the
+/// `/open <path>.mp4|.mov|.m3u8` or `http(s)://…` — demux + decode and play in
+/// a video action-pane tab. Non-blocking: `pump_video` advances frames from the
 /// idle tick. `/close` or Ctrl+C stops it.
 #[cfg(not(feature = "server"))]
 pub(super) fn play_video(path: &str) -> Result<(), alloc::string::String> {
+    let path = path.trim();
+    if crate::browser::url::is_http_url(path) {
+        return play_video_url(path);
+    }
     let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
         serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
         return Err(alloc::format!("{path} not found under any mount or in the store"));
     };
+    if crate::video::hls::looks_like_playlist(&bytes)
+        || path_ends_with_ci(path, ".m3u8")
+        || path_ends_with_ci(path, ".m3u")
+    {
+        return play_hls(path, &bytes);
+    }
     play_video_bytes(path, bytes)
+}
+
+fn path_ends_with_ci(path: &str, ext: &str) -> bool {
+    path.len() >= ext.len()
+        && path
+            .as_bytes()
+            .iter()
+            .rev()
+            .zip(ext.as_bytes().iter().rev())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Fetch an `http(s)` URL (playlist or progressive file) and play it.
+#[cfg(not(feature = "server"))]
+pub(super) fn play_video_url(url: &str) -> Result<(), alloc::string::String> {
+    serial_println!("open> fetching {url}…");
+    crate::shell::upkeep();
+    if crate::shell::poll_interrupt() {
+        return Err(alloc::string::String::from("cancelled"));
+    }
+    let got = crate::net::http::get_follow(url, 60_000).map_err(|e| e.to_string())?;
+    if got.response.status >= 400 {
+        return Err(alloc::format!("HTTP {} for {url}", got.response.status));
+    }
+    let bytes = got.response.body;
+    // The **final** URL after redirects, not the one typed: a playlist's segment
+    // URIs are relative to where the playlist actually came from, and CDNs
+    // redirect these constantly. Resolving against the original URL points every
+    // segment at a host that never served the playlist.
+    let base = got.final_url;
+    if crate::video::hls::looks_like_playlist(&bytes)
+        || path_ends_with_ci(&base, ".m3u8")
+        || path_ends_with_ci(&base, ".m3u")
+    {
+        return play_hls(&base, &bytes);
+    }
+    play_video_bytes(&base, bytes)
+}
+
+/// HLS VOD over the default transport: HTTP for a URL, the store/mounts for a
+/// local playlist.
+#[cfg(not(feature = "server"))]
+fn play_hls(base: &str, playlist_bytes: &[u8]) -> Result<(), alloc::string::String> {
+    play_hls_with(base, playlist_bytes, &mut default_fetch)
+}
+
+/// Fetch one HLS resource: an absolute URL over HTTP, anything else off a mount
+/// or the store (a playlist saved by `/http -O` names its segments relatively).
+#[cfg(not(feature = "server"))]
+fn default_fetch(url: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+    if crate::browser::url::is_http_url(url) {
+        let got = crate::net::http::get_follow(url, 60_000).map_err(|e| e.to_string())?;
+        if got.response.status >= 400 {
+            return Err(alloc::format!("HTTP {} for {url}", got.response.status));
+        }
+        return Ok(got.response.body);
+    }
+    read_mounted(url)
+        .or_else(|| crate::synapse::fs::read(url))
+        .ok_or_else(|| alloc::format!("segment not found: {url}"))
+}
+
+/// HLS VOD: parse playlist, download segments, open the player.
+///
+/// The transport is injected because **who is loading matters**: a `<video>`
+/// clicked in a page must fetch its playlist *and every segment* through the
+/// browser's own loader, which owns the memory cache, redirect handling,
+/// referrer and instrumentation. Fetching the playlist through the browser and
+/// then its segments through a bare HTTP client would be a per-request policy
+/// split invisible from the outside.
+///
+/// UI pumping and Ctrl+C are added **here**, around whichever transport is
+/// supplied, so no caller can forget them (the standing rule: a long loop pumps
+/// `upkeep()` and answers Ctrl+C).
+#[cfg(not(feature = "server"))]
+pub(super) fn play_hls_with(
+    base: &str,
+    playlist_bytes: &[u8],
+    fetch: &mut dyn FnMut(&str) -> Result<alloc::vec::Vec<u8>, alloc::string::String>,
+) -> Result<(), alloc::string::String> {
+    let text = core::str::from_utf8(playlist_bytes)
+        .map_err(|_| alloc::string::String::from("hls: playlist is not UTF-8"))?;
+    serial_println!("open> HLS playlist {base}");
+    match crate::video::probe(playlist_bytes) {
+        Ok(info) => {
+            serial_println!(
+                "open>   {} — {}  {}:{:02}",
+                info.container,
+                info.codec,
+                info.duration_ms / 60000,
+                (info.duration_ms % 60000) / 1000
+            );
+            if !info.decodable {
+                serial_println!("open>   cannot decode: {}", info.unsupported_reason);
+                return Err(alloc::string::String::from(info.unsupported_reason));
+            }
+        }
+        Err(e) => return Err(alloc::string::String::from(e)),
+    }
+
+    let mut pumped = |url: &str| -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+        crate::shell::upkeep();
+        if crate::shell::poll_interrupt() {
+            return Err(alloc::string::String::from("cancelled"));
+        }
+        fetch(url)
+    };
+
+    let (vod, _) = crate::video::hls::resolve_vod(text, base, &mut pumped)?;
+    serial_println!(
+        "open>   {} segment(s), ~{} ms — downloading…",
+        vod.segments.len(),
+        vod.duration_ms
+    );
+    let loaded = crate::video::hls::load_vod(&vod, &mut pumped, |i, n| {
+        crate::shell::upkeep();
+        if crate::shell::poll_interrupt() {
+            return Err(alloc::string::String::from("cancelled"));
+        }
+        if i == 0 || i + 1 == n || (i + 1) % 4 == 0 {
+            serial_println!("open>   segment {}/{}", i + 1, n);
+        }
+        Ok(())
+    })?;
+    serial_println!(
+        "open>   demuxed {} sample(s) ({})",
+        loaded.samples.len(),
+        loaded.container
+    );
+    let t0 = crate::arch::now_ms();
+    match crate::video::StreamDecoder::open_hls(loaded) {
+        Ok(mut dec) => {
+            let frame_count = dec.frame_count();
+            let total_ms = dec.duration_ms;
+            dec.seek_decode(0);
+            serial_println!(
+                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (HLS) — Ctrl+Tab focus, space=pause",
+                dec.src_w,
+                dec.src_h,
+                frame_count,
+                dec.backend,
+                crate::arch::now_ms().saturating_sub(t0)
+            );
+            install_player(base, dec, frame_count, total_ms, false, None, 0)
+        }
+        Err(e) => {
+            serial_println!("open> HLS decode failed: {}", e);
+            Err(alloc::string::String::from(e))
+        }
+    }
 }
 
 /// Start the video player from already-loaded bytes (browser `<video>` click).
 #[cfg(not(feature = "server"))]
 pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result<(), alloc::string::String> {
+    if crate::video::hls::looks_like_playlist(&bytes) {
+        return play_hls(name, &bytes);
+    }
     let t0 = crate::arch::now_ms();
     // Probe first so we can report clearly and handle unsupported streams.
     match crate::video::probe(&bytes) {
@@ -136,42 +299,55 @@ pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result
                 dec.backend,
                 crate::arch::now_ms().saturating_sub(t0)
             );
-            let name = name.rsplit('/').next().unwrap_or(name).to_string();
-            let now = crate::arch::now_ms();
-            VIDEO.with(|v| {
-                *v = Some(VideoPlayer {
-                    dec,
-                    frame_count,
-                    idx: 0,
-                    playing: true,
-                    base_ms: now,
-                    paused_at: 0,
-                    total_ms,
-                    name,
-                    finished_announced: false,
-                    muted: false,
-                    has_audio,
-                    audio_pcm,
-                    audio_rate,
-                    audio_at: 0,
-                    fps_window_start_ms: now,
-                    fps_window_frames: 0,
-                    fps_display: 0,
-                    last_present_ms: 0,
-                    pending_job: false,
-                    ahead: None,
-                })
-            });
-            #[cfg(not(test))]
-            {
-                crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIDEO_SURFACE));
-                present_video_frame();
-            }
+            install_player(name, dec, frame_count, total_ms, has_audio, audio_pcm, audio_rate)
         }
         Err(e) => {
             serial_println!("open> decode failed: {}", e);
-            return Err(alloc::string::String::from(e));
+            Err(alloc::string::String::from(e))
         }
+    }
+}
+
+#[cfg(not(feature = "server"))]
+fn install_player(
+    name: &str,
+    dec: crate::video::StreamDecoder,
+    frame_count: usize,
+    total_ms: u64,
+    has_audio: bool,
+    audio_pcm: Option<alloc::vec::Vec<i16>>,
+    audio_rate: u32,
+) -> Result<(), alloc::string::String> {
+    let name = name.rsplit('/').next().unwrap_or(name).to_string();
+    let now = crate::arch::now_ms();
+    VIDEO.with(|v| {
+        *v = Some(VideoPlayer {
+            dec,
+            frame_count,
+            idx: 0,
+            playing: true,
+            base_ms: now,
+            paused_at: 0,
+            total_ms,
+            name,
+            finished_announced: false,
+            muted: false,
+            has_audio,
+            audio_pcm,
+            audio_rate,
+            audio_at: 0,
+            fps_window_start_ms: now,
+            fps_window_frames: 0,
+            fps_display: 0,
+            last_present_ms: 0,
+            pending_job: false,
+            ahead: None,
+        })
+    });
+    #[cfg(not(test))]
+    {
+        crate::framebuffer::set_right(crate::framebuffer::RightMode::Surface(VIDEO_SURFACE));
+        present_video_frame();
     }
     Ok(())
 }

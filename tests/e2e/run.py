@@ -35,7 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from guest import Guest  # noqa: E402
-from servers import SSH_DIR, Server, tls_context  # noqa: E402
+from servers import HLS_DIR, SSH_DIR, Server, tls_context  # noqa: E402
 
 HOST = "10.0.2.2"  # QEMU user-net alias for the host
 PLAIN_PORT = 8100
@@ -3289,6 +3289,136 @@ def s_open_hevc_vp9(_g):
         g2.close()
 
 
+
+# A real HLS VOD, muxed by libavformat (PyAV) and embedded so this scenario
+# always runs rather than skipping when ffmpeg is absent — which is most CI
+# runners, and skipping is how a demux regression goes unnoticed. Two MPEG-TS
+# segments, 64x64, four H.264 Main-profile pictures each with **B-frames**, so
+# the stream exercises the two things HLS adds over a plain file: PES-carried
+# PTS/DTS with reorder, and a join between segments. zlib-compressed because a
+# TS packet is mostly stuffing (3196 bytes → 1.2 KB).
+_HLS_SEG0_B64 = (
+    "eNrVVX9QFHUU/x4YKmnjcWkKZlsoTsIdu8dxIbrGgQjODTOgptmEy+7e9+427naX3QXuRAEZf8TUTEATNI0C9YdOY5g/KotiTMYJsmkaG6Uc"
+    "GkeJYDqZuBpLLfF6eznBP03TjH90uzNvP9/3fe9933v72bdFecYFKD+8AhnOIhQxRJDhTuPDxUmGhA0b/DL2zN2MlRqBxyRVu6vgfOT/dRXl"
+    "oQUIHZ8fzR0ZwmjViVknI7FxFZVC7nHHk6K5X0NhlKKLhX0lW2MgdwciZ5dCy1G93verCDV+mkghw7ufG5EBbtDNDevSU5KXOPGWKR+heBSn"
+    "C2LZcmeGvuOdfGUQHgkPRCL7viv8sW/scvHp9oxvicupP00GrHYbYSZ4ScEEZc8GWGwBVWZJaWGR2UY4thbAngvzsFEgyUEfdmuElSSzzFbS"
+    "qlt7NU3Ozcysra211AguLPlY0SIpnkw9rqXIgIxeze8DO0nWBElUcwme5ViepggFu0G6MOeT+EqayiVzSYIVWV9QxTQZgHWAoijCj2kvDhBq"
+    "NQfISshqkCYJvxDALkYPABgzCit6ME3ZCd6rSH6WAUuK0BTs8wkqWOQEcly8BoCv8oN0Yda1UxIhGpUBB7hZVWNktVKQwelegCqZkdyQe5Jb"
+    "xbqj5lXASQUDnyRVsl5YMNM61Qef7LSCJEQlegwv+FlNT0UQNaz4WDACPeerVtggw0t+mY0mBU3RFFYQIQQYKqxu41ZYP1ahXo6Rg4AFVxSz"
+    "LlbWICDHcAKrn+QSFMzrmloseLwaB0iSschA7iaPJIPFXxt6bZU4CPFp2z3A+AWRziJUHouYr9YziZ6ud1XBqhfWCs/8XS64KTzNK27Cz0Fn"
+    "9apgQVuzLCRRpddCkxY7QFmPGn2yAdq+GoCqYRm8BRleEzCApiw2eM9VtDWXspAkagRe4hf3oq4jaihhfVv4ORFyt5HoP34kbTeW+I9c2d33"
+    "ddrhyaGnv98y6Nl4a4nranZdE7pbX1N6yTlnzUpu6YGmPI/nZM3OL9YMVZ0tGSeX3f798LHh8sGSF462z5m/8avnj5turvtoZHCqIbDtyeal"
+    "xL66N53daF6LU0k/dLE3uYNo83Kd5WN3DlKhK6NrxbQv74wO7N2h1DXX7TlG9X9DUDAjjTE8I40xPCOzV8LfaeHt+n9lzowZGn+6Gmboth+m"
+    "Z6jjjdTFr0a68tcuLpwKb7cXalX9sybOnB3IaO13PvGouXu1r+nxrGe2VBxa93555J2fX0Nb7AVp+3Pefilh/x+V6FzieGbm683L8j48rzb0"
+    "DKZ+wDfVDy9v+axb3TWPermhsq/H+3Gz5b2AdDfOVFZG9CaebM+6BZxJimHOJMUwZ+xlwJn0X+rR/Ys6k12ze4z6b3oGuzod+WcqQjUp8aEb"
+    "avCoc7Q/e+Gl3XzLnl+7V20dYI2nNp1bZHsoqSPw2CZzebG59dkMtf+TjuExWQ2Zs68PpTyCRq5t/y1+MAicMcUwZ0wxzJmnyoEzjuv3kzP/"
+    "xB+m1aiTaJo/hk5ufRcuaXZdiDt4s2LC+SBl27FopGEq1O7oPWEREsn2frnNeiJ+OG38VG3pEHsh3MolJ19c0Ze+ObXxTxHdnPc="
+)
+_HLS_SEG1_B64 = (
+    "eNrVVW9QFGUYfw8U0ga8OyJtMF0iyhHu2D3wwtM1QRHScJAKasZc9/be4zZu/7C7wJ0g8iENHWcaE4icArEv2EwBmgNMGYRNEjX5p5kmiUAC"
+    "bAhGrshprPR69nKCT32r6XZnnn3e533+/J53f/ts7maTEWUHkpHhY4SChiAy/FH7QJ7ZELVtmyDjkiXPYKWC5zBJVVZvGQz+v67czciIUEdM"
+    "CDsyBNDazkVnguFx5RYA9ogOcwj7GAqgBF3En88vCgPsWYiMLoAjRzX6uV9HqLZvKYUM7Z+ZkAFusC0J6LIkf/PSmVNx2QhFoghdEKse3ZGq"
+    "73hmXx2AR9TiYPDgcM7U+RvX8roaU78hriXdnPXZ7BmEheAkBROUfR2oeVYwpeUX5ORaMoisoi2w58IcbGyRZL8XuzXCRpLpFhtp0709miY7"
+    "0tIqKyutFbwLS15WtEpKSZqe15prQCaPJnjBT5I1XhJVB8GxTpajKULBbpAu7PRKXClNOUgHSbAi6/WrmCZ9sPZRFEUImPZgH6GWO0GzEbLq"
+    "p0lC4H3YxegJQMeMwoolmKbsBOdRJIFlwJMiNAV7vbwKHpm+TBengcKVCSBdmHXtk0TIRqVCATeraoyslvIyBN1LUCYzkhuwm90q1gM1jwJB"
+    "Kjh4JamU9cCCmbepXvhk5w0kISqhMhwvsJoOhRc1rHhZcAK701uusH6GkwSZDYGCQ9EUlhchBTgqrO7jVlgBq9Cvk5H9oPOukM66WFmDhE7G"
+    "ybN6JRevYE63VGK+xKM5QZNkLDKAPa5EksHjrw29t1Lsh/x0xj2FEXiRTidUDouYK9eRhKrrp6pg1QNrhWP+bhfCFI7mFDchOOFk9a5gQdvS"
+    "rSRRpvdCk1Y7qLKeNfRkfbR9PSiqhmWI5mV4TcAAmrJmwHsuo20OykqSqBZ4ietejgy2bziZeLcrcnsHYM9Yjf75myiii1/viP1lgotu767/"
+    "fC571H6689Dy36MeeyN66vvGnZ/s+K6ePWpxPT56c7y2QOp5q4FafyjmbE137uolfu/qh7Wr++80dpeaj4/e6J1N2zO48UpHW0NrVG1R1cBv"
+    "lqbo0md34y+G9j8/YZkcGTK+Yzr3XNtB0ry/Kifiq1vjhbdPbWic3rkPocypA6Pth03ZU2d2dfQcSzz34KZEmJGmMJ6RpjCekeuM8HeKv10z"
+    "z5wFwzKyqxyGZfHk/LDMOpG04niwZW3qipw7gRfsOWW7+hfN9LbGDuZNBnsan2rJ29RatdfYH9/U+SSTvKxtcHrNsFa3d1mS7aB7YlorTv0U"
+    "jfxq7UqcKo+YLZxs/fHwheDTZ1cGGvoXJ7zy0O6Ruw1HKOmD1BNjVYd+OBlrrQ28VBexfM8w292YfN/VqTrH3AC6v94ivsbZtl4HzpjDmDPm"
+    "MOaMXQDOpPxcg/6bigsJGf2uSf+FLyBkc1Z2794Zh+XybvNHFf6BD/svpnz95qpHLm2fs749JhMX1xgvv3jUfeRSa1KXHzgTF8aciQtjzjzh"
+    "As5kTf/LnFlIFeaYSefLPFUMzc6tLTj/ytYrBmtVwvvfdgpDpi8PDBSeTqkcF2NubWwSRvq6Lvw02PfeSqpVqY6IzWuuM1b/CUaQoLM="
+)
+
+
+def s_open_hls(g):
+    """HLS on the real kernel, over the network — the only honest way to test
+    it, since the player fetches a playlist and then every segment it names.
+
+    Asserts the whole chain: `/open http://…m3u8` reaches the fetch path at all
+    (a URL is not a path — `resolve_path` used to prepend the cwd and collapse
+    `https://` to `https:/`), the playlist parses, both MPEG-TS segments are
+    demuxed into one sample table, and the result **plays** in the streaming
+    player with working transport controls.
+
+    The two-segment join is the point. Each segment restarts its own PTS, and
+    the failure mode is silent: read as B-frame reorder rather than as a new
+    segment, segment 1's pictures land on top of segment 0's and the player
+    presents them interleaved — 0,4,1,5,2,6,3,7 — with all 8 frames decoding
+    and the count right. Only a frame-by-frame diff catches that, so it is
+    pinned by the unit tests and by `videodiff hls` against PyAV; what this
+    asserts is that the whole chain runs on the real kernel."""
+    import base64
+    import zlib
+
+    os.makedirs(HLS_DIR, exist_ok=True)
+    for name, b64 in (("s0.ts", _HLS_SEG0_B64), ("s1.ts", _HLS_SEG1_B64)):
+        with open(os.path.join(HLS_DIR, name), "wb") as f:
+            f.write(zlib.decompress(base64.b64decode(b64)))
+    with open(os.path.join(HLS_DIR, "vod.m3u8"), "w") as f:
+        f.write("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                "#EXT-X-MEDIA-SEQUENCE:0\n"
+                "#EXTINF:0.500,\ns0.ts\n#EXTINF:0.500,\ns1.ts\n#EXT-X-ENDLIST\n")
+    # A master playlist pointing at that media playlist: one more level of
+    # indirection, and the variant URI is relative, so it also proves URI
+    # resolution against the playlist's own URL.
+    with open(os.path.join(HLS_DIR, "master.m3u8"), "w") as f:
+        f.write("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=64x64\n"
+                "vod.m3u8\n")
+
+    base = f"http://{HOST}:{PLAIN_PORT}/hls"
+    m = g.mark()
+    g.send(f"/open {base}/vod.m3u8")
+    if not g.wait_for("HLS", 30, m):
+        return False, "/open on an m3u8 URL never reached the HLS path"
+    if not g.wait_for("2 segment(s)", 20, m):
+        return False, "playlist did not resolve to its two segments"
+    if not g.wait_for("64x64", 30, m):
+        return False, "segments did not demux to a decodable track"
+    # 8 pictures across the join — 4 per segment. A segment boundary read as
+    # reorder still yields 8 frames, so the count alone is not enough; the
+    # ordering itself is pinned by the unit tests and by videodiff vs PyAV.
+    if not g.wait_for("8 frame(s)", 20, m):
+        return False, "the two segments did not concatenate into 8 frames"
+    if not g.wait_for("ready in", 25, m):
+        return False, "HLS opened but decoded no frame"
+    m2 = g.mark()
+    g.send_raw(b"\x1b[T")   # Ctrl+Tab: focus the video tab
+    g.wait_quiet(0.3, 10)
+    g.send_raw(b" ")        # pause
+    g.send_raw(b"\x1b[C")   # seek forward
+    g.send_raw(b"\x03")     # Ctrl+C stops
+    if not g.wait_for("video stopped", 15, m2):
+        return False, "HLS transport controls / Ctrl+C did not stop playback"
+
+    # A master playlist: pick a variant, fetch its media playlist, play that.
+    m = g.mark()
+    g.send(f"/open {base}/master.m3u8")
+    if not g.wait_for("8 frame(s)", 40, m):
+        return False, "master playlist did not resolve through to its variant"
+    m2 = g.mark()
+    g.send_raw(b"\x03")
+    g.wait_for("video stopped", 15, m2)
+
+    # An encrypted playlist is refused with a reason, not mis-decoded — and the
+    # shell survives both.
+    with open(os.path.join(HLS_DIR, "enc.m3u8"), "w") as f:
+        f.write("#EXTM3U\n#EXT-X-TARGETDURATION:1\n"
+                '#EXT-X-KEY:METHOD=AES-128,URI="k.bin"\n'
+                "#EXTINF:0.500,\ns0.ts\n#EXT-X-ENDLIST\n")
+    m = g.mark()
+    g.send(f"/open {base}/enc.m3u8")
+    if not g.wait_for("encrypted", 25, m):
+        return False, "an AES-128 playlist was not refused by name"
+    m = g.mark()
+    g.send("/pwd")
+    if not g.wait_for("/home/chitti", 12, m):
+        return False, "the shell did not survive the HLS scenarios"
+    return True, "HLS VOD over HTTP: master + media playlist, 2 TS segments, 8 frames, controls, encrypted refused"
+
+
 def s_panes(g):
     """Pane layout: resize the split, fullscreen toggle, reset — driven by the
     /pane command (serial-observable) + a Ctrl+F fullscreen keystroke."""
@@ -4786,7 +4916,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("ssh_keygen", s_ssh_keygen), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("open_hls", s_open_hls), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("ssh_keygen", s_ssh_keygen), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

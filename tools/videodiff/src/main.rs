@@ -11,8 +11,11 @@
 //!   videodiff probe   <file>          — demux + parameter sets, no pixels
 //!   videodiff headers <file> [n]      — per-frame header dump (n frames)
 //!   videodiff yuv     <file> [n]      — decode n frames, raw I420 to stdout
+//!   videodiff hls     <x.m3u8> [n]    — fetch a local HLS VOD (segments beside
+//!                                       the playlist), demux + decode n frames;
+//!                                       raw RGB24 to stdout when redirected
 //!
-//! `diff.py` drives the last one against PyAV.
+//! `diff.py` drives the pixel dumps against PyAV.
 
 extern crate alloc;
 
@@ -97,7 +100,7 @@ fn main() {
     let path = match args.get(2) {
         Some(p) => p,
         None => {
-            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq|hevcsh> <file> [frames]");
+            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq|hevcsh|hls> <file> [frames]");
             std::process::exit(2);
         }
     };
@@ -112,11 +115,82 @@ fn main() {
         "vp9seq" => vp9seq(&bytes, n),
         "hevcseq" => hevcseq(&bytes, n),
         "hevcsh" => hevcsh(&bytes, n),
+        "hls" => hls_open(path, &bytes, n),
         _ => {
-            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq|hevcsh> <file> [frames]");
+            eprintln!("usage: videodiff <probe|headers|yuv|vp9frame|vp9seq|hevcseq|hevcsh|hls> <file> [frames]");
             std::process::exit(2);
         }
     }
+}
+
+/// Load an HLS VOD playlist from disk (segments resolved relative to the
+/// playlist path) and open it with StreamDecoder — the same path `/open` uses
+/// after network fetch.
+fn hls_open(playlist_path: &str, bytes: &[u8], limit: usize) {
+    let text = std::str::from_utf8(bytes).expect("utf8 playlist");
+    // Base URL = file path for relative segment joins.
+    let base = playlist_path.to_string();
+    let base_dir = std::path::Path::new(playlist_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let fetch = |url: &str| -> Result<Vec<u8>, String> {
+        let p = if url.starts_with('/') || url.contains("://") {
+            std::path::PathBuf::from(url)
+        } else {
+            base_dir.join(url)
+        };
+        std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))
+    };
+    let (vod, _) = video::hls::resolve_vod(text, &base, fetch).expect("resolve_vod");
+    eprintln!(
+        "hls: {} segment(s), duration {} ms",
+        vod.segments.len(),
+        vod.duration_ms
+    );
+    let loaded = video::hls::load_vod(&vod, fetch, |i, n| {
+        eprintln!("  segment {}/{}", i + 1, n);
+        Ok(())
+    })
+    .expect("load_vod");
+    eprintln!(
+        "hls: demuxed {} samples, {} bytes ({})",
+        loaded.samples.len(),
+        loaded.bytes.len(),
+        loaded.container
+    );
+    let mut dec = video::StreamDecoder::open_hls(loaded).expect("open_hls");
+    let n = dec.frame_count().min(limit);
+    eprintln!(
+        "hls: {}x{} frames={} backend={}",
+        dec.src_w, dec.src_h, dec.frame_count(), dec.backend
+    );
+    // Frames go to stdout as raw RGB24 in *display* order when stdout is
+    // redirected, so `diff.py` can compare them against PyAV's decode of the
+    // same segments — the only way to catch an access-unit split that still
+    // decodes. A terminal gets the summary alone rather than a screen of bytes.
+    use std::io::{IsTerminal, Write};
+    let out = std::io::stdout();
+    let dump = !out.is_terminal();
+    let mut w = out.lock();
+    for i in 0..n {
+        if !dec.seek_decode(i) {
+            eprintln!("frame {} did not decode", i);
+            std::process::exit(1);
+        }
+        if dump {
+            let f = dec.cur_frame().expect("decoded frame");
+            let mut rgb = Vec::with_capacity(f.pixels.len() * 3);
+            for px in &f.pixels {
+                rgb.push((px >> 16) as u8);
+                rgb.push((px >> 8) as u8);
+                rgb.push(*px as u8);
+            }
+            w.write_all(&rgb).expect("write rgb");
+        }
+    }
+    let _ = w.flush();
+    eprintln!("hls: decoded {} frame(s) ok", n);
 }
 
 fn probe(bytes: &[u8]) {

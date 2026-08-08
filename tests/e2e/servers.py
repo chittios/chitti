@@ -40,6 +40,13 @@ GIT_HEAD = "35528a725a8925975d241e31a82755548dced31f"
 SSH_DIR = os.path.join(tempfile.gettempdir(), "chitti-e2e-ssh")
 
 
+# Where the `open_hls` scenario writes the playlist + MPEG-TS segments it
+# serves. HLS is a *network* format — the player fetches a playlist and then
+# every segment it names — so the only honest test of it goes over HTTP rather
+# than off a mounted disk.
+HLS_DIR = os.path.join(tempfile.gettempdir(), "chitti-e2e-hls")
+
+
 def _pktline(payload: bytes) -> bytes:
     return b"%04x%s" % (4 + len(payload), payload)
 
@@ -316,6 +323,27 @@ def _handle(conn):
             body = (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", _s.pack(">IIBBBBB", 3, 2, 8, 2, 0, 0, 0))
                     + _chunk(b"IDAT", _z.compress(raw, 9)) + _chunk(b"IEND", b""))
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+        elif path.startswith("/hls/"):
+            # The HLS fixture: a playlist and its MPEG-TS segments. The name is
+            # whitelisted to a bare filename so a path in the request cannot
+            # reach outside the fixture directory.
+            name = path[len("/hls/"):].split("?")[0]
+            body = None
+            if name and "/" not in name and ".." not in name:
+                try:
+                    with open(os.path.join(HLS_DIR, name), "rb") as f:
+                        body = f.read()
+                except OSError:
+                    body = None
+            if body is None:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            else:
+                ctype = (b"application/vnd.apple.mpegurl" if name.endswith(".m3u8")
+                         else b"video/mp2t")
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n%s"
+                    % (ctype, len(body), body)
+                )
         elif path == "/registry":
             # A public agent-registry index (discovery over the network),
             # **signed** so the kernel's index verification accepts it.

@@ -27,8 +27,9 @@ standalone host `/open` path.
 - **audio_control** — `cmd`: `pause` | `seek` | `restart` | `stop` | `mute` | `volume`  
   Optional `ms` (seek), `delta` (volume).
 
-- **video_player** — play H.264 video  
-  `<tool_call>{"name":"video_player","arguments":{"path":"clip.mp4"}}</tool_call>`
+- **video_player** — play H.264 / H.265 / VP9 video, from a file or an HLS URL  
+  `<tool_call>{"name":"video_player","arguments":{"path":"clip.mp4"}}</tool_call>`  
+  `<tool_call>{"name":"video_player","arguments":{"path":"https://cdn.example/v/master.m3u8"}}</tool_call>`
 
 - **video_control** — `cmd`: `pause` | `seek` | `restart` | `mute` | `volume`  
   Optional `frames` (seek), `delta` (volume).

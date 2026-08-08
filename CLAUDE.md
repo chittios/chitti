@@ -1844,7 +1844,7 @@ FDT claims a GICv3 but carries no readable `reg`.
   interop with every server yet (RSA cert chains fail) — a provider that won't
   handshake reports a TLS error, not a wrong result.
 - **Video** (`video/`) — H.264/AVC **baseline + Main/High-profile decoder +
-  player** for `/open .mp4|.mov|.mkv|.webm` (hls/ts pending), built **in
+  player** for `/open .mp4|.mov|.mkv|.webm|.ts|.m3u8` (HLS VOD included), built **in
   stages, each pure + unit-tested off-hardware** and **validated bit-exact
   against ffmpeg/PyAV via the `tools/h264diff/` host harness** (mounts
   `video/*.rs` via `#[path]`; the onnxdiff/cortexdiff pattern — the CAVLC VLC,
@@ -1942,7 +1942,7 @@ FDT claims a GICv3 but carries no readable `reg`.
   non-reference backlog samples are never fed to the decoder at all — but
   catch up in ≤2-frame steps; one giant hurry-jump decodes every backlog
   reference in one job and starves presentation (4K: 8 → 3 fps).
-  **Remaining:** HLS/TS demux, 4K ≥ 15 fps (needs parallel
+  **Remaining:** 4K ≥ 15 fps (needs parallel
   reconstruction — slice-parallel + independent non-ref B's; CABAC parse is
   the serial floor), and the multi-pane split + tab drag-drop. NB: the e2e stdlib muxer writes no
   `ctts`, so its B-frame clips carry no display-reorder info — e2e CABAC clips
@@ -2349,6 +2349,71 @@ FDT claims a GICv3 but carries no readable `reg`.
 
   Still refused rather than guessed: tiles, PCM, 10/12-bit. The rule stands —
   diff whole frames against PyAV before claiming anything works.
+
+  **HLS plays** — `/open http://…/master.m3u8` (and a `.m3u8` or bare `.ts` in
+  the store) fetches the playlist, downloads its MPEG-TS segments, and assembles
+  them into **one sample table** the existing `StreamDecoder` opens, so H.264 and
+  HEVC arrive over HLS with no change to either decoder. `video/m3u8.rs` is the
+  playlist parser, `video/ts.rs` the transport-stream demuxer, `video/hls.rs` the
+  loader — which takes `fetch` as a **closure**, so every unit test runs
+  off-network and the shell path pumps `upkeep()` and answers Ctrl+C between
+  segments. Verified against a real libavformat-muxed VOD by
+  `tools/videodiff hls`, frame-for-frame vs PyAV.
+
+  Seven things this cost, and the first is the one worth reading:
+
+  - **A segment boundary is the only place a media clock may legally restart,
+    and it must be judged *there*.** Segments commonly restart their PTS, and
+    the step back from the end of the previous segment is *smaller* than a deep
+    B-frame reorder — so a generic "small backward step = reorder" rule maps
+    segment 1's pictures on top of segment 0's and the player **interleaves**
+    them. Every frame decodes, the count is right, and the sequence comes out
+    `0, 8, 1, 9, 2, 10, …`. Nothing but a frame-by-frame diff against PyAV finds
+    that; the frame count, the geometry and the decode all look perfect.
+    `ts::Timeline::segment_boundary` takes the boundary explicitly, and
+    `#EXT-X-DISCONTINUITY` overrides it, because a splice may coincidentally
+    continue the numbers.
+  - **PTS is not monotonic, so timestamps cannot be accumulated.** With B-frames
+    a picture's PTS is routinely earlier than its predecessor's in decode order.
+    The step from the previous timestamp is therefore measured **both ways
+    modulo 2^33**: a small forward step is the next picture (which makes the
+    33-bit wrap fall out for free), a small backward step is reorder, anything
+    else is a discontinuity that resumes after the furthest sample so far.
+    PTS and DTS run on **separate** timelines — that is what B-frames *are*.
+  - **`core` has no `f64::round`.** `#EXTINF:9.009` is exact decimal text, so
+    `m3u8::parse_seconds_ms` scales the digits instead — simpler, exact, and it
+    compiles.
+  - **A URL is not a path.** `/open` ran its argument through `resolve_path`,
+    which prepends the cwd and collapses `https://` to `https:/` — so the fetch
+    path was unreachable from the command that needs it most, HLS being fetched
+    by definition. Relatedly `path_extension` now strips a query string for URLs
+    only: `master.m3u8?token=…` matched no `command_hooks` extension and fell
+    through to the text editor.
+  - **Playing a URL is network egress, so it does not go through the hook
+    agent.** The media agent's manifest grants `fs`, `ui` and `todo` — no `net`
+    — and routing a URL through its `video_player` tool would hand it reach it
+    was never granted, by way of a feature that reads as being about file
+    formats. `/open <url>` is therefore handled on the **interactive path**,
+    which is unreachable from `dispatch_system` (the `/passwd` / `/lock`
+    structure: absent from the tool surface beats guarded inside it), and
+    `run_media_tool` refuses a URL naming the missing capability. The browser
+    agent keeps its own URL path, which is what it is for.
+  - **A byte-range playlist points every segment at one resource.** Fetching per
+    segment downloads that whole file once per segment — quadratic. `load_vod`
+    holds the resource while consecutive segments draw ranges from it, and only
+    for ranged segments.
+  - **Every failure names its segment.** A VOD is hundreds of segments; a bare
+    `ts: no PAT/PMT` says neither which one nor whether the download or the
+    demux failed.
+  - **An access unit is only a picture if it carries a VCL NAL.** A
+    parameter-set-only PES otherwise takes sample index 0 and never decodes, so
+    `seek_decode(0)` fails on a stream whose every later frame is fine.
+
+  Refused with a reason rather than guessed at: **encrypted** playlists
+  (`#EXT-X-KEY` with a cipher), **live** ones (no `#EXT-X-ENDLIST`), and
+  **multi-fragment fMP4/CMAF** — `mp4.rs` has no `moof`/`trun` fragment demuxer,
+  so a single self-contained fMP4 segment works and a real CMAF ladder does not.
+  That is the largest remaining gap, since much of the modern web ships CMAF.
 - **Switchable engines, and the rule for adding another.** Two subsystems run an
   alternative implementation **alongside** ours on the `/decoder ring3|kernel`
   pattern — a `bench` subcommand compares them:

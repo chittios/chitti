@@ -8940,6 +8940,27 @@ pub(crate) fn format_pdf_preview(path: &str, digest: &str) -> (alloc::string::St
     (summary, text)
 }
 
+/// Why a media tool will not open `path`, or `None` if it is a local path it
+/// may try.
+///
+/// Playing a URL is **network egress**, and the holder of these tools (the
+/// media agent) has `fs`, `ui` and `todo` in its manifest — no `net`. Accepting
+/// a URL here would hand it reach nobody granted, through a feature that reads
+/// as being about file formats. A human typing `/open <url>` fetches on the
+/// interactive path instead, which is unreachable from `dispatch_system`.
+///
+/// Pure, and applied in **both** arms of `run_media_tool` — the real one and
+/// the headless/test stub — so the stub cannot answer differently from
+/// production, which is exactly how this rule would rot untested.
+pub(crate) fn media_url_refusal(path: &str) -> Option<alloc::string::String> {
+    if !crate::browser::url::is_http_url(path) {
+        return None;
+    }
+    Some(alloc::format!(
+        "error:cannot fetch {path}: this tool plays local files; a URL needs a net capability the media agent does not have (a human can /open the URL directly)"
+    ))
+}
+
 /// Host entry for media tools (`ToolBinding::Media`): image / audio / video
 /// players in the action pane. Paths may be store keys, `/downloads/…`, or
 /// mount paths. Shared by the **media** agent, shell chat, and `/open`.
@@ -8961,6 +8982,8 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
             | "video_open" | "pdf_preview" | "pdf_text" => {
                 if path.is_empty() {
                     alloc::string::String::from("error: missing path")
+                } else if let Some(why) = media_url_refusal(&path) {
+                    why
                 } else {
                     alloc::format!("ok:{name} {path} (stub)")
                 }
@@ -9101,6 +9124,9 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
             "video_player" | "video_open" => {
                 if path.is_empty() {
                     return alloc::string::String::from("error: missing path");
+                }
+                if let Some(why) = media_url_refusal(&path) {
+                    return why;
                 }
                 // The tool's answer must come from what actually happened.
                 // It used to say "ok:video playing" unconditionally, so a file
@@ -9272,8 +9298,9 @@ fn run_open_inner(
     orch: &mut crate::agent::orchestrator::Orchestrator,
 ) {
     if arg.is_empty() {
-        serial_println!("usage: /open <path>   e.g. /open {}", crate::ui_config::ui_path());
+        serial_println!("usage: /open <path>|<url>   e.g. /open {}", crate::ui_config::ui_path());
         serial_println!("  editor: hjkl move, i insert, Esc normal, :w write, :q quit, :wq save+quit");
+        serial_println!("  media:  /open http://host/v/master.m3u8   HLS VOD (playlist + segments) over the network");
         let exts = crate::agent::system::open_hook_extensions();
         if !exts.is_empty() {
             serial_println!(
@@ -9282,6 +9309,33 @@ fn run_open_inner(
             );
             serial_println!("          switches chat to the hook agent; /agents switch 1 back to shell");
         }
+        return;
+    }
+    // A URL is not a path, and it is **not routed through the hook agent**.
+    //
+    // Two separate reasons, and the second is the load-bearing one:
+    //
+    // 1. `resolve_path` would prepend the cwd and collapse `https://` to
+    //    `https:/`, so the media agent then looked for a local file by that
+    //    mangled name. HLS is fetched by definition, so this is the difference
+    //    between `/open https://…/master.m3u8` working and not.
+    // 2. Playing a URL means **network egress**, and the media agent's manifest
+    //    grants `fs`, `ui` and `todo` — no `net`. Handing it a URL through its
+    //    own tool would give it reach it was never granted, by way of a feature
+    //    that looks like it is only about file formats. So the fetch happens
+    //    here, on the interactive path, which is unreachable from
+    //    `dispatch_system` — the same structure `/passwd` and `/lock` use, and
+    //    for the same reason: absent from the tool surface beats guarded inside
+    //    it. `run_media_tool` refuses a URL, so an agent asking for one is told
+    //    what is missing rather than quietly granted it.
+    if crate::browser::url::is_http_url(arg) {
+        let url = arg.trim();
+        #[cfg(not(feature = "server"))]
+        if let Err(e) = video::play_video_url(url) {
+            serial_println!("open> {url}: {e}");
+        }
+        #[cfg(feature = "server")]
+        let _ = url;
         return;
     }
     // Package command_hooks for /open (e.g. media agent owns .mp3/.png/.mp4…).
@@ -11079,6 +11133,55 @@ mod login_reachability_tests {
     /// So the property is "absent from `dispatch_system`", and this asserts
     /// exactly that. If someone later tidies the arms down into `dispatch_system`,
     /// this fails.
+    /// Playing a URL is network egress. The media agent — which is what holds
+    /// `video_player` — has `fs`, `ui` and `todo` in its manifest and no `net`,
+    /// so accepting a URL there would hand it reach nobody granted, through a
+    /// feature that reads as being about file formats.
+    ///
+    /// The human path (`/open <url>`) fetches instead, and `run_open` is absent
+    /// from `dispatch_system` — the same structure `/passwd` and `/lock` use.
+    #[test_case]
+    fn the_media_tool_will_not_fetch_a_url() {
+        for url in [
+            "http://example.invalid/v/master.m3u8",
+            "https://example.invalid/clip.mp4",
+        ] {
+            let why = media_url_refusal(url).expect("a URL is refused");
+            assert!(why.starts_with("error:") && why.contains("net capability"), "{why}");
+            let args = alloc::format!("{{\"path\":\"{url}\"}}");
+            for tool in ["video_player", "video_open"] {
+                let out = run_media_tool(tool, &args);
+                assert!(
+                    out.starts_with("error:"),
+                    "{tool} accepted a URL: {out}"
+                );
+                assert!(
+                    out.contains("net capability"),
+                    "{tool} refused without naming what is missing: {out}"
+                );
+            }
+        }
+        // A local path still reaches the player (it fails for want of the file,
+        // not for want of a capability) — the refusal must not be a blanket one.
+        assert!(media_url_refusal("/no/such/clip.mp4").is_none());
+        assert!(media_url_refusal("~/clip.mp4").is_none());
+        assert!(media_url_refusal("/samples/videos/vod.m3u8").is_none());
+        let out = run_media_tool("video_player", r#"{"path":"/no/such/clip.mp4"}"#);
+        assert!(!out.contains("net capability"), "local path was refused as a URL: {out}");
+    }
+
+    /// `/open` is the human path for a URL, and it must not be reachable from
+    /// the tool surface — otherwise `run_shell_command open <url>` restores
+    /// exactly the egress the test above removes.
+    #[test_case]
+    fn open_is_unreachable_from_the_tool_surface() {
+        assert!(
+            !dispatch_system("open", "https://example.invalid/x.m3u8"),
+            "'/open' is reachable from dispatch_system, so any agent holding \
+             run_shell_command can make it fetch a URL"
+        );
+    }
+
     #[test_case]
     fn passwd_and_lock_are_unreachable_from_the_tool_surface() {
         for (name, arg) in [("passwd", "status"), ("password", "status"), ("lock", "")] {

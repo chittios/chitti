@@ -912,6 +912,15 @@ fn parse_command_hooks(j: &Json) -> Vec<CommandHook> {
 
 /// File extension of `path` (lowercase, with `.`), or empty if none.
 pub fn path_extension(path: &str) -> String {
+    // A media URL routinely carries a query or fragment (`master.m3u8?token=…`),
+    // and taking the extension from the raw tail yields `.m3u8?token=…`, which
+    // matches no hook — so `/open` would silently fall through to the editor.
+    // Only stripped for URLs: `?` is a legal character in a local filename.
+    let path = if path.contains("://") {
+        path.split(['?', '#']).next().unwrap_or(path)
+    } else {
+        path
+    };
     let base = path.rsplit('/').next().unwrap_or(path);
     if let Some(dot) = base.rfind('.') {
         if dot > 0 {
@@ -1582,6 +1591,12 @@ mod tests {
         assert_eq!(path_extension("Foo.PNG"), ".png");
         assert_eq!(path_extension("nope"), "");
         assert_eq!(path_extension(".hidden"), "");
+        // A URL's query/fragment is not part of the extension — a media URL
+        // carries one routinely, and `.m3u8?token=…` matches no hook.
+        assert_eq!(path_extension("https://cdn/v/master.m3u8?token=abc"), ".m3u8");
+        assert_eq!(path_extension("https://cdn/v/clip.mp4#t=10"), ".mp4");
+        // …but a local file may legitimately contain `?`.
+        assert_eq!(path_extension("/store/weird?name.txt"), ".txt");
     }
 
     #[test_case]
