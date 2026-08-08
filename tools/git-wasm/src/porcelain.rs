@@ -57,19 +57,57 @@ fn names_in(dir: &str) -> Vec<String> {
     crate::fs_list(dir).into_iter().map(|(n, _, _)| n).collect()
 }
 
-fn config_path() -> String {
-    alloc::format!("{}/config", git_dir())
+/// Which configuration file a `config` operation is about.
+///
+/// Git has three; we have the two that mean something here. There is no
+/// `--system`: it would be a file no installer writes and no user could find,
+/// so asking for one is refused by name rather than silently treated as global.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// `.git/config` — this repository only.
+    Local,
+    /// `~/.gitconfig` — every repository this user opens.
+    Global,
 }
 
-pub(crate) fn load_config() -> Vec<config::Entry> {
-    match fs_read(&config_path()) {
+pub(crate) fn config_path(scope: Scope) -> String {
+    match scope {
+        Scope::Local => alloc::format!("{}/config", git_dir()),
+        Scope::Global => alloc::format!("{}/.gitconfig", crate::user_home()),
+    }
+}
+
+pub(crate) fn load_scope(scope: Scope) -> Vec<config::Entry> {
+    match fs_read(&config_path(scope)) {
         Some(b) => config::parse(&String::from_utf8_lossy(&b)),
         None => Vec::new(),
     }
 }
 
+/// The local file, which is what `remote` and friends operate on.
+pub(crate) fn load_config() -> Vec<config::Entry> {
+    load_scope(Scope::Local)
+}
+
+fn save_scope(scope: Scope, entries: &[config::Entry]) -> bool {
+    fs_write(&config_path(scope), config::render(entries).as_bytes())
+}
+
 fn save_config(entries: &[config::Entry]) -> bool {
-    fs_write(&config_path(), config::render(entries).as_bytes())
+    save_scope(Scope::Local, entries)
+}
+
+/// Look a key up with git's precedence: **local wins over global**.
+///
+/// That order is the whole point of having two files — a repository-specific
+/// `user.email` has to beat the one you set once for everything, or the
+/// per-repository setting is decorative.
+pub(crate) fn config_lookup(name: &str) -> Option<String> {
+    let local = load_scope(Scope::Local);
+    if let Some(v) = config::get(&local, name) {
+        return Some(v.to_string());
+    }
+    config::get(&load_scope(Scope::Global), name).map(|v| v.to_string())
 }
 
 fn in_repo() -> bool {
@@ -354,15 +392,48 @@ pub(crate) fn tree_of_commit(commit: &[u8]) -> Option<String> {
 
 // --- config ----------------------------------------------------------------
 
-/// `git config <name> [value] | --get <name> | --unset <name> | --list`
+/// `git config [--local|--global] <name> [value] | --get | --unset | --list`
+///
+/// Reads merge the two files with **local winning**; writes go to whichever
+/// file was named, defaulting to local as git does. A `--global` read outside a
+/// repository still works, which is what makes `/git config --global user.name`
+/// usable before you have cloned anything.
 pub fn config_cmd(args: &str) -> String {
-    if !in_repo() {
+    let mut scope: Option<Scope> = None;
+    let mut rest: Vec<&str> = Vec::new();
+    for t in args.split_whitespace() {
+        match t {
+            "--global" => scope = Some(Scope::Global),
+            "--local" => scope = Some(Scope::Local),
+            "--system" => {
+                return "error: --system configuration does not exist on this OS \
+                        (use --global)"
+                    .to_string()
+            }
+            other => rest.push(other),
+        }
+    }
+    // Only a *write* or an explicitly-local operation needs a repository; a
+    // global read or write does not.
+    let needs_repo = scope != Some(Scope::Global);
+    if needs_repo && !in_repo() {
         return no_repo();
     }
-    let mut entries = load_config();
-    let toks: Vec<&str> = args.split_whitespace().collect();
-    match toks.first().copied() {
+    let write_scope = scope.unwrap_or(Scope::Local);
+
+    match rest.first().copied() {
         None | Some("--list") | Some("-l") => {
+            let entries = match scope {
+                Some(s) => load_scope(s),
+                None => {
+                    // Merged view, local last so it is the one a reader sees.
+                    let mut e = load_scope(Scope::Global);
+                    for l in load_scope(Scope::Local) {
+                        config::set(&mut e, &l.name(), &l.value);
+                    }
+                    e
+                }
+            };
             if entries.is_empty() {
                 return "ok: no configuration".to_string();
             }
@@ -372,33 +443,48 @@ pub fn config_cmd(args: &str) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-        Some("--get") => match toks.get(1).and_then(|n| config::get(&entries, n)) {
-            Some(v) => v.to_string(),
-            None => "error: no such key".to_string(),
-        },
-        Some("--unset") => {
-            let Some(name) = toks.get(1) else {
-                return "usage: /git config --unset <name>".to_string();
+        Some("--get") => {
+            let Some(name) = rest.get(1) else {
+                return "usage: /git config [--global] --get <name>".to_string();
             };
+            let found = match scope {
+                Some(s) => config::get(&load_scope(s), name).map(|v| v.to_string()),
+                None => config_lookup(name),
+            };
+            found.unwrap_or_else(|| "error: no such key".to_string())
+        }
+        Some("--unset") => {
+            let Some(name) = rest.get(1) else {
+                return "usage: /git config [--global] --unset <name>".to_string();
+            };
+            let mut entries = load_scope(write_scope);
             if config::unset(&mut entries, name) == 0 {
                 return "error: no such key".to_string();
             }
-            save_config(&entries);
+            save_scope(write_scope, &entries);
             alloc::format!("ok: unset {name}")
         }
-        Some(name) => match toks.get(1) {
-            None => match config::get(&entries, name) {
-                Some(v) => v.to_string(),
-                None => "error: no such key".to_string(),
-            },
+        Some(name) => match rest.get(1) {
+            None => {
+                let found = match scope {
+                    Some(s) => config::get(&load_scope(s), name).map(|v| v.to_string()),
+                    None => config_lookup(name),
+                };
+                found.unwrap_or_else(|| "error: no such key".to_string())
+            }
             Some(_) => {
-                // The value is the rest of the line, so it may contain spaces.
-                let value = args[args.find(name).map(|i| i + name.len()).unwrap_or(0)..].trim();
-                if !config::set(&mut entries, name, value) {
+                // The value is everything after the name, so it may contain
+                // spaces — `user.name Ada Lovelace` is one value, not two.
+                let value = rest[1..].join(" ");
+                let mut entries = load_scope(write_scope);
+                if !config::set(&mut entries, name, &value) {
                     return "error: a name must be section.key or section.sub.key".to_string();
                 }
-                save_config(&entries);
-                alloc::format!("ok: {name}={value}")
+                save_scope(write_scope, &entries);
+                alloc::format!(
+                    "ok: {name}={value}{}",
+                    if write_scope == Scope::Global { " (global)" } else { "" }
+                )
             }
         },
     }

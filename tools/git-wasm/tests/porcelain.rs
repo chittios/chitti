@@ -127,6 +127,75 @@ fn config_parsing_handles_subsections_and_comments() {
     assert_eq!(config::get(&e, "remote.origin.url"), None, "subsections are case-sensitive");
 }
 
+/// **Local overrides global**, which is the whole reason there are two files.
+#[test]
+fn local_config_wins_over_global() {
+    let _g = repo();
+    assert!(git::command("config --global user.name Global Person").contains("(global)"));
+    assert_eq!(git::command("config user.name"), "Global Person", "global applies with no local");
+
+    git::command("config user.name Local Person");
+    assert_eq!(git::command("config user.name"), "Local Person");
+    // Each file still holds its own value; the merge happens on read.
+    assert_eq!(git::command("config --global --get user.name"), "Global Person");
+    assert_eq!(git::command("config --local --get user.name"), "Local Person");
+
+    // Dropping the local value uncovers the global one again.
+    assert!(git::command("config --unset user.name").starts_with("ok:"));
+    assert_eq!(git::command("config user.name"), "Global Person");
+}
+
+/// The two files really are separate on disk, and `--global` does not need a
+/// repository — you set your name before you clone anything.
+#[test]
+fn global_config_lives_outside_the_repository() {
+    let _g = hostsim::reset("/agent/9047", "/home/chitti");
+    assert!(git::command("config --global user.email ada@example.com").starts_with("ok:"));
+    assert!(
+        hostsim::sim().files.contains_key("/home/chitti/.gitconfig"),
+        "global config belongs in the user home, not a repo"
+    );
+    assert_eq!(git::command("config --global --get user.email"), "ada@example.com");
+    // A *local* operation still needs one.
+    assert!(git::command("config user.email x@y").contains("not a git repository"));
+}
+
+/// **The identity is used, not merely stored.** This is the check that was
+/// missing: `user.name` was settable and every commit ignored it.
+#[test]
+fn commits_use_the_configured_identity() {
+    let _g = repo();
+    // The repo() fixture committed before any identity was set.
+    assert!(git::command("show").contains("Chitti <chitti@localhost>"), "the default");
+
+    git::command("config --global user.name Ada Lovelace");
+    git::command("config --global user.email ada@example.com");
+    hostsim::sim().files.insert("/home/chitti/b.txt".into(), b"x
+".to_vec());
+    git::command("add .");
+    git::command("commit -m second");
+    let out = git::command("show");
+    assert!(out.contains("Ada Lovelace <ada@example.com>"), "global identity: {out}");
+
+    // …and a repository-specific identity overrides it.
+    git::command("config user.email work@example.com");
+    hostsim::sim().files.insert("/home/chitti/c.txt".into(), b"y
+".to_vec());
+    git::command("add .");
+    git::command("commit -m third");
+    let out = git::command("show");
+    assert!(out.contains("Ada Lovelace <work@example.com>"), "local override: {out}");
+}
+
+/// `--system` is refused by name rather than quietly treated as global.
+#[test]
+fn system_scope_is_refused_by_name() {
+    let _g = repo();
+    let out = git::command("config --system user.name x");
+    assert!(out.contains("--system"), "{out}");
+    assert!(out.contains("--global"), "it must point at the one that exists: {out}");
+}
+
 // --- worktree --------------------------------------------------------------
 
 /// A linked worktree gets its own directory, checkout and branch, while the

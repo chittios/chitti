@@ -469,7 +469,20 @@ pub(crate) fn git_commit(args: &str) -> String {
     for p in &parents {
         content.push_str(&alloc::format!("parent {p}\n"));
     }
-    let who = alloc::format!("Chitti <chitti@localhost> {} +0000", now_unix());
+    // **`user.name` / `user.email` decide the author**, local overriding global.
+    // They used to be ignored entirely: `git config user.name Ada` wrote a key
+    // nothing read, so the setting looked like it had taken and every commit was
+    // still `Chitti <chitti@localhost>` — worse than having no config at all,
+    // because there was nothing to notice.
+    //
+    // Unset falls back to the machine's identity rather than refusing the commit
+    // the way git does. This is a single-user OS and there is a sensible answer;
+    // stopping the commit to demand a name would be hostile.
+    let name = crate::porcelain::config_lookup("user.name")
+        .unwrap_or_else(|| "Chitti".to_string());
+    let email = crate::porcelain::config_lookup("user.email")
+        .unwrap_or_else(|| "chitti@localhost".to_string());
+    let who = alloc::format!("{name} <{email}> {} +0000", now_unix());
     content.push_str(&alloc::format!("author {who}\ncommitter {who}\n\n{msg}\n"));
     let Some(sha) = write_loose("commit", content.as_bytes()) else {
         return "error: could not write commit".to_string();
@@ -606,7 +619,8 @@ pub fn command(args: &str) -> String {
              git>   diff [--cached] | rm [--cached] <path> | mv <src> <dst> | clean [-f]\n\
              git>   branch | checkout <branch> | switch [-c] <branch> | restore [--staged] <path>\n\
              git>   reset [--soft|--mixed|--hard] [<rev>] | tag [<name>] | tag -d <name>\n\
-             git>   remote [-v|add|remove|rename|set-url|get-url|show] | config <name> [value]\n\
+             git>   remote [-v|add|remove|rename|set-url|get-url|show]\n\
+             git>   config [--global] <name> [value] | --get | --unset | --list\n\
              git>   worktree [list|add <path> [branch]|remove <path>]\n\
              git>   clone <url> [dir] | fetch [remote] | pull [remote] | push [url]\n\
              git>   rev-parse <rev> | ls-files | cat-file [-t|-s|-p] <object>"
