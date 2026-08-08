@@ -2810,12 +2810,16 @@ mod entry_point_tests {
     /// mode, pinned as a pure table.
     #[test_case]
     fn entry_points_subtract_epbs_inside_prior_substreams() {
-        // Body: 4 header bytes, then slice data. Plant 00 00 03 01 (an EPB)
-        // at body index 4+5 = 9, inside a first substream of size 10.
+        // Body: 4 header bytes, then slice data. Plant 00 00 03 01 inside a
+        // first substream of size 10 — the `00 00 03` sequence starts at body
+        // index 4+5 = 9, so the **emulation-prevention byte itself** — the one
+        // `unescape_rbsp` drops, and the only one whose position matters here —
+        // is the 0x03 two bytes later, at index 11. Expecting the start of the
+        // sequence is off by two and lands inside the zero run.
         let mut body = alloc::vec![0x11u8; 4]; // header → data_byte_offset = 4
         body.extend_from_slice(&[1, 1, 1, 1, 1, 0, 0, 3, 1, 1]); // 10 NAL bytes, 1 EPB
         body.extend_from_slice(&[2u8; 20]); // second substream
-        assert_eq!(epb_positions(&body), alloc::vec![9]);
+        assert_eq!(epb_positions(&body), alloc::vec![11]);
         let starts = entry_point_starts_rbsp(&[10, 20], 4, &body);
         // First substream: 10 NAL − 1 EPB = 9 RBSP; second starts at 9.
         assert_eq!(starts, alloc::vec![0, 9, 29]);

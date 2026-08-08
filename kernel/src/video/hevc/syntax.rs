@@ -630,11 +630,16 @@ mod tests {
         let mut c = Canned::new(&[1, 1, 1]);
         assert_eq!(ref_idx(&mut c, 0, 1), 0);
         assert_eq!(c.used(), 0, "a single-entry list codes no bins");
-        // Five references: two context bins then bypass.
+        // Five references: two context bins then bypass. **List 1 codes against
+        // the L0 contexts**, which is not what the specification's context table
+        // says and is what every production coder does (see `ref_idx`'s own
+        // doc comment). Asserting `REF_IDX_L1` here would pin the behaviour that
+        // desynchronises the first bi-predicted AMVP block with more than one L1
+        // reference — i.e. it would re-break the hierarchical B-pyramid.
         let mut c = Canned::new(&[1, 1, 1, 0]);
         assert_eq!(ref_idx(&mut c, 1, 5), 3);
-        assert_eq!(c.seen[0], Bin::Ctx(ct::REF_IDX_L1));
-        assert_eq!(c.seen[1], Bin::Ctx(ct::REF_IDX_L1 + 1));
+        assert_eq!(c.seen[0], Bin::Ctx(ct::REF_IDX_L0), "list 1 shares the L0 contexts");
+        assert_eq!(c.seen[1], Bin::Ctx(ct::REF_IDX_L0 + 1));
         assert_eq!(c.seen[2], Bin::Bypass, "the third bin onward is bypass");
         // And it saturates at the list length rather than running on.
         let mut c = Canned::new(&[1, 1, 1, 1, 1, 1, 1]);
