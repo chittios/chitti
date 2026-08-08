@@ -23,6 +23,19 @@ side effect directly.
 > kind — use it at your own risk. The authors are not responsible for any damage
 > or data loss.
 
+<!-- -->
+
+> [!IMPORTANT]
+> **On real hardware, expect a wired-network console OS.** ChittiOS is developed
+> and verified against QEMU, VirtualBox and UTM; several drivers are written from
+> a specification and have never met the silicon they target. In particular:
+> **there is no WiFi driver that can join a network**, Bluetooth will not pair
+> with modern devices (no SSP, no BLE), audio plays in mono, there is no screen
+> brightness control, and suspend/resume does not restore USB or disk.
+> **[HARDWARE.md](HARDWARE.md) is the full support matrix** — what works, what is
+> unverified, and what is absent, per subsystem. Read it before booting on
+> anything you care about.
+
 ## Why?
 
 Why reinvent the wheel? We're not. Chitti is deliberately **not** "Unix in Rust":
@@ -110,8 +123,9 @@ model from ever directly touching hardware.
   content agents (e.g. **doc**) are data + SOUL, not per-site Rust.
   `/agents start <name> [port]`; **ssh** agent for version exchange (transport
   evolving).
-- **Sound & voice.** virtio-snd / HDA (and legacy paths); `/voice` (VAD → STT →
-  LLM → TTS) with ONNX models (silero, parakeet, KittenTTS).
+- **Sound & voice.** virtio-snd / HDA (and legacy AC'97 / SB16); `/voice`
+  (VAD → STT → LLM → TTS) with ONNX models (silero, parakeet, KittenTTS).
+  Playback is 16-bit **mono** — the voice pipeline is the design target.
 - **Media.** In-kernel PNG/JPEG; WAV/MP3/AAC player; H.264 / H.265 / VP9 video
   player (`/open .mp4|.mov|.mkv|.webm|.ts|.m3u8`, including HLS VOD over the
   network) with streaming decode and transport controls.
@@ -124,7 +138,10 @@ model from ever directly touching hardware.
   natively on Apple Silicon under QEMU-HVF. Features do not diverge by arch.
 - **Real, standards-based drivers.** UEFI/Limine/GOP display; virtio/NVMe/AHCI
   disks; USB xHCI/HID + virtio-input + PL050/PS-2; PCIe/ACPI discovery. Same
-  image for QEMU, VirtualBox, and real UEFI hardware.
+  image for QEMU, VirtualBox, and real UEFI hardware. **Coverage is uneven on
+  bare metal — see [HARDWARE.md](HARDWARE.md) for the per-subsystem matrix,
+  including what is written-but-unverified and what is absent (WiFi, Bluetooth
+  pairing, GPU, backlight).**
 - **Storage & self-install.** GPT/MBR/FAT/ext4; durable agent state on ext4;
   `/install` update-in-place with modal confirm.
 - **Microkernel core.** Unforgeable capabilities, scheduler (cooperative +
@@ -198,6 +215,10 @@ Commands browser (searchable). `/help text` prints a flat list over serial.
 
 > Reminder: this is research software — **boot it from removable media / in a VM,
 > not on a machine whose data you care about.** See the warning above.
+>
+> Booting on real hardware? Check **[HARDWARE.md](HARDWARE.md)** first. The short
+> version: console, keyboard, trackpad and wired Ethernet work; **WiFi does not**,
+> Bluetooth will not pair, audio is mono, and there is no brightness control.
 
 ## Building & running (development)
 
@@ -228,6 +249,7 @@ framebuffer verification are in **[DEVELOPMENT.md](DEVELOPMENT.md)**.
 
 | Doc | Contents |
 |---|---|
+| **[HARDWARE.md](HARDWARE.md)** | Real-hardware support matrix: what works, what is unverified, what is absent |
 | **[CHANNELS.md](CHANNELS.md)** | Messaging channels: Telegram setup, `/channel` reference, adding backends |
 | **[DEVELOPMENT.md](DEVELOPMENT.md)** | Toolchain, build/run/test, VirtualBox |
 | **[DESIGN.md](DESIGN.md)** | Brand, palette, compositor UX |
