@@ -25,17 +25,20 @@ pub fn draw_status_menu(chip: StatusChip) {
         let pos = sc.layout.status_pos;
 
         // Menu size: clock is larger (analog face); volume is a compact control.
+        // Each is one row shorter than it used to be — that row held the
+        // "Esc / click outside to close" footer, and a dropdown that has to
+        // explain how to dismiss it is a dropdown, not a dialog.
         let (cols, rows) = match chip {
-            StatusChip::Clock => (32u64, 16u64),
-            StatusChip::Volume => (28, 12),
-            StatusChip::Net => (36, 12),
-            StatusChip::Mem | StatusChip::Cpu => (34, 10),
-            StatusChip::Battery => (30, 9),
-            StatusChip::Kbd | StatusChip::Mouse => (28, 8),
-            StatusChip::Brand => (28, 8),
+            StatusChip::Clock => (32u64, 15u64),
+            StatusChip::Volume => (28, 11),
+            StatusChip::Net => (36, 11),
+            StatusChip::Mem | StatusChip::Cpu => (34, 9),
+            StatusChip::Battery => (30, 8),
+            StatusChip::Kbd | StatusChip::Mouse => (28, 7),
+            StatusChip::Brand => (28, 7),
             // Wider and taller: it lists actual rows, not a couple of fields.
-            StatusChip::Notifications => (44, 12),
-            StatusChip::Recording => (28, 6),
+            StatusChip::Notifications => (44, 11),
+            StatusChip::Recording => (28, 5),
         };
         let bw = cols * cw + 2 * (BORDER + PAD);
         let bh = rows * ch + 2 * (BORDER + PAD);
@@ -149,33 +152,36 @@ pub fn draw_status_menu(chip: StatusChip) {
         sc.fill_rect(ix, y, content_w, 1, sc.theme.sep_dim);
         y += ch / 2;
 
+        // Each body flows top-down from `y` and returns where it ended; nothing
+        // is placed after it now that the footer is gone, so the return is
+        // dropped rather than threaded on.
         match chip {
             StatusChip::Clock => {
-                y = draw_clock_menu_body(sc, ix, y, content_w, ch, cw, bg);
+                draw_clock_menu_body(sc, ix, y, content_w, ch, cw, bg);
             }
             StatusChip::Net => {
-                y = draw_net_menu_body(sc, ix, y, ch, bg);
+                draw_net_menu_body(sc, ix, y, ch, bg);
             }
             StatusChip::Mem => {
-                y = draw_mem_menu_body(sc, ix, y, ch, bg);
+                draw_mem_menu_body(sc, ix, y, ch, bg);
             }
             StatusChip::Cpu => {
-                y = draw_cpu_menu_body(sc, ix, y, ch, bg);
+                draw_cpu_menu_body(sc, ix, y, ch, bg);
             }
             StatusChip::Battery => {
-                y = draw_battery_menu_body(sc, ix, y, ch, bg);
+                draw_battery_menu_body(sc, ix, y, ch, bg);
             }
             StatusChip::Volume => {
-                y = draw_volume_menu_body(sc, ix, y, content_w, ch, cw, bg);
+                draw_volume_menu_body(sc, ix, y, content_w, ch, cw, bg);
             }
             StatusChip::Kbd => {
-                y = draw_input_menu_body(sc, ix, y, ch, bg, true);
+                draw_input_menu_body(sc, ix, y, ch, bg, true);
             }
             StatusChip::Mouse => {
-                y = draw_input_menu_body(sc, ix, y, ch, bg, false);
+                draw_input_menu_body(sc, ix, y, ch, bg, false);
             }
             StatusChip::Notifications => {
-                y = draw_notify_menu_body(sc, ix, y, content_w, ch, cw, bg);
+                draw_notify_menu_body(sc, ix, y, content_w, ch, cw, bg);
             }
             StatusChip::Brand => {
                 sc.draw_str(ix, y, "Click for About…", sc.theme.chat_fg, bg);
@@ -185,13 +191,9 @@ pub fn draw_status_menu(chip: StatusChip) {
             StatusChip::Recording => {
                 // Click is handled as stop at the shell; this is a fallback.
                 sc.draw_str(ix, y, "Click chip to stop", sc.theme.chat_fg, bg);
-                y += ch;
             }
         }
 
-        // Footer hint.
-        let foot_y = by + bh - BORDER - PAD - ch;
-        sc.draw_str(ix, foot_y, "Esc / click outside to close", sc.theme.title_dim, bg);
         // Full card is clickable for "inside" hit tests (slot 1 = menu body).
         MODAL_RECTS.with(|m| m[1] = (bx, by, bw, bh));
         sc.cursor_overlay();
