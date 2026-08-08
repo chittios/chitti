@@ -81,12 +81,34 @@ const USB_ETH_BUF: usize = 2048;
 /// reads without a huge DMA footprint; CBW/CSW are far smaller.
 const USB_MSC_BUF: usize = 4096;
 
+/// Largest RNDIS control message we exchange. An `INITIALIZE_CMPLT` is 52 bytes
+/// and a `QUERY_CMPLT` for any OID we read is far smaller, but the device
+/// chooses the reply length, so this is sized for headroom and every read is
+/// bounded by it.
+const USB_RNDIS_CTRL_BUF: usize = 1024;
+
 /// What the configured bulk pair is for — Ethernet and mass-storage share the
 /// same endpoint machinery but must not steal each other's traffic.
+///
+/// `Eth` and `Rndis` are **both** USB Ethernet and differ only in framing, but
+/// they cannot be one variant: a bare Ethernet frame and an RNDIS-wrapped one
+/// are indistinguishable by inspection, so the role is what decides whether 44
+/// bytes are a header or the start of a destination MAC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BulkRole {
+    /// CDC-ECM: one bare Ethernet frame per transfer.
     Eth,
+    /// Microsoft RNDIS: a 44-byte header per frame, several frames per transfer,
+    /// and a control-pipe bring-up sequence.
+    Rndis,
     Msc,
+}
+
+impl BulkRole {
+    /// Whether this role carries Ethernet frames (either framing).
+    pub fn is_ethernet(self) -> bool {
+        matches!(self, BulkRole::Eth | BulkRole::Rndis)
+    }
 }
 
 /// A configured bulk IN/OUT endpoint pair on one device — USB Ethernet or MSC.
@@ -102,6 +124,23 @@ pub struct BulkEp {
     pub in_dci: u8,
     pub out_dci: u8,
     pub role: BulkRole,
+    /// Default control pipe, retained so a class request can be issued **after**
+    /// the bulk pair is configured. CDC-ECM and MSC never need this; RNDIS does
+    /// its entire bring-up (initialize, MAC query, packet filter) over it, and
+    /// re-enumerating the device to get ep0 back would tear down the very
+    /// endpoints it is configuring.
+    ep0_va: usize,
+    ep0_pa: u64,
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    /// Interface number the class request is addressed to (`wIndex`).
+    ctrl_iface: u8,
+    /// A small DMA bounce buffer used only by control transfers, kept separate
+    /// from the bulk buffers so a control message cannot clobber a data transfer
+    /// that is still in flight.
+    ctrl_buf_va: usize,
+    ctrl_buf_pa: u64,
+    ctrl_buf_len: usize,
     in_ring_va: usize,
     in_ring_pa: u64,
     in_enq: usize,
@@ -1012,7 +1051,8 @@ impl Xhci {
             // A USB hub (bDeviceClass 9): recurse — the keyboard on a USB-A port
             // lives behind the Mac mini's internal hub, not on a root port.
             if c.dev_class == 9 {
-                unsafe { self.enumerate_hub(&mut c) };
+                // Tier 0: a hub hanging directly off a root port.
+                unsafe { self.enumerate_hub(&mut c, 0) };
                 if port < 32 { self.done_ports |= 1 << port; }
                 continue;
             }
@@ -1075,14 +1115,28 @@ impl Xhci {
             // during enumeration.
             let desc = unsafe { core::slice::from_raw_parts(c.buf_va as *const u8, c.total as usize) };
             if let Some(bi) = find_msc_bot_iface(desc) {
-                if unsafe { self.ensure_configured(c) } && unsafe { self.configure_bulk(c, bi, USB_MSC_BUF, BulkRole::Msc) }
+                if unsafe { self.ensure_configured(c) } && unsafe { self.configure_bulk(c, bi, USB_MSC_BUF, BulkRole::Msc, bi.iface) }
                 {
                     crate::ktrace::log("xhci", "USB MSC (BOT) bulk endpoints configured");
                     got = true;
                 }
+            } else if let Some(r) = find_rndis_ifaces(desc) {
+                // RNDIS **before** the bare class-0x0A check: its data interface
+                // is class 0x0A too, so the ECM arm would claim it and then read
+                // every 44-byte RNDIS header as the head of an Ethernet frame.
+                // SAFETY: `c` is an addressed, configured device.
+                if unsafe { self.ensure_configured(c) }
+                    && unsafe { self.configure_bulk(c, r.data, USB_ETH_BUF, BulkRole::Rndis, r.ctrl_iface) }
+                {
+                    crate::ktrace::log_fmt(format_args!(
+                        "xhci: USB Ethernet (RNDIS) bulk endpoints configured (ctrl iface {}, data iface {})",
+                        r.ctrl_iface, r.data.iface
+                    ));
+                    got = true;
+                }
             } else if let Some(bi) = find_bulk_iface(desc, Some(0x0a)) {
                 // SAFETY: `c` is an addressed, configured device.
-                if unsafe { self.ensure_configured(c) } && unsafe { self.configure_bulk(c, bi, USB_ETH_BUF, BulkRole::Eth) }
+                if unsafe { self.ensure_configured(c) } && unsafe { self.configure_bulk(c, bi, USB_ETH_BUF, BulkRole::Eth, bi.iface) }
                 {
                     crate::ktrace::log("xhci", "USB Ethernet (CDC-ECM) bulk endpoints configured");
                     got = true;
@@ -1125,9 +1179,21 @@ impl Xhci {
     /// hang off an internal hub) is reached. Configure the hub, mark its slot as
     /// a hub in the xHC, power + reset each downstream port, and for every
     /// connected one address the device with the right route string + TT and
-    /// classify it. One tier deep (the Mac mini's topology); nested hubs are
-    /// logged and skipped.
-    unsafe fn enumerate_hub(&mut self, c: &mut Common) {
+    /// classify it.
+    ///
+    /// **Descends into nested hubs**, which is the ordinary desk topology: a
+    /// dock, or a monitor with a built-in hub, puts every device two or three
+    /// tiers below the root and a single-tier walk finds none of them. `tier` is
+    /// this hub's own depth (0 = hanging off a root port); recursion stops at
+    /// [`MAX_HUB_TIER`], which is both the USB 2.0 limit and the width of the
+    /// route string, so a refusal there means the topology is illegal rather
+    /// than that we gave up early.
+    ///
+    /// Recursion depth is bounded by that constant and each frame holds one
+    /// `Common` (a handful of words), so the kernel stack is not at risk; an
+    /// unbounded walk would be, since a hub can legally report itself as
+    /// connected to one of its own downstream ports on faulty hardware.
+    unsafe fn enumerate_hub(&mut self, c: &mut Common, tier: u8) {
         // Standard-request byte for hub class requests (recipient = other/port
         // uses bmRequestType 0x23 set / 0xA3 get).
         const REQ_GET_STATUS: u8 = 0;
@@ -1180,7 +1246,11 @@ impl Xhci {
         }
         spin_delay(2_000_000 + pwr_on_2_good * 400_000);
         for p in 1..=nbr_ports {
-            if self.kbd.is_some() && self.mouse.is_some() {
+            // Same stop condition as `scan_ports`: keyboard, pointer *and* a
+            // bulk device. Stopping at kbd+mouse (as this used to) means a USB
+            // disk or Ethernet dongle sharing a hub with them is never reached
+            // — and behind a dock, sharing a hub is the normal case.
+            if self.kbd.is_some() && self.mouse.is_some() && self.bulk.is_some() {
                 break;
             }
             if !unsafe {
@@ -1229,13 +1299,28 @@ impl Xhci {
                 1 // full speed (PSIV 1)
             };
             let hub_hs = c.loc.speed >= 3;
+            let Some(route) = push_route(c.loc.route, p) else {
+                // Unroutable: a sixth tier, or a downstream port above 15.
+                // Skipping is correct — the alternative is addressing whatever
+                // device the truncated string happens to name.
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: hub port {p} is not routable (route={:#x} tier={tier}) -- skipped",
+                    c.loc.route
+                ));
+                continue;
+            };
             let loc = DevLoc {
                 root_port: c.loc.root_port,
-                route: push_route(c.loc.route, p),
+                route,
                 speed,
                 parent_slot: c.slot,
                 parent_port: p,
-                // A LS/FS device behind a HS hub uses the hub's transaction translator.
+                // A LS/FS device behind a HS hub uses the hub's transaction
+                // translator — and so does one behind a *chain* of hubs whose
+                // nearest high-speed ancestor is this one. `hub_hs` is this
+                // hub's speed, so the TT parent is always the immediate hub,
+                // which is what xHCI wants (§4.9.2: the TT belongs to the
+                // closest HS hub above the device).
                 tt: (speed == 1 || speed == 2) && hub_hs,
             };
             crate::ktrace::log_fmt(format_args!(
@@ -1248,7 +1333,18 @@ impl Xhci {
             };
             crate::ktrace::log_fmt(format_args!("xhci: hub port {p} slot {} dev_class={}", dc.slot, dc.dev_class));
             if dc.dev_class == 9 {
-                crate::ktrace::log_fmt(format_args!("xhci: nested hub on hub port {p} not descended"));
+                if tier + 1 >= MAX_HUB_TIER {
+                    crate::ktrace::log_fmt(format_args!(
+                        "xhci: hub on hub port {p} is at tier {} -- past the USB limit of {MAX_HUB_TIER}, not descended",
+                        tier + 1
+                    ));
+                    continue;
+                }
+                crate::ktrace::log_fmt(format_args!(
+                    "xhci: nested hub on hub port {p} (tier {}) -- descending",
+                    tier + 1
+                ));
+                unsafe { self.enumerate_hub(&mut dc, tier + 1) };
                 continue;
             }
             unsafe { self.classify_and_finish(&mut dc) };
@@ -2667,17 +2763,26 @@ impl Xhci {
     ///
     /// # Safety
     /// `c` must be a device this controller has addressed and configured.
+    /// `ctrl_iface` is the interface number a class request on the default
+    /// control pipe is addressed to. For MSC and CDC-ECM nothing ever issues
+    /// one, so the data interface is the right answer; **for RNDIS it is a
+    /// different interface** (the `E0/01/03` or `02/02/FF` control interface),
+    /// and sending `SEND_ENCAPSULATED_COMMAND` to the data interface is accepted
+    /// by some firmware and silently ignored by the rest — a device that
+    /// initialises with no error and never carries a packet.
     pub unsafe fn configure_bulk(
         &mut self,
         c: &mut Common,
         bi: BulkIface,
         buf_len: usize,
         role: BulkRole,
+        ctrl_iface: u8,
     ) -> bool {
         let Some((in_ring_pa, in_ring_va)) = (self.alloc)(RING_TRBS * 16) else { return false };
         let Some((out_ring_pa, out_ring_va)) = (self.alloc)(RING_TRBS * 16) else { return false };
         let Some((in_buf_pa, in_buf_va)) = (self.alloc)(buf_len) else { return false };
         let Some((out_buf_pa, out_buf_va)) = (self.alloc)(buf_len) else { return false };
+        let Some((ctrl_buf_pa, ctrl_buf_va)) = (self.alloc)(USB_RNDIS_CTRL_BUF) else { return false };
         let (in_ring_va, out_ring_va) = (in_ring_va as usize, out_ring_va as usize);
         // SAFETY: freshly allocated DMA rings; link TRBs make them circular.
         unsafe {
@@ -2714,6 +2819,14 @@ impl Xhci {
             in_dci,
             out_dci,
             role,
+            ep0_va: c.ep0_va,
+            ep0_pa: c.ep0_pa,
+            ep0_enq: c.ep0_enq,
+            ep0_cycle: c.ep0_cycle,
+            ctrl_iface,
+            ctrl_buf_va: ctrl_buf_va as usize,
+            ctrl_buf_pa,
+            ctrl_buf_len: USB_RNDIS_CTRL_BUF,
             in_ring_va,
             in_ring_pa,
             in_enq: 0,
@@ -2738,6 +2851,76 @@ impl Xhci {
     /// True once a bulk pair is configured.
     pub fn has_bulk(&self) -> bool {
         self.bulk.is_some()
+    }
+
+    /// Push a class request body to the bulk device's **control** interface
+    /// (RNDIS `SEND_ENCAPSULATED_COMMAND`).
+    ///
+    /// Uses the retained ep0 handles rather than re-enumerating: the bulk
+    /// endpoints are already configured and re-addressing the device to reach
+    /// its control pipe would tear them down.
+    pub fn bulk_class_out(&mut self, request: u8, body: &[u8]) -> bool {
+        let Some(b) = self.bulk.as_ref() else { return false };
+        if body.is_empty() || body.len() > b.ctrl_buf_len {
+            return false;
+        }
+        let (slot, va, pa, mut enq, mut cyc, buf_va, buf_pa, iface) = (
+            b.slot, b.ep0_va, b.ep0_pa, b.ep0_enq, b.ep0_cycle, b.ctrl_buf_va, b.ctrl_buf_pa, b.ctrl_iface,
+        );
+        // SAFETY: `ctrl_buf` is a live DMA allocation of `ctrl_buf_len` bytes and
+        // `body` is bounds-checked against it above.
+        unsafe { core::ptr::copy_nonoverlapping(body.as_ptr(), buf_va as *mut u8, body.len()) };
+        dma_clean(buf_va, body.len());
+        let pkt = setup(0x21, request, 0, iface as u16, body.len() as u16);
+        // SAFETY: `slot` is addressed and `va`/`pa` are its live ep0 ring.
+        let ok = unsafe { self.control(slot, va, pa, &mut enq, &mut cyc, pkt, buf_pa, body.len() as u32, false) };
+        // The ring cursor advances whether or not the transfer succeeded, so it
+        // is written back either way — losing it would desynchronise ep0 and
+        // every later control transfer on this device would target a stale TRB.
+        if let Some(b) = self.bulk.as_mut() {
+            b.ep0_enq = enq;
+            b.ep0_cycle = cyc;
+        }
+        ok
+    }
+
+    /// Read a class response body back from the bulk device's control interface
+    /// (RNDIS `GET_ENCAPSULATED_RESPONSE`). Returns the bytes read into `out`.
+    ///
+    /// The length asked for is `out.len()` capped to the bounce buffer, and the
+    /// device may answer with less. **The reply length is not reported by this
+    /// transport**, so the caller reads the message's own `MessageLength` rather
+    /// than trusting the buffer size — which is why the RNDIS parsers all bound
+    /// themselves by the declared length as well as by the slice.
+    pub fn bulk_class_in(&mut self, request: u8, out: &mut [u8]) -> Option<usize> {
+        let Some(b) = self.bulk.as_ref() else { return None };
+        let want = out.len().min(b.ctrl_buf_len);
+        if want == 0 {
+            return None;
+        }
+        let (slot, va, pa, mut enq, mut cyc, buf_va, buf_pa, iface) = (
+            b.slot, b.ep0_va, b.ep0_pa, b.ep0_enq, b.ep0_cycle, b.ctrl_buf_va, b.ctrl_buf_pa, b.ctrl_iface,
+        );
+        // Clear the bounce buffer first: a device that answers short would
+        // otherwise leave the previous reply's tail in place, and a parser that
+        // trusts a length field would read it as this reply's content.
+        // SAFETY: `ctrl_buf` is a live DMA allocation of at least `want` bytes.
+        unsafe { core::ptr::write_bytes(buf_va as *mut u8, 0, want) };
+        dma_clean(buf_va, want);
+        let pkt = setup(0xa1, request, 0, iface as u16, want as u16);
+        // SAFETY: as above; `buf_pa` receives at most `want` bytes.
+        let ok = unsafe { self.control(slot, va, pa, &mut enq, &mut cyc, pkt, buf_pa, want as u32, true) };
+        if let Some(b) = self.bulk.as_mut() {
+            b.ep0_enq = enq;
+            b.ep0_cycle = cyc;
+        }
+        if !ok {
+            return None;
+        }
+        dma_invalidate(buf_va, want);
+        // SAFETY: the controller wrote at most `want` bytes into `ctrl_buf`.
+        unsafe { core::ptr::copy_nonoverlapping(buf_va as *const u8, out.as_mut_ptr(), want) };
+        Some(want)
     }
 
     /// Role of the configured bulk pair, if any.
@@ -3094,18 +3277,36 @@ unsafe fn dump_hid_descriptor(buf: usize, len: usize) {
     }
 }
 
+/// The deepest tier of hubs below the root hub this driver descends into. Both
+/// the USB 2.0 limit (5 external hubs between a device and the root) and the
+/// xHCI route string's width (20 bits, one nibble per tier) land on the same
+/// number, so this is the spec's bound rather than ours.
+pub const MAX_HUB_TIER: u8 = 5;
+
 /// Append downstream hub `port` to a route string at the first empty nibble.
 /// xHCI route strings pack one 4-bit hub-port number per tier below the root
 /// hub (`bits[3:0]` = the first-tier hub's downstream port, etc.), up to 5 tiers.
 /// A root-port device has route 0, so a device on `port` of a root-port hub gets
 /// `port` in the low nibble.
-fn push_route(hub_route: u32, port: u8) -> u32 {
-    for tier in 0..5 {
+///
+/// `None` when the string cannot express the position — the tier budget is spent
+/// (a sixth hub, which USB forbids) or the port number does not fit a nibble.
+/// **Returning the unchanged route in those cases is the bug this signature
+/// exists to prevent**: the resulting string names a *different, real* device
+/// one tier up, so the xHC addresses the wrong one and every transfer to it
+/// appears to work. A refusal that names the device is the only safe answer.
+fn push_route(hub_route: u32, port: u8) -> Option<u32> {
+    // Port 0 is not a downstream port (a zero nibble is how "no further tier" is
+    // encoded), and a route string cannot name a port above 15.
+    if port == 0 || port > 0xf {
+        return None;
+    }
+    for tier in 0..MAX_HUB_TIER as u32 {
         if (hub_route >> (4 * tier)) & 0xf == 0 {
-            return hub_route | (((port as u32) & 0xf) << (4 * tier));
+            return Some(hub_route | ((port as u32) << (4 * tier)));
         }
     }
-    hub_route
+    None
 }
 
 /// Pack a USB setup packet into the little-endian u64 a Setup Stage TRB expects.
@@ -3502,6 +3703,55 @@ pub(crate) fn find_msc_bot_iface(desc: &[u8]) -> Option<BulkIface> {
     find_bulk_iface_ex(desc, Some(0x08), Some(0x06), Some(0x50))
 }
 
+/// The two interfaces of an RNDIS function: the control interface that takes the
+/// encapsulated command/response class requests, and the data interface holding
+/// the bulk pair.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RndisIfaces {
+    /// `wIndex` for `SEND_ENCAPSULATED_COMMAND` / `GET_ENCAPSULATED_RESPONSE`.
+    pub ctrl_iface: u8,
+    pub data: BulkIface,
+}
+
+/// Locate an RNDIS function in a configuration descriptor.
+///
+/// **RNDIS and CDC-ECM both put their data on a class-`0x0A` interface**, so the
+/// data interface cannot distinguish them — the control interface's class triple
+/// is the only signal, and it must be found before the data interface is claimed.
+/// Getting this backwards feeds smoltcp a 44-byte RNDIS header as the start of
+/// every Ethernet frame: no error is raised anywhere, the link simply carries
+/// nothing that parses.
+///
+/// The control interface is required to be *present and RNDIS-flavoured*; the
+/// data interface is then the first class-`0x0A` interface with a bulk pair.
+/// Requiring both is what keeps a plain CDC-ACM serial modem — which shares the
+/// `02/02/FF` triple — from being claimed as a NIC: it has no CDC-Data interface
+/// with bulk endpoints in this shape.
+pub(crate) fn find_rndis_ifaces(desc: &[u8]) -> Option<RndisIfaces> {
+    const DT_INTERFACE: u8 = 0x04;
+    let mut i = 0usize;
+    let mut ctrl: Option<u8> = None;
+    while i + 2 <= desc.len() {
+        let len = desc[i] as usize;
+        // A zero or short length would spin, and these bytes came off a bus we
+        // do not control.
+        if len < 2 || i + len > desc.len() {
+            break;
+        }
+        if desc[i + 1] == DT_INTERFACE && len >= 9 {
+            let (number, class, subclass, protocol) = (desc[i + 2], desc[i + 5], desc[i + 6], desc[i + 7]);
+            if crate::net::usb_eth::is_rndis_control(class, subclass, protocol) {
+                ctrl = Some(number);
+                break;
+            }
+        }
+        i += len;
+    }
+    let ctrl_iface = ctrl?;
+    let data = find_bulk_iface(desc, Some(0x0a))?;
+    Some(RndisIfaces { ctrl_iface, data })
+}
+
 #[cfg(test)]
 mod tests {
     // --- endpoint types + bulk descriptor parsing -------------------------
@@ -3514,6 +3764,80 @@ mod tests {
     }
     fn ep_desc(addr: u8, attrs: u8, mps: u16) -> [u8; 7] {
         [7, 0x05, addr, attrs, mps.to_le_bytes()[0], mps.to_le_bytes()[1], 0]
+    }
+
+    /// **RNDIS and CDC-ECM both put their data on a class-`0x0A` interface**, so
+    /// the data interface cannot tell them apart — only the control interface's
+    /// class triple can. Claiming an RNDIS device as ECM reads every 44-byte
+    /// header as the start of an Ethernet frame: no error anywhere, just a link
+    /// on which nothing parses.
+    #[test_case]
+    fn rndis_is_found_by_its_control_interface_not_its_data_one() {
+        let mut d = alloc::vec::Vec::new();
+        // Interface 0: RNDIS control (Wireless / RF / RNDIS), one interrupt IN.
+        d.extend_from_slice(&iface_desc_full(0, 0xe0, 0x01, 0x03));
+        d.extend_from_slice(&ep_desc(0x81, 0x03, 8));
+        // Interface 1: CDC Data with the bulk pair — identical to CDC-ECM's.
+        d.extend_from_slice(&iface_desc_full(1, 0x0a, 0x00, 0x00));
+        d.extend_from_slice(&ep_desc(0x82, 0x02, 512));
+        d.extend_from_slice(&ep_desc(0x02, 0x02, 512));
+
+        let r = find_rndis_ifaces(&d).expect("an RNDIS function must be found");
+        assert_eq!(r.ctrl_iface, 0, "control requests go to the control interface");
+        assert_eq!(r.data.iface, 1);
+        assert_eq!((r.data.in_ep, r.data.out_ep), (0x82, 0x02));
+
+        // The same descriptor with a plain CDC-ECM control interface is NOT
+        // RNDIS, even though its data interface is byte-identical.
+        let mut ecm = alloc::vec::Vec::new();
+        ecm.extend_from_slice(&iface_desc_full(0, 0x02, 0x06, 0x00)); // ECM control
+        ecm.extend_from_slice(&ep_desc(0x81, 0x03, 8));
+        ecm.extend_from_slice(&iface_desc_full(1, 0x0a, 0x00, 0x00));
+        ecm.extend_from_slice(&ep_desc(0x82, 0x02, 512));
+        ecm.extend_from_slice(&ep_desc(0x02, 0x02, 512));
+        assert!(find_rndis_ifaces(&ecm).is_none(), "CDC-ECM must not be taken for RNDIS");
+        // ...and its data interface is still found by the ECM path.
+        assert!(find_bulk_iface(&ecm, Some(0x0a)).is_some());
+    }
+
+    /// The other RNDIS advertisement — CDC / ACM / vendor — must work too, and
+    /// must not swallow a real CDC-ACM serial modem, which shares `02/02` and
+    /// differs only in the protocol byte and in having no CDC-Data bulk pair.
+    #[test_case]
+    fn the_cdc_acm_flavour_of_rndis_is_found_and_a_real_modem_is_not() {
+        let mut d = alloc::vec::Vec::new();
+        d.extend_from_slice(&iface_desc_full(0, 0x02, 0x02, 0xff)); // RNDIS, MS flavour
+        d.extend_from_slice(&ep_desc(0x81, 0x03, 8));
+        d.extend_from_slice(&iface_desc_full(1, 0x0a, 0x00, 0x00));
+        d.extend_from_slice(&ep_desc(0x82, 0x02, 512));
+        d.extend_from_slice(&ep_desc(0x02, 0x02, 512));
+        let r = find_rndis_ifaces(&d).expect("the 02/02/FF flavour must be found");
+        assert_eq!(r.ctrl_iface, 0);
+
+        // A genuine ACM modem: same control class/subclass, protocol 0x01, and
+        // its data interface carries no bulk pair we would claim.
+        let mut modem = alloc::vec::Vec::new();
+        modem.extend_from_slice(&iface_desc_full(0, 0x02, 0x02, 0x01));
+        modem.extend_from_slice(&ep_desc(0x81, 0x03, 8));
+        assert!(find_rndis_ifaces(&modem).is_none());
+
+        // And an ACM control interface with protocol 0xFF but *no* data
+        // interface is not a NIC either — the control triple alone is not
+        // enough to claim a device.
+        let mut lone = alloc::vec::Vec::new();
+        lone.extend_from_slice(&iface_desc_full(0, 0x02, 0x02, 0xff));
+        lone.extend_from_slice(&ep_desc(0x81, 0x03, 8));
+        assert!(find_rndis_ifaces(&lone).is_none(), "no data interface, no NIC");
+    }
+
+    /// A truncated or zero-length descriptor must terminate the walk rather than
+    /// spin — these bytes came off a bus we do not control.
+    #[test_case]
+    fn the_rndis_walk_terminates_on_a_malformed_descriptor() {
+        assert!(find_rndis_ifaces(&[]).is_none());
+        assert!(find_rndis_ifaces(&[0, 0x04, 0, 0, 0, 0xe0, 0x01, 0x03, 0]).is_none());
+        // Header claims more bytes than are present.
+        assert!(find_rndis_ifaces(&[9, 0x04, 0]).is_none());
     }
 
     #[test_case]
@@ -3777,12 +4101,48 @@ mod tests {
     /// in the low nibble; a second tier fills the next nibble.
     #[test_case]
     fn route_string_packs_one_nibble_per_tier() {
-        assert_eq!(push_route(0, 3), 0x3); // tier-1 device on hub port 3
-        assert_eq!(push_route(0, 7), 0x7);
-        assert_eq!(push_route(0x3, 5), 0x53); // tier-2 device behind port 3 then 5
-        assert_eq!(push_route(0x53, 1), 0x153); // tier-3
-        // Port numbers are masked to a nibble (hubs have ≤15 ports on this path).
-        assert_eq!(push_route(0, 0xf), 0xf);
+        assert_eq!(push_route(0, 3), Some(0x3)); // tier-1 device on hub port 3
+        assert_eq!(push_route(0, 7), Some(0x7));
+        assert_eq!(push_route(0x3, 5), Some(0x53)); // tier-2 device behind port 3 then 5
+        assert_eq!(push_route(0x53, 1), Some(0x153)); // tier-3
+        assert_eq!(push_route(0x153, 2), Some(0x2153)); // tier-4
+        assert_eq!(push_route(0x2153, 6), Some(0x6_2153)); // tier-5, the last one
+        // A hub port number fits exactly one nibble.
+        assert_eq!(push_route(0, 0xf), Some(0xf));
+    }
+
+    /// A position a route string cannot express is **refused**, never silently
+    /// truncated into one it can: the truncated string names a different, real
+    /// device one tier up, so the xHC would address that one and every transfer
+    /// would appear to succeed against the wrong hardware.
+    #[test_case]
+    fn an_unroutable_position_is_refused_not_truncated() {
+        // Six tiers of hubs — more than USB 2.0 allows and more than the 20-bit
+        // route string holds.
+        assert_eq!(push_route(0x6_2153, 1), None);
+        // A downstream port above 15 has no nibble.
+        assert_eq!(push_route(0, 16), None);
+        assert_eq!(push_route(0x3, 200), None);
+        // Port 0 is not a downstream port: a zero nibble is precisely how "no
+        // further tier" is encoded, so accepting it would make a device at tier
+        // 2 indistinguishable from its own parent hub.
+        assert_eq!(push_route(0x3, 0), None);
+    }
+
+    /// The recursion bound and the route string's capacity are the same number,
+    /// so a topology that fits one fits the other. If these ever disagree, the
+    /// walk either stops before the string is full (devices silently missing) or
+    /// runs past it (`push_route` returning `None` for a legal position).
+    #[test_case]
+    fn hub_tier_bound_matches_the_route_string_width() {
+        let mut route = 0u32;
+        for tier in 0..MAX_HUB_TIER {
+            route = push_route(route, (tier + 1) & 0xf)
+                .expect("every tier within the bound must be routable");
+        }
+        // Exactly full: 5 nibbles used, and one more is refused.
+        assert_eq!(route >> (4 * MAX_HUB_TIER as u32), 0, "route must fit 20 bits");
+        assert_eq!(push_route(route, 1), None, "a sixth tier must be refused");
     }
 
     /// The Address-Device slot-context word-0 packing used by
