@@ -288,8 +288,67 @@ pub fn format_long(e: &DirEntry) -> String {
     format_long_meta(e, 0, 0, 0)
 }
 
+/// A byte count in `ls -h` form: `86`, `4.6K`, `1.2M`, `3.0G`.
+///
+/// A fraction only below 10 of a unit, since `11.5K` is noise where `12K` is not.
+/// Bytes never take a suffix and never take a fraction. Integer arithmetic
+/// throughout — the kernel's listing path has no business pulling in float
+/// formatting, and `(n * 10 + half) / unit` is the same rounding as
+/// `round(n / unit * 10)`.
+///
+/// **Rounds half-up, where GNU `ls -h` rounds up.** So 4760 B reads `4.6K` here
+/// and `4.7K` there. Stated because someone will eventually diff the two: this
+/// is a deliberate choice (half-up is what a size *is*, nearest), not a
+/// rounding bug.
+pub fn human_size(n: u64) -> String {
+    const UNITS: [(u64, char); 4] =
+        [(1 << 30, 'G'), (1 << 20, 'M'), (1 << 10, 'K'), (1, ' ')];
+    for (unit, suffix) in UNITS {
+        if n < unit || unit == 1 {
+            continue;
+        }
+        // Tenths, rounded half-up.
+        let tenths = (n * 10 + unit / 2) / unit;
+        // Rounding can carry into the next unit (1048000 B -> "1024.0K"); print
+        // it as the unit it rounded into rather than as an out-of-range number.
+        return if tenths >= 10_240 {
+            alloc::format!("{}{}", tenths / 10240, next_suffix(suffix))
+        } else if tenths < 100 {
+            alloc::format!("{}.{}{}", tenths / 10, tenths % 10, suffix)
+        } else {
+            alloc::format!("{}{}", (tenths + 5) / 10, suffix)
+        };
+    }
+    alloc::format!("{n}")
+}
+
+/// The unit above `s`, for the rounding carry in [`human_size`].
+fn next_suffix(s: char) -> char {
+    match s {
+        'K' => 'M',
+        'M' => 'G',
+        _ => 'T',
+    }
+}
+
 /// Like [`format_long`], with explicit soft metadata fields.
 pub fn format_long_meta(e: &DirEntry, mode: u16, uid: u32, mtime: u32) -> String {
+    format_long_meta_sized(e, mode, uid, mtime, false)
+}
+
+/// [`format_long_meta`], with `ls -h` sizes when `human`.
+pub fn format_long_meta_sized(
+    e: &DirEntry,
+    mode: u16,
+    uid: u32,
+    mtime: u32,
+    human: bool,
+) -> String {
+    let size = if human {
+        human_size(e.size as u64)
+    } else {
+        alloc::format!("{}", e.size)
+    };
     let t = if e.is_dir { 'd' } else { '-' };
     let name = if e.is_dir {
         alloc::format!("{}/", e.name)
@@ -298,14 +357,13 @@ pub fn format_long_meta(e: &DirEntry, mode: u16, uid: u32, mtime: u32) -> String
     };
     // mtime: raw unix when non-zero (shell can pretty-print later).
     if mtime == 0 && mode == 0 && uid == 0 {
-        return alloc::format!("{t} {:>10}  {name}", e.size);
+        return alloc::format!("{t} {size:>10}  {name}");
     }
     alloc::format!(
-        "{t} {:04o} uid={:<4} mtime={:<10} {:>10}  {name}",
+        "{t} {:04o} uid={:<4} mtime={:<10} {size:>10}  {name}",
         mode & 0o7777,
         uid,
         mtime,
-        e.size
     )
 }
 
@@ -320,6 +378,47 @@ pub fn format_short(e: &DirEntry) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `ls -h` sizes: bytes bare, one decimal below ten of a unit, none above.
+    #[test_case]
+    fn human_size_matches_the_ls_h_shape() {
+        use super::human_size;
+        assert_eq!(human_size(0), "0");
+        assert_eq!(human_size(86), "86");
+        assert_eq!(human_size(1023), "1023");
+        assert_eq!(human_size(1024), "1.0K");
+        // Half-up, not GNU's ceiling: 4760 B is 4.648 K, which GNU shows as 4.7K.
+        assert_eq!(human_size(4760), "4.6K");
+        assert_eq!(human_size(9617), "9.4K");
+        // At ten of a unit the fraction is dropped: `11.5K` is noise, `12K` is not.
+        assert_eq!(human_size(11729), "12K");
+        assert_eq!(human_size(1 << 20), "1.0M");
+        assert_eq!(human_size(1 << 30), "1.0G");
+    }
+
+    /// Rounding must not print a number that is out of its unit's range.
+    ///
+    /// 1 047 552 B is `1023.0K` before rounding and `1024.0K` after — which reads
+    /// as a bug even though the arithmetic is right. It carries into the next
+    /// unit instead.
+    #[test_case]
+    fn human_size_carries_instead_of_printing_1024_of_a_unit() {
+        use super::human_size;
+        assert_eq!(human_size(1_048_575), "1M");
+        assert_eq!(human_size((1 << 30) - 1), "1G");
+        assert_eq!(human_size((1 << 20) - 1), "1M");
+    }
+
+    /// The long listing uses those sizes only when asked, so the default output
+    /// is byte-identical to before.
+    #[test_case]
+    fn long_listing_is_unchanged_unless_human_is_requested() {
+        use super::{format_long_meta, format_long_meta_sized, DirEntry};
+        let e = DirEntry { name: alloc::string::String::from("gobreaker.go"), is_dir: false, size: 9617 };
+        assert_eq!(format_long_meta(&e, 0o644, 0, 1), format_long_meta_sized(&e, 0o644, 0, 1, false));
+        assert!(format_long_meta_sized(&e, 0o644, 0, 1, false).contains("9617"));
+        assert!(format_long_meta_sized(&e, 0o644, 0, 1, true).contains("9.4K"));
+    }
+
     /// The fast path must be indistinguishable from the slow one.
     ///
     /// `normalize_cow` decides by inspection whether a path is already

@@ -267,11 +267,73 @@ pub(super) fn fs_split_flags(arg: &str) -> (alloc::vec::Vec<char>, alloc::vec::V
     (flags, pos)
 }
 
-/// `/ls [path] [-l]` — hierarchical listing of the store (default `/`).
+/// Is `path` a directory we could list — store, disk mount, or foreign VFS?
+///
+/// Deliberately the same three cases [`fs_ls`] treats as listable, and in the
+/// same order: `/cd` refusing something `/ls` would happily show is worse than
+/// the missing check it replaces.
+pub(super) fn is_listable_dir(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    if crate::synapse::fs::is_dir(path) {
+        return true;
+    }
+    if crate::fs::mount::by_path(path).is_some() {
+        return true;
+    }
+    crate::fs::vfs::readdir(path).is_ok()
+        && (path_on_mount(path) || crate::fs::mount::resolve(path).is_some())
+}
+
+/// `/cd [dir]` — move the shell's working directory.
+///
+/// **The argument is an ordinary path and goes through `resolve_path` like every
+/// other one.** It used to be handed to `set_shell_cwd` raw, which normalises but
+/// does not resolve — and `vpath::normalize` leaves a bare name relative. So
+/// `/cd gobreaker` inside `/home/chitti` stored the cwd as the *relative string*
+/// `gobreaker`, and from then on every path command resolved against a base that
+/// was itself unresolved: `/ls` reported `gobreaker: no such file or directory`
+/// while the prompt claimed to be inside it. `/cd ..` was wrong the same way,
+/// landing at the store root instead of the parent. Every `resolve_path` test
+/// sets an absolute cwd, which is why the resolver stayed correct and the thing
+/// feeding it did not.
+///
+/// A missing target is now **refused**, as `cd` does everywhere else. Silently
+/// accepting it is what made the original failure so hard to read: `cd> gobreaker`
+/// looked exactly like success, and the complaint surfaced one command later
+/// against `/ls`, which was never wrong.
+pub(super) fn fs_cd(arg: &str) {
+    let arg = arg.trim();
+    // Bare `/cd` and `/cd ~` go home, like a login shell. Everything else —
+    // including `.` (stay) and `/` (the store root) — is an ordinary path.
+    let target = if arg.is_empty() || arg == "~" {
+        crate::agent::home::USER_HOME.to_string()
+    } else {
+        super::resolve_path(arg)
+    };
+    if !is_listable_dir(&target) {
+        // A typo and a file are different mistakes; name which one it is.
+        if crate::synapse::fs::is_file(&target) || crate::fs::vfs::read_mount(&target).is_ok() {
+            serial_println!("cd> {target}: not a directory");
+        } else {
+            serial_println!("cd> {target}: no such file or directory");
+        }
+        return;
+    }
+    super::set_shell_cwd(&target);
+    serial_println!("cd> {}", super::shell_cwd());
+}
+
+/// `/ls [path] [-l] [-h]` — hierarchical listing of the store (default: the pwd).
+/// `-l` (or `-1`) is the long form, `-h` gives its sizes in `ls -h` units.
 /// Also: `/ls <n>` lists volume *n* on disk 0; `/ls /mnt` lists a non-store mount.
 pub(super) fn fs_ls(arg: &str) {
     let (flags, pos) = fs_split_flags(arg);
     let long = flags.contains(&'l') || flags.contains(&'1');
+    // `-h` was parsed and then dropped on the floor, so `/ls -lah` printed raw
+    // byte counts and gave no hint that the flag meant nothing.
+    let human = flags.contains(&'h');
     // Numeric → legacy disk volume root listing (before pwd resolution).
     if let Some(t) = pos.first().and_then(|s| s.parse::<usize>().ok()) {
         disk_ls_volume(t);
@@ -338,7 +400,10 @@ pub(super) fn fs_ls(arg: &str) {
                     let (mode, uid, mtime) = store::meta(&full)
                         .map(|m| (m.mode, m.uid, m.mtime))
                         .unwrap_or((0, 0, 0));
-                    serial_println!("  {}", vpath::format_long_meta(e, mode, uid, mtime));
+                    serial_println!(
+                        "  {}",
+                        vpath::format_long_meta_sized(e, mode, uid, mtime, human)
+                    );
                 } else {
                     serial_println!("  {}", vpath::format_short(e));
                 }

@@ -131,6 +131,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Files", title: "List Directory", name: "ls", shortcut: "" },
     Entry { category: "Files", title: "Print File", name: "cat", shortcut: "" },
     Entry { category: "Files", title: "Open / Edit / Play", name: "open", shortcut: "" },
+    Entry { category: "Files", title: "Edit File", name: "edit", shortcut: "" },
     Entry { category: "Files", title: "Image Decoder (ring 3)", name: "decoder", shortcut: "" },
     Entry { category: "System", title: "Heap Allocator (A/B)", name: "heap", shortcut: "" },
     Entry { category: "Web", title: "HTML Engine (A/B)", name: "html", shortcut: "" },
@@ -148,6 +149,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Files", title: "Glob Paths", name: "glob", shortcut: "" },
     Entry { category: "Files", title: "Grep Contents", name: "grep", shortcut: "" },
     Entry { category: "Files", title: "Working Directory", name: "pwd", shortcut: "" },
+    Entry { category: "Files", title: "Change Directory", name: "cd", shortcut: "" },
     // Storage
     Entry { category: "Storage", title: "Disks", name: "disks", shortcut: "" },
     Entry { category: "Storage", title: "Mounts", name: "mounts", shortcut: "" },

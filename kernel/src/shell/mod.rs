@@ -750,10 +750,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "rm" => fs_rm(arg),
         "touch" => fs_touch(arg),
         "pwd" => serial_println!("pwd> {}", shell_cwd()),
-        "cd" => {
-            set_shell_cwd(arg);
-            serial_println!("cd> {}", shell_cwd());
-        }
+        "cd" => fs_cd(arg),
         "channel" | "channels" => run_channel(arg),
         "install" => disk_install(arg),
         "mkext4" => disk_mkext4(arg),
@@ -6371,10 +6368,18 @@ pub fn shell_cwd() -> alloc::string::String {
 /// Set the shell's working directory (`/cd`). `""`/`.`/`~` → the user home.
 pub fn set_shell_cwd(dir: &str) {
     let dir = dir.trim();
-    let dir = if dir.is_empty() || dir == "." || dir == "~" || dir == "/" {
+    let dir = if dir.is_empty() || dir == "~" {
         crate::agent::home::USER_HOME.to_string()
-    } else {
+    } else if dir.starts_with('/') {
         crate::synapse::vpath::normalize(dir)
+    } else {
+        // **The shell cwd is always absolute**, and this is the only place that
+        // can be enforced. `vpath::normalize` deliberately leaves a bare name
+        // relative, so passing one straight through stored a *relative* cwd —
+        // after which `resolve_path` built every path on an unresolved base and
+        // every fs command missed. Resolving here means no call site can break
+        // the invariant, not just the one that did (`/cd`, see `fs_cd`).
+        resolve_path(dir)
     };
     SHELL_CWD.with(|c| *c = dir.clone());
 }
@@ -6675,10 +6680,13 @@ fn suggest_refresh(
             } else {
                 shell_cwd()
             };
-            (
-                alloc::vec::Vec::new(),
-                crate::fs::vfs::readdir(&parent).unwrap_or_default(),
-            )
+            let mut entries = crate::fs::vfs::readdir(&parent).unwrap_or_default();
+            // `/cd` and `/mkdir` can only take a directory, so offering files is
+            // offering a completion that cannot work.
+            if suggest::wants_dirs_only(buf) {
+                entries.retain(|e| e.is_dir);
+            }
+            (alloc::vec::Vec::new(), entries)
         }
         _ => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
     };
@@ -6733,6 +6741,15 @@ fn suggest_would_complete(buf: &str, cur: usize, sel: usize, items: &[suggest::I
     // ends with `/`, or already names an entry in the menu exactly.
     if ctx.kind == suggest::Kind::Path {
         if ctx.prefix.is_empty() || ctx.prefix.ends_with('/') {
+            return false;
+        }
+        // `.`, `..` and `~` are complete paths in themselves — each always names
+        // a real directory — but each is also a *prefix* of half the menu, so the
+        // generic "would accepting change the line" test below completes them
+        // instead of running the command. In a directory holding a `.git`,
+        // `/ls -lah .` turned into `/ls -lah .git/` on Enter and the listing you
+        // asked for never happened. Tab still drills, which is its job.
+        if matches!(ctx.prefix.rsplit('/').next().unwrap_or(""), "." | ".." | "~") {
             return false;
         }
         let norm = crate::synapse::vpath::normalize(&ctx.prefix);
@@ -10528,6 +10545,37 @@ mod agent_flow_tests {
             suggest_would_complete(&buf, buf.len(), 0, &items),
             "a partial path must still complete on Enter"
         );
+
+        // `.` / `..` / `~` are complete paths, even though each is a prefix of
+        // half the menu. In a repo (a `.git` in every listing) `/ls -lah .`
+        // completed to `/ls -lah .git/` on Enter and never ran — the generic
+        // "accepting changes the line" test cannot tell a prefix from a path that
+        // simply happens to start with a dot.
+        let dot = crate::fs::vfs::DirEntry {
+            name: String::from(".git"),
+            is_dir: true,
+            size: 0,
+        };
+        for (typed, line) in [
+            (".", "/ls -lah ."),
+            ("..", "/ls .."),
+            ("~", "/ls ~"),
+            ("sub/..", "/ls sub/.."),
+        ] {
+            let items = suggest::path_items(typed, &[dot.clone(), file.clone()], 8);
+            let buf = String::from(line);
+            assert!(
+                !suggest_would_complete(&buf, buf.len(), 0, &items),
+                "`{typed}` is a complete path and must submit on Enter"
+            );
+        }
+        // …but a real dotted prefix still completes.
+        let items = suggest::path_items(".g", &[dot], 8);
+        let buf = String::from("/ls .g");
+        assert!(
+            suggest_would_complete(&buf, buf.len(), 0, &items),
+            "a partial dotfile name must still complete on Enter"
+        );
     }
 
     /// The system prompt advertises only the small CORE set + search_tools —
@@ -10829,6 +10877,17 @@ mod resolve_path_tests {
         set_shell_cwd(crate::agent::home::USER_HOME);
     }
 
+    /// Run `/cd <arg>` the way a typed command does — through the **dispatcher**,
+    /// not by calling `fs_cd`.
+    ///
+    /// Which matters: the first version of these tests called `fs_cd` directly,
+    /// and stayed green when the `"cd"` arm was pointed back at the old
+    /// `set_shell_cwd(arg)`. A test that reaches past the wiring cannot see the
+    /// wiring come loose, and the wiring is half of what was wrong here.
+    fn cd(arg: &str) {
+        assert!(dispatch_system("cd", arg), "the dispatcher does not know /cd");
+    }
+
     /// Absolute paths pass through; relative and `~` resolve against the pwd
     /// / home, with `.`/`..` collapsed — the Linux rule every fs command uses.
     #[test_case]
@@ -10856,6 +10915,98 @@ mod resolve_path_tests {
             assert_eq!(resolve_path("**/*.rs"), "/home/chitti/work/**/*.rs");
             assert_eq!(resolve_path("~/docs/**"), "/home/chitti/docs/**");
         });
+    }
+
+    /// **A relative `/cd` descends, and the stored cwd stays absolute.**
+    ///
+    /// The bug this pins: `/cd` handed its argument to `set_shell_cwd` raw, and
+    /// `vpath::normalize` leaves a bare name relative — so `/cd gobreaker` stored
+    /// the cwd as the string `gobreaker`, `resolve_path` then built every path on
+    /// that unresolved base, and `/ls` answered `gobreaker: no such file or
+    /// directory` while the prompt claimed to be inside the directory. Note every
+    /// other test in this module sets an *absolute* cwd, which is exactly how the
+    /// resolver stayed right while its input was wrong.
+    #[test_case]
+    fn cd_resolves_a_relative_directory_against_the_pwd() {
+        crate::synapse::fs::write("/home/chitti/repo/src/main.rs", b"fn main() {}\n");
+        set_shell_cwd(crate::agent::home::USER_HOME);
+
+        cd("repo");
+        assert_eq!(shell_cwd(), "/home/chitti/repo");
+        // The whole point: a following relative command now resolves.
+        assert_eq!(resolve_path("src/main.rs"), "/home/chitti/repo/src/main.rs");
+        assert!(shell_cwd().starts_with('/'), "the cwd must never be relative");
+
+        cd("src");
+        assert_eq!(shell_cwd(), "/home/chitti/repo/src");
+        set_shell_cwd(crate::agent::home::USER_HOME);
+    }
+
+    /// `..` walks to the parent, not to the store root.
+    ///
+    /// `normalize("..")` alone pops off an empty stack and yields `/`, so this was
+    /// wrong in the same way and just as quietly.
+    #[test_case]
+    fn cd_dotdot_goes_to_the_parent() {
+        crate::synapse::fs::write("/home/chitti/repo/src/main.rs", b"x\n");
+        set_shell_cwd("/home/chitti/repo/src");
+        cd("..");
+        assert_eq!(shell_cwd(), "/home/chitti/repo");
+        cd("..");
+        assert_eq!(shell_cwd(), "/home/chitti");
+        set_shell_cwd(crate::agent::home::USER_HOME);
+    }
+
+    /// A target that is not a directory is **refused, and the cwd does not move**.
+    ///
+    /// Accepting it silently is what made the original report hard to read: the
+    /// bad `/cd` printed what looked like success and the complaint landed one
+    /// command later, against `/ls`, which was never at fault.
+    #[test_case]
+    fn cd_refuses_a_missing_or_non_directory_target() {
+        crate::synapse::fs::write("/home/chitti/repo/README.md", b"hi\n");
+        set_shell_cwd("/home/chitti/repo");
+
+        cd("nosuchdir");
+        assert_eq!(shell_cwd(), "/home/chitti/repo", "a missing target must not move the cwd");
+        cd("README.md");
+        assert_eq!(shell_cwd(), "/home/chitti/repo", "a file is not a directory");
+        cd("/nope/nope");
+        assert_eq!(shell_cwd(), "/home/chitti/repo");
+        set_shell_cwd(crate::agent::home::USER_HOME);
+    }
+
+    /// The four special arguments, each the Linux meaning.
+    ///
+    /// `.` and `/` used to be mapped to the home alongside the bare form, so
+    /// `/cd .` teleported you out of the directory you were in and `/cd /` could
+    /// never reach the store root.
+    #[test_case]
+    fn cd_special_arguments_follow_the_shell_convention() {
+        crate::synapse::fs::write("/home/chitti/repo/README.md", b"hi\n");
+        set_shell_cwd("/home/chitti/repo");
+
+        cd(".");
+        assert_eq!(shell_cwd(), "/home/chitti/repo", "`.` stays put");
+        cd("/");
+        assert_eq!(shell_cwd(), "/", "`/` is the store root");
+        cd("~");
+        assert_eq!(shell_cwd(), crate::agent::home::USER_HOME);
+        set_shell_cwd("/home/chitti/repo");
+        cd("");
+        assert_eq!(shell_cwd(), crate::agent::home::USER_HOME, "bare cd goes home");
+    }
+
+    /// `set_shell_cwd` itself absolutises, so no *other* call site can reintroduce
+    /// a relative cwd the way `/cd` did.
+    #[test_case]
+    fn the_stored_cwd_is_always_absolute() {
+        set_shell_cwd("/home/chitti");
+        set_shell_cwd("work/sub");
+        assert_eq!(shell_cwd(), "/home/chitti/work/sub");
+        set_shell_cwd("..");
+        assert_eq!(shell_cwd(), "/home/chitti/work");
+        set_shell_cwd(crate::agent::home::USER_HOME);
     }
 
     /// The bare home (no cd) resolves relative names under `/home/chitti`.

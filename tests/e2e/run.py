@@ -437,7 +437,14 @@ def s_fs_pwd(g):
     """FS commands resolve paths against the shell pwd like a Linux shell:
     no `/` = current dir, `~/` = the user home, and path completion keeps the
     typed (relative / `~`) form. Uses a fresh tree under `/home/chitti/work`."""
-    # Setup: cd into a work folder, create files there and in the home.
+    # Setup: cd into a work folder, create files there and in the home. The
+    # folder is created **first** — `/cd` refuses a target that is not a
+    # directory, as every shell does, and this scenario used to depend on it
+    # accepting one that did not exist.
+    m = g.mark()
+    g.send("/mkdir -p /home/chitti/work/sub")
+    if not g.wait_for("mkdir>", 12, m):
+        return False, "/mkdir failed (setup)"
     m = g.mark()
     g.send("/cd /home/chitti/work")
     if not g.wait_for("cd> /home/chitti/work", 12, m):
@@ -482,7 +489,117 @@ def s_fs_pwd(g):
     g.send_raw(b"/cat ~/h\t")
     if not g.wait_for("/cat ~/homedoc.md", 10, m):
         return False, "~ Tab completion did not expand the home"
+
     return True, "fs commands + path completion resolve pwd / ~"
+
+
+def s_fs_cd(g):
+    """`/cd` takes a **relative** path, like every other path-taking command.
+
+    `s_fs_pwd` above only ever cd's to an absolute path, and every `resolve_path`
+    unit test sets an absolute cwd — which is exactly how this stayed broken while
+    all of it passed. `/cd` handed its argument to `set_shell_cwd` raw, and
+    `vpath::normalize` leaves a bare name relative, so `/cd repo` stored the cwd
+    as the *string* `repo`; `resolve_path` then built every path on an unresolved
+    base and `/ls` answered `repo: no such file or directory` for the directory
+    the prompt claimed to be inside. `/cd ..` was wrong the same way, landing at
+    the store root instead of the parent.
+
+    Also pins that a missing target is **refused** without moving the pwd.
+    Accepting it silently is what made the original report land on `/ls`, one
+    command after the actual mistake.
+
+    Self-contained: its own tree, and the pwd is handed back at the end — the pwd
+    is shell-global, so a scenario that moves it and leaves it moved changes what
+    every later scenario means.
+    """
+    # Submit whatever the previous scenario left in the composer before typing:
+    # `s_fs_pwd` ends on an unsubmitted Tab completion, and a `send` appends to a
+    # pending line rather than replacing it.
+    g.send_raw(b"\r")
+    g.wait_quiet(0.4, 10)
+    # And start from a known pwd — `s_fs_pwd` leaves it under `/home/chitti/work`.
+    m = g.mark()
+    g.send("/cd")
+    if not g.wait_for("cd> /home/chitti", 12, m):
+        return False, "bare /cd did not go home (setup)"
+    m = g.mark()
+    g.send("/mkdir -p /home/chitti/cdtest/sub")
+    if not g.wait_for("mkdir>", 12, m):
+        return False, "setup mkdir failed"
+    m = g.mark()
+    g.send("/touch /home/chitti/cdtest/sub/deep.txt")
+    if not g.wait_for("touch> /home/chitti/cdtest/sub/deep.txt", 12, m):
+        return False, "setup touch failed"
+
+    m = g.mark()
+    g.send("/cd cdtest")
+    if not g.wait_for("cd> /home/chitti/cdtest", 12, m):
+        return False, "relative /cd did not resolve against the pwd"
+    # The payoff: a following relative command now resolves.
+    m = g.mark()
+    g.send("/ls")
+    if not (g.wait_for("ls> /home/chitti/cdtest", 12, m) and g.wait_for("sub", 12, m)):
+        return False, "/ls after a relative /cd did not list the pwd"
+    m = g.mark()
+    g.send("/cat sub/deep.txt")
+    if not g.wait_for("cat> /home/chitti/cdtest/sub/deep.txt", 12, m):
+        return False, "a relative path did not resolve against the new pwd"
+
+    # `..` walks to the parent, not to the store root.
+    m = g.mark()
+    g.send("/cd sub")
+    if not g.wait_for("cd> /home/chitti/cdtest/sub", 12, m):
+        return False, "/cd into a subdirectory failed"
+    m = g.mark()
+    g.send("/cd ..")
+    if not g.wait_for("cd> /home/chitti/cdtest", 12, m):
+        return False, "/cd .. did not go to the parent"
+
+    # A missing target is refused and the pwd does not move.
+    m = g.mark()
+    g.send("/cd nosuchdir")
+    if not g.wait_for("no such file or directory", 12, m):
+        return False, "/cd accepted a missing directory"
+    m = g.mark()
+    g.send("/pwd")
+    if not g.wait_for("pwd> /home/chitti/cdtest", 12, m):
+        return False, "a refused /cd moved the pwd anyway"
+
+    # Discoverability: `/cd` was in neither `catalog::ENTRIES` nor
+    # `suggest::PATH_COMMANDS`, so it had no `/help` row, no entry in the slash
+    # popup and no argument completion — it only worked if you already knew it
+    # existed and typed it blind.
+    m = g.mark()
+    g.send("/help text")
+    if not g.wait_for("Change Directory", 20, m):
+        return False, "/cd is missing from /help"
+    # Tab completes a directory argument, and Enter then runs the line.
+    m = g.mark()
+    g.send_raw(b"/cd su\t")
+    if not g.wait_for("/cd sub/", 12, m):
+        return False, "Tab did not complete a directory for /cd"
+    g.send_raw(b"\r")
+    m = g.mark()
+    g.send("/pwd")
+    if not g.wait_for("pwd> /home/chitti/cdtest/sub", 12, m):
+        return False, "the Tab-completed /cd did not run"
+    # …and it completes **directories only**: `deep.txt` lives here, but a file
+    # is not a thing `/cd` can accept, so the popup must not offer it.
+    m = g.mark()
+    g.send_raw(b"/cd d\t")
+    g.wait_quiet(0.6, 10)
+    if "deep.txt" in g.text()[m:]:
+        return False, "/cd completed a file"
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.4, 10)
+
+    # Hand the home back to the next scenario.
+    m = g.mark()
+    g.send("/cd")
+    if not g.wait_for("cd> /home/chitti", 12, m):
+        return False, "bare /cd did not return home"
+    return True, "relative /cd, /cd .., refusal, /help row + dirs-only completion"
 
 
 def s_history_recall(g):
@@ -4350,6 +4467,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("fs_basic", s_fs_basic),
     ("composer_path_complete", s_composer_path_complete),
     ("fs_pwd", s_fs_pwd),
+    ("fs_cd", s_fs_cd),
     ("history_recall", s_history_recall),
     ("git", s_git),
     ("install_plan", s_install_plan),

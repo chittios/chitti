@@ -49,8 +49,29 @@ pub enum Kind {
 /// small hand-list: every entry here must actually take a path (the catalogue
 /// is the source of truth for *names*, this is about *argument shape*).
 pub const PATH_COMMANDS: &[&str] = &[
-    "ls", "cat", "open", "browse", "mkdir", "rm", "cp", "mv", "touch", "glob", "grep",
+    "ls", "cd", "cat", "open", "edit", "browse", "mkdir", "rm", "cp", "mv", "touch", "glob", "grep",
 ];
+
+/// Commands whose path argument can only ever be a **directory**, so the popup
+/// must not offer files. Listing `README.md` under `/cd ` is not merely noise
+/// now that `/cd` refuses a non-directory — it offers a completion that is
+/// guaranteed to fail.
+pub const DIR_ONLY_COMMANDS: &[&str] = &["cd", "mkdir"];
+
+/// The slash command a line begins with, if any (`"/cd sub"` -> `Some("cd")`).
+///
+/// Pure, so the caller can decide what to feed the popup without this module
+/// having to carry the command through [`Context`].
+pub fn leading_command(buf: &str) -> Option<&str> {
+    let rest = buf.trim_start().strip_prefix('/')?;
+    let cmd = rest.split_whitespace().next()?;
+    (!cmd.is_empty()).then_some(cmd)
+}
+
+/// Whether `buf`'s command completes directories only (see [`DIR_ONLY_COMMANDS`]).
+pub fn wants_dirs_only(buf: &str) -> bool {
+    leading_command(buf).is_some_and(|c| DIR_ONLY_COMMANDS.contains(&c))
+}
 
 /// Active completion context: kind, the typed prefix (without `/` or `@`),
 /// and the byte offset in the line where the token starts (`/` or `@`).
@@ -375,6 +396,45 @@ mod tests {
             "/channel must appear for prefix 'chan': {:?}",
             ch.iter().map(|i| i.label.as_str()).collect::<alloc::vec::Vec<_>>()
         );
+    }
+
+    /// The other direction: a command that takes a **path** must also be in the
+    /// catalogue, or it completes its arguments while being invisible in `/help`
+    /// and in the slash popup.
+    ///
+    /// `/cd` was exactly that hole in reverse — absent from *both* lists, so it
+    /// had no suggestion entry, no path completion and no help row, while working
+    /// perfectly when typed blind. The existing test above only checks
+    /// catalogue → suggestions, which cannot see a command that is in neither.
+    #[test_case]
+    fn path_taking_commands_are_in_the_catalogue() {
+        for name in PATH_COMMANDS {
+            assert!(
+                catalog::ENTRIES.iter().any(|e| e.name == *name),
+                "/{name} takes a path but is not in catalog::ENTRIES — it would have \
+                 argument completion while being absent from /help and the popup"
+            );
+        }
+    }
+
+    /// `/cd` completes directories only, and is otherwise an ordinary path
+    /// command.
+    #[test_case]
+    fn cd_completes_directories_only() {
+        assert_eq!(leading_command("/cd sub"), Some("cd"));
+        assert_eq!(leading_command("/ls -lah ."), Some("ls"));
+        assert_eq!(leading_command("hello"), None);
+        assert!(wants_dirs_only("/cd re"));
+        assert!(wants_dirs_only("/mkdir -p re"));
+        // Every other path command still offers files — `/cat dir/` would be
+        // useless with them filtered out.
+        assert!(!wants_dirs_only("/ls re"));
+        assert!(!wants_dirs_only("/cat re"));
+
+        // And `/cd ` is a path context at all, which is what was missing.
+        let c = context("/cd sub", 7).expect("`/cd <path>` must be a path context");
+        assert_eq!(c.kind, Kind::Path);
+        assert_eq!(c.prefix, "sub");
     }
 
     #[test_case]

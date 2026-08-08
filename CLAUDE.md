@@ -1453,8 +1453,9 @@ FDT claims a GICv3 but carries no readable `reg`.
   **The shell has a working directory, and every path-taking command resolves
   through ONE function — `shell::resolve_path`.** The shell agent starts in the
   ChittiOS user home (`agent::home::USER_HOME`, `/home/chitti` — the `~`); `/cd
-  <dir>` moves it (bare `/cd`/`.`/`~`/`/` → home) and `/pwd` prints the live
-  value (`shell::shell_cwd`/`set_shell_cwd`). `resolve_path(p)` implements the
+  <dir>` moves it (bare `/cd` and `/cd ~` → home; `.` stays, `/` is the store
+  root) and `/pwd` prints the live value (`shell::shell_cwd`/`set_shell_cwd`).
+  `resolve_path(p)` implements the
   Linux rule once: `/abs` stays absolute, `~/x` → home, anything else →
   `<pwd>/<x>`, with `.`/`..`/`//` collapsed (`vpath::normalize`). It is applied
   at **every** fs-command call site (`ls`/`cat`/`glob`/`grep`/`touch`/`mkdir`/
