@@ -166,6 +166,33 @@ pub fn mount_entry(entry: MountEntry) -> Result<(), MountError> {
     Ok(())
 }
 
+/// Bind a **host shared folder** (9P) at `path`.
+///
+/// Unlike every other mount this has no block device: `disk`, `start_lba` and
+/// `sectors` are meaningless and are never read, because [`crate::fs::host`]
+/// intercepts the operation before the VFS reaches `probe_disk_nth`. `disk` is
+/// `usize::MAX` rather than 0 deliberately — a path that *did* reach the block
+/// layer then fails loudly instead of quietly operating on the boot disk.
+pub fn mount_host(path: &str, tag: String) -> Result<(), MountError> {
+    let path = path::normalize(path);
+    if is_busy(&path) {
+        return Err(MountError::Busy);
+    }
+    TABLE.with(|t| {
+        t.push(MountEntry {
+            path: path.clone(),
+            disk: usize::MAX,
+            start_lba: 0,
+            sectors: 0,
+            fs: FsType::Host,
+            label: Some(tag),
+            writable: true,
+        })
+    });
+    crate::ktrace::log_fmt(format_args!("fs.mount: {path} (9P host folder)"));
+    Ok(())
+}
+
 /// Remove the mount at `path`.
 pub fn umount(path: &str) -> Result<(), MountError> {
     let path = path::normalize(path);

@@ -30,7 +30,7 @@ def _repo_root():
 
 class Guest:
     def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off", hostfwd=None,
-                 no_model=False, model_disk=None, release=False, disk=None, smp=None):
+                 no_model=False, model_disk=None, release=False, disk=None, smp=None, share=None):
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -82,6 +82,11 @@ class Guest:
         # runtime-load path is proven from nothing. Such guests boot *next to*
         # the main e2e guest, which holds QEMU's write lock on the shared
         # voice-assets disk — skip it or the second QEMU fails to launch.
+        # Opt-in host shared folder over virtio-9p, mounted by the guest at
+        # /host. Off by default: attaching one adds a mount, which would change
+        # what unrelated /mounts and /ls scenarios see.
+        if share:
+            env["CHITTI_SHARE"] = str(share)
         if model_disk:
             env["CHITTI_MODEL_DISK"] = str(model_disk)
         if no_model:

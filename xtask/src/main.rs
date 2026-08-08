@@ -145,6 +145,45 @@ fn smp_count() -> String {
     env::var("CHITTI_SMP").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "8".to_string())
 }
 
+/// QEMU args exporting a **host folder** to the guest over virtio-9p, from
+/// `CHITTI_SHARE=<host path>` (and `CHITTI_SHARE_TAG`, default `hostshare`).
+///
+/// `pci` picks the device model: the aarch64 `-kernel` dev loop has no PCI at
+/// all (ECAM comes from the stub's ACPI), so it must use the virtio-mmio
+/// `virtio-9p-device`, while x86 and the UEFI paths use `virtio-9p-pci`. The
+/// guest driver binds on either.
+///
+/// `security_model=none` because the alternative, `mapped-xattr`, stores guest
+/// ownership in host extended attributes — which makes the shared files awkward
+/// to use from the host, and the point of a shared folder is that both sides
+/// can read it. Files the guest creates are owned by the QEMU process.
+///
+/// Empty means unset: `make` passes the variable through unconditionally, the
+/// trap `CHITTI_RESOLUTION` and `CHITTI_SAMPLE_FILES` both hit.
+fn share_args(pci: bool) -> Vec<String> {
+    let Ok(path) = env::var("CHITTI_SHARE") else {
+        return Vec::new();
+    };
+    if path.trim().is_empty() {
+        return Vec::new();
+    }
+    // A missing directory would make QEMU refuse to start at all, which reads
+    // as "the kernel will not boot" rather than "that folder is not there".
+    if !std::path::Path::new(&path).is_dir() {
+        eprintln!("xtask: CHITTI_SHARE={path} is not a directory — not sharing a host folder");
+        return Vec::new();
+    }
+    let tag = env::var("CHITTI_SHARE_TAG").unwrap_or_else(|_| "hostshare".into());
+    let dev = if pci { "virtio-9p-pci" } else { "virtio-9p-device" };
+    println!("xtask: sharing {path} into the guest as /host (tag {tag})");
+    vec![
+        "-fsdev".into(),
+        format!("local,id=chittishare,path={path},security_model=none"),
+        "-device".into(),
+        format!("{dev},fsdev=chittishare,mount_tag={tag}"),
+    ]
+}
+
 fn user_netdev(id: &str) -> String {
     let mut s = format!("user,id={id}");
     if let Ok(ports) = std::env::var("CHITTI_HOSTFWD") {
@@ -2277,6 +2316,9 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
         qemu.arg(a);
     }
     qemu.args(["-serial", "mon:stdio"]);
+    for a in share_args(false) {
+        qemu.arg(a);
+    }
     // ESP first, data disk LAST: QEMU assigns later virtio-mmio devices to
     // LOWER slots, and the kernel's probe_disk takes the first (lowest) match —
     // so this ordering makes /install + persistence target the data disk, never
@@ -2358,6 +2400,9 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     qemu.args(display_args());
     qemu.args(["-serial", "mon:stdio", "-kernel"]);
     qemu.arg(&elf);
+    for a in share_args(false) {
+        qemu.arg(a);
+    }
     // Hand the guest ramfb the framebuffer resolution to use (the kernel reads
     // opt/chitti/fbres) — derived from the host display, not hardcoded.
     for a in ramfb_res_fw_cfg() {
@@ -3333,6 +3378,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         }
         // NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev); model from CHITTI_NIC.
         cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
+        for a in share_args(true) {
+            cmd.arg(a);
+        }
         eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
         eprintln!("  disk: {}", disk.display());
         let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
@@ -3386,6 +3434,10 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     }
     // NIC (user-net or CHITTI_NET_BRIDGE — see guest_netdev); model from CHITTI_NIC.
     cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
+    // Optional host folder over virtio-9p (CHITTI_SHARE), mounted at /host.
+    for a in share_args(true) {
+        cmd.arg(a);
+    }
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
     // Missing host audio is noisy but non-fatal; use CHITTI_AUDIO=off to silence.
     cmd.args(audio_args("virtio-sound-pci"));

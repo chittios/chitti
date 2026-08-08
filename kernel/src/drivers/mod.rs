@@ -29,4 +29,5 @@ pub mod i2c_hid;
 pub mod pwrbtn;
 pub mod uvc;
 pub mod virtio;
+pub mod virtio_9p;
 pub mod wifi;

@@ -802,6 +802,110 @@ def s_nic_dispatch(g):
     return True, f"{vendor}:{device} -> {driver}, DHCP lease obtained"
 
 
+def s_host_folder(g):
+    """A host folder shared in over virtio-9p is readable AND writable.
+
+    The whole point is that both sides see the same bytes, so this asserts on
+    the **host filesystem** after the guest writes — not just on what the guest
+    prints back to itself, which a purely in-guest cache would satisfy just as
+    well.
+
+    Boots its own guest: attaching a share adds a mount, which would change what
+    unrelated `/mounts` and `/ls` scenarios see.
+    """
+    import shutil
+    import tempfile
+
+    share = os.path.join(tempfile.gettempdir(), "chitti-e2e-share")
+    shutil.rmtree(share, ignore_errors=True)
+    os.makedirs(os.path.join(share, "sub"), exist_ok=True)
+    host_text = "hello from the host\n"
+    with open(os.path.join(share, "hello.txt"), "w") as f:
+        f.write(host_text)
+    with open(os.path.join(share, "sub", "deep.txt"), "w") as f:
+        f.write("nested\n")
+    # Large enough to need several 9P round trips (msize is 64 KiB), so the
+    # chunked write loop is exercised rather than a single-message copy.
+    big = "".join(f"line {i:05}\n" for i in range(12000))
+    with open(os.path.join(share, "big.txt"), "w") as f:
+        f.write(big)
+
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="off", share=share)
+    try:
+        if not g2.wait_for("net: configured", 180):
+            return False, "host-folder guest never booted"
+        txt = g2.text()
+        if "virtio-9p" not in txt:
+            return False, "no virtio-9p device was claimed at boot"
+        if "mounted at /host" not in txt:
+            return False, "the shared folder was not mounted at /host"
+
+        # --- host -> guest -------------------------------------------------
+        m = g2.mark()
+        g2.send("/mounts")
+        if not g2.wait_for("9P (host)", 12, m):
+            return False, "/mounts does not show the host folder"
+
+        m = g2.mark()
+        g2.send("/ls /host")
+        if not g2.wait_for("hello.txt", 12, m):
+            return False, "/ls /host does not list the host's file"
+        if not g2.wait_for("sub/", 5, m):
+            return False, "/ls /host does not show sub/ as a directory"
+
+        m = g2.mark()
+        g2.send("/cat /host/hello.txt")
+        if not g2.wait_for("hello from the host", 12, m):
+            return False, "/cat did not read the host's file back"
+
+        # A nested path needs a real multi-element 9P walk, not just a root listing.
+        m = g2.mark()
+        g2.send("/cat /host/sub/deep.txt")
+        if not g2.wait_for("nested", 12, m):
+            return False, "/cat of a nested host path failed"
+
+        # A file bigger than one 9P message must arrive whole. The byte count
+        # is the assertion: a chunk loop that stops early still prints content.
+        m = g2.mark()
+        g2.send("/cat /host/big.txt")
+        if not g2.wait_for(f"({len(big)} bytes)", 25, m):
+            return False, f"multi-chunk read did not report {len(big)} bytes"
+
+        # --- guest -> host, checked on the HOST side -----------------------
+        m = g2.mark()
+        g2.send("/mkdir /host/fromguest")
+        g2.wait_for("mkdir>", 12, m)
+        m = g2.mark()
+        g2.send("/cp /host/big.txt /host/fromguest/copy.txt")
+        g2.wait_for("cp>", 30, m)
+
+        out = os.path.join(share, "fromguest", "copy.txt")
+        deadline = time.time() + 20
+        while time.time() < deadline and not os.path.exists(out):
+            time.sleep(0.5)
+        if not os.path.exists(out):
+            return False, "the guest's write never appeared on the host filesystem"
+        with open(out) as f:
+            got = f.read()
+        if got != big:
+            return False, f"host file differs after guest copy ({len(got)} vs {len(big)} bytes)"
+
+        # And a delete in the guest must remove the host's file.
+        m = g2.mark()
+        g2.send("/rm /host/hello.txt")
+        g2.wait_for("rm>", 12, m)
+        deadline = time.time() + 15
+        while time.time() < deadline and os.path.exists(os.path.join(share, "hello.txt")):
+            time.sleep(0.5)
+        if os.path.exists(os.path.join(share, "hello.txt")):
+            return False, "the guest's /rm did not remove the host's file"
+
+        return True, f"host folder read+write verified on both sides ({len(big)} bytes round-tripped)"
+    finally:
+        g2.close()
+        shutil.rmtree(share, ignore_errors=True)
+
+
 def s_battery(g):
     """`/battery` must name the step that stopped it, never invent a reading.
 
@@ -4909,6 +5013,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("memory", s_memory),
     ("memory_hierarchy", s_memory_hierarchy),
     ("fs_basic", s_fs_basic),
+    ("host_folder", s_host_folder),
     ("composer_path_complete", s_composer_path_complete),
     ("fs_pwd", s_fs_pwd),
     ("fs_cd", s_fs_cd),

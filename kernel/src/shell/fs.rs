@@ -97,6 +97,18 @@ pub(super) fn disk_mounts() {
         return;
     }
     for mt in m.iter() {
+        // A host shared folder has no disk, LBA or size, and printing the
+        // sentinel index for them reads as a corrupt mount table.
+        if crate::fs::host::is_host(mt) {
+            serial_println!(
+                "  {:<8} host folder                             {:<8} {} tag={}",
+                mt.path,
+                mt.fs.name(),
+                if mt.writable { "rw" } else { "ro" },
+                mt.label.as_deref().unwrap_or("-")
+            );
+            continue;
+        }
         serial_println!(
             "  {:<8} disk {} lba {:<10} {:>6} MiB  {:<8} {} label={}",
             mt.path,

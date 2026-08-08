@@ -6,6 +6,7 @@
 //! - [`vfs`] — unified read/write/readdir over the Synapse store + mounts
 //! - [`ninep`] — 9P2000.L, the protocol behind a **host shared folder**; the
 //!   one filesystem here with no block device under it
+//! - [`host`] — that folder as a mount, dispatched before the block path
 //!
 //! On-disk formats on **internal and external** disks (USB MSC included):
 //! - **FAT16/32** — full RW (create/write/unlink/mkdir; 8.3 create names)
@@ -15,6 +16,7 @@
 //! Agent durable state still goes through `synapse::fs` (ext4-backed store).
 
 pub mod detect;
+pub mod host;
 pub mod mount;
 pub mod ninep;
 pub mod path;

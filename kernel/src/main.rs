@@ -155,6 +155,10 @@ pub extern "C" fn _start() -> ! {
     // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
     #[cfg(not(feature = "refcheck"))]
     chitti_kernel::sound::autodetect();
+    // Attach a host shared folder (virtio-9p) at /host. No-op if absent, which
+    // is the common case — most boots have no folder shared in.
+    #[cfg(not(feature = "refcheck"))]
+    chitti_kernel::fs::host::attach_at_boot();
     #[cfg(not(feature = "refcheck"))]
     run_os();
 
@@ -224,6 +228,9 @@ pub extern "C" fn limine_start() -> ! {
     chitti_kernel::net::autodetect();
     // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
     chitti_kernel::sound::autodetect();
+    // Attach a host shared folder (virtio-9p) at /host. No-op if absent, which
+    // is the common case — most boots have no folder shared in.
+    chitti_kernel::fs::host::attach_at_boot();
     run_os();
 }
 
@@ -411,6 +418,8 @@ pub extern "C" fn aarch64_start() -> ! {
         chitti_kernel::net::autodetect();
         // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
         chitti_kernel::sound::autodetect();
+        // Attach a host shared folder (virtio-9p) at /host. No-op if absent.
+        chitti_kernel::fs::host::attach_at_boot();
     }
     // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
     // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic

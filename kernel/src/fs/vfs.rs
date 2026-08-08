@@ -68,6 +68,11 @@ pub fn stat(path: &str) -> Result<FileStat, VfsError> {
         });
     }
     let (mt, rel) = mount::resolve(&path).ok_or(VfsError::NotMounted)?;
+    // Before the ext-only gate below, which would otherwise refuse every host
+    // path as Unsupported.
+    if super::host::is_host(&mt) {
+        return super::host::stat(if rel.is_empty() { "/" } else { &rel });
+    }
     if !mt.writable || !matches!(mt.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
         return Err(VfsError::Unsupported);
     }
@@ -142,6 +147,11 @@ pub fn read_mount(path: &str) -> Result<Vec<u8>, VfsError> {
 }
 
 fn read_on_volume(mt: &MountEntry, rel: &str) -> Result<Vec<u8>, VfsError> {
+    // A host shared folder has no disk under it, so it must be dispatched
+    // before `probe_disk_nth` — which would fail on its sentinel index.
+    if super::host::is_host(mt) {
+        return super::host::read(rel);
+    }
     let mut dev = crate::block::probe_disk_nth(mt.disk).ok_or(VfsError::Io)?;
     let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
     match mt.fs {
@@ -210,6 +220,9 @@ pub fn write(path: &str, data: &[u8]) -> Result<(), VfsError> {
     if !mt.writable {
         return Err(VfsError::ReadOnly);
     }
+    if super::host::is_host(&mt) {
+        return super::host::write(&rel, data);
+    }
     let mut dev = crate::block::probe_disk_nth(mt.disk).ok_or(VfsError::Io)?;
     let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
     match mt.fs {
@@ -256,6 +269,9 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
     if !mt.writable {
         return Err(VfsError::ReadOnly);
     }
+    if super::host::is_host(&mt) {
+        return super::host::mkdir(&rel);
+    }
     let mut dev = crate::block::probe_disk_nth(mt.disk).ok_or(VfsError::Io)?;
     let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
     match mt.fs {
@@ -291,6 +307,9 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
     }
     if !mt.writable {
         return Err(VfsError::ReadOnly);
+    }
+    if super::host::is_host(&mt) {
+        return super::host::unlink(&rel);
     }
     let mut dev = crate::block::probe_disk_nth(mt.disk).ok_or(VfsError::Io)?;
     let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
@@ -351,6 +370,9 @@ fn readdir_volume_root(mt: &MountEntry) -> Result<Vec<DirEntry>, VfsError> {
 }
 
 fn readdir_on_volume(mt: &MountEntry, rel: &str) -> Result<Vec<DirEntry>, VfsError> {
+    if super::host::is_host(mt) {
+        return super::host::readdir(rel);
+    }
     let mut dev = crate::block::probe_disk_nth(mt.disk).ok_or(VfsError::Io)?;
     let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
     match mt.fs {
@@ -422,6 +444,14 @@ pub fn exists(path: &str) -> bool {
     let path = path::normalize(path);
     if crate::synapse::fs::exists(&path) || crate::synapse::fs::is_dir(&path) {
         return true;
+    }
+    // A host folder is asked directly, because the fallback below proves
+    // existence by *reading* — which reports every directory as absent, and
+    // `/cd /host/sub` depends on the difference.
+    if let Some((mt, rel)) = mount::resolve(&path) {
+        if super::host::is_host(&mt) {
+            return super::host::exists(if rel.is_empty() { "/" } else { &rel });
+        }
     }
     read_mount(&path).is_ok()
 }

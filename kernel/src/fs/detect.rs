@@ -21,6 +21,10 @@ pub enum FsType {
     Ext3,
     Ext4,
     Xfs,
+    /// A **host shared folder** over 9P2000.L. Unlike every other variant this
+    /// is not sniffed from a superblock and has no block device under it — it
+    /// is set when a `virtio-9p` export is attached.
+    Host,
     Unknown,
 }
 
@@ -35,6 +39,7 @@ impl FsType {
             FsType::Ext3 => "ext3",
             FsType::Ext4 => "ext4",
             FsType::Xfs => "XFS",
+            FsType::Host => "9P (host)",
             FsType::Unknown => "unknown",
         }
     }

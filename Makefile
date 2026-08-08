@@ -87,6 +87,12 @@ VBOX_MEM  ?= 8192
 # `SAMPLES=` (or 0/off) for an image without them.
 SAMPLES   ?= 1
 
+# SHARE: a host directory to share into the guest over virtio-9p, mounted at
+# `/host` — `make run SHARE=~/Desktop/chitti`. Copy files in and out with the
+# ordinary `/cp`, `/ls`, `/cat`, `/rm`. Empty (the default) shares nothing.
+# Works on QEMU; VirtualBox uses its own shared folders (`/share` in the guest).
+SHARE     ?=
+
 XTASK   := cargo xtask
 REL     := $(if $(filter 1 true yes,$(RELEASE)),--release,)
 FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
@@ -176,6 +182,7 @@ run:
 	CHITTI_USB_CAM='$(USB_CAM)' \
 	CHITTI_USB_HOST='$(USB_HOST)' \
 	CHITTI_SAMPLE_FILES='$(SAMPLES)' \
+	CHITTI_SHARE='$(SHARE)' \
 	$(XTASK) run $(FLAGS)
 
 ## run-remote: like `run`, but seed `/model remote` at boot from REMOTE_RUN_URL
@@ -196,6 +203,7 @@ run-remote:
 	CHITTI_USB_CAM='$(USB_CAM)' \
 	CHITTI_USB_HOST='$(USB_HOST)' \
 	CHITTI_SAMPLE_FILES='$(SAMPLES)' \
+	CHITTI_SHARE='$(SHARE)' \
 	$(XTASK) run $(FLAGS)
 
 ## model: fetch the GGUF for MODEL into assets/ (required before run / run-uefi)
