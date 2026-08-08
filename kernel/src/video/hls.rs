@@ -5,8 +5,9 @@
 //!
 //! * **VOD** media playlists (`#EXT-X-ENDLIST`) and masters (highest bandwidth)
 //! * **MPEG-TS** segments demuxed by [`super::ts`]
-//! * **fMP4** segments / `#EXT-X-MAP` init via [`super::mp4`] when the bytes
-//!   sniff as ISO-BMFF
+//! * **fMP4** only where the segment is a *non-fragmented* mp4: `mp4.rs` has no
+//!   `moof`/`trun` demuxer, so a CMAF ladder — and a single fragmented file,
+//!   which parses to zero samples — are refused by name
 //! * **No encryption** (`#EXT-X-KEY` with a cipher is refused up front)
 //! * **No live sliding window** yet — missing ENDLIST is an error with a reason
 //!
@@ -224,7 +225,25 @@ pub fn load_vod(
     // parsed into whichever fragment happens to sit first.
     if fmp4_parts.len() == 1 {
         let bytes = fmp4_parts.remove(0);
+        // Fragmented? Then say so, whatever `mp4::parse` makes of it. Depending
+        // on how complete the `moov` is, a fragmented file either fails to parse
+        // or parses with an **empty** sample table — two unrelated-looking
+        // downstream failures ("mp4: …" and "no decodable frames found") for one
+        // cause. The box tree is the reliable signal, so it is asked first.
+        if has_fragment_box(&bytes) {
+            return Err(alloc::format!("hls: {FMP4_UNSUPPORTED}"));
+        }
         let t = mp4::parse(&bytes).map_err(|e| e.to_string())?;
+        // A *fragmented* single file parses fine and yields **no samples**: its
+        // `moov` carries an empty sample table and every real one lives in a
+        // `moof`. That is the shape all fMP4 tooling emits (`ffmpeg
+        // -movflags frag_keyframe+empty_moov`), so without this check the one
+        // segment that looks most like it should work fails several layers
+        // later as "video: no decodable frames found" — which names neither
+        // fragmentation nor the missing demuxer.
+        if t.samples.is_empty() {
+            return Err(alloc::format!("hls: {FMP4_UNSUPPORTED}"));
+        }
         let duration_ms = t.duration_ms().max(vod.duration_ms);
         return Ok(LoadedHls {
             bytes,
@@ -236,10 +255,37 @@ pub fn load_vod(
         });
     }
     Err(alloc::format!(
-        "hls: multi-fragment fMP4/CMAF ({} fragments) needs a moof/trun demuxer, which does not exist yet — MPEG-TS segments work",
+        "hls: multi-fragment fMP4/CMAF ({} fragments): {FMP4_UNSUPPORTED}",
         fmp4_parts.len()
     ))
 }
+
+/// True when the top-level box tree carries movie-fragment boxes — the mark of
+/// a file whose sample table lives in `moof`s rather than in `moov`.
+///
+/// Only the top level is walked, and only the length/type header of each box is
+/// read, so a truncated or hostile file cannot send this anywhere: a length of
+/// zero (or one, the 64-bit form) stops the walk rather than looping.
+fn has_fragment_box(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        let size = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+        let kind = &bytes[i + 4..i + 8];
+        if kind == b"moof" || kind == b"styp" || kind == b"sidx" {
+            return true;
+        }
+        if size < 8 {
+            break; // 0 = "to end of file", 1 = 64-bit size; neither is walkable here
+        }
+        i += size;
+    }
+    false
+}
+
+/// The one reason any fMP4 playlist is refused, so a CMAF ladder and a single
+/// fragmented file give the same diagnosis instead of two unrelated ones.
+const FMP4_UNSUPPORTED: &str =
+    "fragmented MP4 needs a moof/trun demuxer, which mp4.rs does not have yet — MPEG-TS segments work";
 
 /// Take `#EXT-X-BYTERANGE`'s `len@offset` window out of a fetched resource.
 /// A range past the end is an error rather than a clamp — a short read means
@@ -466,6 +512,83 @@ b.ts
         .unwrap_err();
         assert!(err.contains("mixed"), "{err}");
         assert!(err.contains("2/2"), "and which segment: {err}");
+    }
+
+    /// A fragmented MP4 is refused for **being fragmented**, whether it arrives
+    /// as a CMAF ladder or as one self-contained file. The single-file case is
+    /// the trap: `mp4::parse` succeeds on it and returns zero samples, because
+    /// its `moov` sample table is empty by design and every real entry lives in
+    /// a `moof`. Left to fall through, that surfaced as "no decodable frames
+    /// found" — which names neither fragmentation nor the missing demuxer, on
+    /// the one input a user would most expect to work.
+    #[test_case]
+    fn a_fragmented_mp4_is_refused_for_being_fragmented() {
+        // `mp4::parse` must actually reach the empty-sample-table state for this
+        // to be the path under test, so the fixture is a real (tiny) fragmented
+        // file shape: ftyp + moov-with-no-samples.
+        let single = "\
+#EXTM3U
+#EXT-X-TARGETDURATION:1
+#EXTINF:1,
+frag.mp4
+#EXT-X-ENDLIST
+";
+        let (vod, _) = resolve_vod(single, "https://ex/p.m3u8", |_| Ok(Vec::new())).unwrap();
+        let err = load_vod(&vod, |_| Ok(fragmented_mp4()), |_, _| Ok(())).unwrap_err();
+        assert!(
+            err.contains("moof") && err.contains("fragmented"),
+            "a fragmented single file must say so: {err}"
+        );
+
+        // …and a real ladder (init + fragments) says the same thing, with the
+        // fragment count.
+        let ladder = "\
+#EXTM3U
+#EXT-X-TARGETDURATION:1
+#EXT-X-MAP:URI=\"init.mp4\"
+#EXTINF:1,
+a.m4s
+#EXTINF:1,
+b.m4s
+#EXT-X-ENDLIST
+";
+        let (vod, _) = resolve_vod(ladder, "https://ex/p.m3u8", |_| Ok(Vec::new())).unwrap();
+        let err = load_vod(&vod, |_| Ok(iso_bmff_stub()), |_, _| Ok(())).unwrap_err();
+        assert!(err.contains("moof"), "{err}");
+        assert!(err.contains('3'), "counts init + 2 fragments: {err}");
+    }
+
+    #[test_case]
+    fn fragment_boxes_are_found_without_trusting_the_lengths() {
+        assert!(has_fragment_box(&fragmented_mp4()));
+        // A plain file has none.
+        let mut plain = alloc::vec![0u8; 12];
+        plain[..4].copy_from_slice(&12u32.to_be_bytes());
+        plain[4..8].copy_from_slice(b"ftyp");
+        assert!(!has_fragment_box(&plain));
+        // A zero length would otherwise walk forever; so would a 64-bit one.
+        let mut zero = alloc::vec![0u8; 16];
+        zero[4..8].copy_from_slice(b"ftyp");
+        assert!(!has_fragment_box(&zero));
+        assert!(!has_fragment_box(&[]));
+        assert!(!has_fragment_box(&[0u8; 7]));
+    }
+
+    /// `ftyp` + `moov` + `moof` — the box shape of a fragmented file, which is
+    /// what the refusal keys on.
+    fn fragmented_mp4() -> Vec<u8> {
+        fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(kind);
+            v.extend_from_slice(body);
+            v
+        }
+        let mut out = boxed(b"ftyp", b"iso5\0\0\x02\0iso6mp41");
+        // An empty `moov` is enough: whatever `mp4::parse` makes of it, it
+        // cannot find a sample, which is the state this guards.
+        out.extend_from_slice(&boxed(b"moov", &[]));
+        out.extend_from_slice(&boxed(b"moof", &[]));
+        out
     }
 
     #[test_case]

@@ -2409,11 +2409,46 @@ FDT claims a GICv3 but carries no readable `reg`.
     parameter-set-only PES otherwise takes sample index 0 and never decodes, so
     `seek_decode(0)` fails on a stream whose every later frame is fine.
 
+  **`/open <url>` resolves the type from three signals, in this order**, and the
+  order is the whole design: the URL's own extension (what the human typed —
+  no network needed to trust it), then the **bytes**, then the remote
+  `Content-Type`. The header is consulted *last* because
+  `application/octet-stream` is what a great many servers say about everything
+  and a server may simply be wrong, so a PNG served as `text/plain` still
+  reaches the image viewer (`the_bytes_outrank_the_servers_claim`). Routing adds
+  no per-type branch: the body is staged in `/downloads/` under a name carrying
+  the resolved extension and the **existing** `resolve_open_hook` chain takes it
+  from there, exactly as for a local file. Streaming media (HLS and the video
+  containers, by extension) skips staging and plays off the network — a VOD is
+  hundreds of segments and a film is gigabytes. Staging **never overwrites**:
+  `/open` is not a download command and you named no destination, so a colliding
+  name takes `-1`, `-2` (`/http -O`, where you *did* ask, is what confirms and
+  replaces). Handing every URL to the video player — the first cut — made
+  `/open https://…/logo.png` report "unrecognised container (mp4/mov, mkv/webm,
+  m3u8, ts supported)", blaming the video demuxer for a PNG.
+
+  NB a trap found while testing that path, which is **not** about HLS: a focused
+  media tab consumes the keys it handles and lets the rest through to the
+  composer, so typing a command while an *image* tab has focus loses exactly its
+  shortcuts — `/open http://10.0.2.2:8100/logo.png` arrives as
+  `/open http://1..2.2:81/ogo.png`, having eaten `0` (reset) and `l` (rotate
+  left), and then fails as a DNS error. Partial consumption is the wrong shape
+  when the composer still receives the remainder; the video path already guards
+  its half (`media_key` gates on `video_loaded()`), the image path does not.
+
   Refused with a reason rather than guessed at: **encrypted** playlists
-  (`#EXT-X-KEY` with a cipher), **live** ones (no `#EXT-X-ENDLIST`), and
-  **multi-fragment fMP4/CMAF** — `mp4.rs` has no `moof`/`trun` fragment demuxer,
-  so a single self-contained fMP4 segment works and a real CMAF ladder does not.
-  That is the largest remaining gap, since much of the modern web ships CMAF.
+  (`#EXT-X-KEY` with a cipher), **live** ones (no `#EXT-X-ENDLIST`), and **fMP4
+  in every form** — `mp4.rs` has no `moof`/`traf`/`trun` demuxer, so only a
+  *non-fragmented* mp4 segment plays. That is the largest remaining gap, since
+  much of the modern web ships CMAF.
+
+  The trap there is that **a fragmented single file parses fine and yields zero
+  samples**: its `moov` sample table is empty by design and every entry lives in
+  a `moof`. That is exactly what `ffmpeg -movflags frag_keyframe+empty_moov`
+  emits, i.e. the one input most likely to be tried — and left to fall through it
+  surfaced several layers later as "video: no decodable frames found", naming
+  neither fragmentation nor the missing demuxer. `load_vod` checks for the empty
+  table and both shapes now give the same diagnosis.
 - **Switchable engines, and the rule for adding another.** Two subsystems run an
   alternative implementation **alongside** ours on the `/decoder ring3|kernel`
   pattern — a `bench` subcommand compares them:

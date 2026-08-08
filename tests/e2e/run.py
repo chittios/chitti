@@ -3392,12 +3392,29 @@ def s_open_hls(g):
     g.send_raw(b"\x03")     # Ctrl+C stops
     if not g.wait_for("video stopped", 15, m2):
         return False, "HLS transport controls / Ctrl+C did not stop playback"
+    # Give keyboard focus back to the shell. A focused media tab consumes the
+    # keys it handles and lets the rest through, so typing a command at a
+    # focused *image* tab loses exactly its shortcuts: `/open …10.0.2.2:8100/
+    # logo.png` arrives as `…1..2.2:81/ogo.png`, having eaten `0` (reset) and
+    # `l` (rotate left). That is a real trap, but it is not what this scenario
+    # is testing — a user would Ctrl+Tab back too.
+    g.send_raw(b"\x1b[T")
+    g.wait_quiet(0.3, 10)
 
     # A master playlist: pick a variant, fetch its media playlist, play that.
+    # Staged like the first block, and for the same reason: `wait_for` restarts
+    # its own timeout per call, so a single wait gives this *more* work (an
+    # extra round trip for the variant) a *smaller* budget than the load above —
+    # which is what made this step flake on a loaded machine. Each milestone
+    # also says where it stalled.
     m = g.mark()
     g.send(f"/open {base}/master.m3u8")
-    if not g.wait_for("8 frame(s)", 40, m):
+    if not g.wait_for("HLS playlist", 30, m):
+        return False, "master playlist was not fetched"
+    if not g.wait_for("2 segment(s)", 30, m):
         return False, "master playlist did not resolve through to its variant"
+    if not g.wait_for("8 frame(s)", 30, m):
+        return False, "the variant's segments did not concatenate into 8 frames"
     m2 = g.mark()
     g.send_raw(b"\x03")
     g.wait_for("video stopped", 15, m2)
@@ -3412,11 +3429,29 @@ def s_open_hls(g):
     g.send(f"/open {base}/enc.m3u8")
     if not g.wait_for("encrypted", 25, m):
         return False, "an AES-128 playlist was not refused by name"
+    # A URL is not necessarily video, and `/open` used to hand **every** URL to
+    # the video player — so a PNG was fetched and then rejected by the video
+    # demuxer ("unrecognised container (mp4/mov, mkv/webm, m3u8, ts)"). A
+    # non-streaming URL is staged in /downloads/ and opened from there.
+    m = g.mark()
+    g.send(f"/open http://{HOST}:{PLAIN_PORT}/logo.png")
+    if not g.wait_for("/downloads/logo", 25, m):
+        return False, "a PNG URL was not staged into /downloads/"
+    if not g.wait_for("3x2 px", 25, m):
+        return False, "a PNG URL did not reach the image viewer"
+
+    # Twice, to prove the staging never overwrites what is already there.
+    m = g.mark()
+    g.send(f"/open http://{HOST}:{PLAIN_PORT}/logo.png")
+    if not g.wait_for("/downloads/logo-1.png", 25, m):
+        return False, "a second download overwrote the first instead of taking a new name"
+
     m = g.mark()
     g.send("/pwd")
     if not g.wait_for("/home/chitti", 12, m):
         return False, "the shell did not survive the HLS scenarios"
-    return True, "HLS VOD over HTTP: master + media playlist, 2 TS segments, 8 frames, controls, encrypted refused"
+    return True, ("HLS VOD over HTTP: master + media playlist, 2 TS segments, 8 frames, "
+                  "controls, encrypted refused; a non-video URL stages and opens")
 
 
 def s_panes(g):

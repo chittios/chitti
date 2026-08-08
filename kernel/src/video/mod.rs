@@ -85,6 +85,28 @@ pub struct VideoInfo {
     pub unsupported_reason: &'static str,
 }
 
+/// True when a URL names media the player streams off the network rather than
+/// staging in the store: HLS, and the video containers.
+///
+/// Decided by **extension**, deliberately, because the point is to avoid the
+/// fetch: an HLS playlist is useless without its segments and a film is
+/// gigabytes, so neither should be downloaded whole just to find out what it
+/// was. Media that arrives without a usable extension is still recognised from
+/// its bytes afterwards — see `shell::open_url`.
+pub fn is_streaming_media_url(url: &str) -> bool {
+    const STREAMING: &[&str] = &[
+        ".m3u8", ".m3u", ".ts", ".mp4", ".m4v", ".mov", ".mkv", ".webm",
+    ];
+    // A query string is not part of the name (`master.m3u8?token=…`).
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    STREAMING.iter().any(|ext| {
+        name.len() > ext.len()
+            && name.as_bytes()[name.len() - ext.len()..]
+                .eq_ignore_ascii_case(ext.as_bytes())
+    })
+}
+
 /// Sniff the container and, for a supported one, demux + parse the parameter
 /// sets to describe the stream. Does **not** decode pixels.
 pub fn probe(bytes: &[u8]) -> Result<VideoInfo, &'static str> {
@@ -1694,6 +1716,31 @@ mod tests {
 
         // A playlist is text, sniffed ahead of every binary container.
         assert!(matches!(sniff(b"#EXTM3U\n#EXT-X-ENDLIST\n"), Container::HlsPlaylist));
+    }
+
+    #[test_case]
+    fn streaming_urls_are_recognised_by_extension() {
+        for u in [
+            "https://cdn/v/master.m3u8",
+            "https://cdn/v/master.M3U8?token=abc&x=1",
+            "http://h/a.mp4",
+            "http://h/a.MKV#t=3",
+            "http://h/seg0.ts",
+        ] {
+            assert!(is_streaming_media_url(u), "{u}");
+        }
+        // These are fetched whole and opened locally instead.
+        for u in [
+            "https://cdn/logo.png",
+            "https://cdn/song.mp3",
+            "https://cdn/paper.pdf",
+            "https://cdn/notes.md",
+            "https://cdn/",
+            "https://cdn/mp4",
+            "https://cdn/.mp4",
+        ] {
+            assert!(!is_streaming_media_url(u), "{u}");
+        }
     }
 
     #[test_case]

@@ -9329,31 +9329,254 @@ fn run_open_inner(
     //    it. `run_media_tool` refuses a URL, so an agent asking for one is told
     //    what is missing rather than quietly granted it.
     if crate::browser::url::is_http_url(arg) {
-        let url = arg.trim();
-        #[cfg(not(feature = "server"))]
+        open_url(arg.trim(), chat, orch);
+        return;
+    }
+    open_local(&resolve_path(arg), chat, orch);
+}
+
+/// `/open <http(s) url>` — fetch and open, dispatching by what the URL turns
+/// out to be rather than assuming.
+///
+/// Two routes, because the media types differ in *size*, not just in decoder:
+///
+/// * **Streaming** media (HLS and the video containers) is played straight off
+///   the network. An HLS VOD is a playlist plus hundreds of segments and a film
+///   is gigabytes; neither belongs in the store as a side effect of pressing
+///   play.
+/// * **Everything else** — an image, a sound, a PDF, a text file — is one
+///   modest file, so it is downloaded to `/downloads/` exactly as `/http -O`
+///   would and then opened from there. That reuses the whole local dispatch
+///   (the media agent's command hooks, the viewers, the editor) instead of
+///   duplicating it per type, and it leaves the user with the file.
+///
+/// Routing every URL to the video player — which is what the first cut of this
+/// did — meant `/open https://…/logo.png` fetched the image and then reported
+/// "unrecognised container (mp4/mov, mkv/webm, m3u8, ts supported)", blaming the
+/// video demuxer for a PNG.
+#[cfg(not(feature = "server"))]
+fn open_url(
+    url: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
+    if crate::video::is_streaming_media_url(url) {
         if let Err(e) = video::play_video_url(url) {
             serial_println!("open> {url}: {e}");
         }
-        #[cfg(feature = "server")]
-        let _ = url;
         return;
     }
+    let (final_url, content_type, body) = match fetch_for_open(url) {
+        Ok(v) => v,
+        Err(e) => {
+            serial_println!("open> {url}: {e}");
+            return;
+        }
+    };
+    // A URL need not carry a usable extension, so media that arrived without
+    // one is still recognised from its bytes and played rather than staged.
+    if crate::video::hls::looks_like_playlist(&body) || crate::video::probe(&body).is_ok() {
+        if let Err(e) = video::play_video_bytes(&final_url, body) {
+            serial_println!("open> {url}: {e}");
+        }
+        return;
+    }
+    match stage_download(&final_url, &content_type, &body) {
+        Ok(dest) => {
+            serial_println!("open> {} bytes → {dest}", body.len());
+            open_local(&dest, chat, orch);
+        }
+        Err(e) => serial_println!("open> {url}: {e}"),
+    }
+}
+
+#[cfg(feature = "server")]
+fn open_url(
+    url: &str,
+    _chat: &mut Option<ChatSession>,
+    _orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
+    serial_println!("open> {url}: no media runtime in the server build");
+}
+
+/// The extension implied by a body's **own bytes**, for the formats `/open`
+/// routes. Authoritative: a server's `Content-Type` is a claim, and
+/// `application/octet-stream` is what a great many of them claim about
+/// everything.
+///
+/// The magic tested here is the same magic each decoder tests
+/// ([`crate::image::decode`], [`crate::audio::decode`]), so a body that sniffs
+/// as PNG here is one `image::decode` will accept — a viewer chosen from this
+/// cannot be handed something it will reject.
+pub(crate) fn sniff_extension(body: &[u8]) -> Option<&'static str> {
+    if body.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some(".png");
+    }
+    if body.starts_with(&[0xff, 0xd8]) {
+        return Some(".jpg");
+    }
+    if body.starts_with(b"%PDF") {
+        return Some(".pdf");
+    }
+    if body.len() >= 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WAVE" {
+        return Some(".wav");
+    }
+    if body.starts_with(b"ID3") || (body.len() >= 2 && body[0] == 0xff && body[1] & 0xe0 == 0xe0) {
+        return Some(".mp3");
+    }
+    None
+}
+
+/// The extension implied by a `Content-Type` header — the fallback for formats
+/// with no magic to test (text, markdown, JSON), and the reason an
+/// extension-less URL can still reach the right viewer.
+///
+/// Parameters are dropped (`text/html; charset=utf-8`) and matching is
+/// case-insensitive, because both vary freely between servers.
+pub(crate) fn content_type_extension(content_type: &str) -> Option<&'static str> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    Some(match mime.as_str() {
+        "image/png" => ".png",
+        "image/jpeg" | "image/jpg" => ".jpg",
+        "application/pdf" => ".pdf",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => ".wav",
+        "audio/mpeg" | "audio/mp3" => ".mp3",
+        "audio/aac" | "audio/aacp" => ".aac",
+        "video/mp4" => ".mp4",
+        "video/x-matroska" => ".mkv",
+        "video/webm" => ".webm",
+        "video/mp2t" => ".ts",
+        "application/vnd.apple.mpegurl" | "application/x-mpegurl" | "audio/mpegurl" => ".m3u8",
+        "text/markdown" | "text/x-markdown" => ".md",
+        "application/json" => ".json",
+        "text/html" => ".html",
+        "text/plain" => ".txt",
+        _ => return None,
+    })
+}
+
+/// What to call a fetched body in `/downloads/`, so the ordinary extension
+/// routing sends it to the right agent.
+///
+/// Order matters and is not arbitrary:
+///
+/// 1. **The URL's own name**, when some package's `/open` hook already claims
+///    its extension — that is what the user typed and it needs no network to
+///    be trusted.
+/// 2. **The bytes**, which cannot lie about what they are.
+/// 3. **The remote `Content-Type`**, for the formats with no magic to test.
+///
+/// A body that answers none of the three keeps the URL's name and opens in the
+/// editor, which is the honest outcome for an unknown type.
+pub(crate) fn staged_name(url: &str, content_type: &str, body: &[u8]) -> alloc::string::String {
+    let base = url_basename(url).unwrap_or("download");
+    // `resolve_open_hook` takes a path; the directory is irrelevant to it.
+    if crate::agent::system::resolve_open_hook(&alloc::format!("/downloads/{base}")).is_some() {
+        return base.to_string();
+    }
+    match sniff_extension(body).or_else(|| content_type_extension(content_type)) {
+        Some(ext) => alloc::format!("{}{ext}", base.trim_end_matches('.')),
+        None => base.to_string(),
+    }
+}
+
+/// Fetch a URL for `/open`, pumping the UI and answering Ctrl+C. Returns the
+/// **final** URL after redirects (what relative references resolve against) and
+/// the body.
+#[cfg(not(feature = "server"))]
+fn fetch_for_open(
+    url: &str,
+) -> Result<(alloc::string::String, alloc::string::String, alloc::vec::Vec<u8>), alloc::string::String>
+{
+    serial_println!("open> fetching {url}…");
+    upkeep();
+    if poll_interrupt() {
+        return Err(alloc::string::String::from("cancelled"));
+    }
+    let got = crate::net::http::get_follow(url, 60_000).map_err(|e| e.to_string())?;
+    if got.response.status >= 400 {
+        return Err(alloc::format!("HTTP {}", got.response.status));
+    }
+    let content_type = got
+        .response
+        .get("content-type")
+        .unwrap_or_default()
+        .to_string();
+    Ok((got.final_url, content_type, got.response.body))
+}
+
+/// Write a fetched body under `/downloads/` and return the path.
+///
+/// **Never overwrites.** `/open` is not a download command and the user did not
+/// name a destination, so silently replacing `/downloads/notes.md` because a URL
+/// happened to end in that name would be a surprising loss; a colliding name
+/// takes a `-1`, `-2` suffix instead. (`/http -O`, where the user *did* ask to
+/// download, is the place that confirms and overwrites.)
+#[cfg(not(feature = "server"))]
+fn stage_download(
+    final_url: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<alloc::string::String, alloc::string::String> {
+    let name = staged_name(final_url, content_type, body);
+    let dest = crate::shell::unique_download_path(&name, |p| crate::synapse::fs::exists(p))
+        .ok_or_else(|| alloc::string::String::from("too many downloads by that name"))?;
+    if !crate::synapse::fs::exists("/downloads/.keep") {
+        crate::synapse::fs::write("/downloads/.keep", b"");
+    }
+    crate::synapse::fs::write(&dest, body);
+    Ok(dest)
+}
+
+/// `/downloads/<base>`, or `<stem>-N.<ext>` for the first N that is free.
+/// Pure over an existence predicate so the naming rule is testable.
+pub(crate) fn unique_download_path(
+    base: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Option<alloc::string::String> {
+    let first = alloc::format!("/downloads/{base}");
+    if !exists(&first) {
+        return Some(first);
+    }
+    // Split on the LAST dot so `archive.tar.gz` becomes `archive.tar-1.gz`
+    // rather than `archive-1.tar.gz`; either is fine, but only one of them
+    // keeps the extension `/open` dispatches on.
+    let (stem, ext) = match base.rfind('.') {
+        Some(i) if i > 0 => (&base[..i], &base[i..]),
+        _ => (base, ""),
+    };
+    (1..100).find_map(|n| {
+        let p = alloc::format!("/downloads/{stem}-{n}{ext}");
+        (!exists(&p)).then_some(p)
+    })
+}
+
+/// Open a **local** path: the owning package's `/open` hook if one claims the
+/// extension, else an editor tab.
+fn open_local(
+    resolved: &str,
+    chat: &mut Option<ChatSession>,
+    orch: &mut crate::agent::orchestrator::Orchestrator,
+) {
     // Package command_hooks for /open (e.g. media agent owns .mp3/.png/.mp4…).
-    // Resolve the path against the pwd first so `~/x` and relative names work.
-    let resolved = resolve_path(arg);
-    if let Some(hook) = crate::agent::system::resolve_open_hook(&resolved) {
-        open_via_command_hook(&resolved, &hook, chat, orch);
+    if let Some(hook) = crate::agent::system::resolve_open_hook(resolved) {
+        open_via_command_hook(resolved, &hook, chat, orch);
         return;
     }
     #[cfg(not(test))]
     {
         // No hook: text editor tab.
-        crate::editor::open(&resolved);
+        crate::editor::open(resolved);
         crate::framebuffer::focus_set(true);
         serial_println!("editor> {} open in a tab — i insert, Esc normal, :w write, :q quit; Ctrl+Tab returns to shell", resolved);
     }
     #[cfg(test)]
-    let _ = (arg, chat, orch);
+    let _ = (resolved, chat, orch);
 }
 
 /// Which divider is being dragged with the mouse, if any (resize in progress).
@@ -11140,6 +11363,113 @@ mod login_reachability_tests {
     ///
     /// The human path (`/open <url>`) fetches instead, and `run_open` is absent
     /// from `dispatch_system` — the same structure `/passwd` and `/lock` use.
+    /// `/open <url>` stages a non-streaming download, and must never replace a
+    /// file that is already there: the user asked to *open* something, not to
+    /// download it, and did not name a destination — so a URL ending in
+    /// `notes.md` silently overwriting `/downloads/notes.md` would be a loss.
+    /// `/open <url>` routes on three things in order — the URL's own extension,
+    /// then the bytes, then the remote `Content-Type` — because each is trusted
+    /// for a different reason and the last one is a claim by a stranger.
+    #[test_case]
+    fn a_fetched_url_is_named_so_it_routes_to_the_right_agent() {
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0];
+
+        // 1. The URL already names a type some hook claims: keep it, and do not
+        //    let the server's opinion override what the user typed.
+        assert_eq!(
+            staged_name("https://cdn/a/logo.png", "application/octet-stream", PNG),
+            "logo.png"
+        );
+
+        // 2. No usable extension — the bytes decide, which is what makes an
+        //    extension-less CDN URL open in the image viewer at all.
+        assert_eq!(
+            staged_name("https://cdn/asset/12345", "application/octet-stream", PNG),
+            "12345.png"
+        );
+        assert_eq!(staged_name("https://cdn/x/doc", "", b"%PDF-1.7\n"), "doc.pdf");
+        assert_eq!(
+            staged_name("https://cdn/x/tune", "", b"RIFF\0\0\0\0WAVEfmt "),
+            "tune.wav"
+        );
+
+        // 3. Nothing to sniff (text has no magic): the Content-Type is the only
+        //    thing that knows, so it is used — but only here, last.
+        assert_eq!(
+            staged_name("https://cdn/x/readme", "text/markdown; charset=utf-8", b"# hi"),
+            "readme.md"
+        );
+        assert_eq!(
+            staged_name("https://api/v1/thing", "application/json", b"{\"a\":1}"),
+            "thing.json"
+        );
+
+        // Unknown by all three: keep the name and let the editor have it.
+        assert_eq!(
+            staged_name("https://cdn/x/blob", "application/octet-stream", b"\x00\x01\x02"),
+            "blob"
+        );
+        // A host with no path still gets a name.
+        assert!(!staged_name("https://cdn", "image/png", PNG).is_empty());
+    }
+
+    #[test_case]
+    fn the_bytes_outrank_the_servers_claim() {
+        // `application/octet-stream` is what a great many servers say about
+        // everything, and a server may simply be wrong — so a PNG body served
+        // as `text/plain` still reaches the image viewer.
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0];
+        assert_eq!(staged_name("https://cdn/x/thing", "text/plain", PNG), "thing.png");
+        assert_eq!(sniff_extension(PNG), Some(".png"));
+        assert_eq!(sniff_extension(b"%PDF-1.4"), Some(".pdf"));
+        assert_eq!(sniff_extension(&[0xff, 0xd8, 0xff, 0xe0]), Some(".jpg"));
+        assert_eq!(sniff_extension(b"ID3\x03"), Some(".mp3"));
+        assert_eq!(sniff_extension(b"not anything"), None);
+        assert_eq!(sniff_extension(b""), None);
+
+        // Content-Type parsing is case- and parameter-insensitive, since both
+        // vary freely between servers.
+        assert_eq!(content_type_extension("IMAGE/PNG"), Some(".png"));
+        assert_eq!(content_type_extension("text/html; charset=utf-8"), Some(".html"));
+        assert_eq!(
+            content_type_extension("application/vnd.apple.mpegurl"),
+            Some(".m3u8")
+        );
+        assert_eq!(content_type_extension("application/octet-stream"), None);
+        assert_eq!(content_type_extension(""), None);
+    }
+
+    #[test_case]
+    fn a_staged_download_never_overwrites() {
+        let none = |_: &str| false;
+        assert_eq!(
+            unique_download_path("logo.png", none).unwrap(),
+            "/downloads/logo.png"
+        );
+        let taken = |p: &str| p == "/downloads/logo.png";
+        assert_eq!(
+            unique_download_path("logo.png", taken).unwrap(),
+            "/downloads/logo-1.png"
+        );
+        let two = |p: &str| p == "/downloads/logo.png" || p == "/downloads/logo-1.png";
+        assert_eq!(
+            unique_download_path("logo.png", two).unwrap(),
+            "/downloads/logo-2.png"
+        );
+        // The suffix goes before the LAST dot, so the extension `/open`
+        // dispatches on survives.
+        let t = |p: &str| p == "/downloads/a.tar.gz";
+        assert!(unique_download_path("a.tar.gz", t).unwrap().ends_with(".gz"));
+        // A name with no extension still works.
+        let t2 = |p: &str| p == "/downloads/README";
+        assert_eq!(
+            unique_download_path("README", t2).unwrap(),
+            "/downloads/README-1"
+        );
+        // And it gives up rather than looping forever.
+        assert!(unique_download_path("x.png", |_| true).is_none());
+    }
+
     #[test_case]
     fn the_media_tool_will_not_fetch_a_url() {
         for url in [
