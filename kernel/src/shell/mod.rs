@@ -9118,6 +9118,41 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
                 }
                 pdf_text(&path)
             }
+            // The tool that makes "write a doc and turn it into a PDF" one step.
+            // It reads its own fields from the raw arguments rather than the
+            // flattened `path`, because a document body is the one argument that
+            // certainly contains spaces and newlines.
+            "pdf_write" => {
+                let out = json_str(args_json, "path").unwrap_or_default();
+                let content = json_str(args_json, "content")
+                    .or_else(|| json_str(args_json, "text"))
+                    .or_else(|| json_str(args_json, "markdown"))
+                    .unwrap_or_default();
+                if out.is_empty() || content.is_empty() {
+                    return alloc::string::String::from(
+                        "error: pdf_write needs path and content",
+                    );
+                }
+                let out = resolve_path(&out);
+                let title = json_str(args_json, "title").unwrap_or_else(|| {
+                    out.rsplit('/').next().unwrap_or("Document").trim_end_matches(".pdf").into()
+                });
+                let format = json_str(args_json, "format").unwrap_or_default();
+                let bytes = match format.to_ascii_lowercase().as_str() {
+                    "html" | "htm" => crate::pdf::from_html(&content, &title),
+                    "text" | "txt" | "plain" => crate::pdf::from_text(&content, &title),
+                    _ => crate::pdf::from_markdown(&content, &title),
+                };
+                crate::synapse::fs::write(&out, &bytes);
+                if crate::synapse::fs::read(&out).is_none() {
+                    return alloc::format!("error: could not write {out}");
+                }
+                let pages = alloc::string::String::from_utf8_lossy(&bytes)
+                    .matches("/Type /Page ")
+                    .count()
+                    .max(1);
+                alloc::format!("ok: wrote {out} — {pages} page(s), {} bytes", bytes.len())
+            }
             "pdf_control" => {
                 let c = match cmd.as_str() {
                     "next_page" | "next" | "n" => b'n',

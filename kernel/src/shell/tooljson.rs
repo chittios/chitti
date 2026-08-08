@@ -39,6 +39,39 @@ pub(super) fn json_str(obj: &str, key: &str) -> Option<String> {
     None
 }
 
+/// A string-form `"arguments"` whose text is itself a JSON **object**, decoded.
+///
+/// **This is what an OpenAI-compatible endpoint emits**, and every hosted model
+/// speaks that dialect:
+///
+/// ```json
+/// {"name":"list_dir","arguments":"{\"path\": \"/samples/misc\"}"}
+/// ```
+///
+/// The `arguments` value is a *string containing JSON*, not an object. Passing
+/// it through verbatim handed `list_dir` the literal text `{"path": …}` as its
+/// argument line, so it fell back to listing `/`; `grep` and `read` reported
+/// `missing required arg` for arguments the model had supplied correctly. The
+/// whole tool surface looked broken on a hosted backend while being fine
+/// locally, because a local GGUF emits the object form.
+///
+/// Returns `None` when `arguments` is absent, is already an object, or is a
+/// genuine free-form string (the shell shape, `{"arguments": "ls -l"}`) — a
+/// string that does not parse as an object is left exactly as it was.
+fn nested_object_arguments(body: &str) -> Option<String> {
+    let i = body.find("\"arguments\"")?;
+    let after = &body[i + "\"arguments\"".len()..];
+    let colon = after.find(':')?;
+    if !after[colon + 1..].trim_start().starts_with('"') {
+        return None; // already an object, or something else entirely
+    }
+    let inner = json_str(&body[i..], "arguments")?;
+    let t = inner.trim();
+    // Only an object counts. A JSON *array* or a bare scalar in that position is
+    // not something the dispatchers can probe for named keys.
+    (t.starts_with('{') && t.ends_with('}')).then(|| inner)
+}
+
 /// Flatten a tool call's `"arguments"` into the single argument line our
 /// dispatchers take: a bare-string arguments value is used as-is; an object is
 /// probed for the conventional keys the builtin schemas use.
@@ -46,9 +79,17 @@ pub(super) fn json_str(obj: &str, key: &str) -> Option<String> {
 /// Memory tools encode multi-field args as `key\\x1fvalue` (unit separator) so
 /// both key and value survive the flatten step into `execute_chat_tool`.
 pub(super) fn json_args(body: &str) -> String {
+    // A hosted model's `arguments` is a *string holding an object*; probe that
+    // object rather than passing its text along as the argument line.
+    if let Some(inner) = nested_object_arguments(body) {
+        let probed = json_args(&alloc::format!("{{\"arguments\": {inner}}}"));
+        if !probed.is_empty() {
+            return probed;
+        }
+    }
     if let Some(i) = body.find("\"arguments\"") {
         let rest = &body[i..];
-        // `"arguments": "..."` (string form).
+        // `"arguments": "..."` (free-form string form — a shell command line).
         if let Some(v) = json_str(rest, "arguments") {
             return v;
         }
@@ -87,6 +128,12 @@ pub(super) fn extract_arguments_json(body: &str) -> String {
     };
     let rest = after_key[colon + 1..].trim_start();
     if rest.starts_with('"') {
+        // A string holding an object is the OpenAI shape: it *is* the argument
+        // object, so it goes to the Router as one rather than being wrapped as
+        // a free-form `args` line.
+        if let Some(inner) = nested_object_arguments(body) {
+            return inner;
+        }
         // `"arguments": "flattened line"`
         if let Some(v) = json_str(&body[i..], "arguments") {
             return wrap_args_json(&v);
@@ -839,5 +886,64 @@ pub(crate) fn strip_think(s: &str) -> alloc::string::String {
         s[..start].trim().to_string() // unterminated: keep the prefix
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod openai_args_tests {
+    use super::*;
+
+    /// **A hosted model's `arguments` is a string holding JSON.** Every
+    /// OpenAI-compatible endpoint emits that shape, and passing it through
+    /// verbatim is what made `list_dir` list `/` and made `grep`/`read` report
+    /// arguments missing that the model had supplied.
+    #[test_case]
+    fn openai_string_arguments_are_unwrapped() {
+        let call = r#"{"name":"list_dir","arguments":"{\"path\": \"/samples/misc\"}"}"#;
+        assert_eq!(json_args(call), "/samples/misc");
+        // And the Router form is the object itself, not `{"args": "{…}"}`.
+        let obj = extract_arguments_json(call);
+        assert!(obj.contains("\"path\""), "{obj}");
+        assert!(!obj.contains("\"args\""), "must not be re-wrapped: {obj}");
+
+        for (call, want) in [
+            (r#"{"name":"grep","arguments":"{\"query\": \"H.264\"}"}"#, "H.264"),
+            (r#"{"name":"read","arguments":"{\"path\": \"/a/b.txt\"}"}"#, "/a/b.txt"),
+            (r#"{"name":"spawn_subagent","arguments":"{\"task\": \"do it\"}"}"#, "do it"),
+        ] {
+            assert_eq!(json_args(call), want, "{call}");
+        }
+    }
+
+    /// The object form a local GGUF emits still works — this is an addition,
+    /// not a replacement, and the local path must be byte-identical to before.
+    #[test_case]
+    fn object_arguments_are_unchanged() {
+        let call = r#"{"name":"list_dir","arguments":{"path":"/samples/misc"}}"#;
+        assert_eq!(json_args(call), "/samples/misc");
+        let obj = extract_arguments_json(call);
+        assert!(obj.contains("\"path\""), "{obj}");
+    }
+
+    /// **A genuine free-form string is left alone.** `run_shell_command` and the
+    /// bracket dialects put a command *line* there; treating that as JSON would
+    /// break the shell surface to fix the hosted one.
+    #[test_case]
+    fn free_form_string_arguments_are_left_alone() {
+        let call = r#"{"name":"run_shell_command","arguments":"ls -l /tmp"}"#;
+        assert_eq!(json_args(call), "ls -l /tmp");
+        assert!(extract_arguments_json(call).contains("\"args\""));
+
+        // A string that merely *starts* with a brace but is not an object stays
+        // a string too.
+        let call = r#"{"name":"echo","arguments":"{not json"}"#;
+        assert_eq!(json_args(call), "{not json");
+    }
+
+    /// No `arguments` at all is still empty, not a panic.
+    #[test_case]
+    fn missing_arguments_is_empty() {
+        assert_eq!(json_args(r#"{"name":"status"}"#), "");
+        assert_eq!(extract_arguments_json(r#"{"name":"status"}"#), "{}");
     }
 }

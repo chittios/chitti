@@ -371,6 +371,106 @@ pub(super) fn close_pdf() {
 /// * `/pdf page <n>` — jump to a page, which is impractical by key in a long
 ///   document.
 #[cfg(all(not(feature = "server"), not(test)))]
+
+/// `/pdf create <out.pdf> [--from <file>] [--title <t>] [--text <words…>]`
+///
+/// The source format is taken from the input file's extension — `.md`, `.html`
+/// or plain text — because guessing from content is unreliable for short inputs
+/// and the extension is what the user already told us.
+pub(super) fn run_pdf_create(arg: &str) {
+    use alloc::string::{String, ToString};
+    let mut out: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut title = String::new();
+    let mut inline_text = String::new();
+    let mut format: Option<String> = None;
+
+    let toks: alloc::vec::Vec<&str> = arg.split_whitespace().collect();
+    let mut i = 1; // skip the subcommand
+    while i < toks.len() {
+        match toks[i] {
+            "--from" | "-f" => {
+                i += 1;
+                from = toks.get(i).map(|s| super::resolve_path(s));
+            }
+            "--title" | "-t" => {
+                i += 1;
+                // The title is the rest of the line up to the next flag, so it
+                // may contain spaces.
+                let mut parts = alloc::vec::Vec::new();
+                while i < toks.len() && !toks[i].starts_with("--") {
+                    parts.push(toks[i]);
+                    i += 1;
+                }
+                i -= 1;
+                title = parts.join(" ");
+            }
+            "--as" => {
+                i += 1;
+                format = toks.get(i).map(|s| s.to_ascii_lowercase());
+            }
+            "--text" => {
+                inline_text = toks[i + 1..].join(" ");
+                i = toks.len();
+            }
+            t if out.is_none() && !t.starts_with('-') => out = Some(super::resolve_path(t)),
+            t => serial_println!("pdf> ignoring unknown option {t}"),
+        }
+        i += 1;
+    }
+
+    let Some(out_path) = out else {
+        serial_println!(
+            "pdf> usage: /pdf create <out.pdf> [--from <src.md|src.html|src.txt>] [--text <words>] [--title T]"
+        );
+        return;
+    };
+    let (source, ext) = if !inline_text.is_empty() {
+        (inline_text, "md".to_string())
+    } else if let Some(src) = &from {
+        let Some(bytes) = crate::synapse::fs::read(src) else {
+            serial_println!("pdf> no such file: {src}");
+            return;
+        };
+        let ext = src.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        (String::from_utf8_lossy(&bytes).into_owned(), ext)
+    } else {
+        serial_println!("pdf> nothing to write — give --from <file> or --text <words>");
+        return;
+    };
+    let ext = format.unwrap_or(ext);
+    if title.is_empty() {
+        title = out_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("Document")
+            .trim_end_matches(".pdf")
+            .to_string();
+    }
+
+    let bytes = match ext.as_str() {
+        "html" | "htm" => crate::pdf::from_html(&source, &title),
+        "txt" | "text" => crate::pdf::from_text(&source, &title),
+        _ => crate::pdf::from_markdown(&source, &title),
+    };
+    crate::synapse::fs::write(&out_path, &bytes);
+    // Read back rather than trusting the write: a file that cannot be reopened
+    // is worse than one never written, because the user will go on to /open it.
+    if crate::synapse::fs::read(&out_path).is_none() {
+        serial_println!("pdf> could not write {out_path}");
+        return;
+    }
+    let pages = alloc::string::String::from_utf8_lossy(&bytes)
+        .matches("/Type /Page ")
+        .count();
+    serial_println!(
+        "pdf> wrote {out_path} — {} page(s), {} bytes. /open {out_path} to view it.",
+        pages.max(1),
+        bytes.len()
+    );
+}
+
+#[cfg(all(not(feature = "server"), not(test)))]
 pub(super) fn run_pdf(arg: &str) {
     let mut it = arg.split_whitespace();
     let sub = it.next().unwrap_or("");
@@ -435,11 +535,17 @@ pub(super) fn run_pdf(arg: &str) {
                 None => serial_println!("pdf> nothing open"),
             }
         }
-        other => serial_println!("pdf> unknown '{other}' — /pdf [status|text [file]|page <n>]"),
+        "create" | "new" | "write" => run_pdf_create(arg),
+        other => serial_println!(
+            "pdf> unknown '{other}' — /pdf [status|text [file]|page <n>|create <out.pdf> [--from <src>] [--title T]]"
+        ),
     }
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
 pub(super) fn run_pdf(_arg: &str) {}
+
+#[cfg(not(all(not(feature = "server"), not(test))))]
+pub(super) fn run_pdf_create(_arg: &str) {}
 
 /// A **typed** key while the pdf pane is focused: zoom, fit, page stepping.
 /// Returns false when the key is not one of ours, so the caller passes it on.

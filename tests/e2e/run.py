@@ -2394,6 +2394,82 @@ def s_remote_subagent(g):
         g.wait_quiet(0.5, 15)
 
 
+def s_pdf_create(g):
+    """**Create a PDF on the OS, then render it with hayro.**
+
+    The writer is ours; the renderer is not. Round-tripping a document we wrote
+    through the third-party rasterizer already in the image is the strongest
+    check available short of Acrobat — a malformed xref, a wrong `/Length`, a
+    dangling `/Parent` or an unescaped delimiter all fail here while the file
+    still looks like a PDF on disk. `/pdf text` then proves a *second*
+    independent reader (the pdf agent's wasm digest) walks the catalogue and
+    finds the title and page count we wrote.
+
+    `/pdf text` is deliberately last: it opens an **editor tab, which takes
+    keyboard focus** — the one view that does, by design — so anything typed
+    after it goes into the buffer rather than the shell.
+    """
+    # Markdown, via the human command.
+    m = g.mark()
+    g.send("/pdf create /downloads/h264.pdf --title H264 --text H.264 is a video codec using CAVLC and CABAC entropy coding.")
+    if not g.wait_for("pdf> wrote", 30, m):
+        return False, "markdown create failed: " + g.text()[m:][:300]
+
+    # The real proof: hayro parses and rasterizes it.
+    m = g.mark()
+    g.send("/open /downloads/h264.pdf")
+    if not g.wait_for("rendered in", 90, m):
+        return False, "hayro could not render our PDF: " + g.text()[m:][-400:].replace("\n", " | ")
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.5, 15)
+
+    # HTML in, PDF out.
+    m = g.mark()
+    g.send("/http -O http://%s:%d/page.html" % (HOST, PLAIN_PORT))
+    if not g.wait_for("http> saved", 25, m):
+        return False, "could not fetch a page to convert"
+    m = g.mark()
+    g.send("/pdf create /downloads/page.pdf --from /downloads/page.html")
+    if not g.wait_for("pdf> wrote", 30, m):
+        return False, "html create failed: " + g.text()[m:][:300]
+    m = g.mark()
+    g.send("/open /downloads/page.pdf")
+    if not g.wait_for("rendered in", 90, m):
+        return False, "hayro could not render the HTML-derived PDF"
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.5, 15)
+
+    # A multi-page document really produces several pages, as the independent
+    # digest counts them — not as our own writer claims.
+    body = " ".join("Paragraph %d with several words of filler text." % i for i in range(120))
+    m = g.mark()
+    g.send("/pdf create /downloads/long.pdf --title Long --text " + body)
+    if not g.wait_for("pdf> wrote", 60, m):
+        return False, "long create failed"
+
+    # Last, because it grabs focus: the second independent reader.
+    m = g.mark()
+    g.send("/pdf text /downloads/long.pdf")
+    if not g.wait_for("text at /preview/", 60, m):
+        return False, "the wasm digest could not read our PDF: " + g.text()[m:][-300:]
+    out = g.text()[m:]
+    if '"Long"' not in out:
+        return False, "the digest did not find our /Info title: " + out[:300]
+    pages = None
+    for tok in out.replace("pdf> ok: pdf ", "|").split("|"):
+        if "page(s)" in tok:
+            pages = tok.strip().split()[0]
+            break
+    if pages in (None, "1"):
+        return False, "a 120-paragraph document should span pages, digest said %s" % pages
+    # Close the editor tab `/pdf text` opened. It holds keyboard focus — the one
+    # view that does — so leaving it open sends the *next scenario's* commands
+    # into the buffer instead of the shell. Found by doing exactly that.
+    g.send_raw(b"\x17")  # Ctrl+W closes the tab
+    g.wait_quiet(0.5, 15)
+    return True, "pdf create (markdown, html, multi-page) rendered by hayro and read by the wasm digest"
+
+
 def s_http_download(g):
     """`/http -O` downloads a real PNG from the harness server into the store,
     then `/open` decodes it back — network → store → image viewer roundtrip."""
@@ -5321,7 +5397,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("open_hls", s_open_hls), ("git_clone", s_git_clone), ("remote_subagent", s_remote_subagent), ("ssh_client", s_ssh_client), ("ssh_keygen", s_ssh_keygen), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("open_hls", s_open_hls), ("git_clone", s_git_clone), ("pdf_create", s_pdf_create), ("remote_subagent", s_remote_subagent), ("ssh_client", s_ssh_client), ("ssh_keygen", s_ssh_keygen), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

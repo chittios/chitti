@@ -583,6 +583,13 @@ fn builtins() -> Vec<ToolDef> {
             binding: ToolBinding::Media,
         },
         ToolDef {
+            name: "pdf_write".to_string(),
+            description: "Create a PDF from markdown, HTML or plain text. args: path (output .pdf), content (the document source), format (md|html|text, default md), title (optional).".to_string(),
+            input_schema: r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"format":{"type":"string"},"title":{"type":"string"}},"required":["path","content"]}"#.to_string(),
+            required: alloc::vec!["path".to_string(), "content".to_string()],
+            binding: ToolBinding::Media,
+        },
+        ToolDef {
             name: "pdf_text".to_string(),
             description: "Extract a PDF's text: deterministic wasm digest (pdf agent), text in an editor tab. args: path.".to_string(),
             input_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.to_string(),
