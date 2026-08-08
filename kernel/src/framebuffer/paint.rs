@@ -29,6 +29,26 @@ pub(super) fn aa_coverage<F: Fn(i64, i64) -> bool>(dx: i64, dy: i64, inside: F) 
     cov * 255 / (AA_SS * AA_SS) as u32
 }
 
+/// Claim `rect` for a shadow: true when it differs from the last one painted,
+/// false when a repaint would darken pixels that already carry it. See
+/// [`LAST_SHADOW`].
+fn shadow_claim(x: u64, y: u64, w: u64, h: u64) -> bool {
+    LAST_SHADOW.with(|last| {
+        if *last == Some((x, y, w, h)) {
+            return false;
+        }
+        *last = Some((x, y, w, h));
+        true
+    })
+}
+
+/// Forget the last shadow, so the next [`Screen::drop_shadow`] for the same box
+/// paints again. Called from [`Screen::redraw`], which has just repainted
+/// everything a shadow could be lying on.
+pub(super) fn shadow_forget() {
+    LAST_SHADOW.with(|last| *last = None);
+}
+
 impl Screen {
     /// Byte offset into the framebuffer for **logical** pixel `(x, y)`.
     ///
@@ -447,43 +467,53 @@ impl Screen {
         self.put_pixel(x, y, (mix(bg.0, c.0), mix(bg.1, c.1), mix(bg.2, c.2)));
     }
 
-    /// A soft drop shadow for a box at `(x,y,w,h)` — two offset dark rectangles
-    /// (a web-style elevation cue), drawn *before* the box so the box overpaints
-    /// all but the bottom-right offset strip. Clipped at the screen edges by
-    /// `fill_rect`. Darkens whatever is behind (screen bg for panes, the panes
-    /// for a modal) toward black.
+    /// A soft drop shadow for the box at `(x,y,w,h)` — the elevation cue under
+    /// every pane, modal and dropdown. Drawn *before* the box, which then paints
+    /// over the part that falls inside it. Darkens whatever is behind (the
+    /// screen background for a pane, the panes for a modal) toward black, so it
+    /// works over a wallpaper too.
+    ///
+    /// The shadow is the box pushed **down** by the offset and blurred, with a
+    /// quadratic per-pixel falloff — the geometry and the alpha are pure and
+    /// unit-tested in [`crate::panes_layout`], since nothing written in this
+    /// module is compiled by the test build. What it replaced was two
+    /// hard-edged rectangles at fixed darkness, which read as a black border
+    /// rather than as depth: two visible steps and then a cliff to nothing.
+    ///
+    /// Nothing is painted **above** the box top: light comes from above, and
+    /// clipping there also keeps the shadow off whatever sits over the box (a
+    /// dropdown's status bar repaints on its own schedule, so a shadow reaching
+    /// into it would be half-erased).
     pub(super) fn drop_shadow(&self, x: u64, y: u64, w: u64, h: u64) {
-        let s = 4 * self.scale; // shadow depth in px
-        // Only the right + bottom bands stay visible once the box is filled on
-        // top, so shade just those (cheap): a darker inner band nearest the box
-        // fading to a fainter outer band — a soft web-style drop shadow.
-        // Right side.
-        self.shade_rect(x + w, y + s, s, h, 0.28); // inner (darkest)
-        self.shade_rect(x + w + s, y + s, s, h, 0.52); // outer (fainter)
-        // Bottom side.
-        self.shade_rect(x + s, y + h, w, s, 0.28);
-        self.shade_rect(x + s, y + h + s, w + s, s, 0.52);
-        // Bottom-right corner, so the two bands meet cleanly.
-        self.shade_rect(x + w, y + h, s, s, 0.28);
-        // Left side: visible in the gutter for a pane sitting right of another
-        // (the chat pane's is off-screen). Guarded so `x - 2s` cannot underflow.
-        if x >= 2 * s {
-            self.shade_rect(x - s, y + s, s, h, 0.28);
-            self.shade_rect(x - 2 * s, y + s, s, h, 0.52);
-            self.shade_rect(x - s, y + h, s, s, 0.28);
+        if w == 0 || h == 0 || !shadow_claim(x, y, w, h) {
+            return;
         }
-    }
-
-    /// Fill `(x,y,w,h)` with the pixels beneath it darkened toward black by
-    /// `factor` (0 = black, 1 = unchanged) — a cheap translucent-shadow effect
-    /// without an alpha channel. Reads + rewrites each pixel.
-    pub(super) fn shade_rect(&self, x: u64, y: u64, w: u64, h: u64, factor: f32) {        let x1 = (x + w).min(self.width);
-        let y1 = (y + h).min(self.height);
-        for py in y..y1 {
-            for px in x..x1 {
-                let (r, g, b) = self.get_pixel(px, py);
-                let d = |c: u8| (c as f32 * factor) as u8;
-                self.put_pixel(px, py, (d(r), d(g), d(b)));
+        use crate::panes_layout::{shadow_alpha, shadow_falloff, shadow_geom, span_dist};
+        let g = shadow_geom(self.scale);
+        // The shadow's own rectangle: the box, dropped by the offset.
+        let (sx0, sx1) = (x, x + w);
+        let (sy0, sy1) = (y + g.offset, y + g.offset + h);
+        let rx0 = x.saturating_sub(g.blur);
+        let rx1 = (sx1 + g.blur).min(self.width);
+        let ry1 = (sy1 + g.blur).min(self.height);
+        for py in y..ry1 {
+            let dy = span_dist(py, sy0, sy1);
+            if shadow_falloff(dy, g.blur) == 0 {
+                continue;
+            }
+            // The box is opaque and painted on top, so on the rows it covers
+            // only the two side strips are worth touching — walking its whole
+            // interior would be a pane's area in read-modify-write pixels.
+            let spans = if py < y + h {
+                [(rx0, x.min(rx1)), (sx1.min(rx1), rx1)]
+            } else {
+                [(rx0, rx1), (0, 0)]
+            };
+            for (px0, px1) in spans {
+                for px in px0..px1 {
+                    let dx = span_dist(px, sx0, sx1);
+                    self.blend_pixel(px, py, (0, 0, 0), shadow_alpha(dx, dy, g.blur, g.peak));
+                }
             }
         }
     }

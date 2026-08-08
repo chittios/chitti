@@ -328,8 +328,10 @@ pub(super) fn fs_cd(arg: &str) {
         // A typo and a file are different mistakes; name which one it is.
         if crate::synapse::fs::is_file(&target) || crate::fs::vfs::read_mount(&target).is_ok() {
             serial_println!("cd> {target}: not a directory");
+            crate::shell::status::fail1();
         } else {
             serial_println!("cd> {target}: no such file or directory");
+            crate::shell::status::fail1();
         }
         return;
     }
@@ -388,6 +390,7 @@ pub(super) fn fs_ls(arg: &str) {
                         serial_println!("ls> {}: is a file (use /cat)", path);
                     } else {
                         serial_println!("ls> {}: no such file or directory", path);
+                        crate::shell::status::fail1();
                     }
                 }
             }
@@ -429,10 +432,12 @@ pub(super) fn fs_cat(arg: &str) {
     let full = super::resolve_path(arg.trim());
     if full.is_empty() || arg.trim().is_empty() {
         serial_println!("cat> usage: /cat <path>");
+        crate::shell::status::fail1();
         return;
     }
     if crate::synapse::fs::is_dir(&full) {
         serial_println!("cat> {}: is a directory", full);
+        crate::shell::status::fail1();
         return;
     }
     // Store + mounts through the VFS facade.
@@ -453,7 +458,10 @@ pub(super) fn fs_cat(arg: &str) {
                 Err(_) => serial_println!("(binary; {} bytes)", bytes.len()),
             }
         }
-        Err(_) => serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full),
+        Err(_) => {
+            serial_println!("cat> {} not found (store or mounts; see /ls, /mounts)", full);
+            crate::shell::status::fail1();
+        }
     }
 }
 
@@ -467,20 +475,39 @@ fn fs_head_tail(arg: &str, from_end: bool) {
         Ok(v) => v,
         Err(e) => {
             serial_println!("{cmd}> {e}");
-            serial_println!("{cmd}> usage: /{cmd} [-n <lines>|-c <bytes>] <path>");
+            serial_println!("{cmd}> usage: /{cmd} [-n <lines>|-c <bytes>] [path]");
+            crate::shell::status::fail1();
             return;
         }
     };
-    let full = super::resolve_path(raw);
-    if crate::synapse::fs::is_dir(&full) {
-        serial_println!("{cmd}> {full}: is a directory");
-        return;
-    }
-    let bytes = match crate::fs::vfs::read(&full) {
-        Ok(b) => b,
-        Err(_) => {
-            serial_println!("{cmd}> {full} not found (store or mounts; see /ls, /mounts)");
+    // No path (or `-`) means piped input, exactly as `head` reads stdin. With
+    // no pipeline feeding this stage there is nothing to read, which is the
+    // "no path given" case and belongs here rather than in the pure parser —
+    // only the caller knows whether a pipeline is running.
+    let (full, bytes) = if crate::shell::headtail::is_stdin(raw) {
+        match crate::shell::pipeline::take_piped() {
+            Some(text) => (alloc::string::String::from("(piped)"), text.into_bytes()),
+            None => {
+                serial_println!("{cmd}> no path given");
+                serial_println!("{cmd}> usage: /{cmd} [-n <lines>|-c <bytes>] [path]");
+                crate::shell::status::fail1();
+                return;
+            }
+        }
+    } else {
+        let full = super::resolve_path(raw.unwrap_or(""));
+        if crate::synapse::fs::is_dir(&full) {
+            serial_println!("{cmd}> {full}: is a directory");
+            crate::shell::status::fail1();
             return;
+        }
+        match crate::fs::vfs::read(&full) {
+            Ok(b) => (full, b),
+            Err(_) => {
+                serial_println!("{cmd}> {full} not found (store or mounts; see /ls, /mounts)");
+                crate::shell::status::fail1();
+                return;
+            }
         }
     };
     let part = crate::shell::headtail::select(&bytes, &spec);
@@ -529,19 +556,31 @@ pub(super) fn fs_tail(arg: &str) {
 /// read from here. `/clip <text>` is the literal-text form.
 pub(super) fn fs_pbcopy(arg: &str) {
     let raw = arg.trim();
+    // Piped input, or `-` naming it explicitly.
+    if raw.is_empty() || raw == "-" {
+        if let Some(text) = crate::shell::pipeline::take_piped() {
+            let n = text.len();
+            crate::clipboard::set(text, false);
+            serial_println!("pbcopy> copied {n} byte(s) from the pipe");
+            return;
+        }
+    }
     if raw.is_empty() {
         serial_println!("pbcopy> usage: /pbcopy <path>   (for literal text, /clip <text>)");
+        crate::shell::status::fail1();
         return;
     }
     let full = super::resolve_path(raw);
     if crate::synapse::fs::is_dir(&full) {
         serial_println!("pbcopy> {full}: is a directory");
+        crate::shell::status::fail1();
         return;
     }
     let bytes = match crate::fs::vfs::read(&full) {
         Ok(b) => b,
         Err(_) => {
             serial_println!("pbcopy> {full} not found (store or mounts; see /ls, /mounts)");
+            crate::shell::status::fail1();
             return;
         }
     };
@@ -562,6 +601,7 @@ pub(super) fn fs_pbcopy(arg: &str) {
     // worse than a refusal that names the reason.
     let Ok(text) = core::str::from_utf8(&bytes) else {
         serial_println!("pbcopy> {full} is not UTF-8 text; the clipboard carries text only");
+        crate::shell::status::fail1();
         return;
     };
     let n = text.len();
@@ -581,9 +621,29 @@ pub(super) fn fs_grep(arg: &str) {
     let mut parts = arg.split_whitespace();
     let Some(query) = parts.next() else {
         serial_println!("grep> usage: /grep <query> [path_glob]");
+        crate::shell::status::fail1();
         return;
     };
     let path_glob = parts.next().unwrap_or("");
+    // No path and a pipeline feeding us: search what was piped, as `grep`
+    // searches stdin. With a path given, the pipe is not consumed and the
+    // runner reports that.
+    if path_glob.is_empty() {
+        if let Some(text) = crate::shell::pipeline::take_piped() {
+            let files = alloc::vec![(alloc::string::String::from("(piped)"), text)];
+            let hits = crate::tools::pathutil::grep_files(query, &files, 200);
+            if hits.is_empty() {
+                serial_println!("grep> no matches for {:?}", query);
+                crate::shell::status::fail1();
+                return;
+            }
+            serial_println!("grep> {} hit(s) for {:?}:", hits.len(), query);
+            for h in hits {
+                serial_println!("{}", h.text);
+            }
+            return;
+        }
+    }
     let mut paths = crate::synapse::fs::list();
     if !path_glob.is_empty() {
         let resolved = super::resolve_path(path_glob);
@@ -598,6 +658,9 @@ pub(super) fn fs_grep(arg: &str) {
     let hits = crate::tools::pathutil::grep_files(query, &files, 50);
     if hits.is_empty() {
         serial_println!("grep> no matches for {:?}", query);
+        // `grep` reports "no match" as a failure, which is what makes
+        // `/grep x f && /echo found` mean anything.
+        crate::shell::status::fail1();
         return;
     }
     serial_println!("grep> {} hit(s) for {:?}:", hits.len(), query);
@@ -611,6 +674,7 @@ pub(super) fn fs_glob(arg: &str) {
     let raw = arg.trim();
     if raw.is_empty() {
         serial_println!("glob> usage: /glob <pattern>   e.g. /glob **/*.md");
+        crate::shell::status::fail1();
         return;
     }
     let pattern = super::resolve_path(raw);
@@ -660,6 +724,7 @@ pub(super) fn fs_mkdir(arg: &str) {
     let parents = flags.contains(&'p');
     let Some(raw) = pos.first() else {
         serial_println!("mkdir> usage: /mkdir [-p] <path>");
+        crate::shell::status::fail1();
         return;
     };
     let path = super::resolve_path(raw);
@@ -711,6 +776,7 @@ pub(super) fn fs_cp(arg: &str) {
     let recursive = flags.contains(&'r') || flags.contains(&'R');
     if pos.len() < 2 {
         serial_println!("cp> usage: /cp [-r] <src> <dst>");
+        crate::shell::status::fail1();
         return;
     }
     let src = super::resolve_path(&pos[0]);
@@ -719,6 +785,7 @@ pub(super) fn fs_cp(arg: &str) {
     if path_on_mount(&src) || path_on_mount(&dst) {
         if recursive {
             serial_println!("cp> recursive copy across mounts is not supported yet");
+            crate::shell::status::fail1();
             return;
         }
         match crate::fs::vfs::read(&src) {
@@ -741,6 +808,7 @@ pub(super) fn fs_mv(arg: &str) {
     let (_flags, pos) = fs_split_flags(arg);
     if pos.len() < 2 {
         serial_println!("mv> usage: /mv <src> <dst>");
+        crate::shell::status::fail1();
         return;
     }
     let src = super::resolve_path(&pos[0]);
@@ -764,12 +832,14 @@ pub(super) fn fs_rm(arg: &str) {
     let recursive = flags.contains(&'r') || flags.contains(&'R');
     let Some(raw) = pos.first() else {
         serial_println!("rm> usage: /rm [-r] <path>");
+        crate::shell::status::fail1();
         return;
     };
     let path = super::resolve_path(raw);
     if path_on_mount(&path) {
         if recursive {
             serial_println!("rm> recursive remove on mounts is not supported yet");
+            crate::shell::status::fail1();
             return;
         }
         match crate::fs::vfs::unlink(&path) {
@@ -789,6 +859,7 @@ pub(super) fn fs_touch(arg: &str) {
     let path = super::resolve_path(arg.trim());
     if path.is_empty() || arg.trim().is_empty() {
         serial_println!("touch> usage: /touch <path>");
+        crate::shell::status::fail1();
         return;
     }
     if path_on_mount(&path) {

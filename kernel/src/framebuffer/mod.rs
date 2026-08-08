@@ -541,6 +541,20 @@ static POPUP_HOVER: Locked<Option<ModalHit>> = Locked::new(None);
 /// compute pumps `shell::upkeep`) must not blink the pane caret into the box.
 static MODAL_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The box [`Screen::drop_shadow`] last painted a shadow for.
+///
+/// A shadow *darkens the pixels it finds*, so painting the same one twice
+/// without the background having been repainted in between multiplies it toward
+/// black. Every modal and dropdown repaints its whole box on each keystroke —
+/// and the clock dropdown does it once a second, unprompted — so its elevation
+/// converged on a solid black slab within a few seconds of being open. (The
+/// list browsers already carried a comment warning not to shade the backdrop
+/// for exactly this reason; the shadow underneath them had the same bug.)
+///
+/// A full [`Screen::redraw`] repaints everything a shadow could be sitting on,
+/// so it clears this and the next paint lands on clean pixels.
+static LAST_SHADOW: Locked<Option<(u64, u64, u64, u64)>> = Locked::new(None);
+
 /// Clickable status-bar chips (macOS menu-bar style). Brand opens About; the
 /// rest open a dropdown popover with live details.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

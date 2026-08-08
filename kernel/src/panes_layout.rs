@@ -646,6 +646,61 @@ pub fn move_tab<T>(
     true
 }
 
+/// Drop-shadow geometry for an elevated box, in pixels: how far the blur
+/// reaches past the box, how far the shadow is pushed down (the light is above,
+/// so the bottom edge carries more of it than the sides), and the darkening at
+/// the shadow's own edge as a 0..=255 alpha.
+///
+/// Derived from the font scale so a shadow is the same *visual* weight on a
+/// 1024x768 panel and a 2560x1440 one.
+pub struct ShadowGeom {
+    pub blur: u64,
+    pub offset: u64,
+    pub peak: u32,
+}
+
+/// The house drop shadow at font scale `scale`.
+pub fn shadow_geom(scale: u64) -> ShadowGeom {
+    let s = scale.max(1);
+    ShadowGeom { blur: 6 * s, offset: 2 * s, peak: 104 }
+}
+
+/// Distance from `p` to the span `lo..hi` (0 when inside) — one axis of the
+/// distance from a point to a rectangle.
+pub fn span_dist(p: u64, lo: u64, hi: u64) -> u64 {
+    if p < lo {
+        lo - p
+    } else if p >= hi {
+        p - hi + 1
+    } else {
+        0
+    }
+}
+
+/// The 1-D shadow falloff: full weight (255) on the shadow rect, easing to 0
+/// `blur` px outside it.
+///
+/// Quadratic rather than linear because a linear ramp still reads as a *band*
+/// — the eye finds the constant-slope edge — which is exactly what the two
+/// hard-stepped rectangles this replaced looked like. Integer-only, like
+/// `aa_coverage`, so it is FPU-independent.
+pub fn shadow_falloff(d: u64, blur: u64) -> u32 {
+    if blur == 0 || d >= blur {
+        return 0;
+    }
+    let t = 255 - (d * 255 / blur) as u32; // 255 at the edge, 0 at `blur`
+    t * t / 255
+}
+
+/// Shadow alpha at a point `(dx, dy)` px from the shadow rect, 0..=255.
+///
+/// Separable — the product of the two axes' falloffs — which is how a gaussian
+/// box-shadow actually behaves, and it rounds the corners for free.
+pub fn shadow_alpha(dx: u64, dy: u64, blur: u64, peak: u32) -> u32 {
+    let (fx, fy) = (shadow_falloff(dx, blur), shadow_falloff(dy, blur));
+    peak * fx / 255 * fy / 255
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,5 +1355,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The falloff must actually *fall off*: full at the shadow's own edge,
+    /// nothing past the blur, and strictly decreasing in between. A shadow that
+    /// steps between two constants — which is what this replaced — reads as a
+    /// black border, not as elevation.
+    #[test_case]
+    fn shadow_falloff_is_monotone_and_bounded() {
+        for blur in [1u64, 6, 12, 24] {
+            assert_eq!(shadow_falloff(0, blur), 255, "blur={blur} edge is full");
+            assert_eq!(shadow_falloff(blur, blur), 0, "blur={blur} ends at the blur");
+            assert_eq!(shadow_falloff(blur + 99, blur), 0);
+            let mut prev = 256u32;
+            for d in 0..blur {
+                let a = shadow_falloff(d, blur);
+                assert!(a < prev, "blur={blur} d={d} did not decrease ({a} >= {prev})");
+                prev = a;
+            }
+        }
+        // A degenerate geometry casts no shadow rather than dividing by zero.
+        assert_eq!(shadow_falloff(0, 0), 0);
+    }
+
+    /// The corner is the product of both axes, so it is lighter than either
+    /// straight edge — that is what rounds it. And nothing anywhere exceeds the
+    /// peak, or the shadow would be darker than its own darkest point.
+    #[test_case]
+    fn shadow_alpha_rounds_the_corner_and_never_exceeds_peak() {
+        let g = shadow_geom(2);
+        let (blur, peak) = (g.blur, g.peak);
+        let edge = shadow_alpha(1, 0, blur, peak); // straight side
+        let corner = shadow_alpha(1, 1, blur, peak); // diagonally out
+        assert!(corner < edge, "corner {corner} should be lighter than edge {edge}");
+        assert_eq!(shadow_alpha(0, 0, blur, peak), peak);
+        for dx in 0..blur + 4 {
+            for dy in 0..blur + 4 {
+                assert!(shadow_alpha(dx, dy, blur, peak) <= peak);
+            }
+        }
+        // Outside the blur on either axis there is no shadow at all.
+        assert_eq!(shadow_alpha(blur, 0, blur, peak), 0);
+        assert_eq!(shadow_alpha(0, blur, blur, peak), 0);
+    }
+
+    /// One axis of the point-to-rectangle distance. `hi` is exclusive, so the
+    /// last pixel *inside* is at distance 0 and the first one outside is at 1 —
+    /// an off-by-one here puts the whole shadow one pixel under the box, where
+    /// the box paints over it and the shadow looks a pixel thin on two sides.
+    #[test_case]
+    fn span_dist_is_zero_inside_and_one_at_the_first_pixel_out() {
+        assert_eq!(span_dist(10, 10, 20), 0);
+        assert_eq!(span_dist(19, 10, 20), 0);
+        assert_eq!(span_dist(20, 10, 20), 1);
+        assert_eq!(span_dist(9, 10, 20), 1);
+        assert_eq!(span_dist(25, 10, 20), 6);
+        assert_eq!(span_dist(0, 10, 20), 10);
+    }
+
+    /// Shadow weight is a ratio of the font scale, so the same box looks the
+    /// same on a 768p panel and a 1440p one.
+    #[test_case]
+    fn shadow_geom_scales_with_the_font() {
+        let (a, b) = (shadow_geom(1), shadow_geom(2));
+        assert_eq!(b.blur, 2 * a.blur);
+        assert_eq!(b.offset, 2 * a.offset);
+        assert_eq!(a.peak, b.peak, "opacity is not a function of pixel density");
+        assert!(a.offset < a.blur, "the offset must stay inside the blur");
+        // A scale of 0 would be a shadowless (and division-prone) geometry.
+        assert_eq!(shadow_geom(0).blur, shadow_geom(1).blur);
     }
 }

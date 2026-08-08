@@ -276,6 +276,11 @@ impl Screen {
         // would land in the wrong place entirely. Forgotten here rather than at
         // the eight call sites, so a ninth cannot get it wrong.
         self.toast_forget();
+        // Same reason, for the same kind of state: the panes below are about to
+        // be repainted, so the shadows on them are gone and may be painted
+        // afresh. Without this every pane would keep the elevation it was drawn
+        // with and never get another.
+        super::paint::shadow_forget();
         crate::kms::damage(0, 0, self.fb_w as u32, self.fb_h as u32);
         // Dead space around a smaller-than-native desktop. A no-op at native, and
         // painted here (not per-frame) because the letterbox only changes when the

@@ -14,6 +14,7 @@ pub mod catalog;
 pub mod chrome;
 pub mod headtail;
 pub mod pipeline;
+pub mod status;
 pub mod remote;
 pub mod suggest;
 pub mod voice_remote;
@@ -375,6 +376,23 @@ pub fn run() -> ! {
             print_user_turn(msg);
         }
         if let Some(cmd) = msg.strip_prefix('/') {
+            // Composition (`|`, `|&`, `;`, `&&`, `||`, `>`, `>>`) is handled
+            // here, ABOVE `dispatch_system`, and only when an unquoted operator
+            // is actually present — so a line without one takes exactly the
+            // path it took before, byte for byte.
+            //
+            // Keeping the parser above `dispatch_system` is the security
+            // property, not a filing decision: scheduled fires, package-UI
+            // apps, sub-agents and the `ToolBinding::Shell` executor all call
+            // `dispatch_system` directly, and none of them gain pipe syntax by
+            // accident. `/passwd` and `/lock` stay unreachable by construction.
+            if pipeline::has_operator(cmd) {
+                match pipeline::parse(cmd) {
+                    Ok(script) => pipeline::run(&script),
+                    Err(e) => serial_println!("pipeline> {e}"),
+                }
+                continue;
+            }
             let (name, arg) = match cmd.split_once(' ') {
                 Some((n, a)) => (n, a.trim()),
                 None => (cmd, ""),

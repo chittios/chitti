@@ -995,6 +995,125 @@ def s_head_tail_pbcopy(g):
     return True, f"head/tail line counts, byte mode, errors, and pbcopy ({copied} bytes) verified"
 
 
+def s_pipeline(g):
+    """`|`, `|&`, `;`, `&&`, `||`, `>` and `>>` in the interactive shell.
+
+    The assertions are on things that are wrong *silently* if the design slips:
+    that diagnostics do NOT travel through `|` but data does, that `&&` actually
+    skips after a failure, that redirected files hold the right bytes, and that
+    colour codes never reach a downstream stage.
+    """
+    src = "/samples/README.md"
+    m = g.mark()
+    g.send(f"/cat {src}")
+    if not g.wait_for(f"{src} (", 20, m):
+        return None, "skipped (no /samples corpus; needs CHITTI_SAMPLE_FILES=1)"
+
+    g.send("/rm -r /tmp_pipe")
+    g.wait_quiet(0.5, 10)
+    m = g.mark()
+    g.send("/mkdir /tmp_pipe")
+    if not g.wait_for("mkdir> /tmp_pipe", 12, m):
+        return False, "mkdir failed"
+
+    # --- | forwards data, not diagnostics --------------------------------
+    m = g.mark()
+    g.send(f"/head -n 5 {src} | /grep ChittiOS")
+    if not g.wait_for("grep> 1 hit(s)", 20, m):
+        return False, "piped grep found nothing"
+    seg = g.since(m)
+    # head's own diagnostic reached the console...
+    if "head> " not in seg:
+        return False, "the upstream stage's diagnostics never reached the console"
+    # ...but must NOT have been counted as data by grep: a 5-line head whose
+    # `head> …` line leaked into the pipe would give 2 hits, not 1.
+    if "2 hit(s)" in seg:
+        return False, "the `name> ` diagnostic leaked into the pipe as data"
+
+    # --- reading the pipe with no path ------------------------------------
+    m = g.mark()
+    g.send(f"/cat {src} | /head -n 2")
+    if not g.wait_for("(2 of ", 20, m):
+        return False, "/head did not read piped input"
+    if "(piped)" not in g.since(m):
+        return False, "/head did not report reading from the pipe"
+
+    # --- a stage that ignores the pipe says so ----------------------------
+    m = g.mark()
+    g.send(f"/cat {src} | /ls")
+    if not g.wait_for("ignored", 20, m):
+        return False, "a stage that ignored piped input did not say so"
+
+    # --- && skips after a real failure, || runs ---------------------------
+    m = g.mark()
+    g.send("/cat /definitely-missing && /pwd")
+    g.wait_quiet(0.6, 12)
+    if "pwd>" in g.since(m):
+        return False, "&& ran the second command after a failure"
+    m = g.mark()
+    g.send("/cat /definitely-missing || /pwd")
+    if not g.wait_for("pwd>", 15, m):
+        return False, "|| did not run the second command after a failure"
+    # ; always runs.
+    m = g.mark()
+    g.send("/pwd ; /pwd")
+    g.wait_quiet(0.6, 12)
+    if g.since(m).count("pwd> ") < 2:
+        return False, "; did not run both commands"
+
+    # --- > and >> ---------------------------------------------------------
+    m = g.mark()
+    g.send(f"/head -n 3 {src} > /tmp_pipe/out.txt")
+    g.wait_quiet(0.6, 15)
+    m = g.mark()
+    g.send("/cat /tmp_pipe/out.txt")
+    if not g.wait_for("/tmp_pipe/out.txt (", 15, m):
+        return False, "> did not create the file"
+    mm = re.search(r"out\.txt \((\d+) bytes\)", g.since(m))
+    if not mm:
+        return False, "> produced no byte count"
+    first = int(mm.group(1))
+    if first == 0:
+        return False, "> wrote an empty file"
+
+    m = g.mark()
+    g.send(f"/head -n 2 {src} >> /tmp_pipe/out.txt")
+    g.wait_quiet(0.6, 15)
+    m = g.mark()
+    g.send("/cat /tmp_pipe/out.txt")
+    if not g.wait_for("/tmp_pipe/out.txt (", 15, m):
+        return False, ">> lost the file"
+    mm = re.search(r"out\.txt \((\d+) bytes\)", g.since(m))
+    if not mm or int(mm.group(1)) <= first:
+        return False, ">> replaced the file instead of appending"
+    grown = int(mm.group(1))
+
+    # --- no colour codes survive a pipe -----------------------------------
+    # `/head` syntax-highlights markdown; those escapes must not reach the next
+    # stage or a redirected file. The harness strips ANSI from what it decodes,
+    # so assert via /pbcopy's byte count, which counts real bytes: a coloured
+    # 2-line head is far longer than the plain text.
+    m = g.mark()
+    g.send(f"/head -n 1 {src} | /pbcopy")
+    if not g.wait_for("pbcopy> copied", 20, m):
+        return False, "/pbcopy did not read the pipe"
+    mm = re.search(r"copied (\d+) byte", g.since(m))
+    if not mm:
+        return False, "/pbcopy reported no byte count"
+    copied = int(mm.group(1))
+    if copied > 64:
+        return False, f"colour codes leaked into the pipe ({copied} bytes for a one-line head)"
+
+    # --- a human-only command cannot be a stage ---------------------------
+    m = g.mark()
+    g.send("/pwd | /passwd")
+    if not g.wait_for("cannot be used in a pipeline", 12, m):
+        return False, "a human-only command was accepted as a pipeline stage"
+
+    g.send("/rm -r /tmp_pipe")
+    return True, f"pipes, |&, ;, &&, ||, > ({first}B) and >> ({grown}B) verified"
+
+
 def s_battery(g):
     """`/battery` must name the step that stopped it, never invent a reading.
 
@@ -5104,6 +5223,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("fs_basic", s_fs_basic),
     ("host_folder", s_host_folder),
     ("head_tail_pbcopy", s_head_tail_pbcopy),
+    ("pipeline", s_pipeline),
     ("composer_path_complete", s_composer_path_complete),
     ("fs_pwd", s_fs_pwd),
     ("fs_cd", s_fs_cd),

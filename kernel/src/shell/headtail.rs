@@ -34,12 +34,17 @@ impl Spec {
     }
 }
 
-/// Parse `[-n N | -c N | -N] <path>` in any order.
+/// Parse `[-n N | -c N | -N] [path]` in any order.
 ///
-/// Returns `(spec, path)`. Flags may precede or follow the path because a user
-/// who types `/tail file.log -n 50` after seeing the output should not have to
-/// retype the line.
-pub fn parse(arg: &str, from_end: bool) -> Result<(Spec, &str), &'static str> {
+/// Returns `(spec, path)` where **`path` is optional**: with no path the input
+/// is whatever was piped in, exactly as `head` reads stdin. The caller decides
+/// whether an absent path is an error, because only it knows whether a pipeline
+/// is feeding this stage. `-` names piped input explicitly.
+///
+/// Flags may precede or follow the path because a user who types
+/// `/tail file.log -n 50` after seeing the output should not have to retype the
+/// line.
+pub fn parse(arg: &str, from_end: bool) -> Result<(Spec, Option<&str>), &'static str> {
     let mut spec = Spec::lines(DEFAULT_LINES, from_end);
     let mut path: Option<&str> = None;
     let mut want_count: Option<bool> = None; // Some(bytes?) — a flag awaiting its value
@@ -87,10 +92,12 @@ pub fn parse(arg: &str, from_end: bool) -> Result<(Spec, &str), &'static str> {
     if want_count.is_some() {
         return Err("-n / -c needs a count");
     }
-    match path {
-        Some(p) => Ok((spec, p)),
-        None => Err("no path given"),
-    }
+    Ok((spec, path))
+}
+
+/// Whether `path` names piped input rather than a file.
+pub fn is_stdin(path: Option<&str>) -> bool {
+    matches!(path, None | Some("-"))
 }
 
 fn parse_count(s: &str) -> Option<usize> {
@@ -241,27 +248,38 @@ mod tests {
 
     #[test_case]
     fn counts_are_accepted_in_every_form_people_type() {
-        assert_eq!(parse("f.txt", false), Ok((Spec::lines(DEFAULT_LINES, false), "f.txt")));
-        assert_eq!(parse("-n 5 f.txt", false), Ok((Spec::lines(5, false), "f.txt")));
-        assert_eq!(parse("-n5 f.txt", false), Ok((Spec::lines(5, false), "f.txt")));
-        assert_eq!(parse("-5 f.txt", false), Ok((Spec::lines(5, false), "f.txt")));
+        let p = |s| Some(s);
+        assert_eq!(parse("f.txt", false), Ok((Spec::lines(DEFAULT_LINES, false), p("f.txt"))));
+        assert_eq!(parse("-n 5 f.txt", false), Ok((Spec::lines(5, false), p("f.txt"))));
+        assert_eq!(parse("-n5 f.txt", false), Ok((Spec::lines(5, false), p("f.txt"))));
+        assert_eq!(parse("-5 f.txt", false), Ok((Spec::lines(5, false), p("f.txt"))));
         // Flags after the path, because a user re-running with a bigger count
         // appends it rather than retyping the line.
-        assert_eq!(parse("f.txt -n 5", false), Ok((Spec::lines(5, false), "f.txt")));
+        assert_eq!(parse("f.txt -n 5", false), Ok((Spec::lines(5, false), p("f.txt"))));
         assert_eq!(
             parse("-c 100 f.txt", true),
-            Ok((Spec { count: 100, bytes: true, from_end: true }, "f.txt"))
+            Ok((Spec { count: 100, bytes: true, from_end: true }, p("f.txt")))
         );
         // `from_end` comes from which command was typed, never from the args.
         assert_eq!(parse("f.txt", true).unwrap().0.from_end, true);
     }
 
     #[test_case]
+    fn an_absent_path_means_piped_input_not_an_error() {
+        // The parser cannot know whether a pipeline is feeding this stage, so
+        // it reports "no path" as a fact and the caller decides. `-` names
+        // piped input explicitly, as it does everywhere else.
+        assert_eq!(parse("", false), Ok((Spec::lines(DEFAULT_LINES, false), None)));
+        assert_eq!(parse("-n 5", false), Ok((Spec::lines(5, false), None)));
+        assert!(is_stdin(None));
+        assert!(is_stdin(Some("-")));
+        assert!(!is_stdin(Some("f.txt")));
+    }
+
+    #[test_case]
     fn a_malformed_invocation_says_what_is_wrong() {
         // Each of these used to be easy to write as "usage:" and leave the user
         // guessing which part was rejected.
-        assert_eq!(parse("", false), Err("no path given"));
-        assert_eq!(parse("-n 5", false), Err("no path given"));
         assert_eq!(parse("-n f.txt", false), Err("count must be a number"));
         assert_eq!(parse("f.txt -n", false), Err("-n / -c needs a count"));
         assert_eq!(parse("-z f.txt", false), Err("unknown option (try -n <lines> or -c <bytes>)"));
