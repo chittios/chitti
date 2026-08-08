@@ -3083,7 +3083,7 @@ fn agent_system_prompt_compact() -> String {
 }
 
 /// A delegated worker sub-agent's persona + its (attenuated) toolset.
-fn subagent_system_prompt(toolset: &[String]) -> String {
+pub(super) fn subagent_system_prompt(toolset: &[String]) -> String {
     tools_system_prompt(crate::agent::prompt::subagent_rules_block(), toolset)
 }
 
@@ -3600,6 +3600,19 @@ fn run_permissions(arg: &str) {
 /// flattened line (normalized for the Router). `session` is the live
 /// orchestrator session (taint provenance + memory agent id + todos).
 ///
+/// `spawn_subagent`'s arguments as `(role, task)`.
+///
+/// Shared by the local and hosted backends so the two cannot disagree about the
+/// shape a model is expected to emit — they did, and that is half of why the
+/// hosted path refused the tool instead of running it.
+pub(super) fn parse_subagent_args(args: &str) -> (alloc::string::String, alloc::string::String) {
+    let task = crate::session::todo::json_str(args, "task")
+        .or_else(|| crate::session::todo::json_str(args, "args"))
+        .unwrap_or_else(|| args.to_string());
+    let role = crate::session::todo::json_str(args, "role").unwrap_or_else(|| "worker".into());
+    (role, task)
+}
+
 /// `spawn_subagent` is handled by the caller before this.
 /// Run one chat tool call, returning only its text.
 ///
@@ -4642,11 +4655,7 @@ impl ChatSession {
                 // never declassifiable.
                 let mut origin: Option<alloc::string::String> = None;
                 let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
-                    let task = crate::session::todo::json_str(args, "task")
-                        .or_else(|| crate::session::todo::json_str(args, "args"))
-                        .unwrap_or_else(|| args.clone());
-                    let role =
-                        crate::session::todo::json_str(args, "role").unwrap_or_else(|| "worker".into());
+                    let (role, task) = parse_subagent_args(args);
                     let a = theme_sgr("accent", (204, 120, 92));
                     serial_println!("{a}*\x1b[0m \x1b[1mDelegate\x1b[0m  \x1b[2m[{}] {}\x1b[0m", role, task);
                     let summary = self.run_subagent_role(&role, &task);
@@ -5729,7 +5738,7 @@ impl crate::agent::agent_loop::StepSource for ModelSteps<'_> {
 /// [`ToolDispatch`] that runs the system `/command` toolset — the same
 /// `run_tool_command` surface the root shell agent (and a human) uses. Output is
 /// tool/world data, so it re-enters context tainted `UntrustedIngested`.
-struct CommandTools;
+pub(super) struct CommandTools;
 
 impl crate::agent::agent_loop::ToolDispatch for CommandTools {
     fn call(
@@ -10367,6 +10376,35 @@ mod pdf_preview_tests {
         assert!(out.starts_with("error"), "{out}");
         let ok = run_media_tool("pdf_preview", r#"{"path":"/downloads/x.pdf"}"#);
         assert!(ok.starts_with("ok:"), "{ok}");
+    }
+
+    /// `spawn_subagent`'s arguments parse the same for both backends.
+    ///
+    /// They are shared rather than written twice because the hosted path used to
+    /// refuse the tool outright, so nothing kept the two readings honest; the
+    /// moment the hosted path started running sub-agents, a second copy of this
+    /// would have been free to drift.
+    #[test_case]
+    fn subagent_args_parse_the_same_for_every_backend() {
+        // The documented shape.
+        let (role, task) = parse_subagent_args("{\"role\":\"explore\",\"task\":\"find the parser\"}");
+        assert_eq!(role, "explore");
+        assert_eq!(task, "find the parser");
+
+        // No role means the default worker.
+        let (role, task) = parse_subagent_args("{\"task\":\"read notes\"}");
+        assert_eq!(role, "worker");
+        assert_eq!(task, "read notes");
+
+        // `args` is accepted as an alias for `task` — small models emit it.
+        let (_, task) = parse_subagent_args("{\"args\":\"summarise\"}");
+        assert_eq!(task, "summarise");
+
+        // Anything unparseable becomes the task verbatim rather than an empty
+        // delegation: a sub-agent asked to do nothing burns a turn to say so.
+        let (role, task) = parse_subagent_args("just do the thing");
+        assert_eq!(role, "worker");
+        assert_eq!(task, "just do the thing");
     }
 }
 

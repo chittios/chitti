@@ -2362,6 +2362,38 @@ def s_git_clone_ssh(g):
             proc.kill()
 
 
+def s_remote_subagent(g):
+    """**`spawn_subagent` works on the hosted backend.**
+
+    It used to answer "unavailable on the remote backend" — not a policy, just a
+    missing `StepSource`: `subagent::dispatch` is written entirely against that
+    one-method trait and the hosted path had nothing to hand it. The harness's
+    scripted model asks for a delegation, the sub-agent answers on the same
+    hosted endpoint, and the orchestrator reports what came back.
+    """
+    m = g.mark()
+    g.send(f"/model remote http://{HOST}:{PLAIN_PORT} e2e-model")
+    if not g.wait_for("remote backend active", 30, m):
+        return False, "the hosted backend did not activate"
+    try:
+        m = g.mark()
+        g.send("delegate-please")
+        if not g.wait_for("Delegate", 60, m):
+            return False, "no delegation was attempted: " + g.text()[m:][-300:].replace("\n", " | ")
+        out = g.text()[m:]
+        if "unavailable on the remote backend" in out:
+            return False, "the hosted backend still refuses spawn_subagent"
+        if not g.wait_for("SUBAGENT_RAN", 60, m):
+            return False, "the sub-agent never ran: " + g.text()[m:][-400:].replace("\n", " | ")
+        return True, "spawn_subagent dispatches on the hosted backend"
+    finally:
+        # Hand the local model back, or every later scenario runs against the
+        # harness's scripted echo instead of the real one.
+        m = g.mark()
+        g.send("/model local")
+        g.wait_quiet(0.5, 15)
+
+
 def s_http_download(g):
     """`/http -O` downloads a real PNG from the harness server into the store,
     then `/open` decodes it back — network → store → image viewer roundtrip."""
@@ -5289,7 +5321,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("open_hls", s_open_hls), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("ssh_keygen", s_ssh_keygen), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("open_hls", s_open_hls), ("git_clone", s_git_clone), ("remote_subagent", s_remote_subagent), ("ssh_client", s_ssh_client), ("ssh_keygen", s_ssh_keygen), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

@@ -223,7 +223,30 @@ def _handle(conn):
                 last = json.loads(raw or b"{}").get("messages", [{}])[-1].get("content", "")
             except Exception:
                 last = ""
-            out = json.dumps({"choices": [{"message": {"role": "assistant", "content": f"remote reply to: {last[:40]}"}}]}).encode()
+            # A **scripted** hosted model, so the guest's agent loop can be
+            # driven down a specific path. The default is still the echo every
+            # other scenario expects; the branches below only fire for their own
+            # trigger words.
+            try:
+                msgs = json.loads(raw or b"{}").get("messages", [])
+            except Exception:
+                msgs = []
+            joined = " ".join(m.get("content", "") for m in msgs)
+            system = next((m.get("content", "") for m in msgs if m.get("role") == "system"), "")
+            if "isolated Chitti sub-agent" in system:
+                # This is the *sub-agent's* own conversation: answer at once.
+                content = "SUBAGENT_RAN and reported back"
+            elif "Subagent report" in joined:
+                # The orchestrator's turn after the delegation returned.
+                content = "the delegate said it ran"
+            elif "delegate-please" in last:
+                content = (
+                    '<tool_call>{"name":"spawn_subagent",'
+                    '"arguments":{"role":"worker","task":"say hello"}}</tool_call>'
+                )
+            else:
+                content = f"remote reply to: {last[:40]}"
+            out = json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]}).encode()
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(out), out))
         elif path == "/json":
             body = b'{"ok":true,"who":"e2e"}'

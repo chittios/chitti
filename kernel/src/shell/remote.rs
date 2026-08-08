@@ -197,6 +197,120 @@ pub fn chat_completion(cfg: &RemoteConfig, messages: &[(String, String)]) -> Res
 /// A remote chat session: the plain-text message history (system prompt
 /// first), re-sent whole each turn — the server holds no state, so
 /// save/clear/compact are all local list operations.
+
+// --- sub-agents on the hosted backend ---------------------------------------
+
+/// One sub-agent turn against the hosted model.
+///
+/// [`crate::agent::agent_loop::StepSource`] is a single method — "given the
+/// session so far, produce the next step" — and `subagent::dispatch` is written
+/// entirely against it. So delegation was never local-only in any structural
+/// sense: the trait just had one implementation, over `ChatSession`'s KV, and
+/// the hosted path had nothing to hand `dispatch`, so it refused the tool
+/// instead. This is that missing implementation, not a relaxed restriction —
+/// capability attenuation, depth limits and the tool gates are all inside
+/// `dispatch` and are unchanged.
+struct RemoteSteps {
+    cfg: RemoteConfig,
+    /// The sub-agent's **own** conversation. A fresh list is the hosted
+    /// equivalent of the local path swapping the KV out: the parent's context
+    /// must not leak in, and the sub-agent's must not leak back.
+    messages: Vec<(String, String)>,
+    seen: usize,
+    call_id: u64,
+    last_call: Option<(String, String)>,
+}
+
+impl crate::agent::agent_loop::StepSource for RemoteSteps {
+    fn next(&mut self, session: &crate::agent::types::Session) -> crate::agent::agent_loop::Step {
+        use crate::agent::agent_loop::Step;
+        use crate::agent::types::{Role, ToolCall};
+        for m in &session.messages[self.seen.min(session.messages.len())..] {
+            match m.role {
+                Role::User => self.messages.push(("user".to_string(), m.content.clone())),
+                // Tool results go back in the same `<tool_response>` wrapping the
+                // local path uses, so a role's SOUL reads the same either way.
+                Role::Tool => self.messages.push((
+                    "user".to_string(),
+                    alloc::format!("<tool_response>\n{}\n</tool_response>", m.content),
+                )),
+                _ => {}
+            }
+        }
+        self.seen = session.messages.len();
+
+        let text = match chat_completion(&self.cfg, &self.messages) {
+            Ok(t) => t,
+            // A transport failure ends the sub-agent's turn with the reason,
+            // rather than looping against a server that is not answering.
+            Err(e) => return Step::Final(alloc::format!("error: {e}")),
+        };
+        self.messages.push(("assistant".to_string(), text.clone()));
+
+        match super::parse_tool_call(&text) {
+            // A sub-agent cannot delegate further. `dispatch` enforces the depth
+            // limit too, but answering here keeps the refusal identical to the
+            // local path's rather than costing a turn to be told no.
+            Some((cmd, _)) if cmd == "subagent" || cmd == "spawn_subagent" => Step::Final(text),
+            Some((cmd, args)) => {
+                // The same repeat guard the local loop has: an identical call
+                // means the model is stuck, and it already has that output.
+                if self.last_call.as_ref() == Some(&(cmd.clone(), args.clone())) {
+                    return Step::Final(text);
+                }
+                self.last_call = Some((cmd.clone(), args.clone()));
+                self.call_id += 1;
+                Step::Tools(alloc::vec![ToolCall {
+                    call_id: self.call_id,
+                    tool: cmd,
+                    args,
+                }])
+            }
+            None => Step::Final(text),
+        }
+    }
+}
+
+/// Dispatch a sub-agent whose reasoning runs on the hosted model.
+fn run_remote_subagent(cfg: &RemoteConfig, role_name: &str, task: &str) -> Result<String, String> {
+    use crate::agent::{manifest, subagent};
+    let parent = manifest::orchestrator_manifest();
+    let Some(role) = manifest::subagent_role(role_name) else {
+        return Err(alloc::format!(
+            "unknown sub-agent role '{role_name}' (try: explore|plan|worker|reader)"
+        ));
+    };
+    crate::agent::home::ensure(role.id.0, &role.name);
+    let role_label = role.name.clone();
+    let mut steps = RemoteSteps {
+        cfg: cfg.clone(),
+        messages: alloc::vec![(
+            "system".to_string(),
+            super::subagent_system_prompt(&role.toolset),
+        )],
+        seen: 0,
+        call_id: 0,
+        last_call: None,
+    };
+    let mut tools = super::CommandTools;
+    match subagent::dispatch(
+        &parent.capabilities,
+        0,
+        parent.budgets.max_depth,
+        role,
+        task,
+        &mut steps,
+        &mut tools,
+        None,
+    ) {
+        Ok(outcome) => Ok(alloc::format!(
+            "[{role_label}] {}",
+            outcome.record.summary.unwrap_or_default()
+        )),
+        Err(e) => Err(alloc::format!("subagent dispatch refused: {e:?}")),
+    }
+}
+
 pub struct RemoteChat {
     cfg: RemoteConfig,
     messages: Vec<(String, String)>,
@@ -381,8 +495,23 @@ impl RemoteChat {
                 session.budget.tool_calls_used = session.budget.tool_calls_used.saturating_add(1);
                 let mut origin: Option<alloc::string::String> = None;
                 let obs = if cmd == "spawn_subagent" || cmd == "subagent" {
-                    "spawn_subagent is unavailable on the remote backend; do the task yourself with tools"
-                        .to_string()
+                    let (role, task) = super::parse_subagent_args(args);
+                    crate::serial_println!(
+                        "\x1b[38;2;204;120;92m*\x1b[0m \x1b[1mDelegate\x1b[0m \x1b[2m[{role}] {task}\x1b[0m"
+                    );
+                    match run_remote_subagent(&self.cfg, &role, &task) {
+                        Ok(summary) => {
+                            // **Print it.** Locally you watch a sub-agent think,
+                            // because generation streams; `chat_completion`
+                            // returns in one shot, so without this a hosted
+                            // delegation is completely silent — the user sees
+                            // "Delegate", then a pause, then an answer that came
+                            // from nowhere.
+                            super::print_tool_output(&summary);
+                            alloc::format!("Subagent report:\n{summary}")
+                        }
+                        Err(e) => alloc::format!("error: {e}"),
+                    }
                 } else {
                     super::print_tool_header(cmd, args);
                     let (o, org) = super::execute_chat_tool_full(cmd, args, session);
