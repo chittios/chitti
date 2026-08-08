@@ -457,6 +457,125 @@ pub(super) fn fs_cat(arg: &str) {
     }
 }
 
+
+/// `/head [-n N|-c N] <path>` and `/tail [-n N|-c N] <path>` — the first or
+/// last part of a file, over the same VFS facade `/cat` uses (store, mounted
+/// volumes, and a `/host` shared folder alike).
+fn fs_head_tail(arg: &str, from_end: bool) {
+    let cmd = if from_end { "tail" } else { "head" };
+    let (spec, raw) = match crate::shell::headtail::parse(arg, from_end) {
+        Ok(v) => v,
+        Err(e) => {
+            serial_println!("{cmd}> {e}");
+            serial_println!("{cmd}> usage: /{cmd} [-n <lines>|-c <bytes>] <path>");
+            return;
+        }
+    };
+    let full = super::resolve_path(raw);
+    if crate::synapse::fs::is_dir(&full) {
+        serial_println!("{cmd}> {full}: is a directory");
+        return;
+    }
+    let bytes = match crate::fs::vfs::read(&full) {
+        Ok(b) => b,
+        Err(_) => {
+            serial_println!("{cmd}> {full} not found (store or mounts; see /ls, /mounts)");
+            return;
+        }
+    };
+    let part = crate::shell::headtail::select(&bytes, &spec);
+    if spec.bytes {
+        serial_println!("{cmd}> {full} ({} of {} bytes):", part.len(), bytes.len());
+    } else {
+        let total = crate::shell::headtail::count_lines(&bytes);
+        let shown = crate::shell::headtail::count_lines(part);
+        serial_println!("{cmd}> {full} ({shown} of {total} line(s)):");
+    }
+    match core::str::from_utf8(part) {
+        Ok(s) => {
+            // `head` starts at byte 0, so a highlighter's fence/string state is
+            // correct. `tail` starts in the middle, where that state is unknown
+            // — a view beginning inside a code fence would be coloured as if it
+            // were not — so it prints plain rather than confidently wrong.
+            match crate::highlight::lang_for_path(&full).filter(|_| !from_end) {
+                Some(lang) => {
+                    let mut st = crate::highlight::State::default();
+                    for line in s.lines() {
+                        serial_println!("{}", crate::highlight::ansi_line(lang, line, &mut st));
+                    }
+                }
+                None => serial_println!("{}", s.trim_end_matches('\n')),
+            }
+        }
+        // Byte mode can legitimately cut a multi-byte character in half, so an
+        // invalid slice here is not evidence the file is binary.
+        Err(_) => serial_println!("({} bytes; not valid UTF-8 at this cut)", part.len()),
+    }
+}
+
+pub(super) fn fs_head(arg: &str) {
+    fs_head_tail(arg, false);
+}
+
+pub(super) fn fs_tail(arg: &str) {
+    fs_head_tail(arg, true);
+}
+
+/// `/pbcopy <path>` — put a file's contents on the clipboard, which syncs to
+/// the host (OSC-52 over the serial terminal, and the SPICE agent when a
+/// clipboard channel is attached — see `/clip` for which route is live).
+///
+/// Named after the macOS tool, but it takes a **path**: there is no stdin to
+/// read from here. `/clip <text>` is the literal-text form.
+pub(super) fn fs_pbcopy(arg: &str) {
+    let raw = arg.trim();
+    if raw.is_empty() {
+        serial_println!("pbcopy> usage: /pbcopy <path>   (for literal text, /clip <text>)");
+        return;
+    }
+    let full = super::resolve_path(raw);
+    if crate::synapse::fs::is_dir(&full) {
+        serial_println!("pbcopy> {full}: is a directory");
+        return;
+    }
+    let bytes = match crate::fs::vfs::read(&full) {
+        Ok(b) => b,
+        Err(_) => {
+            serial_println!("pbcopy> {full} not found (store or mounts; see /ls, /mounts)");
+            return;
+        }
+    };
+    // Bounded on purpose. The clipboard is held as one String, and the OSC-52
+    // route base64-expands it 4/3 and pushes the result down the serial line —
+    // a multi-megabyte file would take minutes and look like a hang.
+    const MAX: usize = crate::clipboard::vdagent::MAX_CLIPBOARD;
+    if bytes.len() > MAX {
+        serial_println!(
+            "pbcopy> {full} is {} bytes; the clipboard holds at most {MAX} \
+(use /head -c {MAX} {full} to see the start)",
+            bytes.len()
+        );
+        return;
+    }
+    // The clipboard is text on every route it feeds, so a binary file is
+    // refused rather than silently lossily converted — a mangled paste is
+    // worse than a refusal that names the reason.
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        serial_println!("pbcopy> {full} is not UTF-8 text; the clipboard carries text only");
+        return;
+    };
+    let n = text.len();
+    crate::clipboard::set(alloc::string::String::from(text), false);
+    serial_println!(
+        "pbcopy> copied {n} byte(s) from {full}; {}",
+        if crate::clipboard::agent_present() {
+            "announced to the host agent + OSC-52 to the serial terminal"
+        } else {
+            "OSC-52 to the serial terminal"
+        }
+    );
+}
+
 /// `/grep <query> [path_glob]` — content search over the store.
 pub(super) fn fs_grep(arg: &str) {
     let mut parts = arg.split_whitespace();

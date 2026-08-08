@@ -14,7 +14,15 @@ import subprocess
 import threading
 import time
 
-ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# CSI (`ESC [ … final`) **and** OSC (`ESC ] … BEL` or `ESC ] … ESC \`).
+#
+# OSC matters because the guest's clipboard pushes contents to the host
+# terminal as OSC 52 (`ESC ] 52 ; c ; <base64> BEL`), which `/clip` and
+# `/pbcopy` both emit. With only the CSI pattern, `text()` sees an escape it
+# cannot match, treats it as unterminated, and holds back everything after it —
+# so the command's own output never becomes visible and the scenario times out
+# on a line the guest definitely printed.
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 # Default forwarded port set (matches run.py's SVC_PORT/SVC_HTTP_PORT/SVC_SSH_PORT).
 # A parallel run overrides these per shard.

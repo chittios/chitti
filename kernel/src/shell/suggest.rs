@@ -49,7 +49,8 @@ pub enum Kind {
 /// small hand-list: every entry here must actually take a path (the catalogue
 /// is the source of truth for *names*, this is about *argument shape*).
 pub const PATH_COMMANDS: &[&str] = &[
-    "ls", "cd", "cat", "open", "edit", "browse", "mkdir", "rm", "cp", "mv", "touch", "glob", "grep",
+    "ls", "cd", "cat", "head", "tail", "pbcopy", "open", "edit", "browse", "mkdir", "rm", "cp",
+    "mv", "touch", "glob", "grep",
 ];
 
 /// Commands whose path argument can only ever be a **directory**, so the popup

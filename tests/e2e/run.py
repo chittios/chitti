@@ -906,6 +906,95 @@ def s_host_folder(g):
         shutil.rmtree(share, ignore_errors=True)
 
 
+def s_head_tail_pbcopy(g):
+    """`/head`, `/tail` and `/pbcopy` over the store.
+
+    The assertion that matters is the LINE COUNTS, not that output appeared:
+    `tail -n 1` returning an empty slice for a newline-terminated file is the
+    classic bug here and still prints a plausible-looking header.
+    """
+    # The shell has no `echo >`, so a known multi-line file from the seeded
+    # sample corpus is the subject; assertions are on counts the guest itself
+    # reports, so they hold whatever the sample happens to say.
+    src = "/samples/README.md"
+    m = g.mark()
+    g.send(f"/cat {src}")
+    # The success line is `cat> <path> (N bytes):` and the failure line is
+    # `cat> <path> not found` — both start with `cat>`, so waiting on the
+    # prefix alone would treat a missing corpus as a pass and then fail
+    # confusingly three commands later.
+    if not g.wait_for(f"{src} (", 20, m):
+        return None, "skipped (no /samples corpus; needs CHITTI_SAMPLE_FILES=1)"
+
+    # --- head -----------------------------------------------------------
+    # Wait on the distinctive substring rather than the prefix: `wait_for`
+    # returns the instant "head>" appears, and the rest of the line may not
+    # have arrived yet — a regex run right after it races the serial stream.
+    m = g.mark()
+    g.send(f"/head -n 3 {src}")
+    if not g.wait_for("(3 of ", 15, m):
+        return False, "/head -n 3 did not report showing 3 lines"
+
+    # --- tail: the trailing-newline case --------------------------------
+    m = g.mark()
+    g.send(f"/tail -n 1 {src}")
+    if not g.wait_for("(1 of ", 15, m):
+        return False, "/tail -n 1 did not report showing exactly 1 line"
+    # And that line must have actual content — the trailing-newline bug prints
+    # a perfectly plausible header and then nothing at all.
+    g.wait_quiet(0.5, 10)
+    after = g.since(m).split("line(s)):", 1)[-1].strip().splitlines()
+    if not after or not after[0].strip():
+        return False, "/tail -n 1 printed a header but no line (trailing-newline bug)"
+
+    # --- byte mode and flags after the path ------------------------------
+    m = g.mark()
+    g.send(f"/head -c 12 {src}")
+    if not g.wait_for("(12 of ", 15, m):
+        return False, "/head -c 12 did not report 12 bytes"
+    m = g.mark()
+    g.send(f"/tail {src} -n 2")
+    if not g.wait_for("(2 of ", 15, m):
+        return False, "flags after the path were not accepted"
+
+    # --- errors name what is wrong ---------------------------------------
+    m = g.mark()
+    g.send("/head -n 5")
+    if not g.wait_for("no path given", 12, m):
+        return False, "/head with no path did not say so"
+    m = g.mark()
+    g.send(f"/tail -z {src}")
+    if not g.wait_for("unknown option", 12, m):
+        return False, "/tail with a bad flag did not say so"
+
+    # --- pbcopy puts the file on the clipboard ---------------------------
+    m = g.mark()
+    g.send(f"/pbcopy {src}")
+    if not g.wait_for("pbcopy> copied", 20, m):
+        return False, "/pbcopy did not report copying"
+    g.wait_quiet(0.5, 10)
+    mm = re.search(r"pbcopy> copied (\d+) byte", g.since(m))
+    if not mm:
+        return False, "/pbcopy did not report a byte count"
+    copied = int(mm.group(1))
+    # The clipboard must now hold exactly that, and `/clip` must PREVIEW it
+    # rather than dumping the whole file back at the console.
+    m = g.mark()
+    g.send("/clip")
+    if not g.wait_for(f"clip> {copied} byte(s)", 15, m):
+        return False, f"the clipboard does not hold the {copied} bytes /pbcopy reported"
+    if not g.wait_for("more line(s)", 10, m):
+        return False, "/clip dumped the whole clipboard instead of previewing it"
+
+    # A directory is refused rather than read.
+    m = g.mark()
+    g.send("/pbcopy /samples")
+    if not g.wait_for("is a directory", 12, m):
+        return False, "/pbcopy of a directory was not refused"
+
+    return True, f"head/tail line counts, byte mode, errors, and pbcopy ({copied} bytes) verified"
+
+
 def s_battery(g):
     """`/battery` must name the step that stopped it, never invent a reading.
 
@@ -5014,6 +5103,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("memory_hierarchy", s_memory_hierarchy),
     ("fs_basic", s_fs_basic),
     ("host_folder", s_host_folder),
+    ("head_tail_pbcopy", s_head_tail_pbcopy),
     ("composer_path_complete", s_composer_path_complete),
     ("fs_pwd", s_fs_pwd),
     ("fs_cd", s_fs_cd),

@@ -12,6 +12,7 @@
 pub mod agents_catalog;
 pub mod catalog;
 pub mod chrome;
+pub mod headtail;
 pub mod remote;
 pub mod suggest;
 pub mod voice_remote;
@@ -748,6 +749,9 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "encrypt" => disk_encrypt(arg),
         "unlock" => disk_unlock(arg),
         "cat" => fs_cat(arg),
+        "head" => fs_head(arg),
+        "tail" => fs_tail(arg),
+        "pbcopy" => fs_pbcopy(arg),
         "grep" => fs_grep(arg),
         "glob" => fs_glob(arg),
         "mkdir" => fs_mkdir(arg),
@@ -10138,7 +10142,21 @@ fn run_clip(arg: &str) {
         match crate::clipboard::get() {
             Some((text, _)) => {
                 serial_println!("clip> {} byte(s):", text.len());
-                serial_println!("{}", text);
+                // Preview, not a dump. `/pbcopy <file>` makes a clipboard of
+                // hundreds of KB ordinary, and echoing all of it buries the
+                // command that produced it — `/cat` is there for the whole file.
+                const PREVIEW_LINES: usize = 20;
+                let spec = crate::shell::headtail::Spec::lines(PREVIEW_LINES, false);
+                let head = crate::shell::headtail::select(text.as_bytes(), &spec);
+                serial_println!("{}", core::str::from_utf8(head).unwrap_or("").trim_end_matches('\n'));
+                if head.len() < text.len() {
+                    let total = crate::shell::headtail::count_lines(text.as_bytes());
+                    serial_println!(
+                        "clip> … {} more line(s), {} more byte(s)",
+                        total.saturating_sub(PREVIEW_LINES),
+                        text.len() - head.len()
+                    );
+                }
                 serial_println!("clip> (copy in the editor/chat syncs to the host; host paste syncs here)");
             }
             None => serial_println!("clip> empty (copy something, or paste from the host)"),

@@ -133,6 +133,9 @@ pub const ENTRIES: &[Entry] = &[
     // Files
     Entry { category: "Files", title: "List Directory", name: "ls", shortcut: "" },
     Entry { category: "Files", title: "Print File", name: "cat", shortcut: "" },
+    Entry { category: "Files", title: "First Lines", name: "head", shortcut: "" },
+    Entry { category: "Files", title: "Last Lines", name: "tail", shortcut: "" },
+    Entry { category: "Files", title: "Copy File To Clipboard", name: "pbcopy", shortcut: "" },
     Entry { category: "Files", title: "Open / Edit / Play", name: "open", shortcut: "" },
     Entry { category: "Files", title: "Edit File", name: "edit", shortcut: "" },
     Entry { category: "Files", title: "Image Decoder (ring 3)", name: "decoder", shortcut: "" },
