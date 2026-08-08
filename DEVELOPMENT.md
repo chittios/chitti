@@ -60,7 +60,7 @@ A [`Makefile`](Makefile) wraps the common flows (`make help` lists them);
 | `make test` | `cargo xtask test` (in-kernel unit suite) |
 | `make e2e` / `make e2e-full` | boot the real kernel + drive the shell over serial (`--slow` adds model/voice) |
 | `make verify` | x86 build + `test` + aarch64 build (the standing-rule gate) |
-| `make vbox` | rebuild the aarch64 image and reload it into a VirtualBox VM |
+| `make vbox` / `make vbox-remote` | rebuild the aarch64 image and reload it into a VirtualBox VM (vbox boots the local GGUF; vbox-remote seeds `/model remote` from `REMOTE_RUN_URL`/`REMOTE_MODEL`/`REMOTE_KEY`) |
 | `make sample-files` | `cargo xtask sample-files` — fetch the `/samples/` corpus (see below) |
 | `make model` / `make fmt` / `make clean` | fetch the GGUF / format / clean |
 

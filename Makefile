@@ -13,9 +13,10 @@
 # BRIDGE:       host NIC to L2-bridge (empty = QEMU user-net / slirp). macOS
 #               vmnet-bridged needs sudo — leave empty for host services via 10.0.2.2
 # REMOTE_URL:   auto `/model remote` at boot (empty = no seed → local model).
-#               `make run` leaves this empty (boots the local GGUF); use
-#               `make run-remote` to seed a hosted backend. Under user-net the
-#               host is always 10.0.2.2 (not the Mac's LAN IP).
+#               `make run` / `make vbox` leave this empty (boot the local GGUF);
+#               use `make run-remote` / `make vbox-remote` to seed a hosted
+#               backend. Under user-net the host is always 10.0.2.2 (not the
+#               Mac's LAN IP).
 # REMOTE_MODEL: model name sent to the hosted server (LM Studio / Ollama / …)
 # REMOTE_KEY:   bearer token for the hosted server (`Authorization: Bearer …`).
 #               Empty = none (a LAN LM Studio / Ollama needs no key). Prefer
@@ -33,7 +34,7 @@ BRIDGE       ?=
 REMOTE_URL   ?=
 REMOTE_MODEL ?= ornith-1.0-9b
 REMOTE_KEY   ?= $(CHITTI_REMOTE_KEY)
-# Hosted backend seeded by `run-remote` (override on the command line).
+# Hosted backend seeded by `run-remote` / `vbox-remote` (override on the command line).
 REMOTE_RUN_URL ?= http://10.0.2.2:1234
 
 # Host USB passthrough into QEMU (Bluetooth / UVC camera). Empty = none.
@@ -124,7 +125,8 @@ help:
 	@echo "  make model MODEL=bonsai-27b-ternary && make run MODEL=bonsai-27b-ternary  # Q2_0 build"
 	@echo "  make run-remote REMOTE_RUN_URL=http://10.0.2.2:1234 REMOTE_MODEL=ornith-1.0-9b"
 	@echo "  make run-remote REMOTE_RUN_URL=https://opencode.ai/zen REMOTE_MODEL=deepseek-v4-flash REMOTE_KEY=sk-…"
-	@echo "  make vbox MODEL=0.8b REMOTE_RUN_URL=https://opencode.ai/zen REMOTE_MODEL=deepseek-v4-flash REMOTE_KEY=sk-…  # same seed, UEFI/VM image"
+	@echo "  make vbox MODEL=lfm2.5-2.6b   # VM image on the local GGUF (no remote seed)"
+	@echo "  make vbox-remote REMOTE_RUN_URL=https://opencode.ai/zen REMOTE_MODEL=deepseek-v4-flash REMOTE_KEY=sk-…  # same seed, UEFI/VM image"
 	@echo "  make run BRIDGE=en0           # L2 bridge (often needs sudo on macOS)"
 	@echo "  make usb-list                 # grep host USB for BT / camera candidates"
 	@echo "  make run USB_BT=1 USB_CAM=1   # passthrough grepped BT dongle + webcam"
@@ -268,16 +270,21 @@ m1n1:
 	$(XTASK) m1n1 $(REL)
 
 ## vbox: rebuild the aarch64 image and (re)load it into VirtualBox VM VBOX_VM
+##       uses the local bundled GGUF (MODEL); no remote seed (see vbox-remote)
 ##       forces USB keyboard + USB tablet + xHCI (aarch64 has no PS/2 input path)
-##       REMOTE_RUN_URL/REMOTE_MODEL/REMOTE_KEY seed `/model remote` at boot
-##       (embedded on the ESP as \chitti-model.json — the stub hands it to the
-##       kernel via the boot-info page, the UEFI-boot analogue of run-remote's
-##       fw_cfg seed). NB: do not put Make `#` comments inside the shell recipe —
-##       they break `\` line continuation and re-run later lines in a fresh shell
-##       with VM empty.
-.PHONY: vbox
-vbox:
-	CHITTI_REMOTE_URL='$(REMOTE_RUN_URL)' \
+##       NB: do not put Make `#` comments inside the shell recipe — they break
+##       `\` line continuation and re-run later lines in a fresh shell with VM
+##       empty.
+## vbox-remote: like `vbox`, but seed `/model remote` at boot from
+##       REMOTE_RUN_URL/REMOTE_MODEL/REMOTE_KEY (embedded on the ESP as
+##       \chitti-model.json — the stub hands it to the kernel via the boot-info
+##       page, the UEFI-boot analogue of run-remote's fw_cfg seed):
+##       `make vbox-remote REMOTE_RUN_URL=https://opencode.ai/zen REMOTE_MODEL=deepseek-v4-flash REMOTE_KEY=sk-…`
+.PHONY: vbox vbox-remote
+vbox:        VBOX_SEED_URL := $(REMOTE_URL)
+vbox-remote: VBOX_SEED_URL := $(REMOTE_RUN_URL)
+vbox vbox-remote:
+	CHITTI_REMOTE_URL='$(VBOX_SEED_URL)' \
 	CHITTI_REMOTE_MODEL='$(REMOTE_MODEL)' \
 	CHITTI_REMOTE_KEY='$(REMOTE_KEY)' \
 	CHITTI_RESOLUTION='$(VBOX_RES)' CHITTI_SAMPLE_FILES='$(SAMPLES)' $(XTASK) image -arch aarch64 -model $(MODEL)
