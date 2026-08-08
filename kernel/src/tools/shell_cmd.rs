@@ -22,6 +22,37 @@ pub fn is_destructive_cmd(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Every stage of a shell line as `(name, args)`.
+///
+/// **A pipeline is as effectful as its worst stage**, so callers that gate on
+/// effect must see all of them. `ls / | rm /x` reads as a harmless `ls` if only
+/// the first token is examined, which is exactly the smuggling shape the
+/// `channel send` and `schedule add` classifications already had to learn.
+///
+/// An empty result means the line could not be read at all — callers must treat
+/// that as effectful, not as inert.
+pub fn stages(command: &str) -> alloc::vec::Vec<(String, String)> {
+    let body = command.trim();
+    let body = body.strip_prefix('/').unwrap_or(body);
+    if crate::shell::pipeline::has_operator(body) {
+        return match crate::shell::pipeline::parse(body) {
+            Ok(script) => script.stages().map(|s| (s.name.clone(), s.arg.clone())).collect(),
+            Err(_) => alloc::vec::Vec::new(),
+        };
+    }
+    match parse_command_line(command) {
+        Ok(pair) => alloc::vec![pair],
+        Err(_) => alloc::vec::Vec::new(),
+    }
+}
+
+/// Whether **any** stage of a shell line is destructive.
+pub fn line_is_destructive(command: &str) -> bool {
+    let st = stages(command);
+    // Unreadable is not harmless.
+    st.is_empty() || st.iter().any(|(n, _)| is_destructive_cmd(n))
+}
+
 /// Split `command` into (name, args). Accepts optional leading `/`.
 pub fn parse_command_line(command: &str) -> Result<(String, String), &'static str> {
     let s = command.trim();
@@ -46,8 +77,34 @@ pub fn parse_command_line(command: &str) -> Result<(String, String), &'static st
     Ok((name.to_string(), rest.to_string()))
 }
 
+/// Run a composed line (`|`, `&&`, `>`, …) and return what it printed.
+///
+/// **`enter_tool_call` is set explicitly here, and that is load-bearing.** The
+/// pipeline runner calls `dispatch_system` directly rather than going through
+/// `run_tool_command`, so without this the stages would run with `in_tool_call`
+/// at zero — indistinguishable from a human typing at the console, which is the
+/// one signal the human-only refusals rely on. Getting this wrong would be a
+/// privilege escalation dressed as a refactor.
+fn run_pipeline_line(command: &str) -> String {
+    let body = command.trim();
+    let body = body.strip_prefix('/').unwrap_or(body);
+    let script = match crate::shell::pipeline::parse(body) {
+        Ok(s) => s,
+        Err(e) => return format!("error:{e}"),
+    };
+    crate::shell::enter_tool_call();
+    crate::serial::capture_begin();
+    crate::shell::pipeline::run(&script);
+    let out = crate::serial::capture_end();
+    crate::shell::leave_tool_call();
+    out
+}
+
 /// Run immediately (foreground). Returns tool result text.
 pub fn run_foreground(command: &str) -> String {
+    if crate::shell::pipeline::has_operator(command) {
+        return run_pipeline_line(command);
+    }
     let (name, args) = match parse_command_line(command) {
         Ok(x) => x,
         Err(e) => return format!("error:{e}"),
@@ -73,6 +130,15 @@ pub fn run_from_tool_args(args_json: &str) -> String {
         .unwrap_or_else(|| {
             args_json.contains("\"background\":true") || args_json.contains("\"background\": true")
         });
+    if crate::shell::pipeline::has_operator(&command) {
+        if background {
+            // A background job is stored as one (name, args) pair and replayed
+            // through `run_tool_command`; a pipeline does not fit that shape,
+            // and pretending it did would run only the first stage.
+            return String::from("error: background jobs cannot be pipelines — run it in the foreground, or background a single command");
+        }
+        return run_pipeline_line(&command);
+    }
     let (name, rest) = match parse_command_line(&command) {
         Ok(x) => x,
         Err(e) => return format!("error:{e}"),

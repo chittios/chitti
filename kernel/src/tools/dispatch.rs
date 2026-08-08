@@ -305,25 +305,32 @@ pub fn effect_of(def: &registry::ToolDef, call: &ToolCall) -> Effect {
             let cmdline = todo::json_str(&call.args, "command")
                 .or_else(|| todo::json_str(&call.args, "cmd"))
                 .unwrap_or_default();
-            match crate::tools::shell_cmd::parse_command_line(&cmdline) {
-                Ok((name, rest)) => {
-                    let extra = todo::json_str(&call.args, "args").unwrap_or_default();
-                    let full = if extra.is_empty() {
-                        rest
-                    } else if rest.is_empty() {
-                        extra
-                    } else {
-                        format!("{rest} {extra}")
-                    };
-                    Effect {
-                        irreversible: crate::tools::shell_cmd::is_destructive_cmd(&name),
-                        egress: name == "http" || shell_http_args_destructive(&full),
-                    }
-                }
-                // Unparseable: treat as effectful. A command we cannot read is
-                // not a command we may assume is harmless.
-                Err(_) => Effect::BOTH,
+            // **A pipeline is as effectful as its WORST stage.** Reading only
+            // the first token would classify `ls / | rm /x` by the `ls` — the
+            // same smuggling shape as `channel send` and `schedule add`, and
+            // the reason agent-side composition could not be enabled until this
+            // looked at every stage.
+            let stages = crate::tools::shell_cmd::stages(&cmdline);
+            // Unparseable, or a pipeline we could not read: treat as effectful.
+            // A command we cannot read is not a command we may assume is
+            // harmless.
+            if stages.is_empty() {
+                return Effect::BOTH;
             }
+            let extra = todo::json_str(&call.args, "args").unwrap_or_default();
+            let mut eff = Effect::INERT;
+            for (name, rest) in &stages {
+                let full = if extra.is_empty() {
+                    rest.clone()
+                } else if rest.is_empty() {
+                    extra.clone()
+                } else {
+                    format!("{rest} {extra}")
+                };
+                eff.irreversible |= crate::tools::shell_cmd::is_destructive_cmd(name);
+                eff.egress |= name == "http" || shell_http_args_destructive(&full);
+            }
+            eff
         }
 
         // Remote calls and network fetches: egress by construction.
@@ -1589,6 +1596,18 @@ mod tests {
             ("storage_get", r#"{"key":"k"}"#, false, false),
             ("run_shell_command", r#"{"command":"rm /tmp/x"}"#, true, false),
             ("run_shell_command", r#"{"command":"ls /"}"#, false, false),
+            // A pipeline is as effectful as its WORST stage. Reading only the
+            // first token classifies each of these as inert, and the dangerous
+            // stage runs behind a harmless-looking one.
+            ("run_shell_command", r#"{"command":"ls / | rm /tmp/x"}"#, true, false),
+            ("run_shell_command", r#"{"command":"ls / && rm /tmp/x"}"#, true, false),
+            ("run_shell_command", r#"{"command":"ls / ; rm /tmp/x"}"#, true, false),
+            ("run_shell_command", r#"{"command":"ls / | http http://127.0.0.1:9/"}"#, false, true),
+            // …and a pipeline of harmless stages stays inert, so this is not
+            // just "anything with a pipe is destructive".
+            ("run_shell_command", r#"{"command":"ls / | grep x"}"#, false, false),
+            // An unreadable line is effectful, never assumed harmless.
+            ("run_shell_command", r#"{"command":"ls / | "}"#, true, true),
             // Messaging: sending reaches a third party, listing does not.
             ("channel", r#"{"args":"send hello"}"#, false, true),
             ("channel", r#"{"args":"reply ok"}"#, false, true),

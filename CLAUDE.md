@@ -1595,9 +1595,24 @@ FDT claims a GICv3 but carries no readable `reg`.
   a GEMM microkernel into `cortex`.
 - **Commands compose** — `|`, `|&`, `;`, `&&`, `||`, `>`, `>>`
   (`shell/pipeline.rs` parser + runner, `shell/status.rs` exit status;
-  `/help pipeline`). **Interactive shell only**: `run_shell_command` still
-  rejects shell metacharacters, so the taint/effect surface and the
-  `security::redteam` census are untouched.
+  `/help pipeline`). Available **at the prompt and to agents** through
+  `run_shell_command`, which the system prompt advertises.
+
+  **An agent-reachable pipeline is only safe because `effect_of` reads every
+  stage.** `tools::shell_cmd::stages` enumerates them and the
+  `RunShellCommand` arm takes the **worst** — otherwise `ls / | rm /x`
+  classifies by the `ls` and the destructive stage runs behind a harmless first
+  token. Exactly the smuggling shape `channel send` and `schedule add` already
+  had to learn, and the reason this could not be turned on until the
+  classification looked past the first token. `security::redteam` carries
+  `pipeline-smuggled-rm` for it, and an unreadable line is `Effect::BOTH`, never
+  assumed harmless. The agent entry point also sets `enter_tool_call` itself,
+  because the runner calls `dispatch_system` directly rather than through
+  `run_tool_command` — without it the stages would run with `in_tool_call` at
+  zero, indistinguishable from a human at the console, which is a privilege
+  escalation dressed as a refactor. Background jobs refuse a pipeline outright:
+  `tools::bg` stores one `(name, args)` pair and would replay only the first
+  stage.
 
   **The parser lives ABOVE `dispatch_system`, and that is the security
   property, not a filing decision.** Scheduled fires, package-UI apps,

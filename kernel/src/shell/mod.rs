@@ -2049,7 +2049,7 @@ fn print_help(arg: &str) {
 /// `/help pipeline` — the composition operators and, more importantly, their
 /// two honest limits.
 fn print_help_pipeline() {
-    serial_println!("Combining commands (interactive shell only):");
+    serial_println!("Combining commands (at this prompt, and from an agent's run_shell_command):");
     serial_println!("  /a | /b          send a's output into b");
     serial_println!("  /a |& /b         send a's output AND its `a> ` diagnostics");
     serial_println!("  /a ; /b          run both");
@@ -2632,6 +2632,11 @@ fn tools_system_prompt(persona: &str, toolset: &[String]) -> String {
         s.push_str(short);
         s.push('\n');
     }
+    // Composition, in two lines. Worth the prefill: without it the model runs
+    // three round trips to filter a file it could have piped in one, and it
+    // cannot discover the syntax from a tool schema.
+    s.push_str("run_shell_command accepts one line with | (pipe stdout) |& (pipe stdout+errors) ; && || > >> \u{2014} e.g. \"ls / | grep agent\", \"cat a.txt > b.txt\".\n");
+    s.push_str("Piping feeds grep/head/tail/pbcopy when they are given no path; other commands take a path and ignore it.\n");
     s.push_str("- search_tools \u{2014} Find more tools by keyword (e.g. wifi, install, mcp); call this when no listed tool fits.\n");
     s.push_str("- use_tool \u{2014} Call a deferred/MCP tool: {\"tool_name\":\"mcp__srv__t\",\"tool_input\":{…}} after search_tools.\n");
     s.push_str("After tools run you get <tool_response>...; then answer, or call more tools.");
@@ -11115,6 +11120,34 @@ mod agent_flow_tests {
         // `help`/`wifi` are NOT core, so they stay out of the inline prompt.
         assert!(!p.contains("- help "), "non-core tools are found via search_tools, not listed");
         assert!(!p.contains("- wifi "));
+    }
+
+    /// The prompt tells the model composition exists, and the shell actually
+    /// accepts what it advertises.
+    ///
+    /// A prompt that promises syntax the tool rejects is worse than silence: the
+    /// model spends a turn on a call that comes back `error:` and has no way to
+    /// learn why. So this asserts both halves together.
+    #[test_case]
+    fn the_prompt_advertises_composition_and_the_shell_accepts_it() {
+        let toolset: alloc::vec::Vec<String> = alloc::vec!["read".into(), "run_shell_command".into()];
+        let p = tools_system_prompt("You are Chitti.", &toolset);
+        assert!(p.contains("run_shell_command accepts one line with |"), "composition is advertised");
+
+        // Every operator named in the prompt parses, and each yields the number
+        // of stages the model would expect.
+        for (line, stages) in [
+            ("ls / | grep agent", 2),
+            ("ls / |& grep agent", 2),
+            ("ls / ; pwd", 2),
+            ("ls / && pwd", 2),
+            ("ls / || pwd", 2),
+            ("cat a.txt > b.txt", 1),
+            ("cat a.txt >> b.txt", 1),
+        ] {
+            let got = crate::tools::shell_cmd::stages(line);
+            assert_eq!(got.len(), stages, "the prompt advertises `{line}` but it does not parse");
+        }
     }
 
     /// Memory tools are CORE (listed inline) when the agent toolset includes them.
