@@ -29,6 +29,7 @@ pub mod e1000;
 pub mod igb;
 pub mod nic_ids;
 pub mod r8169;
+pub mod rndis;
 pub mod usb_eth;
 pub mod pci;
 pub mod virtio_net_pci;

@@ -235,6 +235,53 @@ pub fn usb_msc_ready() -> bool {
     false
 }
 
+/// Whether the configured bulk Ethernet pair speaks **RNDIS** rather than
+/// CDC-ECM. The two are indistinguishable from the frames themselves — a
+/// 44-byte RNDIS header is perfectly valid Ethernet-looking bytes — so this is
+/// the only thing that decides how the data path reads a transfer.
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_is_rndis() -> bool {
+    x86_64::xhci::usb_bulk_is_rndis()
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_is_rndis() -> bool {
+    aarch64::xhci::usb_bulk_is_rndis()
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_is_rndis() -> bool {
+    false
+}
+
+/// Class request **out** on the bulk device's control pipe (RNDIS
+/// `SEND_ENCAPSULATED_COMMAND`).
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_class_out(request: u8, body: &[u8]) -> bool {
+    x86_64::xhci::usb_bulk_class_out(request, body)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_class_out(request: u8, body: &[u8]) -> bool {
+    aarch64::xhci::usb_bulk_class_out(request, body)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_class_out(_request: u8, _body: &[u8]) -> bool {
+    false
+}
+
+/// Class request **in** on the bulk device's control pipe (RNDIS
+/// `GET_ENCAPSULATED_RESPONSE`).
+#[cfg(target_arch = "x86_64")]
+pub fn usb_bulk_class_in(request: u8, out: &mut [u8]) -> Option<usize> {
+    x86_64::xhci::usb_bulk_class_in(request, out)
+}
+#[cfg(target_arch = "aarch64")]
+pub fn usb_bulk_class_in(request: u8, out: &mut [u8]) -> Option<usize> {
+    aarch64::xhci::usb_bulk_class_in(request, out)
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn usb_bulk_class_in(_request: u8, _out: &mut [u8]) -> Option<usize> {
+    None
+}
+
 /// USB Ethernet bulk transport, arch-neutral (the controller lives under the
 /// per-arch xHCI wrapper, exactly like `mouse_poll`). Used by `net::usb_eth`.
 #[cfg(target_arch = "x86_64")]

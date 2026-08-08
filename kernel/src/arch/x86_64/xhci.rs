@@ -64,9 +64,29 @@ fn maybe_prune_msc_mounts() {
 pub fn usb_bulk_ready() -> bool {
     XHCI.with(|s| {
         s.as_ref()
-            .map(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth))
+            .map(|x| x.bulk_role().is_some_and(|r| r.is_ethernet()))
             .unwrap_or(false)
     })
+}
+
+/// Whether the configured Ethernet bulk pair speaks RNDIS (framed) rather than
+/// CDC-ECM (raw). Nothing in the frames themselves distinguishes the two.
+pub fn usb_bulk_is_rndis() -> bool {
+    XHCI.with(|s| {
+        s.as_ref()
+            .map(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Rndis))
+            .unwrap_or(false)
+    })
+}
+
+/// Class request out on the bulk device's control pipe.
+pub fn usb_bulk_class_out(request: u8, body: &[u8]) -> bool {
+    XHCI.with(|s| s.as_mut().map(|x| x.bulk_class_out(request, body)).unwrap_or(false))
+}
+
+/// Class request in on the bulk device's control pipe.
+pub fn usb_bulk_class_in(request: u8, out: &mut [u8]) -> Option<usize> {
+    XHCI.with(|s| s.as_mut().and_then(|x| x.bulk_class_in(request, out)))
 }
 
 /// Whether a USB mass-storage bulk pair is configured.
@@ -82,7 +102,7 @@ pub fn usb_msc_ready() -> bool {
 pub fn usb_bulk_arm_in() {
     XHCI.with(|s| {
         if let Some(x) = s.as_mut() {
-            if x.bulk_role() == Some(crate::xhci::BulkRole::Eth) {
+            if x.bulk_role().is_some_and(|r| r.is_ethernet()) {
                 x.bulk_arm_in();
             }
         }
@@ -93,7 +113,7 @@ pub fn usb_bulk_arm_in() {
 pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
     XHCI.with(|s| {
         s.as_mut().and_then(|x| {
-            if x.bulk_role() == Some(crate::xhci::BulkRole::Eth) {
+            if x.bulk_role().is_some_and(|r| r.is_ethernet()) {
                 x.bulk_take_in(out)
             } else {
                 None
@@ -107,7 +127,7 @@ pub fn usb_bulk_send(data: &[u8]) -> bool {
     XHCI.with(|s| {
         s.as_mut()
             .map(|x| {
-                x.bulk_role() == Some(crate::xhci::BulkRole::Eth) && x.bulk_send(data)
+                x.bulk_role().is_some_and(|r| r.is_ethernet()) && x.bulk_send(data)
             })
             .unwrap_or(false)
     })

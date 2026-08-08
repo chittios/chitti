@@ -238,7 +238,31 @@ fn maybe_prune_msc_mounts() {
 /// uses whichever controller actually has the bulk endpoints — the adapter could be
 /// plugged into either port.
 pub fn usb_bulk_ready() -> bool {
-    XHCI.with(|s| s.iter().any(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)))
+    XHCI.with(|s| s.iter().any(|x| x.bulk_role().is_some_and(|r| r.is_ethernet())))
+}
+
+/// Whether the configured Ethernet bulk pair speaks RNDIS (framed) rather than
+/// CDC-ECM (raw). Nothing in the frames themselves distinguishes the two.
+pub fn usb_bulk_is_rndis() -> bool {
+    XHCI.with(|s| s.iter().any(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Rndis)))
+}
+
+/// Class request out on the bulk device's control pipe.
+pub fn usb_bulk_class_out(request: u8, body: &[u8]) -> bool {
+    XHCI.with(|s| {
+        s.iter_mut()
+            .filter(|x| x.bulk_role().is_some_and(|r| r.is_ethernet()))
+            .any(|x| x.bulk_class_out(request, body))
+    })
+}
+
+/// Class request in on the bulk device's control pipe.
+pub fn usb_bulk_class_in(request: u8, out: &mut [u8]) -> Option<usize> {
+    XHCI.with(|s| {
+        s.iter_mut()
+            .filter(|x| x.bulk_role().is_some_and(|r| r.is_ethernet()))
+            .find_map(|x| x.bulk_class_in(request, out))
+    })
 }
 
 /// Whether a USB mass-storage bulk pair is configured on any controller.
@@ -249,7 +273,7 @@ pub fn usb_msc_ready() -> bool {
 /// Queue a bulk IN transfer on the controller holding the Ethernet adapter.
 pub fn usb_bulk_arm_in() {
     XHCI.with(|s| {
-        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)) {
+        for x in s.iter_mut().filter(|x| x.bulk_role().is_some_and(|r| r.is_ethernet())) {
             x.bulk_arm_in();
         }
     });
@@ -258,7 +282,7 @@ pub fn usb_bulk_arm_in() {
 /// Collect a received frame from whichever Ethernet controller has one.
 pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
     XHCI.with(|s| {
-        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)) {
+        for x in s.iter_mut().filter(|x| x.bulk_role().is_some_and(|r| r.is_ethernet())) {
             if let Some(n) = x.bulk_take_in(out) {
                 return Some(n);
             }
@@ -270,7 +294,7 @@ pub fn usb_bulk_take_in(out: &mut [u8]) -> Option<usize> {
 /// Queue a frame on the controller holding the Ethernet adapter.
 pub fn usb_bulk_send(data: &[u8]) -> bool {
     XHCI.with(|s| {
-        for x in s.iter_mut().filter(|x| x.bulk_role() == Some(crate::xhci::BulkRole::Eth)) {
+        for x in s.iter_mut().filter(|x| x.bulk_role().is_some_and(|r| r.is_ethernet())) {
             if x.bulk_send(data) {
                 return true;
             }
