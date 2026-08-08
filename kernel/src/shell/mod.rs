@@ -719,6 +719,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "display" | "resolution" | "res" => run_display(arg),
         "shortcuts" | "keys" => run_shortcuts(),
         "clip" | "clipboard" => run_clip(arg),
+        "vbox" => run_vbox(arg),
         "ktrace" | "logs" => toggle_ktrace(),
         "close" => close_action(),
         "pdf" => run_pdf(arg),
@@ -10158,6 +10159,29 @@ fn run_clip(arg: &str) {
                 "OSC-52 to the serial terminal"
             }
         );
+    }
+}
+
+/// `/vbox [up]` — VirtualBox Guest Additions transport (VMMDev).
+///
+/// Bare `/vbox` only reports. `up` performs the first *writes* to the device
+/// and is command-gated for the reason `/wifi up` is: an untested driver
+/// should not touch a real hypervisor's hardware just because the machine
+/// started.
+fn run_vbox(arg: &str) {
+    match arg.trim() {
+        "" | "status" => {
+            crate::drivers::vbox::probe();
+            serial_println!("vbox> {}", crate::drivers::vbox::status());
+        }
+        "up" => match crate::drivers::vbox::bring_up() {
+            Ok(v) => serial_println!(
+                "vbox> transport up; host {v}.\n      HGCM is not implemented, so the shared \
+clipboard and shared folders are not available yet."
+            ),
+            Err(e) => serial_println!("vbox> {e}"),
+        },
+        other => serial_println!("vbox> unknown argument '{other}' (try /vbox or /vbox up)"),
     }
 }
 

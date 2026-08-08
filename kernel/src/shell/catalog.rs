@@ -215,6 +215,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Display / Resolution", name: "display", shortcut: "" },
     Entry { category: "System & UI", title: "Shortcuts", name: "shortcuts", shortcut: "" },
     Entry { category: "System & UI", title: "Clipboard", name: "clip", shortcut: "" },
+    Entry { category: "System & UI", title: "VirtualBox guest transport", name: "vbox", shortcut: "" },
     Entry { category: "System & UI", title: "Close Action Pane", name: "close", shortcut: "Ctrl+W" },
     Entry { category: "System & UI", title: "About ChittiOS", name: "about", shortcut: "" },
     Entry { category: "System & UI", title: "Commands Help", name: "help", shortcut: "Cmd+/ or F1" },
