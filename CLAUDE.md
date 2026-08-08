@@ -1593,6 +1593,102 @@ FDT claims a GICv3 but carries no readable `reg`.
   active in the firmware's boot context). **Next:** app endpoints 0x20/0x21,
   `initdata` (perf/power tables + channel rings), the firmware command ring, then
   a GEMM microkernel into `cortex`.
+- **Host integration — a shared folder and a shared clipboard.** Copying files
+  and text between the host and the guest, over three channels with genuinely
+  different reach. All new virtio devices go through **one** shared layer
+  (`drivers/virtio/`: `layout.rs` is the pure split-ring arithmetic, `queue.rs`
+  the DMA-backed queue, `transport.rs` one trait over virtio-mmio v1/v2 and
+  modern virtio-pci) — because the aarch64 `-kernel` dev loop has **only mmio**
+  (no ACPI, so no ECAM, so PCI discovery finds nothing) while x86 has **only
+  PCI**, and a device bound on one arch and not the other is exactly the
+  divergence the dual-arch rule forbids. The ring math lives outside
+  `arch/aarch64/` specifically so the test build compiles it. Nothing existing
+  was migrated onto it: rewriting seven working drivers would risk them all for
+  no functional gain.
+
+  - **`/host` is a real host folder** (`make run SHARE=<dir>`, `CHITTI_SHARE`)
+    over **virtio-9p** — `drivers/virtio_9p.rs` plus `fs/ninep/` (wire codec,
+    then a client tested against an **in-memory 9P server**, which is where the
+    fid leaks and chunking bugs actually surface). `/ls /cat /cp /mkdir /rm` all
+    work on it, both directions, verified byte-exact on a real boot and by the
+    `host_folder` e2e scenario, which asserts on the **host filesystem** after
+    the guest writes — an in-guest cache would satisfy anything weaker.
+
+    It is the first filesystem here with **no block device under it**. The mount
+    table is otherwise `disk` + `start_lba` + `sectors` and every VFS operation
+    resolves a mount then calls `probe_disk_nth`, so `FsType::Host` is
+    dispatched immediately before that in each of read/write/mkdir/unlink/stat/
+    readdir/exists; its `disk` is `usize::MAX` so a path that *did* reach the
+    block layer fails loudly instead of quietly working on the boot disk. The
+    session is **taken out of its lock** rather than held across I/O (a
+    whole-file read is many round trips and `Locked::with` runs with interrupts
+    disabled), and the device wait uses `poll_interrupt()` and never `upkeep()`
+    — the rule the block drivers document, since this runs from inside
+    filesystem calls reachable from the UI pump.
+
+    Traps the 9P tests pin, all silent when wrong: `size` counts itself; **a
+    short `Rwalk` is a success reply** (fewer qids than names means the last
+    component does not exist — check only the message type and you hold the
+    parent and report it as the child); readdir resumes from the last entry's
+    own opaque cookie, not a byte count; a name too long for the 16-bit length
+    is refused, never truncated, because a truncated name is a valid name for a
+    *different* file; and the server may only ever **lower** `msize`.
+
+  - **The clipboard has two routes, and which one reaches the host depends on
+    the host.** `clipboard/` keeps the existing **OSC-52 over serial** bridge
+    (needs the console attached to a terminal) and adds the graphical-window
+    one: `clipboard/vdagent.rs` (pure SPICE agent framing) over
+    `drivers/virtio_serial.rs`, i.e. what `-chardev qemu-vdagent,clipboard=on`
+    connects to. Confirmed by QEMU's *own* vdagent trace parsing our
+    announcement and our grab (`cap clipboard`, `cap clipboard-by-demand`,
+    `grab_selection selection clipboard`, `grab_type type text`).
+
+    **On a macOS host this does not reach the Mac pasteboard**, and `/clip`
+    says so rather than implying success. QEMU bridges its internal clipboard
+    to a real one only through a display backend that registers a clipboard
+    peer — `gtk` and `dbus` do, **`cocoa` does not** — so under the default
+    `-display cocoa` the link is live and ends inside QEMU. Use OSC-52 over
+    serial there, or VirtualBox.
+
+    Two protocol decisions carry the risk. **We announce no capability that
+    adds a conditional field**: four clipboard messages carry an optional
+    4-byte selection prefix and GRAB carries a second one for the grab serial,
+    and QEMU decides whether they are present from *our* announcement — claim
+    either without encoding it and every later field shifts by four bytes, so a
+    grab for UTF-8 text reads as a grab for nothing. `CLIPBOARD_BY_DEMAND` **is**
+    required (QEMU's `have_clipboard()` checks it; without it the clipboard is
+    silently inert while the link looks healthy). And **the two framings do not
+    nest one to one** — a chunk caps at 1024 bytes while a message may be
+    megabytes and the `VDAgentMessage` header is only in the first chunk, so
+    treating a chunk as a message works until the first paste over ~1 KB.
+
+    virtio-serial itself: queue numbering is **not** sequential per port (port 0
+    owns 0/1, the **control** pair is 2/3, port `i>=1` owns `2i+2`/`2i+3` — the
+    obvious "port 1 is 2/3" lands on the control channel), a port is unwritable
+    until a four-step control handshake completes (a write before it is dropped
+    in silence), and the port is found **by name** because QEMU picks the
+    number. Queues must be configured before `DRIVER_OK` but the port number is
+    only learned after, so several ports are prepared up front.
+
+  - **VirtualBox is staged, and only the transport exists** (`drivers/vbox.rs`,
+    `/vbox`). Its clipboard *and* its shared folders both ride HGCM, which rides
+    VMMDev (PCI `80ee:cafe`) — "write a request's physical address to one
+    register and the host fills it in". The device, the register and the request
+    framing are here with offsets pinned by tests; **HGCM and both services are
+    not**, the same staging `wifi/iwl` uses and for the same reason: nothing
+    here emulates the device, and code written from memory would look complete,
+    send well-formed garbage to a real hypervisor and report success. Three
+    things it does get right: **which window the register lives in is a property
+    of the VM, not the arch** (BAR0 is I/O space, BAR3 is MMIO with the *same*
+    offsets, and `VMMDev.cpp` creates BAR3 only under `if (pThis->fMmioReq)` —
+    so both are probed, and an ARM guest without it is reported *unreachable*,
+    a different fact from "no device"); the register takes a **32-bit** physical
+    address, so a buffer above 4 GiB is refused rather than truncated into a
+    request read from whatever lives at the low 32 bits; and `rc` is seeded to a
+    failure value so a request the host never touched cannot read as success.
+    Probing only ever **reads**; the first writes are behind `/vbox up`, gated
+    exactly as `/wifi up` is.
+
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
   ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
