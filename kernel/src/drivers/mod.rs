@@ -15,6 +15,11 @@
 //! - [`wifi`] — Broadcom FullMAC PCIe (brcmfmac-class) on Apple Silicon
 //! - [`bluetooth`] — USB Bluetooth identify + pure HCI codec (transport later)
 //! - [`uvc`] — USB Video Class descriptor parse + identify (isoc capture later)
+//! - [`virtio`] — one split-virtqueue + transport (mmio/PCI) shared by the
+//!   host-integration devices below, so each binds on both arches
+//! - [`virtio_9p`] — the 9P2000.L client behind a host shared folder
+//! - [`virtio_serial`] — the multiport serial transport the clipboard agent
+//!   rides on
 
 pub mod battery;
 pub mod bluetooth;
@@ -23,4 +28,5 @@ pub mod i2c;
 pub mod i2c_hid;
 pub mod pwrbtn;
 pub mod uvc;
+pub mod virtio;
 pub mod wifi;
