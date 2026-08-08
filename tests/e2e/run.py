@@ -1104,6 +1104,29 @@ def s_pipeline(g):
     if copied > 64:
         return False, f"colour codes leaked into the pipe ({copied} bytes for a one-line head)"
 
+    # --- completion after an operator -------------------------------------
+    # The reported bug: the popup kept offering the FIRST stage's folder
+    # completions after `|`, because the context took `split_whitespace().next()`
+    # of the whole line as "the" command. Tab is serial-visible (accepting
+    # re-echoes the rebuilt line), so this is assertable end to end.
+    g.send_raw(b"\x03")  # clear any half-typed line
+    g.wait_quiet(0.4, 8)
+    m = g.mark()
+    g.send_raw(b"/ls / | /he\t")
+    if not g.wait_for("/ls / | /head", 12, m):
+        return False, "Tab after `|` did not complete a COMMAND (offered paths instead?)"
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.4, 8)
+
+    # And once the second stage has its command, ITS argument shape applies:
+    # a path, at the right offset, leaving the first stage untouched.
+    m = g.mark()
+    g.send_raw(b"/pwd | /cat /tmp_pipe/ou\t")
+    if not g.wait_for("/pwd | /cat /tmp_pipe/out.txt", 12, m):
+        return False, "Tab did not complete the second stage's path argument"
+    g.send_raw(b"\x03")
+    g.wait_quiet(0.4, 8)
+
     # --- a human-only command cannot be a stage ---------------------------
     m = g.mark()
     g.send("/pwd | /passwd")

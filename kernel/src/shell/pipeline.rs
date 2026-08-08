@@ -147,6 +147,72 @@ pub fn has_operator(line: &str) -> bool {
     false
 }
 
+/// What the text after the last unquoted operator is completing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailKind {
+    /// A new command begins here — after `|`, `|&`, `||`, `&&` or `;`.
+    Command,
+    /// A redirection target, which is a **path whatever the command is** —
+    /// after `>` or `>>`.
+    RedirectPath,
+}
+
+/// Byte offset where the completable tail of `line` begins, and what it is.
+///
+/// This is what the composer's suggestion popup needs: after `|` a *new*
+/// command starts, so offering the first command's path arguments is wrong.
+/// Returns `(0, Command)` when there is no unquoted operator — the whole line —
+/// so a caller that always consults this behaves exactly as before on a plain
+/// command.
+///
+/// Scans bytes, which is safe because every operator and quote is ASCII and no
+/// UTF-8 continuation byte can collide with one; the offsets are therefore
+/// already byte offsets into `line`.
+pub fn completion_tail(line: &str) -> (usize, TailKind) {
+    let b = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut out = (0usize, TailKind::Command);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => {
+                quote = Some(c);
+                i += 1;
+            }
+            b'|' => {
+                // `|`, `|&` and `||` all start a new command; only the width
+                // differs.
+                let w = if matches!(b.get(i + 1), Some(b'|') | Some(b'&')) { 2 } else { 1 };
+                out = (i + w, TailKind::Command);
+                i += w;
+            }
+            b'&' if b.get(i + 1) == Some(&b'&') => {
+                out = (i + 2, TailKind::Command);
+                i += 2;
+            }
+            b';' => {
+                out = (i + 1, TailKind::Command);
+                i += 1;
+            }
+            b'>' => {
+                let w = if b.get(i + 1) == Some(&b'>') { 2 } else { 1 };
+                out = (i + w, TailKind::RedirectPath);
+                i += w;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 /// Remove ANSI escape sequences.
 ///
 /// Commands colourise for the console — `/cat` and `/head` syntax-highlight —

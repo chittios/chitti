@@ -69,9 +69,36 @@ pub fn leading_command(buf: &str) -> Option<&str> {
     (!cmd.is_empty()).then_some(cmd)
 }
 
-/// Whether `buf`'s command completes directories only (see [`DIR_ONLY_COMMANDS`]).
+/// The command of the stage the caret is in — the last one on the line, not
+/// the first. `"/ls / | /cd su"` -> `Some("cd")`.
+pub fn active_command(buf: &str) -> Option<&str> {
+    let (off, tail) = crate::shell::pipeline::completion_tail(buf);
+    if tail == crate::shell::pipeline::TailKind::RedirectPath {
+        // A redirect target belongs to no command's argument shape.
+        return None;
+    }
+    let seg = buf[off..].trim_start();
+    // `match`, not `unwrap_or`: its argument is evaluated eagerly, so the
+    // `return None` in the else branch fired even when the `/` stripped fine —
+    // which made every dirs-only completion stop working. Caught by
+    // `cd_completes_directories_only`, which is why that test exists.
+    let seg = match seg.strip_prefix('/') {
+        Some(r) => r,
+        None if off > 0 => seg,
+        None => return None,
+    };
+    let cmd = seg.split_whitespace().next()?;
+    (!cmd.is_empty()).then_some(cmd)
+}
+
+/// Whether the caret's command completes directories only (see
+/// [`DIR_ONLY_COMMANDS`]).
+///
+/// Keyed on [`active_command`], not the first command on the line: after
+/// `/ls / | /cd ` the popup must offer directories for `cd`, not files for
+/// `ls`.
 pub fn wants_dirs_only(buf: &str) -> bool {
-    leading_command(buf).is_some_and(|c| DIR_ONLY_COMMANDS.contains(&c))
+    active_command(buf).is_some_and(|c| DIR_ONLY_COMMANDS.contains(&c))
 }
 
 /// Active completion context: kind, the typed prefix (without `/` or `@`),
@@ -101,38 +128,61 @@ pub fn context(buf: &str, cur: usize) -> Option<Context> {
             }
         }
     }
-    // /command only when the line (before caret) is a single leading command.
-    let trimmed_start = before.trim_start();
-    let lead = before.len() - trimmed_start.len();
-    if let Some(rest) = trimmed_start.strip_prefix('/') {
-        if !rest.contains(' ') && !rest.contains('\t') {
-            return Some(Context {
-                kind: Kind::Command,
-                prefix: rest.to_string(),
-                token_start: lead,
-            });
-        }
-        // Path argument after a path-taking command: `/ls /co`, `/ls /configs/`,
-        // `/cp /a /b`. The token is whatever follows the last whitespace.
-        if let Some(cmd) = rest.split_whitespace().next() {
-            let after_cmd = rest.as_bytes().get(cmd.len()).map(|&b| b == b' ' || b == b'\t');
-            if PATH_COMMANDS.contains(&cmd) && after_cmd == Some(true) {
-                let start = before
-                    .rfind(|c: char| c == ' ' || c == '\t')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                let token = &before[start..];
-                if !token.contains(' ') && !token.contains('\t') {
-                    return Some(Context {
-                        kind: Kind::Path,
-                        prefix: token.to_string(),
-                        token_start: start,
-                    });
-                }
-            }
+    // Completion applies to the LAST stage of the line, not the first command
+    // on it. Without this, `/head -n 3 /x | /gr` took `head` as the command,
+    // found it in PATH_COMMANDS, and offered *folders* for `/gr` — the first
+    // stage's argument shape applied to a completely different command.
+    let (seg_off, tail) = crate::shell::pipeline::completion_tail(before);
+    let seg = &before[seg_off..];
+
+    // A redirection target is a path whatever the command was: `/ls / > /tm`
+    // completes a file, not a directory listing of `/ls`'s argument.
+    if tail == crate::shell::pipeline::TailKind::RedirectPath {
+        return path_context(seg, seg_off);
+    }
+
+    let trimmed_start = seg.trim_start();
+    let lead = seg.len() - trimmed_start.len();
+    // A later stage may be typed with or without its own `/` — the parser
+    // accepts both, so the popup must too. Accepting a bare word at the start
+    // of the *whole* line would turn ordinary chat into a command popup, which
+    // is why the no-slash form is allowed only after an operator.
+    let rest = match trimmed_start.strip_prefix('/') {
+        Some(r) => r,
+        None if seg_off > 0 => trimmed_start,
+        None => return None,
+    };
+    if !rest.contains(' ') && !rest.contains('\t') {
+        return Some(Context {
+            kind: Kind::Command,
+            prefix: rest.to_string(),
+            token_start: seg_off + lead,
+        });
+    }
+    // Path argument after a path-taking command: `/ls /co`, `/ls /configs/`,
+    // `/cp /a /b`. The token is whatever follows the last whitespace.
+    if let Some(cmd) = rest.split_whitespace().next() {
+        let after_cmd = rest.as_bytes().get(cmd.len()).map(|&b| b == b' ' || b == b'\t');
+        if PATH_COMMANDS.contains(&cmd) && after_cmd == Some(true) {
+            return path_context(seg, seg_off);
         }
     }
     None
+}
+
+/// Path completion for the token at the end of `seg`, reported at its absolute
+/// offset in the line.
+fn path_context(seg: &str, seg_off: usize) -> Option<Context> {
+    let start = seg.rfind(|c: char| c == ' ' || c == '\t').map(|i| i + 1).unwrap_or(0);
+    let token = &seg[start..];
+    if token.contains(' ') || token.contains('\t') {
+        return None;
+    }
+    Some(Context {
+        kind: Kind::Path,
+        prefix: token.to_string(),
+        token_start: seg_off + start,
+    })
 }
 
 /// Ranked command suggestions for `prefix` (without the leading `/`).
@@ -342,6 +392,94 @@ mod tests {
         let c = context("  /ls", 5).unwrap();
         assert_eq!(c.prefix, "ls");
         assert_eq!(c.token_start, 2);
+    }
+
+    #[test_case]
+    fn after_a_pipe_the_popup_completes_a_command_not_the_first_stage_s_paths() {
+        // The reported bug: `context` took `rest.split_whitespace().next()` as
+        // THE command for the whole line, so `/head … /x | /gr` matched `head`
+        // in PATH_COMMANDS and offered *folders* for `/gr` — the first stage's
+        // argument shape applied to a different command entirely.
+        let line = "/head -n 3 /samples/README.md | /gr";
+        let c = context(line, line.len()).unwrap();
+        assert_eq!(c.kind, Kind::Command, "after `|` a new command begins");
+        assert_eq!(c.prefix, "gr");
+        // The token starts at the `/`, so accepting replaces `/gr` and leaves
+        // the rest of the line alone.
+        assert_eq!(&line[c.token_start..], "/gr");
+
+        // Every stage separator behaves the same way.
+        for sep in ["|", "|&", "||", "&&", ";"] {
+            let line = alloc::format!("/ls / {sep} /he");
+            let c = context(&line, line.len()).unwrap();
+            assert_eq!(c.kind, Kind::Command, "after `{sep}`");
+            assert_eq!(c.prefix, "he");
+        }
+    }
+
+    #[test_case]
+    fn a_later_stage_completes_its_own_path_arguments() {
+        // Once the second stage HAS a command, its own argument shape applies —
+        // grep takes a path, so a path is offered, at the right offset.
+        let line = "/cat /x | /grep foo /sam";
+        let c = context(line, line.len()).unwrap();
+        assert_eq!(c.kind, Kind::Path);
+        assert_eq!(c.prefix, "/sam");
+        assert_eq!(&line[c.token_start..], "/sam");
+
+        // And a stage whose command takes no path offers nothing, rather than
+        // inheriting the first stage's path-ness.
+        let line = "/cat /x | /mounts ";
+        assert!(context(line, line.len()).is_none());
+    }
+
+    #[test_case]
+    fn a_stage_typed_without_its_slash_still_completes() {
+        // The parser accepts `| grep y`, so the popup must too. But a bare word
+        // at the start of the whole line is ordinary chat and must NOT open a
+        // command popup.
+        let line = "/ls / | gr";
+        let c = context(line, line.len()).unwrap();
+        assert_eq!((c.kind, c.prefix.as_str()), (Kind::Command, "gr"));
+        assert_eq!(&line[c.token_start..], "gr");
+        assert!(context("hello wor", 9).is_none(), "plain chat must not complete");
+    }
+
+    #[test_case]
+    fn a_redirect_target_completes_a_path_whatever_the_command_is() {
+        // `>` is a path position even after a command that takes none, and even
+        // after a dirs-only one.
+        let line = "/mounts > /tm";
+        let c = context(line, line.len()).unwrap();
+        assert_eq!((c.kind, c.prefix.as_str()), (Kind::Path, "/tm"));
+        let line = "/ls / >> /var/lo";
+        let c = context(line, line.len()).unwrap();
+        assert_eq!((c.kind, c.prefix.as_str()), (Kind::Path, "/var/lo"));
+        // A redirect target is a file, so it is never dirs-only even when the
+        // stage's command is `/mkdir`.
+        assert!(!wants_dirs_only("/mkdir /a > /b"));
+    }
+
+    #[test_case]
+    fn dirs_only_follows_the_active_stage() {
+        // `/cd` completes directories; `/ls` does not. After a pipe it must be
+        // the *last* stage that decides.
+        assert!(wants_dirs_only("/cd /con"));
+        assert!(!wants_dirs_only("/ls /con"));
+        assert!(wants_dirs_only("/ls / | /cd /con"));
+        assert!(!wants_dirs_only("/cd /a | /ls /con"));
+        assert_eq!(active_command("/ls / | /cd su"), Some("cd"));
+        assert_eq!(active_command("/ls /x"), Some("ls"));
+    }
+
+    #[test_case]
+    fn a_quoted_operator_does_not_start_a_new_completion_stage() {
+        // The quote rules must match the parser's, or the popup and the runner
+        // disagree about where a stage begins.
+        let line = r#"/grep "a | b" /sam"#;
+        let c = context(line, line.len()).unwrap();
+        assert_eq!(c.kind, Kind::Path, "the `|` is inside quotes");
+        assert_eq!(c.prefix, "/sam");
     }
 
     #[test_case]
