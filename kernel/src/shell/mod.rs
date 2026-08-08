@@ -8588,6 +8588,9 @@ pub fn upkeep() {
     // Package-UI apps (chess, games…): surface events + guest tick.
     crate::service::package_ui::tick();
     crate::net::poll();
+    // Host clipboard channel (SPICE agent over virtio-serial). Non-blocking;
+    // a no-op when no such device is attached.
+    crate::clipboard::tick();
     crate::service::supervise_tick();
     // External messaging channels (Telegram, …) — short non-blocking poll.
     crate::msgchan::tick();
@@ -10139,9 +10142,22 @@ fn run_clip(arg: &str) {
             }
             None => serial_println!("clip> empty (copy something, or paste from the host)"),
         }
+        // Which host route is actually live. "The clipboard did not sync" has
+        // several causes — no agent channel, an unanswered one, or a host UI
+        // that has nowhere to put it — and they are indistinguishable without
+        // this line.
+        serial_println!("clip> {}", crate::clipboard::agent_status());
     } else {
         crate::clipboard::set(String::from(arg), false);
-        serial_println!("clip> set {} byte(s) + pushed to the host clipboard", arg.len());
+        serial_println!(
+            "clip> set {} byte(s); {}",
+            arg.len(),
+            if crate::clipboard::agent_present() {
+                "announced to the host agent + OSC-52 to the serial terminal"
+            } else {
+                "OSC-52 to the serial terminal"
+            }
+        );
     }
 }
 

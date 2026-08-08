@@ -93,6 +93,15 @@ SAMPLES   ?= 1
 # Works on QEMU; VirtualBox uses its own shared folders (`/share` in the guest).
 SHARE     ?=
 
+# CLIPBOARD: attach the SPICE clipboard agent channel (virtio-serial +
+# `qemu-vdagent`), so a copy in the guest and a copy on the host share one
+# clipboard. On by default for `make run`. NB QEMU bridges its internal
+# clipboard to a real one only through a display backend that registers a
+# clipboard peer — gtk and dbus do, **cocoa does not** — so on macOS the link
+# is live but ends inside QEMU; `/clip` in the guest says which route is
+# actually working. Set `CLIPBOARD=` (or 0/off) to omit the device.
+CLIPBOARD ?= 1
+
 XTASK   := cargo xtask
 REL     := $(if $(filter 1 true yes,$(RELEASE)),--release,)
 FLAGS   := -arch $(ARCH) -model $(MODEL) $(REL)
@@ -183,6 +192,7 @@ run:
 	CHITTI_USB_HOST='$(USB_HOST)' \
 	CHITTI_SAMPLE_FILES='$(SAMPLES)' \
 	CHITTI_SHARE='$(SHARE)' \
+	CHITTI_CLIPBOARD='$(CLIPBOARD)' \
 	$(XTASK) run $(FLAGS)
 
 ## run-remote: like `run`, but seed `/model remote` at boot from REMOTE_RUN_URL
@@ -204,6 +214,7 @@ run-remote:
 	CHITTI_USB_HOST='$(USB_HOST)' \
 	CHITTI_SAMPLE_FILES='$(SAMPLES)' \
 	CHITTI_SHARE='$(SHARE)' \
+	CHITTI_CLIPBOARD='$(CLIPBOARD)' \
 	$(XTASK) run $(FLAGS)
 
 ## model: fetch the GGUF for MODEL into assets/ (required before run / run-uefi)

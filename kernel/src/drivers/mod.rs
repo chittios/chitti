@@ -30,4 +30,5 @@ pub mod pwrbtn;
 pub mod uvc;
 pub mod virtio;
 pub mod virtio_9p;
+pub mod virtio_serial;
 pub mod wifi;

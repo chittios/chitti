@@ -159,6 +159,9 @@ pub extern "C" fn _start() -> ! {
     // is the common case — most boots have no folder shared in.
     #[cfg(not(feature = "refcheck"))]
     chitti_kernel::fs::host::attach_at_boot();
+    // Host clipboard channel (SPICE agent over virtio-serial). No-op if absent.
+    #[cfg(not(feature = "refcheck"))]
+    chitti_kernel::clipboard::agent_init();
     #[cfg(not(feature = "refcheck"))]
     run_os();
 
@@ -231,6 +234,8 @@ pub extern "C" fn limine_start() -> ! {
     // Attach a host shared folder (virtio-9p) at /host. No-op if absent, which
     // is the common case — most boots have no folder shared in.
     chitti_kernel::fs::host::attach_at_boot();
+    // Host clipboard channel (SPICE agent over virtio-serial). No-op if absent.
+    chitti_kernel::clipboard::agent_init();
     run_os();
 }
 
@@ -420,6 +425,8 @@ pub extern "C" fn aarch64_start() -> ! {
         chitti_kernel::sound::autodetect();
         // Attach a host shared folder (virtio-9p) at /host. No-op if absent.
         chitti_kernel::fs::host::attach_at_boot();
+        // Host clipboard channel (SPICE agent over virtio-serial).
+        chitti_kernel::clipboard::agent_init();
     }
     // Everything is up (framebuffer, USB/input, disk, persistent store) with IRQs
     // masked. NOW begin timer-preemptive scheduling: unmask IRQs so the generic

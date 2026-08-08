@@ -184,6 +184,39 @@ fn share_args(pci: bool) -> Vec<String> {
     ]
 }
 
+/// QEMU args for the **SPICE clipboard agent channel**: a virtio-serial bus
+/// with one port named `com.redhat.spice.0`, backed by the `qemu-vdagent`
+/// chardev. Enabled by `CHITTI_CLIPBOARD=1`.
+///
+/// `pci` picks the bus model for the same reason `share_args` does — the
+/// aarch64 `-kernel` dev loop has no PCI.
+///
+/// **What this does and does not buy, by host.** The chardev connects the guest
+/// to QEMU's *internal* clipboard manager. QEMU only bridges that to a real
+/// system clipboard through a display backend that registers a clipboard peer,
+/// and only `gtk` and `dbus` do — **`cocoa` does not**. So on a Linux/GTK host
+/// this is window-to-window copy/paste, and on macOS the link is live but ends
+/// inside QEMU. The guest says as much in `/clip` rather than implying it
+/// worked.
+fn clipboard_args(pci: bool) -> Vec<String> {
+    let on = env::var("CHITTI_CLIPBOARD").map(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        !(v.is_empty() || v == "0" || v == "off" || v == "no")
+    });
+    if on != Ok(true) {
+        return Vec::new();
+    }
+    let bus = if pci { "virtio-serial-pci" } else { "virtio-serial-device" };
+    vec![
+        "-device".into(),
+        format!("{bus},id=chitticlip"),
+        "-chardev".into(),
+        "qemu-vdagent,id=vdagent,name=vdagent,clipboard=on,mouse=off".into(),
+        "-device".into(),
+        "virtserialport,bus=chitticlip.0,chardev=vdagent,name=com.redhat.spice.0".into(),
+    ]
+}
+
 fn user_netdev(id: &str) -> String {
     let mut s = format!("user,id={id}");
     if let Ok(ports) = std::env::var("CHITTI_HOSTFWD") {
@@ -2319,6 +2352,9 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
     for a in share_args(false) {
         qemu.arg(a);
     }
+    for a in clipboard_args(false) {
+        qemu.arg(a);
+    }
     // ESP first, data disk LAST: QEMU assigns later virtio-mmio devices to
     // LOWER slots, and the kernel's probe_disk takes the first (lowest) match —
     // so this ordering makes /install + persistence target the data disk, never
@@ -2401,6 +2437,9 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
     qemu.args(["-serial", "mon:stdio", "-kernel"]);
     qemu.arg(&elf);
     for a in share_args(false) {
+        qemu.arg(a);
+    }
+    for a in clipboard_args(false) {
         qemu.arg(a);
     }
     // Hand the guest ramfb the framebuffer resolution to use (the kernel reads
@@ -3436,6 +3475,10 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     cmd.args(["-netdev", &guest_netdev("chittinet"), "-device", &format!("{},netdev=chittinet", nic_model())]);
     // Optional host folder over virtio-9p (CHITTI_SHARE), mounted at /host.
     for a in share_args(true) {
+        cmd.arg(a);
+    }
+    // Optional SPICE clipboard agent channel (CHITTI_CLIPBOARD).
+    for a in clipboard_args(true) {
         cmd.arg(a);
     }
     // virtio-snd on the host's audio backend (mic + speaker) for /voice.
