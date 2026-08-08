@@ -332,9 +332,18 @@ fn known_hosts_cmd(arg: &str) {
                 serial_println!("ssh> usage: /ssh known-hosts forget <host>");
                 return;
             };
+            // Match with **or without** the `[host]:port` decoration: the file
+            // writes a non-default port that way, and a user forgetting a host
+            // types the host.
             let kept: Vec<&str> = text
                 .lines()
-                .filter(|l| !l.split_whitespace().next().is_some_and(|h| h.split(',').any(|x| x == host)))
+                .filter(|l| {
+                    !l.split_whitespace().next().is_some_and(|pat| {
+                        pat.split(',').any(|x| {
+                            x == host || crate::net::ssh::hostkey::pattern_host(x) == host
+                        })
+                    })
+                })
                 .collect();
             let removed = text.lines().count() - kept.len();
             let mut out = kept.join("\n");

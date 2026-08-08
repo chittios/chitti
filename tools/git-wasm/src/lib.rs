@@ -95,6 +95,7 @@ extern "C" {
     fn host_inflate(src: *const u8, src_len: i32, out: *mut u8, out_cap: i32) -> i64;
     fn host_deflate(src: *const u8, src_len: i32, out: *mut u8, out_cap: i32) -> i32;
     fn host_http(req: *const u8, req_len: i32, out: *mut u8, out_cap: i32) -> i64;
+    fn host_ssh(req: *const u8, req_len: i32, out: *mut u8, out_cap: i32) -> i64;
 }
 
 // A native build gets the same imports from a simulator over the kernel's own
@@ -105,7 +106,7 @@ pub mod hostsim;
 #[cfg(not(target_arch = "wasm32"))]
 use hostsim::{
     host_deflate, host_fs_exists, host_fs_list, host_fs_read, host_fs_write, host_home,
-    host_http, host_inflate, host_now_unix, host_sha1, host_user_home,
+    host_http, host_inflate, host_now_unix, host_sha1, host_ssh, host_user_home,
 };
 
 /// Shared **output** buffer for host-import results (single-threaded wasm).
@@ -356,6 +357,7 @@ fn json_escape(s: &str) -> String {
 
 pub mod git;
 pub mod remote;
+pub mod sshurl;
 
 /// The agent's git root: `<home>/git`.
 /// Collapse `//`, `/./` and `/../` in a store path.

@@ -30,7 +30,7 @@ mod media;
 mod notify;
 mod pdf;
 mod schedule;
-mod ssh;
+pub(crate) mod ssh;
 pub mod record;
 mod system;
 mod tooljson;

@@ -27,4 +27,5 @@ pub mod client;
 pub mod cipher;
 pub mod hostkey;
 pub mod kex;
+pub mod table;
 pub mod wire;

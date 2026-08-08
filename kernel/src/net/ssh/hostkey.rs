@@ -220,6 +220,27 @@ pub fn host_pattern(host: &str, port: u16) -> String {
     }
 }
 
+/// The bare hostname inside a `known_hosts` pattern: `[h]:2222` -> `h`.
+///
+/// A user forgetting a host thinks in hosts, not in the `[host]:port` form the
+/// file uses for a non-default port — so `forget example.com` has to drop
+/// `[example.com]:2222` as well, or the entry it cannot see is the one that
+/// keeps refusing them.
+pub fn pattern_host(pattern: &str) -> &str {
+    match pattern.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map(|(h, _)| h).unwrap_or(rest),
+        None => pattern,
+    }
+}
+
+/// Does a `known_hosts` entry name `host`, with or without a port decoration?
+pub fn entry_names_host(entry: &KnownHost, host: &str) -> bool {
+    entry
+        .hosts
+        .iter()
+        .any(|h| h == host || pattern_host(h) == host)
+}
+
 /// Decide whether `key` is the key we already trust for `host`.
 pub fn check(entries: &[KnownHost], host: &str, port: u16, key: &PublicKey) -> Trust {
     let pattern = host_pattern(host, port);
@@ -395,6 +416,20 @@ mod tests {
         }
         // A different *port* is a different host entry.
         assert_eq!(check(&entries, "example.com", 2222, &key), Trust::Unknown);
+    }
+
+    /// Forgetting a host must reach its `[host]:port` entries too — the form the
+    /// file uses for a non-default port, and the one a user never types.
+    #[test_case]
+    fn a_host_matches_its_port_decorated_entry() {
+        let key = ed_key();
+        let e = parse_known_hosts(&known_hosts_line("example.com", 2222, &key));
+        assert_eq!(e[0].hosts[0], "[example.com]:2222");
+        assert!(entry_names_host(&e[0], "example.com"), "the bare host must match");
+        assert!(entry_names_host(&e[0], "[example.com]:2222"), "the exact form too");
+        assert!(!entry_names_host(&e[0], "other.com"));
+        assert_eq!(pattern_host("[10.0.2.2]:2223"), "10.0.2.2");
+        assert_eq!(pattern_host("github.com"), "github.com");
     }
 
     /// Non-default ports use OpenSSH's `[host]:port` form so the files stay

@@ -1887,6 +1887,82 @@ def s_ssh_client(g):
             proc.kill()
 
 
+def s_git_clone_ssh(g):
+    """**`/git clone` over SSH**, against the same real OpenSSH server.
+
+    The transport git actually uses for private repositories, and the one the
+    HTTP path cannot stand in for: over SSH the advertisement and the pack share
+    **one bidirectional stream**, so the client must stop reading at the flush
+    packet rather than at end of stream — a reader that waits for EOF deadlocks
+    against a server waiting for the wants. Nothing but a real `git-upload-pack`
+    exercises that.
+
+    Skips when the host has no sshd or no git.
+    """
+    import shutil
+
+    if not shutil.which("git"):
+        return None, "no git on this host (skipping)"
+    started = _start_sshd()
+    if started is None:
+        return None, "no sshd on this host (skipping)"
+    proc, user = started
+    repo = os.path.join(SSH_DIR, "srv.git")
+    try:
+        # A real bare repository with one commit, served by the real
+        # `git-upload-pack` the sshd will exec.
+        work = os.path.join(SSH_DIR, "work")
+        os.makedirs(work, exist_ok=True)
+        env = dict(os.environ, GIT_AUTHOR_NAME="e2e", GIT_AUTHOR_EMAIL="e2e@x",
+                   GIT_COMMITTER_NAME="e2e", GIT_COMMITTER_EMAIL="e2e@x")
+        with open(os.path.join(work, "hello.txt"), "w") as f:
+            f.write("over ssh\n")
+        for cmd in (["init", "-q", "-b", "main"], ["add", "-A"],
+                    ["commit", "-qm", "first"]):
+            subprocess.run(["git"] + cmd, cwd=work, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "clone", "-q", "--bare", work, repo], env=env, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # `ssh_client` may have run first and left both a downloaded key (whose
+        # overwrite would want a confirmation modal) and a `known_hosts` entry
+        # for a *previous* sshd — each scenario starts its own with a fresh host
+        # key, so the client is right to refuse the second as a changed key.
+        # Clearing both is what makes the two scenarios independent.
+        g.send("/rm /downloads/id_ed25519")
+        g.wait_quiet(0.4, 10)
+        g.send(f"/ssh known-hosts forget {HOST}")
+        g.wait_quiet(0.4, 10)
+        m = g.mark()
+        g.send(f"/http -O http://{HOST}:{PLAIN_PORT}/id_ed25519")
+        if not g.wait_for("http> saved", 25, m):
+            return False, "could not deliver the SSH identity"
+        m = g.mark()
+        g.send("/cp /downloads/id_ed25519 /configs/core/id_ed25519")
+        if not g.wait_for("cp>", 15, m):
+            return False, "could not install the identity"
+
+        # The scp-like form, with an explicit port through the URL form since the
+        # test sshd is not on 22.
+        m = g.mark()
+        g.send(f"/git clone ssh://{user}@{HOST}:{SSHD_PORT}{repo} /home/chitti/viassh")
+        if not g.wait_for("ok: cloned", 120, m):
+            return False, "clone over ssh failed: " + g.text()[m:][-1500:].replace("\n", " | ")
+
+        # The checked-out content really came from the remote.
+        m = g.mark()
+        g.send("/cat /home/chitti/viassh/hello.txt")
+        if not g.wait_for("over ssh", 20, m):
+            return False, "the cloned file's content is wrong"
+        return True, "git clone over ssh (real git-upload-pack, one bidirectional stream)"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
 def s_http_download(g):
     """`/http -O` downloads a real PNG from the harness server into the store,
     then `/open` decodes it back — network → store → image viewer roundtrip."""
@@ -4646,7 +4722,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

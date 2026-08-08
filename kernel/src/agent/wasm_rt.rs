@@ -1606,6 +1606,115 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_http")?;
 
+    // host_ssh(req_ptr, req_len, out_ptr, out_cap) -> i64
+    //
+    // One import, sub-commanded by the JSON's `op`, because SSH needs a *stateful*
+    // stream and the guest can only hold an integer: git's protocol is
+    // interactive — the server sends its ref advertisement, then waits for the
+    // client's wants — so a single request/response call like `host_http` cannot
+    // express it. The connection lives in `net::ssh::table` and the guest holds
+    // an id.
+    //
+    //   {"op":"open","u":user,"h":host,"p":port,"c":command,"k":keypath} -> id
+    //   {"op":"read","s":id}   -> up to out_cap bytes; low 32 bits = full length
+    //   {"op":"write","s":id,"b":"<base64>"} -> 0
+    //   {"op":"eof","s":id}    -> 0
+    //   {"op":"close","s":id}  -> 0
+    //
+    // Gated exactly like `host_http`: the calling agent must declare a `net`
+    // capability. Errors are negative and their text is written to `out` so the
+    // guest can report *why* rather than a bare code.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_ssh",
+            |mut caller: Caller<'_, HostState>,
+             req_ptr: i32,
+             req_len: i32,
+             out_ptr: i32,
+             out_cap: i32|
+             -> i64 {
+                let agent_id = caller.data().bind.agent_id;
+                if !crate::agent::system::has_net_cap(agent_id) {
+                    return -1;
+                }
+                let Some(req) = read_guest_str(&caller, req_ptr, req_len) else {
+                    return -2;
+                };
+                let Some(j) = crate::json::Json::parse(&req) else {
+                    return -3;
+                };
+                let op = j.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                let sid = j.get("s").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+
+                // Report an error's text through `out` — a bare -5 tells the user
+                // nothing, and "permission denied" vs "no route" vs "bad key" are
+                // the three things they need to tell apart.
+                let mut fail = |caller: &mut Caller<'_, HostState>, msg: &str| -> i64 {
+                    let _ = fill_guest(caller, out_ptr, out_cap, msg.as_bytes());
+                    -5
+                };
+
+                match op {
+                    "open" => {
+                        let user = j.get("u").and_then(|v| v.as_str()).unwrap_or("git").to_string();
+                        let host = j.get("h").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let port = j.get("p").and_then(|v| v.as_f64()).unwrap_or(22.0) as u16;
+                        let cmd = j.get("c").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if host.is_empty() || cmd.is_empty() {
+                            return -4;
+                        }
+                        let keypath = j.get("k").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let key = match crate::shell::ssh::load_identity(keypath.as_deref()) {
+                            Ok(k) => k,
+                            Err(e) => return fail(&mut caller, &e),
+                        };
+                        match crate::net::ssh::table::open(
+                            agent_id,
+                            &user,
+                            &host,
+                            port,
+                            &cmd,
+                            key.as_ref(),
+                        ) {
+                            Ok(id) => id as i64,
+                            Err(e) => fail(&mut caller, &e),
+                        }
+                    }
+                    "read" => match crate::net::ssh::table::read(agent_id, sid) {
+                        None => -6,
+                        Some(Err(e)) => fail(&mut caller, &e),
+                        Some(Ok(data)) => match fill_guest(&mut caller, out_ptr, out_cap, &data) {
+                            Some(n) => n as i64,
+                            None => -1,
+                        },
+                    },
+                    "write" => {
+                        let body = match j.get("b").and_then(|v| v.as_str()) {
+                            Some(b64) => crate::net::ws::base64_decode(b64).unwrap_or_default(),
+                            None => alloc::vec::Vec::new(),
+                        };
+                        match crate::net::ssh::table::write(agent_id, sid, &body) {
+                            None => -6,
+                            Some(Err(e)) => fail(&mut caller, &e),
+                            Some(Ok(())) => 0,
+                        }
+                    }
+                    "eof" => match crate::net::ssh::table::send_eof(agent_id, sid) {
+                        None => -6,
+                        Some(Err(e)) => fail(&mut caller, &e),
+                        Some(Ok(())) => 0,
+                    },
+                    "close" => {
+                        crate::net::ssh::table::close(agent_id, sid);
+                        0
+                    }
+                    _ => -4,
+                }
+            },
+        )
+        .map_err(|_| "define host_ssh")?;
+
     Ok(())
 }
 

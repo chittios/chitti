@@ -10,7 +10,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use crate::{
-    fs_write, from_hex, http, to_hex,
+    fs_write, from_hex, host_ssh, http, to_hex,
 };
 use crate::git::{
     checkout_tree, collect_blobs, current_branch, git_dir, head_commit, obj_raw, parse_tree,
@@ -184,6 +184,230 @@ fn inflate_object(pack: &[u8], start: usize, want_size: u64) -> Option<(Vec<u8>,
 
 // --- clone ----------------------------------------------------------------------
 
+
+/// A remote's transport: smart HTTP, or `git-upload-pack` over SSH.
+///
+/// The two differ in more than the bytes they move. Over HTTP each phase is its
+/// own request, so the body's end delimits the advertisement. Over SSH there is
+/// **one bidirectional stream**: the server sends its advertisement and then
+/// waits, so the client must stop reading at the flush packet rather than at end
+/// of stream — a reader that waits for EOF deadlocks against a server that is
+/// waiting for the wants.
+enum Transport {
+    Http { base: String },
+    Ssh { session: u32 },
+}
+
+impl Transport {
+    fn open(url: &str) -> Result<Self, String> {
+        match crate::sshurl::parse(url) {
+            None => Ok(Transport::Http {
+                base: url.trim_end_matches('/').to_string(),
+            }),
+            Some(r) => {
+                let req = alloc::format!(
+                    "{{\"op\":\"open\",\"u\":\"{}\",\"h\":\"{}\",\"p\":{},\"c\":\"{}\"}}",
+                    json_escape(&r.user),
+                    json_escape(&r.host),
+                    r.port,
+                    json_escape(&r.upload_pack())
+                );
+                match ssh_call(&req) {
+                    Ok((id, _)) if id > 0 => Ok(Transport::Ssh { session: id as u32 }),
+                    Ok((_, msg)) | Err(msg) => Err(alloc::format!("error: ssh: {msg}")),
+                }
+            }
+        }
+    }
+
+    /// The ref advertisement.
+    fn advertise(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Transport::Http { base } => match http(
+                "GET",
+                &alloc::format!("{base}/info/refs?service=git-upload-pack"),
+                &[("Accept", "application/x-git-upload-pack-advertisement")],
+                b"",
+            ) {
+                Ok((200, b)) => Ok(b),
+                Ok((s, _)) => Err(alloc::format!("error: info/refs status {s}")),
+                Err(_) => Err("error: info/refs request failed".to_string()),
+            },
+            // **Stop at the flush packet**, not at EOF.
+            Transport::Ssh { session } => ssh_read_until_flush(*session),
+        }
+    }
+
+    /// Send the wants and read the packfile.
+    fn fetch(&self, request: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Transport::Http { base } => match http(
+                "POST",
+                &alloc::format!("{base}/git-upload-pack"),
+                &[
+                    ("Content-Type", "application/x-git-upload-pack-request"),
+                    ("Accept", "application/x-git-upload-pack-result"),
+                ],
+                request.as_bytes(),
+            ) {
+                Ok((200, b)) => Ok(b),
+                Ok((s, _)) => Err(alloc::format!("error: upload-pack status {s}")),
+                Err(_) => Err("error: upload-pack request failed".to_string()),
+            },
+            Transport::Ssh { session } => {
+                let b64 = b64_encode(request.as_bytes());
+                let req = alloc::format!("{{\"op\":\"write\",\"s\":{session},\"b\":\"{b64}\"}}");
+                if let Ok((n, msg)) = ssh_call(&req) {
+                    if n < 0 {
+                        return Err(alloc::format!("error: ssh write: {msg}"));
+                    }
+                }
+                // Read to the end of the stream: the pack is the last thing the
+                // server sends, so here EOF *is* the delimiter.
+                ssh_read_all(*session)
+            }
+        }
+    }
+
+    fn close(&self) {
+        if let Transport::Ssh { session } = self {
+            let _ = ssh_call(&alloc::format!("{{\"op\":\"close\",\"s\":{session}}}"));
+        }
+    }
+}
+
+/// One `host_ssh` call. Returns `(code, message)` — the message carries the
+/// host's error text on a negative code, which is the difference between
+/// "permission denied" and "no route" reaching the user.
+fn ssh_call(req: &str) -> Result<(i64, String), String> {
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let r = unsafe {
+        host_ssh(
+            req.as_ptr(),
+            req.len() as i32,
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+        )
+    };
+    if r < 0 {
+        let msg = String::from_utf8_lossy(&buf[..buf.len().min(512)])
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+        return Ok((r, if msg.is_empty() { alloc::format!("error {r}") } else { msg }));
+    }
+    Ok((r, String::new()))
+}
+
+/// Read one chunk from an SSH session, growing the buffer when the host says the
+/// data was longer than it fit — the same contract every other filling import
+/// follows.
+fn ssh_read_chunk(session: u32) -> Result<Vec<u8>, String> {
+    let req = alloc::format!("{{\"op\":\"read\",\"s\":{session}}}");
+    let mut cap = 64 * 1024usize;
+    for _ in 0..2 {
+        let mut buf = alloc::vec![0u8; cap];
+        let r = unsafe {
+            host_ssh(
+                req.as_ptr(),
+                req.len() as i32,
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            )
+        };
+        if r < 0 {
+            let msg = String::from_utf8_lossy(&buf[..buf.len().min(512)]).trim().to_string();
+            return Err(alloc::format!("error: ssh read: {msg}"));
+        }
+        let n = r as usize;
+        if n <= cap {
+            buf.truncate(n);
+            return Ok(buf);
+        }
+        cap = n;
+    }
+    Err("error: ssh read did not fit twice".to_string())
+}
+
+/// Read pkt-lines until the flush packet that ends the advertisement.
+fn ssh_read_until_flush(session: u32) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        // Is a top-level flush already present?
+        if pkt_ends_with_flush(&out) {
+            return Ok(out);
+        }
+        let chunk = ssh_read_chunk(session)?;
+        if chunk.is_empty() {
+            // EOF before a flush: the server said something and quit, which is
+            // how a missing repository or a refused key arrives.
+            if out.is_empty() {
+                return Err("error: the server closed the connection with no refs".to_string());
+            }
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk);
+    }
+}
+
+/// Walk the pkt-line framing and report whether a flush (`0000`) terminates it.
+fn pkt_ends_with_flush(buf: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        let Ok(hex) = core::str::from_utf8(&buf[i..i + 4]) else {
+            return false;
+        };
+        let Ok(len) = usize::from_str_radix(hex, 16) else {
+            return false;
+        };
+        if len == 0 {
+            return true; // flush
+        }
+        if len < 4 || i + len > buf.len() {
+            return false; // incomplete
+        }
+        i += len;
+    }
+    false
+}
+
+fn ssh_read_all(session: u32) -> Result<Vec<u8>, String> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let chunk = ssh_read_chunk(session)?;
+        if chunk.is_empty() {
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk);
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut o = String::new();
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        o.push(T[(n >> 18) as usize & 63] as char);
+        o.push(T[(n >> 12) as usize & 63] as char);
+        o.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        o.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    o
+}
+
 pub fn clone(args: &str) -> String {
     let toks: Vec<&str> = args.split_whitespace().collect();
     let Some(url) = toks.first().map(|s| s.to_string()) else {
@@ -207,16 +431,17 @@ pub fn clone(args: &str) -> String {
     // the object store/refs/checkout all land inside the cloned folder.
     crate::set_cwd(&target);
 
-    // 1. Advertised refs.
-    let adv = match http(
-        "GET",
-        &alloc::format!("{base}/info/refs?service=git-upload-pack"),
-        &[("Accept", "application/x-git-upload-pack-advertisement")],
-        b"",
-    ) {
-        Ok((200, b)) => b,
-        Ok((s, _)) => return alloc::format!("error: info/refs status {s}"),
-        Err(_) => return "error: info/refs request failed".to_string(),
+    // 1. Advertised refs, over whichever transport the URL names.
+    let transport = match Transport::open(&base) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let adv = match transport.advertise() {
+        Ok(b) => b,
+        Err(e) => {
+            transport.close();
+            return e;
+        }
     };
     let mut refs: Vec<(String, String)> = Vec::new();
     for line in parse_pkt_lines(&adv) {
@@ -248,19 +473,14 @@ pub fn clone(args: &str) -> String {
         4 + 5 + 40 + 1 + CAPS.len() + 1
     );
     let req = alloc::format!("{want}00000009done\n");
-    let pack = match http(
-        "POST",
-        &alloc::format!("{base}/git-upload-pack"),
-        &[
-            ("Content-Type", "application/x-git-upload-pack-request"),
-            ("Accept", "application/x-git-upload-pack-result"),
-        ],
-        req.as_bytes(),
-    ) {
-        Ok((200, b)) => b,
-        Ok((s, _)) => return alloc::format!("error: upload-pack status {s}"),
-        Err(_) => return "error: upload-pack request failed".to_string(),
+    let pack = match transport.fetch(&req) {
+        Ok(b) => b,
+        Err(e) => {
+            transport.close();
+            return e;
+        }
     };
+    transport.close();
     // The packfile starts at the `PACK` magic (pkt-line ACK/NAK precedes it).
     let Some(pi) = pack.windows(4).position(|w| w == b"PACK") else {
         return "error: no packfile in the upload-pack response".to_string();

@@ -193,3 +193,22 @@ pub unsafe fn host_http(req: *const u8, req_len: i32, out: *mut u8, out_cap: i32
     };
     ((status as i64) << 32) | fill(out, out_cap, &body) as i64
 }
+
+/// `host_ssh` for the host tests.
+///
+/// Deliberately a **refusal**, not a simulated SSH server: the transport's value
+/// is that it speaks to a real sshd, and a simulator here would test this file
+/// rather than the protocol. The clone-over-SSH path is covered by the
+/// `git_clone_ssh` e2e scenario against real OpenSSH; what this stub pins is that
+/// an SSH URL fails *cleanly* on a build with no SSH available.
+///
+/// # Safety
+/// Matches the wasm import signature; `out` must be valid for `out_cap` bytes.
+pub unsafe fn host_ssh(_req: *const u8, _req_len: i32, out: *mut u8, out_cap: i32) -> i64 {
+    const MSG: &[u8] = b"no ssh transport in the host test harness";
+    let n = MSG.len().min(out_cap.max(0) as usize);
+    if n > 0 {
+        core::ptr::copy_nonoverlapping(MSG.as_ptr(), out, n);
+    }
+    -5
+}

@@ -754,6 +754,126 @@ impl Client {
         }
     }
 
+    /// Open a channel, run `command`, and hand back a stream.
+    ///
+    /// Separate from [`Client::session`] because git's protocol is
+    /// *interactive*: the server sends its ref advertisement, then waits for the
+    /// client's wants, then sends the pack. A call that runs the command to
+    /// completion cannot express that, and a caller that only ever writes first
+    /// would deadlock against a server that speaks first.
+    pub fn exec_stream(&mut self, command: &str) -> Result<ExecStream, String> {
+        let id = self.next_channel;
+        self.next_channel += 1;
+        let mut ch = channel::Channel::new(id);
+        self.send_packet(&channel::open_session(id))?;
+        loop {
+            let p = self.recv_packet()?;
+            match channel::parse(&p) {
+                Some(channel::Event::OpenConfirmation {
+                    remote_id,
+                    window,
+                    max_packet,
+                    ..
+                }) => {
+                    ch.confirm(remote_id, window, max_packet);
+                    break;
+                }
+                Some(channel::Event::OpenFailure { description, .. }) => {
+                    return Err(alloc::format!("ssh: channel refused: {description}"));
+                }
+                _ => {}
+            }
+        }
+        self.send_packet(&channel::request_exec(ch.remote_id, command, false))?;
+        Ok(ExecStream {
+            ch,
+            buf: Vec::new(),
+            eof: false,
+            stderr: Vec::new(),
+        })
+    }
+
+    /// Read from `s` until at least one byte arrives, or the channel ends.
+    ///
+    /// Returns an empty vector at end of stream. Data for other channels cannot
+    /// arrive here — `exec_stream` is used one at a time — but window credit and
+    /// the exit status can, and both are handled rather than dropped.
+    pub fn stream_read(&mut self, s: &mut ExecStream) -> Result<Vec<u8>, String> {
+        if !s.buf.is_empty() {
+            return Ok(core::mem::take(&mut s.buf));
+        }
+        while !s.eof {
+            let p = match self.recv_packet() {
+                Ok(p) => p,
+                Err(e) if e.contains("closed by peer") => {
+                    s.eof = true;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            match channel::parse(&p) {
+                Some(channel::Event::Data { data, .. }) => {
+                    if let Some(extra) = s.ch.consume(data.len()) {
+                        self.send_packet(&channel::window_adjust(s.ch.remote_id, extra))?;
+                    }
+                    if !data.is_empty() {
+                        return Ok(data);
+                    }
+                }
+                // stderr from `git-upload-pack` is the server's error text, and
+                // losing it turns a clear message into a silent empty fetch.
+                Some(channel::Event::ExtendedData { data, .. }) => {
+                    if let Some(extra) = s.ch.consume(data.len()) {
+                        self.send_packet(&channel::window_adjust(s.ch.remote_id, extra))?;
+                    }
+                    s.stderr.extend_from_slice(&data);
+                }
+                Some(channel::Event::WindowAdjust { extra, .. }) => s.ch.grant(extra),
+                Some(channel::Event::ExitStatus { status, .. }) => s.ch.exit_status = Some(status),
+                Some(channel::Event::Eof { .. }) => s.eof = true,
+                Some(channel::Event::Close { .. }) => {
+                    let _ = self.send_packet(&channel::close(s.ch.remote_id));
+                    s.eof = true;
+                }
+                _ => {}
+            }
+            if crate::shell::poll_interrupt() {
+                return Err("cancelled".to_string());
+            }
+            crate::shell::upkeep();
+        }
+        Ok(Vec::new())
+    }
+
+    /// Write to the channel, respecting the peer's window.
+    pub fn stream_write(&mut self, s: &mut ExecStream, mut data: &[u8]) -> Result<(), String> {
+        while !data.is_empty() {
+            let n = s.ch.sendable(data.len());
+            if n == 0 {
+                // The window is shut; the only thing that reopens it is an
+                // adjust from the peer, so read one packet and try again.
+                let p = self.recv_packet()?;
+                if let Some(channel::Event::WindowAdjust { extra, .. }) = channel::parse(&p) {
+                    s.ch.grant(extra);
+                }
+                if crate::shell::poll_interrupt() {
+                    return Err("cancelled".to_string());
+                }
+                crate::shell::upkeep();
+                continue;
+            }
+            self.send_packet(&channel::data(s.ch.remote_id, &data[..n]))?;
+            s.ch.sent(n);
+            data = &data[n..];
+        }
+        Ok(())
+    }
+
+    /// Close our write half — how a git client says "that is all my wants".
+    pub fn stream_eof(&mut self, s: &mut ExecStream) -> Result<(), String> {
+        self.send_packet(&channel::eof(s.ch.remote_id))
+    }
+
     pub fn disconnect(&mut self) {
         let mut w = wire::Writer::msg(1); // SSH_MSG_DISCONNECT
         w.put_u32(11); // SSH_DISCONNECT_BY_APPLICATION
@@ -761,6 +881,24 @@ impl Client {
         w.put_str("");
         let _ = self.send_packet(&w.into_vec());
         crate::net::tcp_close(self.sock);
+    }
+}
+
+/// A running remote command, read and written a piece at a time.
+pub struct ExecStream {
+    ch: channel::Channel,
+    buf: Vec<u8>,
+    eof: bool,
+    /// Whatever the command wrote to stderr, kept so a failure can be explained.
+    pub stderr: Vec<u8>,
+}
+
+impl ExecStream {
+    pub fn exit_status(&self) -> Option<u32> {
+        self.ch.exit_status
+    }
+    pub fn is_eof(&self) -> bool {
+        self.eof
     }
 }
 
