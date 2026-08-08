@@ -1593,6 +1593,69 @@ FDT claims a GICv3 but carries no readable `reg`.
   active in the firmware's boot context). **Next:** app endpoints 0x20/0x21,
   `initdata` (perf/power tables + channel rings), the firmware command ring, then
   a GEMM microkernel into `cortex`.
+- **Commands compose** — `|`, `|&`, `;`, `&&`, `||`, `>`, `>>`
+  (`shell/pipeline.rs` parser + runner, `shell/status.rs` exit status;
+  `/help pipeline`). **Interactive shell only**: `run_shell_command` still
+  rejects shell metacharacters, so the taint/effect surface and the
+  `security::redteam` census are untouched.
+
+  **The parser lives ABOVE `dispatch_system`, and that is the security
+  property, not a filing decision.** Scheduled fires, package-UI apps,
+  sub-agents and the `ToolBinding::Shell` executor all call `dispatch_system`
+  directly; parsing inside it would hand every one of them pipe syntax by
+  accident and make `effect_of` classify a whole pipeline by its first stage.
+  Above it, `/passwd` and `/lock` stay unreachable by construction — the rule
+  the human-only section states — and a stage naming one is refused at the
+  parse. `has_operator` is the gate: a line with no unquoted operator takes
+  exactly the path it took before.
+
+  **stdout/stderr needed no change to any command.** There is no
+  `serial_eprintln!` here, but commands already print `name> …` status lines
+  and unprefixed data lines, and a pipeline knows each stage's name — so
+  `"{name}> "` is a *precise* classifier rather than a heuristic. That
+  convention is now load-bearing: a command that emits **data** lines prefixed
+  `name> ` would have them silently swallowed as diagnostics. None do; if one
+  ever must, give that command an explicit diagnostic macro rather than
+  rewriting every call site.
+
+  Four things that cost a debugging cycle each:
+
+  - **`serial::CAPTURE` had to become a stack first**, and that was a live bug
+    on its own: `bg::pump` calls `run_tool_command` from inside `upkeep()`
+    (which long-running commands call), so captures nest — and a single
+    `Option<String>` meant the inner call threw the outer buffer away and then
+    took it, so an agent got `""` for a command that ran fine. Text goes to the
+    **innermost** sink only; appending to all of them contaminates an outer
+    command's result with an unrelated job's output. `Tee` writes through to the
+    console (what `run_tool_command` wants), `Redirect` does not (what a
+    pipeline stage needs).
+  - **`>` is not a separator, and `has_operator` missed it.** It binds inside a
+    stage rather than between stages, so checking only the pipeline separators
+    made `/head -n 3 f > out` skip the composition path entirely — `/head` then
+    saw `f > out` as its argument and said "only one path at a time".
+  - **Colour codes must not leave a stage.** `/cat` and `/head` syntax-highlight
+    and those escapes are in the capture verbatim, so a downstream `/grep`
+    matched against text with colour codes in it and failed for no visible
+    reason. Data *leaving* a stage is stripped; data going to the console is
+    not, so the last stage keeps its highlighting.
+  - **Piped input is offered, never injected.** Commands take a **path**, not
+    stdin, so appending upstream output to the downstream argument would make
+    `/ls | /grep foo` pass a directory listing as grep's *path*. A stage reads
+    the pipe by naming `-` or omitting its path (`head`, `tail`, `pbcopy`,
+    `grep`); any other stage ignores it and **reports the byte count it
+    ignored**, because silently dropping the first stage's work looks exactly
+    like nothing having happened.
+
+  Exit status is a cell handlers set on their error paths, 127 for an unknown
+  command. The dangerous part is that an **unconverted handler always reports
+  success**, so `status::REPORTS_STATUS` enumerates the converted set, a test
+  pins that every name in it is real, and `&&`/`||` after anything outside it
+  warns once rather than implying a check that is not happening. Grow that list
+  deliberately: add the `fail()` calls, *then* the name. Redirection writes
+  through the same `path_on_mount` → VFS / else store split every other write
+  command makes — routing a store path at `vfs::write` gets `NotMounted`, which
+  on a dev boot is every path.
+
 - **Host integration — a shared folder and a shared clipboard.** Copying files
   and text between the host and the guest, over three channels with genuinely
   different reach. All new virtio devices go through **one** shared layer

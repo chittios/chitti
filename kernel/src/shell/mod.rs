@@ -2013,6 +2013,10 @@ fn print_about_text() {
 /// args are easy to type). It does **not** run the command or dump it into the
 /// chat response stream.
 fn print_help(arg: &str) {
+    if matches!(arg.trim(), "pipeline" | "pipelines" | "pipe") {
+        print_help_pipeline();
+        return;
+    }
     let force_text = matches!(arg.trim(), "text" | "list" | "--text" | "-t");
     #[cfg(not(test))]
     {
@@ -2042,10 +2046,38 @@ fn print_help(arg: &str) {
 }
 
 /// Flat serial help (also used when no framebuffer is available).
+/// `/help pipeline` — the composition operators and, more importantly, their
+/// two honest limits.
+fn print_help_pipeline() {
+    serial_println!("Combining commands (interactive shell only):");
+    serial_println!("  /a | /b          send a's output into b");
+    serial_println!("  /a |& /b         send a's output AND its `a> ` diagnostics");
+    serial_println!("  /a ; /b          run both");
+    serial_println!("  /a && /b         run b only if a succeeded");
+    serial_println!("  /a || /b         run b only if a failed");
+    serial_println!("  /a > file        write a's output to a file (>> appends)");
+    serial_println!("");
+    serial_println!("A command's `name> ` lines are diagnostics and stay on screen;");
+    serial_println!("everything else is data and is what travels through a pipe.");
+    serial_println!("");
+    serial_println!("Commands read a pipe by taking no path, or `-`: /head /tail /pbcopy /grep.");
+    serial_println!("Any other command ignores it and says so — it never silently vanishes.");
+    serial_println!("");
+    // The one thing a user cannot discover by trying it: `&&` after an
+    // unconverted command looks like it checked something and did not.
+    serial_println!("&& and || only mean something after a command that reports failure:");
+    serial_println!("  {}", crate::shell::status::REPORTS_STATUS.join(" "));
+    serial_println!("Anything else always counts as success (the shell says so when it matters).");
+    serial_println!("");
+    serial_println!("Quotes stop an operator splitting the line, but are passed to the");
+    serial_println!("command as typed — commands here do not parse quotes themselves.");
+}
+
 fn print_help_text() {
     serial_println!("Chitti commands:");
     serial_println!("  <message>        chat with the agent — it calls /commands as tools (Ctrl+C to stop)");
     serial_println!("  /help            Commands browser (search + scroll); /help text = this list");
+    serial_println!("  /help pipeline   combining commands: | |& ; && || > >>");
     serial_println!("  /about           About ChittiOS (or click the status-bar logo)");
     serial_println!("  /agents          Agents browser (Ctrl+Space); /agents text = list");
     for e in catalog::ENTRIES {
