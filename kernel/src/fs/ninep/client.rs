@@ -31,6 +31,15 @@ const ROOT_FID: u32 = 0;
 /// derives its chunk size from what was actually agreed rather than from this.
 pub const MSIZE_WANT: u32 = 64 * 1024;
 
+/// Buffer size used for the version handshake alone, before the real message
+/// size is known.
+///
+/// The buffers are grown to the **agreed** msize afterwards rather than
+/// allocated at the proposal: a server that negotiates 8 KiB should not cost
+/// 128 KiB of kernel heap for the session's whole life, and the first-fit
+/// allocator punishes exactly that kind of over-allocation.
+const BOOTSTRAP: usize = 512;
+
 /// `Twrite` header: `size[4] type[1] tag[2] fid[4] offset[8] count[4]`.
 const TWRITE_HDR: usize = HDR + 4 + 8 + 4;
 /// `Rread` header: `size[4] type[1] tag[2] count[4]`.
@@ -54,12 +63,14 @@ impl<T: Rpc> Session<T> {
     pub fn attach(t: T, uname: &str, aname: &str) -> Result<Session<T>, P9Error> {
         let mut s = Session {
             t,
-            msize: MSIZE_WANT,
+            // Only the handshake fits until the size is agreed; `build` clamps
+            // to `msize`, so this bounds the first message too.
+            msize: BOOTSTRAP as u32,
             tag: 0,
             next_fid: ROOT_FID + 1,
             free_fids: Vec::new(),
-            req: vec![0; MSIZE_WANT as usize],
-            rep: vec![0; MSIZE_WANT as usize],
+            req: vec![0; BOOTSTRAP],
+            rep: vec![0; BOOTSTRAP],
         };
 
         // Tversion uses the NOTAG tag (0xffff) by definition.
@@ -79,11 +90,14 @@ impl<T: Rpc> Session<T> {
             return Err(P9Error::Version);
         }
         // The server may only ever *lower* msize. Honouring a larger value
-        // would overrun the buffers already sized for the proposal.
+        // would size the buffers off a number the client never proposed.
         s.msize = agreed.min(MSIZE_WANT);
         if (s.msize as usize) < TWRITE_HDR + 1 {
             return Err(P9Error::TooLarge);
         }
+        // Now that the size is settled, size the buffers to it exactly.
+        s.req.resize(s.msize as usize, 0);
+        s.rep.resize(s.msize as usize, 0);
 
         let n = s.build(T_ATTACH, 0, |e| {
             e.u32(ROOT_FID);
@@ -780,7 +794,11 @@ mod tests {
     }
 
     fn session(build: impl FnOnce(&mut FakeServer)) -> Session<Loopback> {
-        let mut srv = FakeServer::new(MSIZE_WANT);
+        // A small negotiated msize keeps each session's buffers to a few KiB.
+        // The suite runs in one kernel with a first-fit heap, so tests that
+        // each hold 128 KiB add up to real pressure on everything after them —
+        // which showed up as an unrelated scheduler test failing intermittently.
+        let mut srv = FakeServer::new(8192);
         build(&mut srv);
         Session::attach(Loopback { srv }, "chitti", "").unwrap()
     }
@@ -790,7 +808,7 @@ mod tests {
         let mut s = session(|srv| {
             srv.add("hello.txt", false, b"hi from the host");
         });
-        assert_eq!(s.msize(), MSIZE_WANT);
+        assert_eq!(s.msize(), 8192);
         assert_eq!(s.read_file("/hello.txt").unwrap(), b"hi from the host");
         // A leading slash, a bare name and a redundant `.` are the same path.
         assert_eq!(s.read_file("hello.txt").unwrap(), b"hi from the host");
