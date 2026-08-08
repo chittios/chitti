@@ -74,7 +74,11 @@ fn reload() {
             // Empty dir is fine.
             return;
         }
-        let raw = core::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+        // `n` is the listing's full length, which may exceed our buffer — the
+        // browser shows what fits rather than growing, but it must clamp: slicing
+        // by an unclamped host length is a guest trap.
+        let n = (n as usize).min(buf.len());
+        let raw = core::str::from_utf8(&buf[..n]).unwrap_or("");
         // Collect then dirs-first sort (host already dirs-first usually).
         let mut rows: Vec<(String, bool, usize)> = Vec::new();
         for line in raw.split('\n') {
@@ -441,7 +445,9 @@ pub fn get(args: &str) -> String {
     if n < 0 {
         return format!("error: cannot read {path}");
     }
-    String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+    // `n` is the file's full length; a bigger file is shown truncated, but the
+    // slice must be clamped — see `reload`.
+    String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned()
 }
 
 pub fn set(args: &str) -> String {

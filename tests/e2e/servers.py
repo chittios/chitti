@@ -20,6 +20,31 @@ import time
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# The git smart-HTTP fixture: a two-commit repository packed by real `git
+# pack-objects`, whose history git chose to **delta-compress**. Shared verbatim
+# with the git agent's own host tests (tools/git-wasm/tests/) so the two cannot
+# drift — and deltas are the case that matters, since a server deltifies any
+# repository past a couple of commits and resolving one wrong is what made every
+# real `/git clone` fail.
+GIT_PACK = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tools", "git-wasm", "tests", "ref-delta.pack"
+)
+GIT_HEAD = "35528a725a8925975d241e31a82755548dced31f"
+
+
+def _pktline(payload: bytes) -> bytes:
+    return b"%04x%s" % (4 + len(payload), payload)
+
+
+def _git_advertisement() -> bytes:
+    """`GET /info/refs?service=git-upload-pack` — the v0 ref advertisement."""
+    caps = b"multi_ack ofs-delta no-progress"
+    sha = GIT_HEAD.encode()
+    out = _pktline(b"# service=git-upload-pack\n") + b"0000"
+    out += _pktline(b"%s HEAD\x00%s\n" % (sha, caps))
+    out += _pktline(b"%s refs/heads/main\n" % sha)
+    return out + b"0000"
+
 
 def _openssl():
     for c in ("/opt/homebrew/opt/openssl@3/bin/openssl", "/usr/local/opt/openssl@3/bin/openssl", "openssl"):
@@ -139,7 +164,27 @@ def _handle(conn):
             _ws_send_text(conn, b"echo:" + payload)
             time.sleep(0.3)
             return
-        if path.startswith("/v1/models"):
+        if path.startswith("/repo.git/info/refs"):
+            body = _git_advertisement()
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\n"
+                b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+            )
+        elif path.startswith("/repo.git/git-upload-pack"):
+            # Drain the client's want/done request before replying — a server that
+            # answers without reading leaves the body in the socket, and the guest's
+            # next request reads it as a response.
+            n = int(hdrs.get("content-length", "0"))
+            raw = rest
+            while len(raw) < n:
+                raw += conn.recv(4096)
+            with open(GIT_PACK, "rb") as f:
+                body = b"0008NAK\n" + f.read()
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-result\r\n"
+                b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+            )
+        elif path.startswith("/v1/models"):
             body = b'{"object":"list","data":[{"id":"e2e-model"}]}'
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
         elif path.startswith("/v1/chat/completions"):

@@ -563,6 +563,54 @@ def s_git(g):
     return True, "git init/status/add/commit/log over the /git command hook"
 
 
+def s_git_clone(g):
+    """`/git clone` over smart HTTP against the host test server.
+
+    The half `s_git` cannot reach: the network path, the packfile walk, and the
+    checkout. Three things it pins, each a bug that shipped:
+
+    * **The whole pack arrives.** The guest's host-call buffer was a fixed 64 KiB
+      and `host_http` answered `min(len, cap)`, so a real repository's pack came
+      back truncated and *looked complete* — the clone died inside the
+      decompressor blaming zlib.
+    * **Deltas resolve.** A delta object's base reference (a sha, or an offset)
+      sits raw between the object header and the zlib stream, not inside the
+      compressed payload. The fixture is a real `git pack-objects` pack of a
+      history git chose to deltify, because a server deltifies anything past a
+      couple of commits — reading the base from the wrong place made every real
+      clone fail at the first delta.
+    * **Nested files keep their directory.** The checkout recursed into subtrees
+      without carrying the path prefix, flattening the whole tree into the repo
+      root.
+    """
+    m = g.mark()
+    g.send(f"/git clone http://{HOST}:{PLAIN_PORT}/repo.git /home/chitti/cloned")
+    if not g.wait_for("ok: cloned", 60, m):
+        return False, "clone did not report success: " + g.text()[m:][:200].replace("\n", " | ")
+    # 12 objects in the fixture pack; a short walk would report fewer.
+    if "12 objects" not in g.text()[m:]:
+        return False, "clone did not unpack all 12 objects"
+    m = g.mark()
+    g.send("/git status")
+    if not g.wait_for("nothing to commit", 20, m):
+        return False, "a fresh clone is not clean (index/checkout paths disagree)"
+    # The deltified file: 400 lines, reconstructed from a delta against the first
+    # commit's version. A wrong base or a payload offset by its own base reference
+    # still produces *a* file, so check for text the delta *inserted*, not just
+    # existence. `/grep` splits on whitespace and takes no quotes, so the needle is
+    # one token — and one that the fixture's filler words do not contain.
+    m = g.mark()
+    g.send("/grep further /home/chitti/cloned/**")
+    if not g.wait_for("src/net/mod.rs", 20, m):
+        return False, "the delta-reconstructed file is missing or wrong"
+    # And the nested path really is nested, not flattened to the root.
+    m = g.mark()
+    g.send("/ls /home/chitti/cloned/src/net")
+    if not g.wait_for("mod.rs", 20, m):
+        return False, "nested file was flattened out of src/net/"
+    return True, "git clone over smart HTTP (full pack, delta objects, nested checkout)"
+
+
 def s_restart(g):
     """`/restart` reboots the machine via `arch::reboot`.
 
@@ -2300,11 +2348,19 @@ def s_samples(g):
     # (`p` prev page, `f` fit), so a command typed with the pane focused loses
     # those characters — `/cat /samples/README.md` arrived as `/cat /samles/REME.md`
     # while this was still routing typed letters as arrows. Ctrl+C hands the keys
-    # back, and Shift+Tab returns focus to the composer.
+    # back.
+    #
+    # A `Shift+Tab` used to follow, to "return focus to the composer". It is a
+    # **toggle**, not a set, so once Ctrl+C had already released the tab it moved
+    # focus the other way — onto the action pane, where the next scenario's
+    # `/open` put an image, and the image viewer then ate `+ = - _ r R l L 0` out
+    # of every command typed for the rest of the sweep (`/git clone http://…` as
+    # `/git cone http://1..2.2:81/…`). Twelve scenarios failed downstream of it,
+    # looking like unrelated network regressions. It was a workaround for the
+    # arrow-routing bug named above, which the kernel has since fixed, so it now
+    # only over-corrects.
     g.send_raw(b"\x03")
     g.wait_quiet(0.5, 15)
-    g.send_raw(b"\x1b[Z")
-    g.wait_quiet(0.4, 10)
     # The corpus records its own provenance, which is what makes shipping an
     # image with it defensible.
     m = g.mark()
@@ -4333,7 +4389,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

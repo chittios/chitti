@@ -613,6 +613,23 @@ pub fn manifest_fuel(id: u64) -> Option<u64> {
         .map(|v| v.max(1) as u64)
 }
 
+/// The manifest's `wasm.memory_pages` for system agent `id` (the wasm runtime's
+/// linear-memory ceiling, in 64 KiB pages). `None` when the manifest declares
+/// none, which leaves [`crate::agent::wasm_rt::DEFAULT_MAX_MEMORY_PAGES`].
+///
+/// Fuel bounds how long a guest runs; this bounds how much it can hold, and the
+/// two are not interchangeable. The default 2 MiB suits a tool that digests one
+/// small argument, and is well under what a guest handling a whole *document*
+/// needs — the git agent's clone holds a packfile plus every object it unpacks.
+pub fn manifest_pages(id: u64) -> Option<u32> {
+    let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
+    let j = Json::parse(def.manifest_json)?;
+    j.get("wasm")
+        .and_then(|w| w.get("memory_pages"))
+        .and_then(|f| f.as_i64())
+        .map(|v| v.clamp(1, u32::MAX as i64) as u32)
+}
+
 /// Whether system agent `id`'s manifest grants an **unrestricted** (`Scope::Any`)
 /// filesystem scope — gates the wasm `host_fs_write` import. The git agent
 /// declares one so it can clone/checkout into `/home/…` and any user folder;

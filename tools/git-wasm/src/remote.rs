@@ -12,14 +12,21 @@ use alloc::vec::Vec;
 use crate::{
     fs_write, from_hex, http, to_hex,
 };
-use crate::git::{current_branch, git_dir, head_commit, read_loose, write_loose, write_ref, parse_tree, obj_raw};
-use crate::{zlib_decompress, zlib_deflate, fs_read};
-use crate::git_root;
+use crate::git::{
+    checkout_tree, collect_blobs, current_branch, git_dir, head_commit, obj_raw, parse_tree,
+    read_loose, write_ref,
+};
+use crate::{fs_read, zlib_deflate};
+use alloc::collections::BTreeMap;
 
 /// Capabilities we request from upload-pack (must be a subset of what the
 /// server advertises — requesting `multi_ack_detailed`/`report-status` from a
 /// server that only offers `multi_ack` makes it reject the whole request).
-const CAPS: &str = "multi_ack thin-pack ofs-delta no-progress";
+///
+/// Deliberately **not** `thin-pack`: a thin pack may carry deltas whose base was
+/// never sent, on the promise that the client already has it. A clone has nothing,
+/// so the only thing that capability can buy here is `delta base not found`.
+const CAPS: &str = "multi_ack ofs-delta no-progress";
 
 /// pkt-line: `4-hex len + payload`; `0000` = flush.
 fn parse_pkt_lines(data: &[u8]) -> Vec<Vec<u8>> {
@@ -118,6 +125,32 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// How a delta object names the object it is a delta against. Both forms sit
+/// **raw** in the packfile, ahead of the compressed delta — see the walk.
+enum BaseRef {
+    /// Not a delta.
+    None,
+    /// `OBJ_OFS_DELTA`: bytes to count back from this object's own header.
+    Ofs(u64),
+    /// `OBJ_REF_DELTA`: the base's sha, which may be an object on disk.
+    Sha(String),
+}
+
+/// One object recovered from the packfile, with the sha it hashes to (computed
+/// once — it names the loose file *and* indexes the object as a delta base).
+struct PackObj {
+    kind: String,
+    sha: String,
+    content: Vec<u8>,
+}
+
+/// Write a loose object whose sha is already known, skipping the re-hash
+/// [`write_loose`] would do.
+fn write_object(kind: &str, sha: &str, content: &[u8]) -> bool {
+    let Some(z) = zlib_deflate(&obj_raw(kind, content)) else { return false };
+    fs_write(&crate::git::obj_path(sha), &z)
+}
+
 fn kind_name(t: u8) -> &'static str {
     match t {
         1 => "commit",
@@ -128,54 +161,25 @@ fn kind_name(t: u8) -> &'static str {
     }
 }
 
-/// Inflate the pack object whose zlib body starts at `pack[start..]`, expected
-/// to decompress to `want_size` bytes. The kernel's decoder rejects trailing
-/// bytes (adler check), so the exact window is the first whose decompressed
-/// length matches the declared size — no false boundaries.
+/// Inflate the pack object whose zlib body starts at `pack[start..]`, expected to
+/// decompress to `want_size` bytes; returns it with the number of input bytes the
+/// stream occupied.
+///
+/// One call. `host_inflate` tolerates trailing bytes and reports how much of the
+/// input the stream consumed, which is exactly the question "where does the next
+/// object start" — so handing it the whole remainder is correct. This used to
+/// widen a window one byte at a time looking for a length that matched, i.e. a
+/// full inflate per byte of every object: for this pack's 172 objects that is on
+/// the order of a hundred thousand decompressions of up to 180 KiB each, which
+/// exhausts the fuel budget long before it finishes.
 fn inflate_object(pack: &[u8], start: usize, want_size: u64) -> Option<(Vec<u8>, usize)> {
-    let mut end = (start + 6).min(pack.len());
-    while end <= pack.len() {
-        if let Some((dec, consumed)) = zlib_decompress(&pack[start..end]) {
-            if consumed == end - start && dec.len() as u64 == want_size {
-                return Some((dec, end - start));
-            }
-        }
-        end += 1;
+    let (dec, consumed) = crate::zlib_decompress_hint(pack.get(start..)?, want_size as usize)?;
+    // The declared size is the object's own claim about itself; a stream that
+    // decompresses to something else means the pack is not what its header says.
+    if dec.len() as u64 != want_size {
+        return None;
     }
-    None
-}
-
-/// Write a checkout-tree recursively (overwriting the working tree).
-fn checkout_tree(tree_sha: &str) {
-    let Some((_, t)) = read_loose(tree_sha) else { return };
-    let Some(ents) = parse_tree(&t) else { return };
-    let root = git_root();
-    for (mode, name, sha) in ents {
-        if mode == "40000" {
-            checkout_tree(&sha);
-        } else if let Some((_, blob)) = read_loose(&sha) {
-            fs_write(&alloc::format!("{root}/{name}"), &blob);
-        }
-    }
-}
-
-/// Flatten a tree into `(sha, path)` blob leaves (full relative paths).
-fn collect_blobs(tree_sha: &str) -> Vec<(String, String)> {
-    fn rec(tree_sha: &str, prefix: &str, out: &mut Vec<(String, String)>) {
-        let Some((_, t)) = read_loose(tree_sha) else { return };
-        let Some(ents) = crate::git::parse_tree(&t) else { return };
-        for (mode, name, sha) in ents {
-            let full = if prefix.is_empty() { name.clone() } else { alloc::format!("{prefix}/{name}") };
-            if mode == "40000" {
-                rec(&sha, &full, out);
-            } else {
-                out.push((sha, full));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    rec(tree_sha, "", &mut out);
-    out
+    Some((dec, consumed))
 }
 
 // --- clone ----------------------------------------------------------------------
@@ -262,83 +266,109 @@ pub fn clone(args: &str) -> String {
         return "error: no packfile in the upload-pack response".to_string();
     };
 
-    // 3. Parse the packfile. `parsed` holds (stream pos, kind, content); deltas
-    // resolve against earlier objects (OFS) or by sha (REF / loose).
-    let mut parsed: Vec<(usize, String, Vec<u8>)> = Vec::new();
+    // 3. Parse the packfile. Deltas resolve against an earlier object by stream
+    // position (OFS) or by sha (REF / loose), so both indexes are built as we go —
+    // the sha one especially, because the alternative is re-hashing every object
+    // already parsed on every REF_DELTA.
+    let mut parsed: Vec<PackObj> = Vec::new();
+    let mut by_pos: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut by_sha: BTreeMap<String, usize> = BTreeMap::new();
     let mut p = pi;
-    if &pack[p..p + 4] != b"PACK" {
-        return "error: bad PACK header".to_string();
+    // Header: magic, version, object count. Bounds-checked because a short read
+    // here is an index panic, and a guest panic is `loop {}` until the fuel runs
+    // out — an error message beats a hang.
+    if pack.len() < p + 12 {
+        return "error: truncated PACK header".to_string();
     }
     p += 4;
     let _version = u32::from_be_bytes(pack[p..p + 4].try_into().unwrap_or([0; 4]));
     p += 4;
     let count = u32::from_be_bytes(pack[p..p + 4].try_into().unwrap_or([0; 4])) as usize;
     p += 4;
-    for _ in 0..count {
+    for i in 0..count {
         let obj_start = p;
         let (typ, want_size) = match read_varint(&pack, &mut p) {
             Some(v) => v,
-            None => return "error: bad object header".to_string(),
+            None => return alloc::format!("error: bad object header (object {i} of {count})"),
+        };
+        // **A delta object's base reference is RAW, not compressed.** It sits in the
+        // packfile between the type/size header and the zlib stream — an offset
+        // varint for OFS_DELTA, twenty bytes of sha for REF_DELTA — and the
+        // compressed payload that follows is the delta *in full*.
+        //
+        // Reading it out of the decompressed bytes instead, as this did, means
+        // inflating from twenty bytes too early: the decoder is handed the sha and
+        // answers `not deflate`, which is reported as a corrupt object. That is what
+        // `object inflate failed (object 5 of 172)` was — the first delta in the
+        // pack, and so every clone of any repository whose history the server chose
+        // to delta-compress, which is all of them past a few commits.
+        let base = match typ {
+            7 => {
+                let Some(raw) = pack.get(p..p + 20) else {
+                    return "error: truncated ref-delta base".to_string();
+                };
+                p += 20;
+                BaseRef::Sha(to_hex(raw))
+            }
+            6 => match read_ofs_offset(&pack, &mut p) {
+                Some(off) => BaseRef::Ofs(off),
+                None => return "error: bad ofs-delta".to_string(),
+            },
+            _ => BaseRef::None,
         };
         let (dec, stream_len) = match inflate_object(&pack, p, want_size) {
             Some(v) => v,
-            None => return "error: object inflate failed".to_string(),
+            None => {
+                return alloc::format!(
+                    "error: object inflate failed (object {i} of {count}, type {typ}, {} pack bytes)",
+                    pack.len() - pi
+                )
+            }
         };
         p += stream_len;
-        match typ {
-            6 | 7 => {
-                // The payload starts with the base reference, then the delta.
-                let (base, delta_start): (Option<(String, Vec<u8>)>, usize) = if typ == 7 {
-                    // REF_DELTA: 20-byte base sha.
-                    let base_sha = to_hex(&dec[..20.min(dec.len())]);
-                    let base = parsed
-                        .iter()
-                        .rev()
-                        .find(|(_, k, c)| {
-                            crate::sha1(&obj_raw(k, c)) == base_sha
-                        })
-                        .map(|(_, k, c)| (k.clone(), c.clone()))
-                        .or_else(|| read_loose(&base_sha));
-                    (base, 20)
-                } else {
-                    // OFS_DELTA: negative offset back to the base object's stream position.
-                    let mut op = 0usize;
-                    let off = match read_ofs_offset(&dec, &mut op) {
-                        Some(o) => o,
-                        None => return "error: bad ofs-delta".to_string(),
-                    };
-                    let base_pos = match obj_start.checked_sub(off as usize) {
-                        Some(b) => b,
+        let (kind, content) = match base {
+            BaseRef::None => (kind_name(typ).to_string(), dec),
+            b => {
+                let found = match &b {
+                    // A REF_DELTA may name a base that arrived earlier in this pack
+                    // or one already on disk.
+                    BaseRef::Sha(sha) => by_sha
+                        .get(sha)
+                        .map(|&i| (parsed[i].kind.clone(), parsed[i].content.clone()))
+                        .or_else(|| read_loose(sha)),
+                    // An OFS_DELTA counts backwards from its own header to the base
+                    // object's header.
+                    BaseRef::Ofs(off) => match obj_start.checked_sub(*off as usize) {
+                        Some(pos) => by_pos
+                            .get(&pos)
+                            .map(|&i| (parsed[i].kind.clone(), parsed[i].content.clone())),
                         None => return "error: bad ofs-delta offset".to_string(),
-                    };
-                    let base = parsed
-                        .iter()
-                        .rev()
-                        .find(|(pos, _, _)| *pos == base_pos)
-                        .map(|(_, k, c)| (k.clone(), c.clone()));
-                    (base, op)
+                    },
+                    BaseRef::None => None,
                 };
-                let (bk, bc) = match base {
-                    Some(b) => b,
-                    None => return "error: delta base not found".to_string(),
+                let Some((bk, bc)) = found else {
+                    return "error: delta base not found".to_string();
                 };
-                let full = match apply_delta(&bc, &dec[delta_start.min(dec.len())..]) {
-                    Some(f) => f,
+                // A delta reconstructs an object of the base's *kind* — the type
+                // field said "delta", so this is the only place the kind comes from.
+                match apply_delta(&bc, &dec) {
+                    Some(f) => (bk, f),
                     None => return "error: delta apply failed".to_string(),
-                };
-                parsed.push((obj_start, bk, full));
+                }
             }
-            _ => {
-                parsed.push((obj_start, kind_name(typ).to_string(), dec));
-            }
-        }
+        };
+        // Hashed once, here: the sha is needed to index this object as a delta base
+        // and again to name its loose file, and it is the same sha both times.
+        let sha = crate::git::hash_object(&kind, &content);
+        by_pos.insert(obj_start, parsed.len());
+        by_sha.insert(sha.clone(), parsed.len());
+        parsed.push(PackObj { kind, sha, content });
     }
 
     // 4. Write loose objects, refs, checkout HEAD.
     let mut n_obj = 0usize;
-    for (_, kind, content) in &parsed {
-        if kind != "unknown" {
-            write_loose(kind, content);
+    for o in &parsed {
+        if o.kind != "unknown" && write_object(&o.kind, &o.sha, &o.content) {
             n_obj += 1;
         }
     }
@@ -354,13 +384,12 @@ pub fn clone(args: &str) -> String {
         .lines()
         .find_map(|l| l.strip_prefix("tree ").map(|t| t.to_string()));
     if let Some(t) = tree_sha.clone() {
-        checkout_tree(&t);
-        // Stage the checked-out HEAD tree so `git status` is clean after clone.
-        let mut index: Vec<(String, String, String)> = Vec::new();
-        for (sha, path) in collect_blobs(&t) {
-            index.push((String::from("100644"), sha, path));
-        }
-        crate::git::write_index(&index);
+        checkout_tree(&t, "");
+        // Stage the checked-out HEAD tree so `git status` is clean after clone —
+        // same walk, so the index and the working tree cannot disagree, and each
+        // entry keeps the tree's own mode rather than a hardcoded 100644 (which
+        // made every executable file look modified on the next commit).
+        crate::git::write_index(&collect_blobs(&t));
     }
     // HEAD → the branch the server's HEAD points at (resolve by sha, so a
     // clone always lands on a branch whose objects it actually fetched).

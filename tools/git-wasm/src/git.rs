@@ -342,21 +342,19 @@ pub(crate) fn git_status(_args: &str) -> String {
     let working = working_files(&git_root());
     // Index vs HEAD tree: an index entry is "staged" unless the HEAD tree holds
     // the same path with the same blob.
-    let head_blobs: Vec<(String, String)> = head
+    let head_blobs: Vec<(String, String, String)> = head
         .as_ref()
         .and_then(|h| {
             // The commit names its tree; walk that tree's blobs.
             let (_, c) = read_loose(h)?;
             let text = String::from_utf8_lossy(&c);
             let tree_sha = text.lines().find_map(|l| l.strip_prefix("tree "))?;
-            let (_, tc) = read_loose(&tree_sha)?;
-            let t = parse_tree(&tc)?;
-            collect_blobs(&t)
+            Some(collect_blobs(tree_sha))
         })
         .unwrap_or_default();
     let staged: Vec<String> = index
         .iter()
-        .filter(|(_, sha, path)| !head_blobs.iter().any(|(s, p)| s == sha && p == path))
+        .filter(|(_, sha, path)| !head_blobs.iter().any(|(_, s, p)| s == sha && p == path))
         .map(|(_, _, p)| p.clone())
         .collect();
     let indexed: Vec<&String> = index.iter().map(|(_, _, p)| p).collect();
@@ -383,17 +381,29 @@ pub(crate) fn git_status(_args: &str) -> String {
     out
 }
 
-pub(crate) fn collect_blobs(tree: &[(String, String, String)]) -> Option<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    for (mode, name, sha) in tree {
-        if mode == "40000" {
-            let (_, c) = read_loose(sha)?;
-            out.extend(collect_blobs(&parse_tree(&c)?)?);
-        } else {
-            out.push((sha.clone(), name.clone()));
+/// Flatten a tree into index entries — `(mode, sha, repo-relative path)`, the
+/// exact shape [`write_index`] and [`read_index`] use.
+///
+/// The path prefix matters for the same reason it does in [`checkout_tree`]: a
+/// nested blob reported under its bare basename never matches the index entry for
+/// `dir/name`, so `git status` called every file in a subdirectory freshly staged
+/// right after a clone.
+pub(crate) fn collect_blobs(tree_sha: &str) -> Vec<(String, String, String)> {
+    fn rec(tree_sha: &str, prefix: &str, out: &mut Vec<(String, String, String)>) {
+        let Some((_, t)) = read_loose(tree_sha) else { return };
+        let Some(ents) = parse_tree(&t) else { return };
+        for (mode, name, sha) in ents {
+            let rel = if prefix.is_empty() { name } else { alloc::format!("{prefix}/{name}") };
+            if mode == "40000" {
+                rec(&sha, &rel, out);
+            } else {
+                out.push((mode, sha, rel));
+            }
         }
     }
-    Some(out)
+    let mut out = Vec::new();
+    rec(tree_sha, "", &mut out);
+    out
 }
 
 pub(crate) fn git_add(args: &str) -> String {
@@ -521,21 +531,32 @@ pub(crate) fn git_checkout(args: &str) -> String {
     let Some(tree_sha) = tree_sha else {
         return "error: commit has no tree".to_string();
     };
-    checkout_tree(&tree_sha);
+    checkout_tree(&tree_sha, "");
+    // The index follows the tree that was just checked out, or `status` reports
+    // every file in the new branch as untracked.
+    write_index(&collect_blobs(&tree_sha));
     fs_write(&alloc::format!("{}/HEAD", git_dir()), alloc::format!("ref: refs/heads/{branch}\n").as_bytes());
     alloc::format!("ok: switched to '{branch}' ({})", &sha[..8.min(sha.len())])
 }
 
-pub(crate) fn checkout_tree(tree_sha: &str) {
+/// Write a tree out over the working directory, `prefix` being where in the repo
+/// this tree sits (`""` at the root).
+///
+/// **The prefix is load-bearing.** Recursing without it wrote every nested file at
+/// the repo root under its bare basename, so a clone of any repo with
+/// subdirectories produced a flat pile — with same-named files (`src/mod.rs`,
+/// `net/mod.rs`) overwriting each other, and a working tree that then disagreed
+/// with the index `collect_blobs` built from the same tree.
+pub(crate) fn checkout_tree(tree_sha: &str, prefix: &str) {
     let Some((_, t)) = read_loose(tree_sha) else { return };
     let Some(ents) = parse_tree(&t) else { return };
+    let root = git_root();
     for (mode, name, sha) in ents {
-        let root = git_root();
-        let full = alloc::format!("{root}/{name}");
+        let rel = if prefix.is_empty() { name } else { alloc::format!("{prefix}/{name}") };
         if mode == "40000" {
-            checkout_tree(&sha);
+            checkout_tree(&sha, &rel);
         } else if let Some((_, blob)) = read_loose(&sha) {
-            fs_write(&full, &blob);
+            fs_write(&alloc::format!("{root}/{rel}"), &blob);
         }
     }
 }

@@ -1,0 +1,7 @@
+# These packfiles are **test fixtures, not build output**. They are real
+# `git pack-objects` output, checked in and `include_bytes!`-ed by clone.rs —
+# without them the suite does not compile.
+#
+# The repo root ignores `*.pack` (build artifacts elsewhere), so this negates it
+# for this directory only.
+!*.pack

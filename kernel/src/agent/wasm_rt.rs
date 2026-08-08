@@ -1278,6 +1278,8 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
 
     // host_fs_list(path, out, cap) → n. Lines `name\tkind\tsize\n` for children
     // of `path` (Synapse virtual FS, same view as shell `/ls`). kind is `d` or `f`.
+    // `n` is the listing's **full** length; `n > cap` means it was truncated and
+    // the guest should retry with a bigger buffer (see `fill_guest`).
     linker
         .func_wrap(
             "chitti",
@@ -1308,22 +1310,21 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                         continue;
                     }
                     let _ = write!(s, "{name}\t{kind}\t{}\n", e.size);
-                    if s.len() >= out_cap as usize {
-                        s.truncate(out_cap as usize);
-                        break;
-                    }
                 }
-                let bytes = s.as_bytes();
-                let n = bytes.len().min(out_cap as usize);
-                if write_guest_bytes(&mut caller, out_ptr, &bytes[..n]).is_err() {
-                    return -1;
+                // The whole listing is built and its **full** length reported, so a
+                // guest with too small a buffer can grow and ask again. Stopping at
+                // `out_cap` instead would also cut the last line mid-field, which
+                // parses as a plausible bogus entry rather than as an error.
+                match fill_guest(&mut caller, out_ptr, out_cap, s.as_bytes()) {
+                    Some(n) => n as i32,
+                    None => -1,
                 }
-                n as i32
             },
         )
         .map_err(|_| "define host_fs_list")?;
 
-    // host_fs_read(path, out, cap) → n bytes of file content (capped).
+    // host_fs_read(path, out, cap) → n, the file's **full** length (up to `cap`
+    // bytes of it are written; `n > cap` means retry bigger — see `fill_guest`).
     linker
         .func_wrap(
             "chitti",
@@ -1346,11 +1347,11 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                 let Some(data) = crate::synapse::fs::read(&path) else {
                     return -2;
                 };
-                let n = data.len().min(out_cap as usize);
-                if write_guest_bytes(&mut caller, out_ptr, &data[..n]).is_err() {
-                    return -1;
+                // The **file's** length, not the written length — see `fill_guest`.
+                match fill_guest(&mut caller, out_ptr, out_cap, &data) {
+                    Some(n) => n as i32,
+                    None => -1,
                 }
-                n as i32
             },
         )
         .map_err(|_| "define host_fs_read")?;
@@ -1487,9 +1488,11 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         .map_err(|_| "define host_sha1")?;
 
     // host_inflate(src, srclen, out, outcap) -> i64  (zlib decompress; low 32
-    // bits = out length, high 32 bits = **input bytes consumed** — a packfile
-    // packs one zlib stream per object, so the caller must know where each
-    // stream ends; -1 on error).
+    // bits = the **decompressed** length, high 32 bits = **input bytes consumed**
+    // — a packfile packs one zlib stream per object, so the caller must know
+    // where each stream ends; -1/-2 on error). Trailing bytes after the stream
+    // are fine, which is what lets a caller hand it the rest of the pack and use
+    // `consumed` to walk to the next object instead of searching for the end.
     linker
         .func_wrap(
             "chitti",
@@ -1506,17 +1509,17 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                 let Ok((dec, consumed)) = crate::image::inflate::zlib_decompress_len(&src) else {
                     return -2;
                 };
-                let n = dec.len().min(out_cap.max(0) as usize);
-                if write_guest_bytes(&mut caller, out_ptr, &dec[..n]).is_err() {
-                    return -1;
+                // The **decompressed** length, not the written one — see `fill_guest`.
+                match fill_guest(&mut caller, out_ptr, out_cap, &dec) {
+                    Some(n) => ((consumed as i64) << 32) | n as i64,
+                    None => -1,
                 }
-                ((consumed as i64) << 32) | n as i64
             },
         )
         .map_err(|_| "define host_inflate")?;
 
     // host_deflate(src, srclen, out, outcap) -> i32  (zlib **stored-block**
-    // compress — valid zlib real git accepts; len or -1).
+    // compress — valid zlib real git accepts; the **compressed** length, or -1).
     linker
         .func_wrap(
             "chitti",
@@ -1531,20 +1534,22 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                     return -1;
                 };
                 let enc = zlib_deflate_stored(&src);
-                let n = enc.len().min(out_cap.max(0) as usize);
-                if write_guest_bytes(&mut caller, out_ptr, &enc[..n]).is_err() {
-                    return -1;
+                // The **compressed** length, not the written one — see `fill_guest`.
+                match fill_guest(&mut caller, out_ptr, out_cap, &enc) {
+                    Some(n) => n as i32,
+                    None => -1,
                 }
-                n as i32
             },
         )
         .map_err(|_| "define host_deflate")?;
 
     // host_http(req_ptr, req_len, out_ptr, out_cap) -> i64 = (status << 32) | len.
     // `req` JSON: {"m":"GET|POST","u":"url","h":"K: V; K: V","b":"<base64 body>"}.
-    // Response body (raw bytes) is written to `out` (capped); the low 32 bits of
-    // the return are its length, the high bits the HTTP status. Gated: the
-    // calling agent must declare a `net` capability in its manifest.
+    // Up to `out_cap` bytes of the response body are written to `out`; the low 32
+    // bits of the return are the body's **full** length (so `len > out_cap` means
+    // "retry with a buffer this big" — see `fill_guest`), the high bits the HTTP
+    // status. Gated: the calling agent must declare a `net` capability in its
+    // manifest.
     linker
         .func_wrap(
             "chitti",
@@ -1589,11 +1594,14 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                     Ok(r) => r,
                     Err(_) => return -5,
                 };
-                let n = resp.body.len().min(out_cap.max(0) as usize);
-                if write_guest_bytes(&mut caller, out_ptr, &resp.body[..n]).is_err() {
-                    return -1;
+                // The **body's** length, not the written one — see `fill_guest`. This
+                // is the one that mattered: a git packfile is hundreds of KiB and the
+                // guest's buffer was 64, so every clone of a real repository came back
+                // as a truncated pack and died inside the decompressor.
+                match fill_guest(&mut caller, out_ptr, out_cap, &resp.body) {
+                    Some(n) => ((resp.status as i64) << 32) | n as i64,
+                    None => -1,
                 }
-                ((resp.status as i64) << 32) | n as i64
             },
         )
         .map_err(|_| "define host_http")?;
@@ -1692,6 +1700,30 @@ fn read_guest_bytes(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Optio
 fn read_guest_str(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
     let b = read_guest_bytes(caller, ptr, len)?;
     String::from_utf8(b).ok()
+}
+
+/// Write as much of `data` as fits in the guest's `cap`-byte buffer at `out_ptr`
+/// and report **how long `data` actually was** — not how much was written.
+///
+/// A guest cannot size a buffer before it knows the answer's size, and a host that
+/// replies `min(len, cap)` makes "it fit" and "it did not" indistinguishable: a
+/// 182 KiB packfile handed to a 64 KiB buffer came back as a perfectly plausible
+/// complete 64 KiB one, and the git agent failed inflating the object that
+/// straddled the cut — reported as `object inflate failed`, which points at the
+/// decompressor rather than at the truncation two layers up.
+///
+/// So the contract is the image tenant's: the callee reports what it needed, the
+/// caller grows its arena and asks again. A caller that does not care about
+/// truncation must clamp the returned length to its own capacity before slicing.
+fn fill_guest(
+    caller: &mut Caller<'_, HostState>,
+    out_ptr: i32,
+    cap: i32,
+    data: &[u8],
+) -> Option<usize> {
+    let n = data.len().min(cap.max(0) as usize);
+    write_guest_bytes(caller, out_ptr, &data[..n]).ok()?;
+    Some(data.len())
 }
 
 fn write_guest_bytes(

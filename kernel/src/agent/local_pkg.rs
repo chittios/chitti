@@ -109,6 +109,12 @@ const KNOWN_KINDS: &[&str] = &["service", "skill_agent", "subagent"];
 const KNOWN_DOMAINS: &[&str] =
     &["fs", "console", "spawn", "todo", "inference", "ipc", "skill_manage", "channel", "net", "ui"];
 const KNOWN_RIGHTS: &[&str] = &["read", "write", "exec", "delete", "list"];
+/// Ceiling on `wasm.memory_pages` (4096 × 64 KiB = 256 MiB). The runtime enforces
+/// whatever a manifest asks for as a *limit*, so an absurd value is not itself
+/// dangerous — but a guest that can ask for more linear memory than the kernel
+/// heap holds turns an out-of-memory into a guest trap at an arbitrary moment,
+/// and a typo'd extra digit should be a diagnostic rather than that.
+const MAX_MEMORY_PAGES: i64 = 4096;
 
 /// Check a manifest, reporting what [`crate::agent::system::parse_manifest`] would
 /// silently swallow.
@@ -232,6 +238,16 @@ pub fn lint(json: &str) -> Vec<Diagnostic> {
         if let Some(f) = w.get("fuel").and_then(|v| v.as_i64()) {
             if f <= 0 {
                 out.push(Diagnostic::error("wasm.fuel", "must be positive"));
+            }
+        }
+        if let Some(p) = w.get("memory_pages").and_then(|v| v.as_i64()) {
+            if p <= 0 {
+                out.push(Diagnostic::error("wasm.memory_pages", "must be positive"));
+            } else if p > MAX_MEMORY_PAGES {
+                out.push(Diagnostic::error(
+                    "wasm.memory_pages",
+                    "over the 256 MiB ceiling a guest may ask for",
+                ));
             }
         }
     }

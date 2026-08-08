@@ -12,6 +12,12 @@ description = "git tool module for the Chitti git agent (assets/tools.wasm)"
 # cdylib = the wasm module; rlib lets `cargo test` run the pure logic on the host.
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
+# No unit-test target. `src/hostsim.rs` mounts the kernel's own `image/inflate.rs`,
+# `image/deflate.rs` and `net/sha1.rs` via `#[path]`, and those carry `#[test_case]`
+# suites for the kernel's custom test harness — which a `cfg(test)` build of this
+# crate cannot compile. The tests therefore live in `tests/`, where the library is
+# built *without* `cfg(test)` and the mounted files come in without their suites.
+test = false
 
 [profile.release]
 opt-level = "s"

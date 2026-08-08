@@ -236,13 +236,12 @@ pub fn call_agent_export(agent_id: u64, export: &str, args_json: &str) -> Result
             return call_js_export(agent_id, &wasm, export, args_json);
         }
     }
-    wasm_rt::call_string_bound(
-        &wasm,
-        export,
-        args_json,
-        Limits::default().with_fuel(crate::agent::system::manifest_fuel(agent_id).unwrap_or(CALL_FUEL)),
-        bindings_for(agent_id),
-    )
+    let mut limits = Limits::default()
+        .with_fuel(crate::agent::system::manifest_fuel(agent_id).unwrap_or(CALL_FUEL));
+    if let Some(pages) = crate::agent::system::manifest_pages(agent_id) {
+        limits = limits.with_pages(pages);
+    }
+    wasm_rt::call_string_bound(&wasm, export, args_json, limits, bindings_for(agent_id))
 }
 
 /// Run one tool of a JavaScript-derived module: arguments as JSON on fd 0, result
@@ -673,7 +672,9 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
     };
     let limits = Limits::default()
         .with_fuel(CALL_FUEL)
-        .with_pages(64);
+        // 64 pages (4 MiB) unless the manifest asks for more — every existing app
+        // declares none and so keeps exactly its old ceiling.
+        .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64));
     let session = Session::instantiate(&wasm, limits, bind).map_err(|e| {
         crate::serial_println!("package_ui> {name}: wasm instantiate failed: {e}");
         let raw = format!(

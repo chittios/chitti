@@ -81,6 +81,7 @@ mod wasm_glue {
 // returns the calling agent's `/agent/<id>` so we build them ourselves. Write
 // is home-scoped on the host; read/list are unscoped store reads.
 
+#[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "chitti")]
 extern "C" {
     fn host_fs_read(path: *const u8, path_len: i32, out: *mut u8, out_cap: i32) -> i32;
@@ -96,7 +97,25 @@ extern "C" {
     fn host_http(req: *const u8, req_len: i32, out: *mut u8, out_cap: i32) -> i64;
 }
 
-/// Shared scratch for host-import I/O (single-threaded wasm).
+// A native build gets the same imports from a simulator over the kernel's own
+// SHA-1/zlib, so the git logic — the packfile walk above all — is testable
+// without an OS. The call sites below are identical either way.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hostsim;
+#[cfg(not(target_arch = "wasm32"))]
+use hostsim::{
+    host_deflate, host_fs_exists, host_fs_list, host_fs_read, host_fs_write, host_home,
+    host_http, host_inflate, host_now_unix, host_sha1, host_user_home,
+};
+
+/// Shared **output** buffer for host-import results (single-threaded wasm).
+///
+/// Grown on demand, never shrunk. Inputs are *not* staged through it — a host
+/// import reads guest memory at whatever pointer it is handed, so a slice can be
+/// passed where it already lives. Copying inputs in here is not just waste: the
+/// copy was `s[..src.len()].copy_from_slice(src)` against a fixed 64 KiB buffer,
+/// which panics on anything larger, and a wasm panic handler is `loop {}` — so
+/// `git add` of a 100 KiB file hung the instance until it ran out of fuel.
 static mut SCRATCH: Option<Vec<u8>> = None;
 
 /// The shell agent's current directory, passed in the tool call (`{"cwd":…}`).
@@ -104,36 +123,72 @@ static mut SCRATCH: Option<Vec<u8>> = None;
 /// exactly like the git CLI running in a shell.
 static mut CURRENT_CWD: Option<String> = None;
 
-fn scratch() -> &'static mut Vec<u8> {
+/// The output buffer, grown to at least `want` bytes.
+fn scratch(want: usize) -> &'static mut Vec<u8> {
     unsafe {
-        if SCRATCH.is_none() {
-            SCRATCH = Some(vec![0u8; SCRATCH_CAP]);
+        let b = SCRATCH.get_or_insert_with(|| vec![0u8; SCRATCH_MIN]);
+        if b.len() < want {
+            b.resize(want, 0);
         }
-        SCRATCH.as_mut().unwrap()
+        b
     }
 }
 
-/// Cap on one host-import result (a file, a list, an HTTP body). Generous for
-/// the smart-HTTP packfile of a small repo; bigger clones are refused.
-const SCRATCH_CAP: usize = 64 << 10;
+/// Starting size for a host-import result. Big enough that a loose object, a
+/// directory listing or a refs advertisement lands in one call.
+const SCRATCH_MIN: usize = 64 << 10;
+
+/// Starting size for an HTTP response. A clone's packfile is the one host result
+/// that is routinely hundreds of KiB, and unlike a file read a second attempt
+/// costs a **second download** — so this starts where most repositories fit
+/// rather than where the smallest one does.
+const HTTP_MIN: usize = 1 << 20;
+
+/// Run a host import that fills the output buffer, sizing the buffer from what it
+/// reports.
+///
+/// `f(ptr, cap) -> (aux, len)`: a negative `len` is an error, and a `len` greater
+/// than `cap` means the host had more to give — the buffer grows to exactly that
+/// and the call is repeated once. This is the guest half of the host's
+/// `fill_guest` contract, and it is the fix for the bug this file's history is
+/// about: with a fixed buffer and a host that answered `min(len, cap)`, a 182 KiB
+/// packfile arrived as a complete-looking 64 KiB one and the clone died inside the
+/// decompressor, pointing at the wrong layer.
+fn filled(hint: usize, f: impl Fn(*mut u8, i32) -> (i64, i64)) -> Option<(i64, Vec<u8>)> {
+    let mut want = hint;
+    for _ in 0..2 {
+        let (ptr, cap) = {
+            let b = scratch(want);
+            (b.as_mut_ptr(), b.len())
+        };
+        let (aux, n) = f(ptr, cap as i32);
+        if n < 0 {
+            return None;
+        }
+        let n = n as usize;
+        if n <= cap {
+            return Some((aux, scratch(0)[..n].to_vec()));
+        }
+        want = n;
+    }
+    None
+}
 
 /// The calling agent's home (`/agent/<id>`).
 fn home() -> String {
-    let s = scratch();
+    let s = scratch(SCRATCH_MIN);
     let n = unsafe { host_home(s.as_mut_ptr(), s.len() as i32) };
     if n <= 0 {
         return String::new();
     }
-    String::from_utf8_lossy(&s[..n as usize]).into_owned()
+    String::from_utf8_lossy(&s[..(n as usize).min(s.len())]).into_owned()
 }
 
 fn fs_read(path: &str) -> Option<Vec<u8>> {
-    let s = scratch();
-    let n = unsafe { host_fs_read(path.as_ptr(), path.len() as i32, s.as_mut_ptr(), s.len() as i32) };
-    if n < 0 {
-        return None;
-    }
-    Some(s[..n as usize].to_vec())
+    filled(SCRATCH_MIN, |p, c| {
+        (0, unsafe { host_fs_read(path.as_ptr(), path.len() as i32, p, c) } as i64)
+    })
+    .map(|(_, v)| v)
 }
 
 fn fs_write(path: &str, data: &[u8]) -> bool {
@@ -146,12 +201,12 @@ fn fs_exists(path: &str) -> bool {
 
 /// List a directory: `name\t<d|f>\tsize\n` per child.
 fn fs_list(path: &str) -> Vec<(String, bool, u64)> {
-    let s = scratch();
-    let n = unsafe { host_fs_list(path.as_ptr(), path.len() as i32, s.as_mut_ptr(), s.len() as i32) };
-    if n < 0 {
+    let Some((_, raw)) = filled(SCRATCH_MIN, |p, c| {
+        (0, unsafe { host_fs_list(path.as_ptr(), path.len() as i32, p, c) } as i64)
+    }) else {
         return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&s[..n as usize]);
+    };
+    let text = String::from_utf8_lossy(&raw);
     let mut out = Vec::new();
     for line in text.lines() {
         let mut it = line.splitn(3, '\t');
@@ -166,12 +221,8 @@ fn fs_list(path: &str) -> Vec<(String, bool, u64)> {
 }
 
 fn sha1(data: &[u8]) -> String {
-    let s = scratch();
     let mut digest = [0u8; 20];
-    let ok = unsafe {
-        s[..data.len()].copy_from_slice(data);
-        host_sha1(s.as_mut_ptr(), data.len() as i32, digest.as_mut_ptr())
-    };
+    let ok = unsafe { host_sha1(data.as_ptr(), data.len() as i32, digest.as_mut_ptr()) };
     if ok != 0 {
         return String::new();
     }
@@ -179,30 +230,38 @@ fn sha1(data: &[u8]) -> String {
 }
 
 /// zlib-decompress `src`; returns `(bytes, input_consumed)`.
+///
+/// Trailing bytes after the stream are fine, and `input_consumed` says where it
+/// ended — so a caller walking a packfile hands over the whole remainder and steps
+/// by the answer.
 fn zlib_decompress(src: &[u8]) -> Option<(Vec<u8>, usize)> {
-    let s = scratch();
-    s[..src.len()].copy_from_slice(src);
-    let r = unsafe { host_inflate(s.as_ptr(), src.len() as i32, s.as_mut_ptr(), s.len() as i32) };
-    if r < 0 {
-        return None;
-    }
-    let consumed = ((r as u64) >> 32) as usize;
-    let n = (r & 0xffff_ffff) as usize;
-    Some((s[..n].to_vec(), consumed))
+    zlib_decompress_hint(src, SCRATCH_MIN)
+}
+
+/// [`zlib_decompress`] where the caller already knows the decompressed size (a
+/// pack object header declares it), so the buffer is right the first time.
+fn zlib_decompress_hint(src: &[u8], hint: usize) -> Option<(Vec<u8>, usize)> {
+    let (consumed, out) = filled(hint.max(1), |p, c| {
+        let r = unsafe { host_inflate(src.as_ptr(), src.len() as i32, p, c) };
+        if r < 0 {
+            return (0, -1);
+        }
+        (((r as u64) >> 32) as i64, r & 0xffff_ffff)
+    })?;
+    Some((out, consumed as usize))
 }
 
 fn zlib_deflate(src: &[u8]) -> Option<Vec<u8>> {
-    let s = scratch();
-    s[..src.len()].copy_from_slice(src);
-    let n = unsafe { host_deflate(s.as_ptr(), src.len() as i32, s.as_mut_ptr(), s.len() as i32) };
-    if n < 0 {
-        return None;
-    }
-    Some(s[..n as usize].to_vec())
+    // Stored blocks, so the output is the input plus a little framing.
+    filled(src.len() + 1024, |p, c| {
+        (0, unsafe { host_deflate(src.as_ptr(), src.len() as i32, p, c) } as i64)
+    })
+    .map(|(_, v)| v)
 }
 
 /// HTTP request/response. `req` JSON `{"m","u","h","b"}`; returns `(status,
-/// body)` (body capped at the scratch).
+/// body)` — the **whole** body, growing the buffer and re-requesting once if the
+/// first attempt was not big enough.
 fn http(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<(u16, Vec<u8>), i64> {
     use alloc::format;
     let mut h = String::new();
@@ -220,15 +279,18 @@ fn http(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Resul
         json_escape(&h),
         base64(body),
     );
-    let s = scratch();
-    s[..req.len()].copy_from_slice(req.as_bytes());
-    let r = unsafe { host_http(s.as_ptr(), req.len() as i32, s.as_mut_ptr(), s.len() as i32) };
-    if r < 0 {
-        return Err(r);
-    }
-    let status = (r >> 32) as u16;
-    let n = (r & 0xffff_ffff) as usize;
-    Ok((status, s[..n.min(s.len())].to_vec()))
+    // The request goes straight out of its own allocation: a push body is the whole
+    // packfile in base64 and staging it through a fixed buffer is what used to
+    // panic the instance.
+    let (status, out) = filled(HTTP_MIN, |p, c| {
+        let r = unsafe { host_http(req.as_ptr(), req.len() as i32, p, c) };
+        if r < 0 {
+            return (r, -1);
+        }
+        ((r >> 32) & 0xffff, r & 0xffff_ffff)
+    })
+    .ok_or(-1i64)?;
+    Ok((status as u16, out))
 }
 
 // --- hex / base64 -----------------------------------------------------------
@@ -292,8 +354,8 @@ fn json_escape(s: &str) -> String {
 
 // --- git logic (see kernel draft; ported to host-import primitives) ----------
 
-mod git;
-mod remote;
+pub mod git;
+pub mod remote;
 
 /// The agent's git root: `<home>/git`.
 /// Collapse `//`, `/./` and `/../` in a store path.
@@ -328,18 +390,28 @@ fn git_root() -> String {
 
 /// The ChittiOS user home (`/home/chitti`) — the shell agent's `~`.
 pub(crate) fn user_home() -> String {
-    let s = scratch();
+    let s = scratch(SCRATCH_MIN);
     let n = unsafe { host_user_home(s.as_mut_ptr(), s.len() as i32) };
     if n <= 0 {
         return "/home/chitti".to_string();
     }
-    String::from_utf8_lossy(&s[..n as usize]).into_owned()
+    String::from_utf8_lossy(&s[..(n as usize).min(s.len())]).into_owned()
 }
 
 /// The base directory for relative git targets: the shell's current directory
 /// when it invoked us, else the user home.
 pub(crate) fn base_dir() -> String {
     unsafe { CURRENT_CWD.clone() }.unwrap_or_else(user_home)
+}
+
+/// Drop the process-wide guest state between native tests. On wasm the instance
+/// itself is the boundary, so this exists only for the simulator.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reset_state() {
+    unsafe {
+        SCRATCH = None;
+        CURRENT_CWD = None;
+    }
 }
 
 /// Persist the git working directory for subsequent commands.
