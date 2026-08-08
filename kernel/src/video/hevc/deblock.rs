@@ -265,10 +265,10 @@ mod tests {
         // inventing an edge, which over a GOP is a slow contrast loss.
         let mut p = plane(&[[128; 8]; 8]);
         let before = p.clone();
-        filter_luma_edge(&mut p, 4, 1, 8, beta(30, 0), [tc(30, 2, 0); 2], [false; 2], [false; 2]);
+        filter_luma_edge(&mut p, 4, 1, 8, beta(30, 0), [tc(30, 2, 0); 2], [false; 2], [false; 2], 255);
         assert_eq!(p, before);
         let mut p = plane(&[[128; 8]; 8]);
-        filter_chroma_edge(&mut p, 4, 1, 8, [tc(30, 2, 0, 255); 2], [false; 2], [false; 2]);
+        filter_chroma_edge(&mut p, 4, 1, 8, [tc(30, 2, 0); 2], [false; 2], [false; 2], 255);
         assert_eq!(p, before);
     }
 
@@ -284,7 +284,7 @@ mod tests {
         }
         let mut p = plane(&rows);
         let before = p.clone();
-        filter_luma_edge(&mut p, 4, 1, 8, beta(26, 0), [tc(26, 2, 0); 2], [false; 2], [false; 2]);
+        filter_luma_edge(&mut p, 4, 1, 8, beta(26, 0), [tc(26, 2, 0); 2], [false; 2], [false; 2], 255);
         assert_eq!(p, before, "a 210-level step is content, not blocking");
     }
 
@@ -298,7 +298,7 @@ mod tests {
             *r = [100, 100, 100, 100, 108, 108, 108, 108];
         }
         let mut p = plane(&rows);
-        filter_luma_edge(&mut p, 4, 1, 8, beta(37, 0), [tc(37, 2, 0); 2], [false; 2], [false; 2]);
+        filter_luma_edge(&mut p, 4, 1, 8, beta(37, 0), [tc(37, 2, 0); 2], [false; 2], [false; 2], 255);
         for y in 0..8 {
             let row = &p[y * 8..y * 8 + 8];
             // The step is spread: p0 rises, q0 falls, and the outermost
@@ -325,7 +325,7 @@ mod tests {
             *r = [100, 100, 100, 100, 108, 108, 108, 108];
         }
         let mut p = plane(&rows);
-        filter_luma_edge(&mut p, 4, 1, 8, beta(37, 0), [tc(37, 2, 0); 2], [true; 2], [false; 2]);
+        filter_luma_edge(&mut p, 4, 1, 8, beta(37, 0), [tc(37, 2, 0); 2], [true; 2], [false; 2], 255);
         for y in 0..8 {
             let row = &p[y * 8..y * 8 + 8];
             assert_eq!(&row[..4], &[100, 100, 100, 100], "p side written");
@@ -348,7 +348,7 @@ mod tests {
             };
         }
         let mut p = plane(&rows);
-        filter_luma_edge(&mut p, 4, 1, 8, beta(37, 0), [tc(37, 2, 0); 2], [false; 2], [false; 2]);
+        filter_luma_edge(&mut p, 4, 1, 8, beta(37, 0), [tc(37, 2, 0); 2], [false; 2], [false; 2], 255);
         for y in 0..4 {
             assert!(p[y * 8 + 3] != 100, "top half should be filtered");
         }
@@ -376,7 +376,7 @@ mod tests {
         }
         let vert = plane(&rows);
         let mut a = vert.clone();
-        filter_luma_edge(&mut a, 4, 1, 8, beta(35, 0), [tc(35, 2, 0); 2], [false; 2], [false; 2]);
+        filter_luma_edge(&mut a, 4, 1, 8, beta(35, 0), [tc(35, 2, 0); 2], [false; 2], [false; 2], 255);
 
         // Transpose the input, filter as a horizontal edge (across = stride).
         let mut b = vec![0u16; 64];
@@ -385,7 +385,7 @@ mod tests {
                 b[x * 8 + y] = vert[y * 8 + x];
             }
         }
-        filter_luma_edge(&mut b, 4 * 8, 8, 1, beta(35, 0), [tc(35, 2, 0); 2], [false; 2], [false; 2]);
+        filter_luma_edge(&mut b, 4 * 8, 8, 1, beta(35, 0), [tc(35, 2, 0); 2], [false; 2], [false; 2], 255);
         for y in 0..8 {
             for x in 0..8 {
                 assert_eq!(a[y * 8 + x], b[x * 8 + y], "at ({x},{y})");
@@ -401,7 +401,7 @@ mod tests {
             *r = [100, 100, 100, 100, 120, 120, 120, 120];
         }
         let mut p = plane(&rows);
-        filter_chroma_edge(&mut p, 4, 1, 8, [tc(40, 2, 0, 255); 2], [false; 2], [false; 2]);
+        filter_chroma_edge(&mut p, 4, 1, 8, [tc(40, 2, 0); 2], [false; 2], [false; 2], 255);
         for y in 0..8 {
             let row = &p[y * 8..y * 8 + 8];
             assert_eq!(&row[..3], &[100, 100, 100], "chroma wrote p1 or beyond");

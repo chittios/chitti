@@ -64,3 +64,4 @@ userspace/**/*.bin
 !userspace/imgdec/imgdec-*.bin
 
 node_modules/
+*.pack
