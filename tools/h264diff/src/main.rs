@@ -95,7 +95,14 @@ use video::h264;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: h264diff <file.mp4> [--stream[=jump]]");
+    // Encode a synthetic desktop-like clip with the kernel recorder encoder,
+    // mux it, and open it through StreamDecoder (the same path as `/open`).
+    // Exit 0 only when frame 0 paints non-black.
+    if args.iter().any(|a| a == "--record-selftest") {
+        record_selftest(&args);
+        return;
+    }
+    let path = args.get(1).expect("usage: h264diff <file.mp4> [--stream[=jump]] | --record-selftest");
     let bytes = std::fs::read(path).expect("read file");
     if args.iter().any(|a| a == "--bench") {
         // Streaming throughput: decode on demand (no full-clip RGB cache).
@@ -270,4 +277,153 @@ fn main() {
         n += 1;
     }
     eprintln!("h264diff: wrote {} frame(s)", n);
+}
+
+fn record_selftest(args: &[String]) {
+    use video::h264::encoder::Encoder;
+    use video::mp4_mux::{self, Sample};
+
+    // Match a real `/record` geometry (50% of a typical panel, MB-aligned).
+    let (w, h) = args
+        .iter()
+        .find(|a| a.starts_with("--size="))
+        .and_then(|a| {
+            let s = a.trim_start_matches("--size=");
+            let mut it = s.split('x');
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .unwrap_or((64usize, 48usize));
+    eprintln!("record-selftest: encoding {w}x{h}");
+    let mut enc = Encoder::new(w, h, 28).expect("encoder");
+    let mut px = vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            px[y * w + x] = if y < 8.max(h / 16) {
+                0x00ff_ffff // white bar
+            } else if (x / 16 + y / 16) % 2 == 0 {
+                0x00cc_785c // brand terracotta
+            } else {
+                0x00_30_40_80
+            };
+        }
+    }
+    let mut samples = Vec::new();
+    for i in 0..3 {
+        let au = enc.encode_rgb32(&px, i == 0).expect("encode");
+        eprintln!(
+            "record-selftest: frame {i} au_len={} first8={:02x?}",
+            au.len(),
+            &au[..au.len().min(8)]
+        );
+        samples.push(Sample {
+            bytes: au,
+            duration: 200,
+            sync: i == 0,
+        });
+    }
+
+    // Native CAVLC path on raw sample0.
+    {
+        let sps = h264::parse_sps(&video::bits::unescape_rbsp(&enc.sps_nal[1..])).unwrap();
+        let pps = h264::parse_pps(&video::bits::unescape_rbsp(&enc.pps_nal[1..])).unwrap();
+        let nals = h264::split_avcc(&samples[0].bytes, 4);
+        assert!(!nals.is_empty(), "no NAL in sample0");
+        let df = h264::decoder::decode_access_unit(&sps, &pps, &[(nals[0].rbsp(), true)], None)
+            .expect("native decode sample0");
+        let mean_y = df.y.iter().map(|&p| p as u32).sum::<u32>() / df.y.len() as u32;
+        let bright = df.y.iter().filter(|&&p| p > 200).count();
+        eprintln!(
+            "record-selftest: native mean_y={mean_y} y0={} bright={}/{} (want white bar)",
+            df.y[0],
+            bright,
+            df.y.len()
+        );
+        // Pure mid-gray prediction has no bright pixels; a white bar must survive.
+        if bright < df.y.len() / 64 {
+            panic!(
+                "native decode lost the white bar (bright={bright}, mean_y={mean_y}) — residual empty?"
+            );
+        }
+    }
+
+    let file = mp4_mux::mux_avc(
+        w as u32,
+        h as u32,
+        1000,
+        &enc.sps_nal,
+        &enc.pps_nal,
+        &samples,
+    )
+    .expect("mux");
+    eprintln!("record-selftest: muxed {} bytes", file.len());
+
+    // Demux sample offsets must land inside mdat, not at file start (ftyp).
+    {
+        let track = video::mp4::parse(&file).expect("demux");
+        let s0 = &track.samples[0];
+        eprintln!(
+            "record-selftest: sample0 offset={} size={} file_len={}",
+            s0.offset,
+            s0.size,
+            file.len()
+        );
+        assert!(s0.offset > 8, "sample0 offset {} looks like stco=0 bug", s0.offset);
+        let head = &file[s0.offset..s0.offset + s0.size.min(8)];
+        eprintln!("record-selftest: sample0 first8={:02x?}", head);
+        // Must not be 'ftyp'
+        assert!(
+            !(head.len() >= 8 && &head[4..8] == b"ftyp"),
+            "sample0 is ftyp — stco still wrong"
+        );
+    }
+
+    let mut dec = video::StreamDecoder::open(file).expect("StreamDecoder open");
+    eprintln!("record-selftest: backend={}", dec.backend);
+    assert!(
+        dec.seek_decode(0),
+        "seek_decode(0) failed backend={}",
+        dec.backend
+    );
+    let f = dec.cur_frame().expect("cur_frame");
+    let nonzero = f.pixels.iter().filter(|&&p| p & 0x00ff_ffff != 0).count();
+    let mean_r: u64 = f
+        .pixels
+        .iter()
+        .map(|&p| ((p >> 16) & 0xff) as u64)
+        .sum::<u64>()
+        / f.pixels.len() as u64;
+    let mean_g: u64 = f
+        .pixels
+        .iter()
+        .map(|&p| ((p >> 8) & 0xff) as u64)
+        .sum::<u64>()
+        / f.pixels.len() as u64;
+    let mean_b: u64 = f
+        .pixels
+        .iter()
+        .map(|&p| (p & 0xff) as u64)
+        .sum::<u64>()
+        / f.pixels.len() as u64;
+    eprintln!(
+        "record-selftest: frame0 {}x{} nonzero={}/{} mean_rgb=({},{},{}) p0={:08x}",
+        f.w,
+        f.h,
+        nonzero,
+        f.pixels.len(),
+        mean_r,
+        mean_g,
+        mean_b,
+        f.pixels[0]
+    );
+    if nonzero <= f.pixels.len() / 4 {
+        panic!(
+            "frame is nearly black ({nonzero}/{}) — same failure as /record → /open",
+            f.pixels.len()
+        );
+    }
+    assert!(
+        dec.seek_decode(1),
+        "seek_decode(1) failed after P frame"
+    );
+    eprintln!("record-selftest: OK");
 }

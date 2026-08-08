@@ -5,8 +5,10 @@
 //! ChittiOS, deliberately scoped so a cooperative kernel can keep up:
 //!
 //! * **Baseline profile, CAVLC only** (matches our decoder's simple path).
-//! * **I_16x16 DC** for keyframes and for changed macroblocks.
-//! * **P_Skip** for macroblocks that match the previous reconstructed frame
+//! * **I_PCM** for keyframes and changed macroblocks (bit-exact; the residual
+//!   I_16x16 path still mis-decodes at real screen sizes — kept dead for a
+//!   later rewrite).
+//! * **P_Skip** for macroblocks that match the previous source frame
 //!   (the win for desktop UI — static regions cost one skip run, not a frame).
 //! * Fixed QP, zero-motion only (no motion search).
 //!
@@ -592,9 +594,10 @@ impl Encoder {
                 skip_run = 0;
             }
 
-            // Encode as I_16x16 DC. In I slice mb_type = 1+mode+4*cbpc+12*cbpl;
-            // in P slice add 5 (I_NxN=5, I_16x16 starts at 6).
-            self.encode_i16_mb(
+            // I_PCM: raw samples. The residual I16 path still fails closed at
+            // real screen sizes (host selftest: 64×48 paints, 720×448 decodes
+            // near-black). PCM is large but bit-exact; P_Skip compresses static UI.
+            self.encode_pcm_mb(
                 &mut w,
                 y,
                 u,
@@ -606,7 +609,7 @@ impl Encoder {
                 mb_x,
                 mb_y,
                 is_idr,
-            )?;
+            );
         }
         if !is_idr {
             // Trailing skip run (may be zero).
@@ -634,6 +637,57 @@ impl Encoder {
         Ok(au)
     }
 
+    /// I_PCM macroblock (mb_type 25 in an I slice, 30 in a P slice).
+    fn encode_pcm_mb(
+        &self,
+        w: &mut BitWriter,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        recon_y: &mut [u8],
+        recon_u: &mut [u8],
+        recon_v: &mut [u8],
+        nnz_y: &mut [u8],
+        mb_x: usize,
+        mb_y: usize,
+        is_i_slice: bool,
+    ) {
+        // Table 7-11: I_PCM = 25; in a P slice Intra types are offset by +5.
+        w.ue(if is_i_slice { 25 } else { 30 });
+        w.byte_align_zeros();
+        let bx = mb_x * 16;
+        let by = mb_y * 16;
+        let cw = self.w / 2;
+        for yy in 0..16 {
+            for xx in 0..16 {
+                let p = y[(by + yy) * self.w + bx + xx];
+                w.u(8, p as u32);
+                recon_y[(by + yy) * self.w + bx + xx] = p;
+            }
+        }
+        let (cbx, cby) = (bx / 2, by / 2);
+        for yy in 0..8 {
+            for xx in 0..8 {
+                let p = u[(cby + yy) * cw + cbx + xx];
+                w.u(8, p as u32);
+                recon_u[(cby + yy) * cw + cbx + xx] = p;
+            }
+        }
+        for yy in 0..8 {
+            for xx in 0..8 {
+                let p = v[(cby + yy) * cw + cbx + xx];
+                w.u(8, p as u32);
+                recon_v[(cby + yy) * cw + cbx + xx] = p;
+            }
+        }
+        for j in 0..4 {
+            for i in 0..4 {
+                nnz_y[(mb_y * 4 + j) * (self.mb_w * 4) + mb_x * 4 + i] = 16;
+            }
+        }
+    }
+
+    #[allow(dead_code)] // residual path kept for a future compressed I16 rewrite
     fn encode_i16_mb(
         &self,
         w: &mut BitWriter,
@@ -682,6 +736,10 @@ impl Encoder {
         }
 
         // Residual per 4×4 in BLK_XY order; DC stored in raster (x + y*4).
+        // Order is load-bearing (JM / H.264 §8.5): **extract unquantized DC,
+        // then quantize AC, then Hadamard+quant the DC array.** Quantizing DC
+        // before the Hadamard was zeroing almost everything and every recording
+        // became mid-gray prediction with a ~10-byte AU.
         let mut dc = [0i32; 16];
         let mut ac_blocks = [[0i32; 16]; 16];
         for b in 0..16 {
@@ -695,12 +753,25 @@ impl Encoder {
                 }
             }
             fdt_4x4(&mut blk);
-            quant_4x4(&mut blk, self.qp, true);
             dc[by4 * 4 + bx4] = blk[0];
             blk[0] = 0;
+            quant_4x4(&mut blk, self.qp, true);
             ac_blocks[b] = blk;
         }
+        #[cfg(test)]
+        let dc_pre = dc;
         quant_luma_dc(&mut dc, self.qp);
+        #[cfg(test)]
+        {
+            // Catch silent no-op residual: a bright MB must keep some DC.
+            let bright = org.iter().any(|&o| o > 200);
+            if bright && dc.iter().all(|&c| c == 0) && ac_blocks.iter().all(|b| b.iter().all(|&c| c == 0)) {
+                panic!(
+                    "bright MB residual fully zeroed (org0={} pred0={} dc_pre0={:?} qp={})",
+                    org[0], pred[0], dc_pre[0], self.qp
+                );
+            }
+        }
 
         // Chroma 8×8 (both planes).
         let cw = self.w / 2;
@@ -755,9 +826,9 @@ impl Encoder {
                     }
                 }
                 fdt_4x4(&mut blk);
-                quant_4x4(&mut blk, self.qp, true);
                 dc_c[b] = blk[0];
                 blk[0] = 0;
+                quant_4x4(&mut blk, self.qp, true);
                 ac_c[b] = blk;
             }
             quant_chroma_dc(&mut dc_c, self.qp);
@@ -956,6 +1027,89 @@ mod tests {
     use crate::video::h264::{parse_pps, parse_sps, split_avcc};
 
     #[test_case]
+    fn a_cavlc_write_residual_roundtrips_a_nonzero_dc() {
+        let mut w = BitWriter::new();
+        let mut scan = [0i32; 16];
+        scan[0] = 5;
+        write_residual(&mut w, &scan, 16, 0);
+        let bytes = w.into_bytes_aligned();
+        assert!(!bytes.is_empty(), "wrote nothing for DC=5");
+        let mut r = crate::video::bits::BitReader::new(&bytes);
+        let (coeffs, tc) = super::super::cavlc::residual_block(&mut r, 16, 0).unwrap();
+        assert_eq!(tc, 1, "total_coeff");
+        assert_eq!(coeffs[0], 5, "DC level round-trip, got {coeffs:?}");
+    }
+
+    #[test_case]
+    fn a_aaa_white_rgb_converts_to_bright_luma() {
+        let px0 = 0x00ff_ffffu32;
+        let r = ((px0 >> 16) & 255) as i32;
+        let g = ((px0 >> 8) & 255) as i32;
+        let b = (px0 & 255) as i32;
+        assert_eq!((r, g, b), (255, 255, 255), "pixel layout");
+        let (y, u, v) = rgb32_to_yuv420(16, 16, &[px0; 16 * 16]);
+        let mean = y.iter().map(|&p| p as u32).sum::<u32>() / y.len() as u32;
+        assert!(mean > 200, "white mean Y={mean}, y0={} u0={} v0={}", y[0], u[0], v[0]);
+    }
+
+    #[test_case]
+    fn a_i16_residual_path_keeps_dc_for_white_minus_gray() {
+        // Replicate one MB residual path outside the bitstream writer.
+        let pred = 128i32;
+        let org = 235i32; // approx white luma
+        let mut dc = [0i32; 16];
+        for b in 0..16 {
+            let mut blk = [org - pred; 16];
+            fdt_4x4(&mut blk);
+            quant_4x4(&mut blk, 28, true);
+            dc[b] = blk[0];
+        }
+        assert!(
+            dc.iter().any(|&c| c != 0),
+            "4x4 DC quant zeroed white-gray residual: {dc:?}"
+        );
+        quant_luma_dc(&mut dc, 28);
+        assert!(
+            dc.iter().any(|&c| c != 0),
+            "luma DC quant zeroed: {dc:?}"
+        );
+    }
+
+    #[test_case]
+    fn a_white_macroblock_is_not_a_tiny_empty_au() {
+        let mut enc = Encoder::new(16, 16, 28).unwrap();
+        let px = vec![0x00ff_ffffu32; 16 * 16];
+        let au = enc.encode_rgb32(&px, true).unwrap();
+        let nals = split_avcc(&au, 4);
+        assert_eq!(nals.len(), 1, "au_len={} first={:02x?}", au.len(), &au[..au.len().min(8)]);
+        let sps = parse_sps(&unescape_rbsp(&enc.sps_nal[1..])).unwrap();
+        let pps = parse_pps(&unescape_rbsp(&enc.pps_nal[1..])).unwrap();
+        let df = decode_access_unit(&sps, &pps, &[(nals[0].rbsp(), true)], None)
+            .unwrap_or_else(|e| panic!("decode failed: {e} (au_len={})", au.len()));
+        let mean_y = df.y.iter().map(|&p| p as u32).sum::<u32>() / df.y.len() as u32;
+        assert!(
+            mean_y > 180,
+            "white frame mean Y={mean_y} (want bright); au_len={} y0={}",
+            au.len(),
+            df.y[0]
+        );
+    }
+
+    #[test_case]
+    fn forward_quant_does_not_zero_a_large_residual() {
+        // A 4×4 of residual 100 must survive QP 28 — if it quantises to zero the
+        // whole encoder is a no-op and every frame is mid-gray prediction.
+        let mut blk = [100i32; 16];
+        fdt_4x4(&mut blk);
+        assert!(blk[0].abs() > 100, "fdt DC should grow, got {}", blk[0]);
+        quant_4x4(&mut blk, 28, true);
+        assert!(
+            blk.iter().any(|&c| c != 0),
+            "quant_4x4 zeroed a large residual: {blk:?}"
+        );
+    }
+
+    #[test_case]
     fn rgb_to_yuv_black_and_white() {
         let black = [0u32; 16 * 16];
         let (y, u, v) = rgb32_to_yuv420(16, 16, &black);
@@ -1044,5 +1198,166 @@ mod tests {
         assert_eq!((track.width, track.height), (32, 32));
         assert_eq!(track.samples.len(), 2);
         assert!(track.samples[0].is_sync);
+    }
+
+    /// The live player opens recordings through [`StreamDecoder`] (rust_h264
+    /// first). A clip that demuxes but never paints is exactly the failure
+    /// reported for `/record` → `/open`.
+    #[test_case]
+    fn recorded_mp4_paints_through_the_player_decoder() {
+        // Real recordings land near 720×448 at 50% scale; a 64×48 residual
+        // path can look fine while a full-size IDR does not. Use a size that
+        // exercises multiple MB rows and the rust_h264 StreamDecoder path.
+        let (w, h) = (80usize, 64usize);
+        let mut enc = Encoder::new(w, h, 28).unwrap();
+        // Distinct colour so a black/empty frame is an obvious fail.
+        let mut px = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                // Brand terracotta-ish, with a white bar so residual is non-flat.
+                px[y * w + x] = if y < 8 {
+                    0x00ff_ffff
+                } else {
+                    0x00cc_785c
+                };
+            }
+        }
+        let mut samples = Vec::new();
+        for i in 0..3 {
+            // Mix IDR + P (skip) like a real recording.
+            let au = enc.encode_rgb32(&px, i == 0).unwrap();
+            samples.push(crate::video::mp4_mux::Sample {
+                bytes: au,
+                duration: 200,
+                sync: i == 0,
+            });
+        }
+        // Sanity: the first sample alone must decode via the native path that
+        // the unit tests already trust, *before* we blame the container.
+        let raw0_len = samples[0].bytes.len();
+        {
+            let sps_rbsp = unescape_rbsp(&enc.sps_nal[1..]);
+            let pps_rbsp = unescape_rbsp(&enc.pps_nal[1..]);
+            let sps = parse_sps(&sps_rbsp).unwrap();
+            let pps = parse_pps(&pps_rbsp).unwrap();
+            let nals = split_avcc(&samples[0].bytes, 4);
+            assert_eq!(
+                nals.len(),
+                1,
+                "one NAL per sample (au_len={raw0_len}, first8={:02x?})",
+                &samples[0].bytes[..samples[0].bytes.len().min(8)]
+            );
+            assert!(
+                matches!(nals[0].kind, crate::video::h264::NalType::SliceIdr),
+                "first sample must be IDR"
+            );
+            let df = decode_access_unit(&sps, &pps, &[(nals[0].rbsp(), true)], None);
+            assert!(
+                df.is_ok(),
+                "native decode of raw sample0 failed: {:?} (au_len={raw0_len})",
+                df.err()
+            );
+            let df = df.unwrap();
+            // Residual must have done *something* — pure 128 gray means the
+            // encoder wrote empty residuals and the player paints a blank.
+            let mean_y = df.y.iter().map(|&p| p as u32).sum::<u32>() / df.y.len() as u32;
+            assert!(
+                mean_y > 140 || mean_y < 100,
+                "mean Y={mean_y} looks like empty-residual mid-gray; AU was {raw0_len} bytes"
+            );
+        }
+        let file = crate::video::mp4_mux::mux_avc(
+            w as u32,
+            h as u32,
+            1000,
+            &enc.sps_nal,
+            &enc.pps_nal,
+            &samples,
+        )
+        .expect("mux");
+        // Demuxed sample0 must still decode natively (proves the container
+        // did not corrupt the AU).
+        {
+            let track = crate::video::mp4::parse(&file).expect("demux");
+            assert_eq!(track.samples.len(), 3);
+            let s0 = &track.samples[0];
+            assert!(
+                s0.offset >= 16,
+                "sample0 offset {} is inside ftyp — stco broken",
+                s0.offset
+            );
+            assert_eq!(
+                s0.size, raw0_len,
+                "demux sample0 size {} != encoded AU {}; offset={}",
+                s0.size,
+                raw0_len,
+                s0.offset
+            );
+            assert!(
+                s0.offset + s0.size <= file.len(),
+                "sample0 out of range: off={} size={} file={}",
+                s0.offset,
+                s0.size,
+                file.len()
+            );
+            let au = &file[s0.offset..s0.offset + s0.size];
+            assert_ne!(&au.get(4..8).unwrap_or(&[]), b"ftyp");
+            let cfg = match &track.config {
+                crate::video::mp4::CodecConfig::Avc(a) => a,
+                _ => panic!("expected AVC"),
+            };
+            assert_eq!(cfg.length_size, 4);
+            let sps = parse_sps(&unescape_rbsp(&cfg.sps[0][1..])).unwrap();
+            let pps = parse_pps(&unescape_rbsp(&cfg.pps[0][1..])).unwrap();
+            let nals = split_avcc(au, cfg.length_size);
+            assert!(
+                !nals.is_empty(),
+                "demuxed sample0 has no NALs (len={}, first8={:02x?})",
+                au.len(),
+                &au[..au.len().min(8)]
+            );
+            let df = decode_access_unit(
+                &sps,
+                &pps,
+                &[(nals[0].rbsp(), true)],
+                None,
+            );
+            assert!(
+                df.is_ok(),
+                "native decode of *demuxed* sample0 failed: {:?} (au first 16 bytes {:02x?})",
+                df.err(),
+                &au[..au.len().min(16)]
+            );
+        }
+        let mut dec = crate::video::StreamDecoder::open(file).expect("open StreamDecoder");
+        assert!(
+            dec.seek_decode(0),
+            "seek_decode(0) must produce a picture (backend={})",
+            dec.backend
+        );
+        let f = dec.cur_frame().expect("cur_frame after seek_decode");
+        // StreamDecoder may downscale for display (DISPLAY_MAX_EDGE); src size is authoritative.
+        assert_eq!((dec.src_w as usize, dec.src_h as usize), (w, h));
+        // Not all black / not all zero — a real image.
+        let nonzero = f.pixels.iter().filter(|&&p| p & 0x00ff_ffff != 0).count();
+        assert!(
+            nonzero > f.pixels.len() / 4,
+            "frame is nearly black ({nonzero}/{} non-zero) — encoder bitstream is unplayable",
+            f.pixels.len()
+        );
+        // White bar must survive (top row should be bright, not black/gray).
+        let top = f.pixels[0];
+        let top_yish = ((top >> 16) & 0xff).max((top >> 8) & 0xff).max(top & 0xff);
+        assert!(
+            top_yish > 180,
+            "top pixel {:08x} is not bright — white bar lost (backend={})",
+            top,
+            dec.backend
+        );
+        // And the next display frame must also resolve (P after IDR).
+        assert!(
+            dec.seek_decode(1),
+            "seek_decode(1) must produce a picture after a P frame"
+        );
     }
 }

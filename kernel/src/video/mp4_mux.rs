@@ -41,15 +41,13 @@ pub fn mux_avc(
     }
 
     let mut mdat_payload = Vec::new();
-    let mut chunk_offsets: Vec<u32> = Vec::new();
+    let mut rel_offsets: Vec<u32> = Vec::new();
     let mut sample_sizes: Vec<u32> = Vec::new();
     let mut sync_samples: Vec<u32> = Vec::new(); // 1-based indices
     let mut total_duration: u64 = 0;
 
-    // mdat header is 8 bytes; sample data starts at file offset after ftyp+mdat hdr.
-    // We'll patch offsets after building ftyp.
     for (i, s) in samples.iter().enumerate() {
-        chunk_offsets.push(mdat_payload.len() as u32); // relative; patched later
+        rel_offsets.push(mdat_payload.len() as u32);
         sample_sizes.push(s.bytes.len() as u32);
         if s.sync {
             sync_samples.push((i + 1) as u32);
@@ -57,6 +55,16 @@ pub fn mux_avc(
         total_duration += s.duration as u64;
         mdat_payload.extend_from_slice(&s.bytes);
     }
+
+    // ftyp first so we know the absolute file offset of mdat payload.
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(b"isom");
+    ftyp.extend_from_slice(&0x200u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isomiso2avc1mp41");
+    let ftyp_box = box_raw(b"ftyp", &ftyp);
+    let mdat_box = box_raw(b"mdat", &mdat_payload);
+    // Sample data starts immediately after the 8-byte mdat header.
+    let mdat_data_off = (ftyp_box.len() + 8) as u32;
 
     let avcc = build_avcc(sps_nal, pps_nal)?;
     let stsd = build_stsd(width, height, &avcc);
@@ -88,19 +96,21 @@ pub fn mux_avc(
         box_full(b"stss", 0, 0, &b)
     };
 
-    // Placeholder stco — patched once we know mdat offset.
-    let stco_placeholder = {
+    // Absolute chunk offsets — written correctly the first time. (A post-hoc
+    // patch of nested `stco` used to miss the box inside `trak` and left every
+    // sample pointing at file offset 0 / the ftyp header.)
+    let stco = {
         let mut b = Vec::new();
-        b.extend_from_slice(&(chunk_offsets.len() as u32).to_be_bytes());
-        for _ in &chunk_offsets {
-            b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&(rel_offsets.len() as u32).to_be_bytes());
+        for &rel in &rel_offsets {
+            b.extend_from_slice(&(mdat_data_off + rel).to_be_bytes());
         }
         box_full(b"stco", 0, 0, &b)
     };
 
     let stbl = box_container(
         b"stbl",
-        &[stsd, stts, stsc, stsz, stss, stco_placeholder],
+        &[stsd, stts, stsc, stsz, stss, stco],
     );
     let minf = box_container(
         b"minf",
@@ -181,25 +191,10 @@ pub fn mux_avc(
     };
     let moov = box_container(b"moov", &[mvhd, trak]);
 
-    // ftyp
-    let mut ftyp = Vec::new();
-    ftyp.extend_from_slice(b"isom");
-    ftyp.extend_from_slice(&0x200u32.to_be_bytes());
-    ftyp.extend_from_slice(b"isomiso2avc1mp41");
-    let ftyp_box = box_raw(b"ftyp", &ftyp);
-
-    // mdat
-    let mdat_box = box_raw(b"mdat", &mdat_payload);
-
-    // Absolute sample offsets = ftyp.len + 8 (mdat header) + relative
-    let mdat_data_off = (ftyp_box.len() + 8) as u32;
-    let mut out = Vec::with_capacity(ftyp_box.len() + mdat_box.len() + moov.len() + 256);
+    let mut out = Vec::with_capacity(ftyp_box.len() + mdat_box.len() + moov.len());
     out.extend_from_slice(&ftyp_box);
     out.extend_from_slice(&mdat_box);
-    // Patch stco inside moov: find 'stco' and rewrite offsets.
-    let mut moov_bytes = moov;
-    patch_stco(&mut moov_bytes, mdat_data_off, &chunk_offsets);
-    out.extend_from_slice(&moov_bytes);
+    out.extend_from_slice(&moov);
     Ok(out)
 }
 
@@ -295,38 +290,6 @@ fn box_container(typ: &[u8; 4], children: &[Vec<u8>]) -> Vec<u8> {
     box_raw(typ, &body)
 }
 
-fn patch_stco(moov: &mut [u8], mdat_data_off: u32, rel_offsets: &[u32]) {
-    // Find 'stco' fourcc and rewrite the offset table.
-    let mut i = 0;
-    while i + 8 <= moov.len() {
-        let size = u32::from_be_bytes([moov[i], moov[i + 1], moov[i + 2], moov[i + 3]]) as usize;
-        if size < 8 || i + size > moov.len() {
-            break;
-        }
-        if &moov[i + 4..i + 8] == b"stco" {
-            // full box: ver/flags at i+8, entry_count at i+12, entries at i+16
-            if i + 16 + rel_offsets.len() * 4 <= i + size {
-                let count = u32::from_be_bytes([
-                    moov[i + 12],
-                    moov[i + 13],
-                    moov[i + 14],
-                    moov[i + 15],
-                ]) as usize;
-                let n = count.min(rel_offsets.len());
-                for (k, &rel) in rel_offsets.iter().take(n).enumerate() {
-                    let off = mdat_data_off + rel;
-                    let p = i + 16 + k * 4;
-                    moov[p..p + 4].copy_from_slice(&off.to_be_bytes());
-                }
-            }
-            return;
-        }
-        // Recurse into containers by continuing the linear scan — stco is a
-        // leaf so a flat scan of the whole moov blob finds it.
-        i += if size == 0 { 8 } else { size };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,10 +309,29 @@ mod tests {
                 sync: i == 0,
             });
         }
+        let raw0 = samples[0].bytes.clone();
         let mp4 = mux_avc(32, 32, 1000, &enc.sps_nal, &enc.pps_nal, &samples).unwrap();
         let track = mp4::parse(&mp4).expect("demux");
         assert_eq!((track.width, track.height), (32, 32));
         assert_eq!(track.samples.len(), 3);
         assert!(track.samples[0].is_sync);
+        // The load-bearing check: sample0 must sit in mdat, not at file offset 0
+        // (ftyp). A nested stco patch used to miss the box and leave every
+        // chunk_offset at 0 — the player then "decoded" ftyp as a NAL and painted black.
+        let s0 = &track.samples[0];
+        assert!(
+            s0.offset >= 16,
+            "sample0 offset {} is still inside ftyp — stco broken",
+            s0.offset
+        );
+        assert_eq!(s0.size, raw0.len());
+        let au = &mp4[s0.offset..s0.offset + s0.size];
+        assert_eq!(
+            au, raw0.as_slice(),
+            "demuxed sample0 != encoded AU (first8 demux={:02x?} enc={:02x?})",
+            &au[..au.len().min(8)],
+            &raw0[..raw0.len().min(8)]
+        );
+        assert_ne!(&au[4..8.min(au.len())], b"ftyp", "sample0 is the ftyp box");
     }
 }
