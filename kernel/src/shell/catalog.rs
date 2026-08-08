@@ -62,7 +62,10 @@ pub const COMMAND_ALIASES: &[&str] = &[
 /// only ever be refused — leaving a job that fails forever and silently. A
 /// manifest hook is dead code for the same reason `dispatch_system` never sees
 /// these names, but reserving them says so out loud rather than relying on it.
-pub const RESERVED_HUMAN_ONLY: &[&str] = &["passwd", "password", "lock"];
+// `ssh-keygen` is here because *overwriting* a private key locks the human out
+// of every server that trusts it — so no schedule may fire it and no package may
+// claim the name, exactly as for the login commands.
+pub const RESERVED_HUMAN_ONLY: &[&str] = &["passwd", "password", "lock", "ssh-keygen"];
 
 /// Whether `name` names a human-only command that automation must not install.
 pub fn is_human_only(name: &str) -> bool {
@@ -160,6 +163,8 @@ pub const ENTRIES: &[Entry] = &[
     // Network
     Entry { category: "Network", title: "Network Status", name: "network", shortcut: "" },
     Entry { category: "Network", title: "Ping Host", name: "ping", shortcut: "" },
+    Entry { category: "Network", title: "SSH Client", name: "ssh", shortcut: "" },
+    Entry { category: "Network", title: "Generate an SSH Key", name: "ssh-keygen", shortcut: "" },
     Entry { category: "Network", title: "Wi-Fi", name: "wifi", shortcut: "" },
     Entry { category: "Network", title: "HTTP Client", name: "http", shortcut: "" },
     Entry {

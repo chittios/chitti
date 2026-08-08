@@ -431,6 +431,9 @@ pub fn run() -> ! {
                 "http" => run_http(arg),
                 "ws" => run_ws(arg),
                 "ssh" => ssh::run_ssh(arg),
+                // Human-only: writing/replacing a private key must never be
+                // reachable from `run_shell_command` (see `run_keygen`).
+                "ssh-keygen" | "sshkeygen" => ssh::run_keygen(arg),
                 "mcp" => run_mcp(arg),
                 // The login commands live **here**, in the interactive-only match,
                 // and must never move down into `dispatch_system`.

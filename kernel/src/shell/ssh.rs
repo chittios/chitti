@@ -295,6 +295,121 @@ fn forward_local(c: &mut client::Client, lport: u16, rhost: &str, rport: u16) {
     }
 }
 
+/// `/ssh-keygen [-t ed25519|ecdsa] [-f <path>] [-C <comment>] [-y]`
+///
+/// **Human-only**, and therefore matched in the interactive arm of the REPL and
+/// absent from `dispatch_system`. Not because generating a key is dangerous, but
+/// because *overwriting* one is: an agent that replaced `id_ed25519` would lock
+/// the human out of every server that trusts it, silently and irreversibly. The
+/// standing rule is that such commands are absent from the tool surface rather
+/// than guarded inside it, since `run_shell_command` forwards any token to
+/// `dispatch_system` with no capability and no manifest entry.
+pub(super) fn run_keygen(arg: &str) {
+    let mut kind = "ed25519".to_string();
+    let mut path: Option<String> = None;
+    let mut comment: Option<String> = None;
+    let mut show_public = false;
+
+    let toks: Vec<&str> = arg.split_whitespace().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i] {
+            "-t" => {
+                i += 1;
+                match toks.get(i) {
+                    Some(v) => kind = v.to_string(),
+                    None => return serial_println!("ssh-keygen> usage: -t ed25519|ecdsa"),
+                }
+            }
+            "-f" => {
+                i += 1;
+                match toks.get(i) {
+                    Some(v) => path = Some(super::resolve_path(v)),
+                    None => return serial_println!("ssh-keygen> usage: -f <path>"),
+                }
+            }
+            "-C" => {
+                i += 1;
+                match toks.get(i) {
+                    Some(v) => comment = Some(v.to_string()),
+                    None => return serial_println!("ssh-keygen> usage: -C <comment>"),
+                }
+            }
+            // ssh-keygen's own flag: print the public half of an existing key.
+            "-y" => show_public = true,
+            t => return serial_println!("ssh-keygen> unknown option {t}"),
+        }
+        i += 1;
+    }
+
+    let algorithm = match kind.as_str() {
+        "ed25519" | "ssh-ed25519" => "ssh-ed25519",
+        "ecdsa" | "ecdsa-sha2-nistp256" => "ecdsa-sha2-nistp256",
+        other => {
+            return serial_println!(
+                "ssh-keygen> unsupported type {other} (ed25519 or ecdsa; RSA is not implemented)"
+            )
+        }
+    };
+    let default_path = if algorithm == "ssh-ed25519" {
+        "/home/chitti/.ssh/id_ed25519"
+    } else {
+        "/home/chitti/.ssh/id_ecdsa"
+    };
+    let path = path.unwrap_or_else(|| default_path.to_string());
+
+    // `-y` reads rather than writes: the public half of a key you already have,
+    // which is the thing you paste into a hosting provider.
+    if show_public {
+        let Some(bytes) = crate::synapse::fs::read(&path) else {
+            return serial_println!("ssh-keygen> no such key: {path}");
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        return match auth::parse_openssh_private(&text) {
+            Ok(k) => serial_print!("{}", auth::authorized_key_line(&k.public(), "")),
+            Err(e) => serial_println!("ssh-keygen> {path}: {e}"),
+        };
+    }
+
+    // Overwriting a private key loses access to every server that trusts it, so
+    // it confirms through the modal — the same treatment `/install` gets, and the
+    // reason this command is human-only in the first place.
+    if crate::synapse::fs::read(&path).is_some()
+        && !crate::modal::confirm(
+            "Overwrite SSH key",
+            &alloc::format!("{path} already exists. Replace it?"),
+        )
+    {
+        return serial_println!("ssh-keygen> cancelled ({path} kept)");
+    }
+
+    let key = match auth::generate(algorithm) {
+        Ok(k) => k,
+        Err(e) => return serial_println!("ssh-keygen> {e}"),
+    };
+    let comment = comment.unwrap_or_else(|| "chitti@chittios".to_string());
+    let pem = auth::encode_openssh_private(&key, &comment);
+    let pub_line = auth::authorized_key_line(&key.public(), &comment);
+    let pub_path = alloc::format!("{path}.pub");
+
+    crate::synapse::fs::write(&path, pem.as_bytes());
+    crate::synapse::fs::write(&pub_path, pub_line.as_bytes());
+    // The store write is infallible here, but a read-back is what proves the
+    // key is actually retrievable — a key that cannot be read again is worse
+    // than one that was never generated, because the user will trust it.
+    if crate::synapse::fs::read(&path).is_none() {
+        return serial_println!("ssh-keygen> {path} could not be written");
+    }
+    serial_println!(
+        "ssh-keygen> wrote {path} and {pub_path}\n\
+         ssh-keygen> {} {}\n\
+         ssh-keygen> add this line to the server's authorized_keys:\n{}",
+        key.algorithm(),
+        key.public().fingerprint(),
+        pub_line.trim_end()
+    );
+}
+
 fn list_keys() {
     let mut any = false;
     for p in IDENTITY_PATHS {

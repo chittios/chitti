@@ -169,6 +169,121 @@ pub fn parse_openssh_private(pem: &str) -> Result<PrivateKey, &'static str> {
     }
 }
 
+/// Generate a new private key of `algorithm` (`ssh-ed25519` / `ecdsa-sha2-nistp256`).
+///
+/// Keyed from [`crate::security::rng`], never `arch::hw_rand` — which returns
+/// **zero** on every machine without `RDRAND`/`RNDR`, i.e. every QEMU and HVF
+/// default CPU. A key generated from zeros is a perfectly valid key that anyone
+/// can reproduce, and nothing about it looks wrong.
+pub fn generate(algorithm: &str) -> Result<PrivateKey, &'static str> {
+    let mut seed = [0u8; 32];
+    match algorithm {
+        "ssh-ed25519" | "ed25519" => {
+            crate::security::rng::fill_random(&mut seed);
+            Ok(PrivateKey::Ed25519(alloc::boxed::Box::new(
+                ed25519_dalek::SigningKey::from_bytes(&seed),
+            )))
+        }
+        "ecdsa-sha2-nistp256" | "ecdsa" => {
+            // Rejection-sample: a uniform 32-byte string is not necessarily a
+            // valid P-256 scalar (it must be in `1..n`), and clamping one that
+            // is not would bias the key.
+            for _ in 0..64 {
+                crate::security::rng::fill_random(&mut seed);
+                if let Ok(sk) = p256::ecdsa::SigningKey::from_bytes(&seed.into()) {
+                    return Ok(PrivateKey::EcdsaP256(alloc::boxed::Box::new(sk)));
+                }
+            }
+            Err("could not draw a valid P-256 scalar")
+        }
+        _ => Err("unsupported key type (ed25519 or ecdsa)"),
+    }
+}
+
+/// Serialise a private key in the unencrypted OpenSSH container.
+///
+/// The exact inverse of [`parse_openssh_private`], which is what makes it
+/// testable: a key that survives write → parse → sign → verify is one OpenSSH
+/// can also read, because both sides of the round trip are the format this file
+/// documents. Four details the format insists on, each silently fatal:
+///
+/// * the two **check integers must be equal** — that is how a reader tells a
+///   wrong passphrase from a corrupt file, and they are random rather than zero
+///   so the field carries the entropy it is meant to;
+/// * the private section is padded to the cipher block size (8 with no cipher)
+///   with the bytes **1, 2, 3…**, not zeros;
+/// * ed25519's private string is **seed ‖ public**, 64 bytes, not the 32-byte
+///   seed alone;
+/// * the public blob appears **twice**, once outside and once inside, and
+///   OpenSSH compares them.
+pub fn encode_openssh_private(key: &PrivateKey, comment: &str) -> String {
+    let pubkey = key.public();
+    let mut check = [0u8; 4];
+    crate::security::rng::fill_random(&mut check);
+    let check = u32::from_be_bytes(check);
+
+    let mut body = Writer::new();
+    body.put_u32(check);
+    body.put_u32(check);
+    match key {
+        PrivateKey::Ed25519(sk) => {
+            let vk = sk.verifying_key();
+            body.put_str("ssh-ed25519");
+            body.put_string(&vk.to_bytes());
+            let mut secret = Vec::with_capacity(64);
+            secret.extend_from_slice(&sk.to_bytes());
+            secret.extend_from_slice(&vk.to_bytes());
+            body.put_string(&secret);
+        }
+        PrivateKey::EcdsaP256(sk) => {
+            body.put_str("ecdsa-sha2-nistp256");
+            body.put_str("nistp256");
+            body.put_string(sk.verifying_key().to_encoded_point(false).as_bytes());
+            body.put_mpint(&sk.to_bytes());
+        }
+    }
+    body.put_str(comment);
+    let mut body = body.into_vec();
+    let mut pad = 1u8;
+    while body.len() % 8 != 0 {
+        body.push(pad);
+        pad += 1;
+    }
+
+    let mut w = Writer::new();
+    w.put_str("none"); // cipher
+    w.put_str("none"); // kdf
+    w.put_string(&[]); // kdf options
+    w.put_u32(1); // one key
+    w.put_string(&pubkey.encode());
+    w.put_string(&body);
+
+    let mut blob = b"openssh-key-v1\0".to_vec();
+    blob.extend_from_slice(w.as_slice());
+
+    // OpenSSH wraps the base64 at 70 columns; anything reads it, but a file that
+    // matches byte-for-byte is one a human can diff against `ssh-keygen`'s.
+    let b64 = crate::net::ws::base64_encode(&blob);
+    let mut out = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    for chunk in b64.as_bytes().chunks(70) {
+        out.push_str(core::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+    out
+}
+
+/// The one-line public-key form: what goes in `authorized_keys`, and what a
+/// hosting provider's "add an SSH key" box wants pasted into it.
+pub fn authorized_key_line(key: &PublicKey, comment: &str) -> String {
+    let b64 = crate::net::ws::base64_encode(&key.encode());
+    if comment.is_empty() {
+        alloc::format!("{} {b64}\n", key.algorithm())
+    } else {
+        alloc::format!("{} {b64} {comment}\n", key.algorithm())
+    }
+}
+
 /// `SSH_MSG_SERVICE_REQUEST` for `ssh-userauth`.
 pub fn service_request(name: &str) -> Vec<u8> {
     let mut w = Writer::msg(SSH_MSG_SERVICE_REQUEST);
@@ -319,6 +434,63 @@ mod tests {
             let other = publickey_signed_data(&[0x22u8; 32], "git", &pubkey);
             assert!(!pubkey.verify(&other, &sig), "must not verify under another session");
         }
+    }
+
+    /// **A generated key survives write → parse → sign → verify**, for both
+    /// types. That chain is what says the file OpenSSH will read carries the key
+    /// we think it does; each half alone proves nothing about the other.
+    #[test_case]
+    fn a_generated_key_round_trips_through_the_openssh_container() {
+        for alg in ["ssh-ed25519", "ecdsa-sha2-nistp256"] {
+            let key = generate(alg).expect("generate");
+            assert_eq!(key.algorithm(), alg);
+            let pem = encode_openssh_private(&key, "chitti@e2e");
+            assert!(pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----\n"), "{alg}");
+            assert!(pem.trim_end().ends_with("-----END OPENSSH PRIVATE KEY-----"), "{alg}");
+
+            let back = parse_openssh_private(&pem).expect("our own container must parse");
+            assert_eq!(back.algorithm(), alg);
+            assert_eq!(back.public(), key.public(), "{alg}: the same key must come back");
+
+            // And it is usable: a signature from the reparsed half verifies under
+            // the original's public key.
+            let msg = b"round trip";
+            assert!(key.public().verify(msg, &back.sign(msg)), "{alg}");
+        }
+    }
+
+    /// Two generated keys differ — the check that catches a CSPRNG returning
+    /// zeros, which is what `arch::hw_rand` does on every machine we test on.
+    #[test_case]
+    fn generated_keys_are_not_all_the_same() {
+        let a = generate("ssh-ed25519").unwrap().public();
+        let b = generate("ssh-ed25519").unwrap().public();
+        assert_ne!(a, b, "two generated keys must differ");
+        let PublicKey::Ed25519(bytes) = a else { panic!("ed25519") };
+        assert!(bytes.iter().any(|&x| x != 0), "an all-zero key means a dead RNG");
+    }
+
+    /// An unknown key type is refused rather than defaulted to something.
+    #[test_case]
+    fn generate_refuses_an_unknown_type() {
+        assert!(generate("ssh-rsa").is_err());
+        assert!(generate("").is_err());
+    }
+
+    /// The `.pub` line is the `authorized_keys` form, with the comment optional.
+    #[test_case]
+    fn the_public_line_is_the_authorized_keys_form() {
+        let key = generate("ssh-ed25519").unwrap().public();
+        let line = authorized_key_line(&key, "chitti@os");
+        let mut f = line.split_whitespace();
+        assert_eq!(f.next(), Some("ssh-ed25519"));
+        let b64 = f.next().expect("the key");
+        assert_eq!(f.next(), Some("chitti@os"));
+        assert_eq!(f.next(), None);
+        // The base64 really is the key blob.
+        assert_eq!(crate::net::ws::base64_decode(b64).as_deref(), Some(&key.encode()[..]));
+        // Without a comment there are exactly two fields.
+        assert_eq!(authorized_key_line(&key, "").split_whitespace().count(), 2);
     }
 
     /// An unencrypted ed25519 key round-trips from the OpenSSH container.

@@ -1887,6 +1887,70 @@ def s_ssh_client(g):
             proc.kill()
 
 
+def s_ssh_keygen(g):
+    """**A key generated on the OS authenticates to real OpenSSH.**
+
+    The only test that can prove `ssh-keygen` produced a real key: the guest
+    generates one, prints its `authorized_keys` line, the harness installs *that
+    line* on a real sshd, and the guest logs in with it. Every part of the
+    format has to be right for that to work — the private container we wrote and
+    read back, the public blob's base64, and the signature over the
+    session-id-prefixed request — and any of them being wrong fails here while
+    looking perfectly fine on disk.
+    """
+    started = _start_sshd()
+    if started is None:
+        return None, "no sshd on this host (skipping)"
+    proc, user = started
+    try:
+        # A previous scenario's sshd had a different host key; this is a new
+        # server, so drop what we knew.
+        g.send(f"/ssh known-hosts forget {HOST}")
+        g.wait_quiet(0.4, 10)
+
+        for kind in ("ed25519", "ecdsa"):
+            path = f"/home/chitti/.ssh/gen_{kind}"
+            m = g.mark()
+            g.send(f"/ssh-keygen -t {kind} -f {path} -C e2e@chitti")
+            if not g.wait_for("ssh-keygen> wrote", 30, m):
+                return False, f"{kind}: keygen produced nothing: " + g.text()[m:][:300]
+            out = g.text()[m:]
+            if "SHA256:" not in out:
+                return False, f"{kind}: no fingerprint reported"
+
+            # Take the public line off the serial output and trust it to a real
+            # sshd. `-y` re-derives it from the stored private key, so this also
+            # proves the file we wrote can be read back and is the same key.
+            m = g.mark()
+            g.send(f"/ssh-keygen -y -f {path}")
+            algo = "ssh-ed25519" if kind == "ed25519" else "ecdsa-sha2-nistp256"
+            if not g.wait_for(algo, 20, m):
+                return False, f"{kind}: -y did not print a public key"
+            line = next(
+                (l.strip() for l in g.text()[m:].splitlines() if l.strip().startswith(algo)),
+                None,
+            )
+            if not line:
+                return False, f"{kind}: could not read the public line"
+            with open(os.path.join(SSH_DIR, "authorized_keys"), "w") as f:
+                f.write(line + "\n")
+
+            m = g.mark()
+            g.send(f"/ssh -i {path} {user}@{HOST}:{SSHD_PORT} echo GEN''_{kind.upper()}_OK")
+            if not g.wait_for(f"GEN_{kind.upper()}_OK", 60, m):
+                return False, (
+                    f"{kind}: a generated key did not authenticate: "
+                    + g.text()[m:][-400:].replace("\n", " | ")
+                )
+        return True, "generated ed25519 + ecdsa keys authenticate to real OpenSSH"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
 def s_git_clone_ssh(g):
     """**`/git clone` over SSH**, against the same real OpenSSH server.
 
@@ -4722,7 +4786,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("ssh_keygen", s_ssh_keygen), ("git_clone_ssh", s_git_clone_ssh), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 
