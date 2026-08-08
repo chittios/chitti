@@ -13,6 +13,7 @@ pub mod agents_catalog;
 pub mod catalog;
 pub mod chrome;
 pub mod headtail;
+pub mod pipeline;
 pub mod remote;
 pub mod suggest;
 pub mod voice_remote;
