@@ -4,6 +4,8 @@
 //! - [`path`] — pure path normalize + longest-prefix mount resolve
 //! - [`mount`] — global mount table
 //! - [`vfs`] — unified read/write/readdir over the Synapse store + mounts
+//! - [`ninep`] — 9P2000.L, the protocol behind a **host shared folder**; the
+//!   one filesystem here with no block device under it
 //!
 //! On-disk formats on **internal and external** disks (USB MSC included):
 //! - **FAT16/32** — full RW (create/write/unlink/mkdir; 8.3 create names)
@@ -14,6 +16,7 @@
 
 pub mod detect;
 pub mod mount;
+pub mod ninep;
 pub mod path;
 pub mod vfs;
 
