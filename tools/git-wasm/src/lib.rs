@@ -88,6 +88,7 @@ extern "C" {
     fn host_fs_write(path: *const u8, path_len: i32, data: *const u8, data_len: i32) -> i32;
     fn host_fs_list(path: *const u8, path_len: i32, out: *mut u8, out_cap: i32) -> i32;
     fn host_fs_exists(path: *const u8, path_len: i32) -> i32;
+    fn host_fs_remove(path: *const u8, path_len: i32) -> i32;
     fn host_home(out: *mut u8, out_cap: i32) -> i32;
     fn host_user_home(out: *mut u8, out_cap: i32) -> i32;
     fn host_now_unix() -> i64;
@@ -105,7 +106,7 @@ extern "C" {
 pub mod hostsim;
 #[cfg(not(target_arch = "wasm32"))]
 use hostsim::{
-    host_deflate, host_fs_exists, host_fs_list, host_fs_read, host_fs_write, host_home,
+    host_deflate, host_fs_exists, host_fs_list, host_fs_read, host_fs_remove, host_fs_write, host_home,
     host_http, host_inflate, host_now_unix, host_sha1, host_ssh, host_user_home,
 };
 
@@ -194,6 +195,12 @@ fn fs_read(path: &str) -> Option<Vec<u8>> {
 
 fn fs_write(path: &str, data: &[u8]) -> bool {
     unsafe { host_fs_write(path.as_ptr(), path.len() as i32, data.as_ptr(), data.len() as i32) == 0 }
+}
+
+/// Delete a store path. Best-effort: a missing file is not an error, which is
+/// what `git clean` and `git rm` want.
+fn fs_remove(path: &str) -> bool {
+    unsafe { host_fs_remove(path.as_ptr(), path.len() as i32) == 0 }
 }
 
 fn fs_exists(path: &str) -> bool {
@@ -355,7 +362,9 @@ fn json_escape(s: &str) -> String {
 
 // --- git logic (see kernel draft; ported to host-import primitives) ----------
 
+pub mod config;
 pub mod git;
+pub mod porcelain;
 pub mod remote;
 pub mod sshurl;
 

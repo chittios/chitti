@@ -212,3 +212,13 @@ pub unsafe fn host_ssh(_req: *const u8, _req_len: i32, out: *mut u8, out_cap: i3
     }
     -5
 }
+
+/// `host_fs_remove` for the host tests.
+///
+/// # Safety
+/// Matches the wasm import signature.
+pub unsafe fn host_fs_remove(path: *const u8, path_len: i32) -> i32 {
+    let p = core::str::from_utf8(core::slice::from_raw_parts(path, path_len as usize)).unwrap_or("");
+    sim().files.remove(p);
+    0
+}

@@ -486,105 +486,10 @@ pub fn clone(args: &str) -> String {
         return "error: no packfile in the upload-pack response".to_string();
     };
 
-    // 3. Parse the packfile. Deltas resolve against an earlier object by stream
-    // position (OFS) or by sha (REF / loose), so both indexes are built as we go —
-    // the sha one especially, because the alternative is re-hashing every object
-    // already parsed on every REF_DELTA.
-    let mut parsed: Vec<PackObj> = Vec::new();
-    let mut by_pos: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut by_sha: BTreeMap<String, usize> = BTreeMap::new();
-    let mut p = pi;
-    // Header: magic, version, object count. Bounds-checked because a short read
-    // here is an index panic, and a guest panic is `loop {}` until the fuel runs
-    // out — an error message beats a hang.
-    if pack.len() < p + 12 {
-        return "error: truncated PACK header".to_string();
-    }
-    p += 4;
-    let _version = u32::from_be_bytes(pack[p..p + 4].try_into().unwrap_or([0; 4]));
-    p += 4;
-    let count = u32::from_be_bytes(pack[p..p + 4].try_into().unwrap_or([0; 4])) as usize;
-    p += 4;
-    for i in 0..count {
-        let obj_start = p;
-        let (typ, want_size) = match read_varint(&pack, &mut p) {
-            Some(v) => v,
-            None => return alloc::format!("error: bad object header (object {i} of {count})"),
-        };
-        // **A delta object's base reference is RAW, not compressed.** It sits in the
-        // packfile between the type/size header and the zlib stream — an offset
-        // varint for OFS_DELTA, twenty bytes of sha for REF_DELTA — and the
-        // compressed payload that follows is the delta *in full*.
-        //
-        // Reading it out of the decompressed bytes instead, as this did, means
-        // inflating from twenty bytes too early: the decoder is handed the sha and
-        // answers `not deflate`, which is reported as a corrupt object. That is what
-        // `object inflate failed (object 5 of 172)` was — the first delta in the
-        // pack, and so every clone of any repository whose history the server chose
-        // to delta-compress, which is all of them past a few commits.
-        let base = match typ {
-            7 => {
-                let Some(raw) = pack.get(p..p + 20) else {
-                    return "error: truncated ref-delta base".to_string();
-                };
-                p += 20;
-                BaseRef::Sha(to_hex(raw))
-            }
-            6 => match read_ofs_offset(&pack, &mut p) {
-                Some(off) => BaseRef::Ofs(off),
-                None => return "error: bad ofs-delta".to_string(),
-            },
-            _ => BaseRef::None,
-        };
-        let (dec, stream_len) = match inflate_object(&pack, p, want_size) {
-            Some(v) => v,
-            None => {
-                return alloc::format!(
-                    "error: object inflate failed (object {i} of {count}, type {typ}, {} pack bytes)",
-                    pack.len() - pi
-                )
-            }
-        };
-        p += stream_len;
-        let (kind, content) = match base {
-            BaseRef::None => (kind_name(typ).to_string(), dec),
-            b => {
-                let found = match &b {
-                    // A REF_DELTA may name a base that arrived earlier in this pack
-                    // or one already on disk.
-                    BaseRef::Sha(sha) => by_sha
-                        .get(sha)
-                        .map(|&i| (parsed[i].kind.clone(), parsed[i].content.clone()))
-                        .or_else(|| read_loose(sha)),
-                    // An OFS_DELTA counts backwards from its own header to the base
-                    // object's header.
-                    BaseRef::Ofs(off) => match obj_start.checked_sub(*off as usize) {
-                        Some(pos) => by_pos
-                            .get(&pos)
-                            .map(|&i| (parsed[i].kind.clone(), parsed[i].content.clone())),
-                        None => return "error: bad ofs-delta offset".to_string(),
-                    },
-                    BaseRef::None => None,
-                };
-                let Some((bk, bc)) = found else {
-                    return "error: delta base not found".to_string();
-                };
-                // A delta reconstructs an object of the base's *kind* — the type
-                // field said "delta", so this is the only place the kind comes from.
-                match apply_delta(&bc, &dec) {
-                    Some(f) => (bk, f),
-                    None => return "error: delta apply failed".to_string(),
-                }
-            }
-        };
-        // Hashed once, here: the sha is needed to index this object as a delta base
-        // and again to name its loose file, and it is the same sha both times.
-        let sha = crate::git::hash_object(&kind, &content);
-        by_pos.insert(obj_start, parsed.len());
-        by_sha.insert(sha.clone(), parsed.len());
-        parsed.push(PackObj { kind, sha, content });
-    }
-
+    let parsed = match unpack_all(&pack) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     // 4. Write loose objects, refs, checkout HEAD.
     let mut n_obj = 0usize;
     for o in &parsed {
@@ -633,6 +538,283 @@ pub fn clone(args: &str) -> String {
         n_obj,
         refs.len()
     )
+}
+
+/// Walk a packfile into resolved objects. Shared by `clone` and `fetch`,
+/// which differ in what they do with the refs afterwards, not in how they
+/// read a pack.
+fn unpack_all(pack: &[u8]) -> Result<Vec<PackObj>, String> {
+    let Some(pi) = pack.windows(4).position(|w| w == b"PACK") else {
+        return Err("error: no packfile in the response".to_string());
+    };
+    // 3. Parse the packfile. Deltas resolve against an earlier object by stream
+    // position (OFS) or by sha (REF / loose), so both indexes are built as we go —
+    // the sha one especially, because the alternative is re-hashing every object
+    // already parsed on every REF_DELTA.
+    let mut parsed: Vec<PackObj> = Vec::new();
+    let mut by_pos: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut by_sha: BTreeMap<String, usize> = BTreeMap::new();
+    let mut p = pi;
+    // Header: magic, version, object count. Bounds-checked because a short read
+    // here is an index panic, and a guest panic is `loop {}` until the fuel runs
+    // out — an error message beats a hang.
+    if pack.len() < p + 12 {
+        return Err("error: truncated PACK header".to_string());
+    }
+    p += 4;
+    let _version = u32::from_be_bytes(pack[p..p + 4].try_into().unwrap_or([0; 4]));
+    p += 4;
+    let count = u32::from_be_bytes(pack[p..p + 4].try_into().unwrap_or([0; 4])) as usize;
+    p += 4;
+    for i in 0..count {
+        let obj_start = p;
+        let (typ, want_size) = match read_varint(&pack, &mut p) {
+            Some(v) => v,
+            None => return Err(alloc::format!("error: bad object header (object {i} of {count})")),
+        };
+        // **A delta object's base reference is RAW, not compressed.** It sits in the
+        // packfile between the type/size header and the zlib stream — an offset
+        // varint for OFS_DELTA, twenty bytes of sha for REF_DELTA — and the
+        // compressed payload that follows is the delta *in full*.
+        //
+        // Reading it out of the decompressed bytes instead, as this did, means
+        // inflating from twenty bytes too early: the decoder is handed the sha and
+        // answers `not deflate`, which is reported as a corrupt object. That is what
+        // `object inflate failed (object 5 of 172)` was — the first delta in the
+        // pack, and so every clone of any repository whose history the server chose
+        // to delta-compress, which is all of them past a few commits.
+        let base = match typ {
+            7 => {
+                let Some(raw) = pack.get(p..p + 20) else {
+                    return Err("error: truncated ref-delta base".to_string());
+                };
+                p += 20;
+                BaseRef::Sha(to_hex(raw))
+            }
+            6 => match read_ofs_offset(&pack, &mut p) {
+                Some(off) => BaseRef::Ofs(off),
+                None => return Err("error: bad ofs-delta".to_string()),
+            },
+            _ => BaseRef::None,
+        };
+        let (dec, stream_len) = match inflate_object(&pack, p, want_size) {
+            Some(v) => v,
+            None => {
+                return Err(alloc::format!(
+                    "error: object inflate failed (object {i} of {count}, type {typ}, {} pack bytes)",
+                    pack.len() - pi
+                ));
+            }
+        };
+        p += stream_len;
+        let (kind, content) = match base {
+            BaseRef::None => (kind_name(typ).to_string(), dec),
+            b => {
+                let found = match &b {
+                    // A REF_DELTA may name a base that arrived earlier in this pack
+                    // or one already on disk.
+                    BaseRef::Sha(sha) => by_sha
+                        .get(sha)
+                        .map(|&i| (parsed[i].kind.clone(), parsed[i].content.clone()))
+                        .or_else(|| read_loose(sha)),
+                    // An OFS_DELTA counts backwards from its own header to the base
+                    // object's header.
+                    BaseRef::Ofs(off) => match obj_start.checked_sub(*off as usize) {
+                        Some(pos) => by_pos
+                            .get(&pos)
+                            .map(|&i| (parsed[i].kind.clone(), parsed[i].content.clone())),
+                        None => return Err("error: bad ofs-delta offset".to_string()),
+                    },
+                    BaseRef::None => None,
+                };
+                let Some((bk, bc)) = found else {
+                    return Err("error: delta base not found".to_string());
+                };
+                // A delta reconstructs an object of the base's *kind* — the type
+                // field said "delta", so this is the only place the kind comes from.
+                match apply_delta(&bc, &dec) {
+                    Some(f) => (bk, f),
+                    None => return Err("error: delta apply failed".to_string()),
+                }
+            }
+        };
+        // Hashed once, here: the sha is needed to index this object as a delta base
+        // and again to name its loose file, and it is the same sha both times.
+        let sha = crate::git::hash_object(&kind, &content);
+        by_pos.insert(obj_start, parsed.len());
+        by_sha.insert(sha.clone(), parsed.len());
+        parsed.push(PackObj { kind, sha, content });
+    }
+
+    Ok(parsed)
+}
+
+/// [`unpack_all`], then write every object loose; returns how many were new.
+fn unpack_into_store(pack: &[u8]) -> Result<usize, String> {
+    let parsed = unpack_all(pack)?;
+    let mut n = 0usize;
+    for o in &parsed {
+        if o.kind != "unknown" && write_object(&o.kind, &o.sha, &o.content) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+// --- fetch / pull ----------------------------------------------------------------
+
+/// `git fetch [remote]` — update `refs/remotes/<remote>/*` from the server.
+///
+/// Objects are downloaded exactly as `clone` does; only the ref namespace and
+/// the fact that nothing is checked out differ.
+pub fn fetch(args: &str) -> String {
+    let name = args.split_whitespace().next().unwrap_or("origin").to_string();
+    let entries = crate::porcelain::load_config();
+    let Some(url) = crate::config::get(&entries, &alloc::format!("remote.{name}.url")).map(|s| s.to_string())
+    else {
+        return alloc::format!("error: no such remote '{name}' (see /git remote -v)");
+    };
+    let transport = match Transport::open(&url) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let adv = match transport.advertise() {
+        Ok(b) => b,
+        Err(e) => {
+            transport.close();
+            return e;
+        }
+    };
+    let refs = parse_advertised_refs(&adv);
+    if refs.is_empty() {
+        transport.close();
+        return "error: no refs advertised".to_string();
+    }
+    // Ask for every branch head we do not already have.
+    let mut wants: Vec<String> = Vec::new();
+    for (sha, r) in &refs {
+        if r.starts_with("refs/heads/") && crate::git::read_loose(sha).is_none() {
+            wants.push(sha.clone());
+        }
+    }
+    let mut n_obj = 0usize;
+    if !wants.is_empty() {
+        let mut req = String::new();
+        for (i, sha) in wants.iter().enumerate() {
+            let line = if i == 0 {
+                alloc::format!("want {sha}\0{CAPS}\n")
+            } else {
+                alloc::format!("want {sha}\n")
+            };
+            req.push_str(&alloc::format!("{:04x}{line}", 4 + line.len()));
+        }
+        req.push_str("00000009done\n");
+        match transport.fetch(&req) {
+            Ok(pack) => match unpack_into_store(&pack) {
+                Ok(n) => n_obj = n,
+                Err(e) => {
+                    transport.close();
+                    return e;
+                }
+            },
+            Err(e) => {
+                transport.close();
+                return e;
+            }
+        }
+    }
+    transport.close();
+    let mut updated = 0usize;
+    for (sha, r) in &refs {
+        if let Some(branch) = r.strip_prefix("refs/heads/") {
+            crate::porcelain::write_ref_raw(&alloc::format!("refs/remotes/{name}/{branch}"), sha);
+            updated += 1;
+        }
+    }
+    alloc::format!("ok: fetched {name} — {n_obj} new object(s), {updated} remote ref(s)")
+}
+
+/// `git pull [remote]` — fetch, then **fast-forward only**.
+///
+/// A real merge needs a three-way merge this does not have, so a divergent
+/// branch is refused with the two shas rather than being merged wrongly. That
+/// refusal is the honest outcome: silently taking one side would lose work.
+pub fn pull(args: &str) -> String {
+    let name = args.split_whitespace().next().unwrap_or("origin").to_string();
+    let fetched = fetch(&name);
+    if fetched.starts_with("error") {
+        return fetched;
+    }
+    let branch = crate::git::current_branch();
+    let Some(remote_sha) = crate::porcelain::read_ref_raw(&alloc::format!("refs/remotes/{name}/{branch}")) else {
+        return alloc::format!("{fetched}\nerror: {name} has no branch '{branch}'");
+    };
+    let local = crate::git::head_commit();
+    if local.as_deref() == Some(remote_sha.as_str()) {
+        return alloc::format!("{fetched}\nok: already up to date");
+    }
+    // Fast-forward is only legal when our commit is an ancestor of theirs.
+    if let Some(local_sha) = &local {
+        if !is_ancestor(local_sha, &remote_sha) {
+            return alloc::format!(
+                "{fetched}\nerror: {branch} has diverged from {name}/{branch} \
+                 ({} vs {}) — merge is not implemented",
+                &local_sha[..8.min(local_sha.len())],
+                &remote_sha[..8.min(remote_sha.len())]
+            );
+        }
+    }
+    crate::git::write_ref(&branch, &remote_sha);
+    let Some((_, commit)) = crate::git::read_loose(&remote_sha) else {
+        return alloc::format!("{fetched}\nerror: could not read {remote_sha}");
+    };
+    let Some(tree) = crate::porcelain::tree_of_commit(&commit) else {
+        return alloc::format!("{fetched}\nerror: the commit names no tree");
+    };
+    crate::git::write_index(&crate::git::collect_blobs(&tree));
+    crate::git::checkout_tree(&tree, "");
+    alloc::format!(
+        "{fetched}\nok: fast-forwarded {branch} to {}",
+        &remote_sha[..8.min(remote_sha.len())]
+    )
+}
+
+/// Is `ancestor` reachable from `descendant` by following first parents?
+fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    let mut cur = descendant.to_string();
+    for _ in 0..10_000 {
+        if cur == ancestor {
+            return true;
+        }
+        let Some((_, c)) = crate::git::read_loose(&cur) else {
+            return false;
+        };
+        let Some(p) = String::from_utf8_lossy(&c)
+            .lines()
+            .find_map(|l| l.strip_prefix("parent ").map(|s| s.trim().to_string()))
+        else {
+            return false;
+        };
+        cur = p;
+    }
+    false
+}
+
+/// The `(sha, name)` pairs out of a ref advertisement.
+fn parse_advertised_refs(adv: &[u8]) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    for line in parse_pkt_lines(adv) {
+        let s = String::from_utf8_lossy(&line).to_string();
+        if s.is_empty() || s.starts_with('#') || s.len() < 41 {
+            continue;
+        }
+        let sha = s[..40].to_string();
+        let name = s[40..].split('\0').next().unwrap_or("").trim().to_string();
+        if sha.bytes().all(|b| b.is_ascii_hexdigit()) && !name.is_empty() {
+            refs.push((sha, name));
+        }
+    }
+    refs
 }
 
 // --- push ------------------------------------------------------------------------

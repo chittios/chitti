@@ -1444,6 +1444,42 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_fs_write")?;
 
+    // host_fs_remove(path) -> i32 (0 removed, -1 bad args, -2 refused).
+    //
+    // Gated **exactly like `host_fs_write`**, and deliberately so: deleting a
+    // file is a write in every sense that matters here, so an agent that may
+    // not create a path may not remove one either, and the same
+    // `/agent/<n>/` exclusion keeps one agent out of another's SOUL and
+    // storage. `git rm`, `git clean` and `git tag -d` are the callers.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_fs_remove",
+            |caller: Caller<'_, HostState>, path_ptr: i32, path_len: i32| -> i32 {
+                let id = caller.data().bind.agent_id;
+                if id == 0 {
+                    return -3;
+                }
+                let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
+                    return -1;
+                };
+                let home = crate::agent::home::path(id);
+                let p = crate::synapse::vpath::normalize(&path);
+                let in_home = p == home || p.starts_with(&alloc::format!("{home}/"));
+                if !in_home {
+                    if !crate::agent::system::fs_any_scope(id) {
+                        return -2;
+                    }
+                    if p.starts_with("/agent/") {
+                        return -2;
+                    }
+                }
+                crate::synapse::fs::delete(&p);
+                0
+            },
+        )
+        .map_err(|_| "define host_fs_remove")?;
+
     // host_fs_exists(path) -> i32 (1 exists, 0 missing, -1 bad args).
     linker
         .func_wrap(

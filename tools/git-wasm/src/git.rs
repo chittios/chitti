@@ -515,12 +515,39 @@ pub(crate) fn git_branch(_args: &str) -> String {
     out
 }
 
+/// `git switch [-c] <branch>` — checkout's modern half.
+pub(crate) fn git_switch(args: &str) -> String {
+    let create = args.split_whitespace().any(|t| t == "-c" || t == "-C");
+    let name = args
+        .split_whitespace()
+        .find(|t| !t.starts_with('-'))
+        .unwrap_or("");
+    if name.is_empty() {
+        return "usage: /git switch [-c] <branch>".to_string();
+    }
+    git_checkout(&if create {
+        alloc::format!("-b {name}")
+    } else {
+        name.to_string()
+    })
+}
+
 pub(crate) fn git_checkout(args: &str) -> String {
+    let create = args.split_whitespace().any(|t| t == "-b" || t == "-B");
     let branch = args
         .split_whitespace()
         .find(|t| !t.starts_with('/') && !t.starts_with('-'))
         .unwrap_or("master")
         .to_string();
+    // `-b` creates the branch at the current commit before switching, which is
+    // the whole point of the flag; without it `checkout -b new` looked up a
+    // branch that does not exist yet and reported it as an unknown commit.
+    if create && read_ref(&branch).is_none() {
+        let Some(head) = head_commit() else {
+            return "error: nothing committed yet — cannot branch".to_string();
+        };
+        write_ref(&branch, &head);
+    }
     let sha = read_ref(&branch).unwrap_or_else(|| branch.clone());
     let Some((_, commit)) = read_loose(&sha) else {
         return alloc::format!("error: no such branch or commit '{branch}'");
@@ -574,7 +601,15 @@ pub fn command(args: &str) -> String {
     };
     match sub {
         "" | "help" => alloc::format!(
-            "git> usage: /git init|status|add <path>|commit -m <msg>|log|branch|checkout <branch>|clone <url> [dir]|push <url>"
+            "git> usage:\n\
+             git>   init | status | add <path> | commit -m <msg> | log | show [<rev>]\n\
+             git>   diff [--cached] | rm [--cached] <path> | mv <src> <dst> | clean [-f]\n\
+             git>   branch | checkout <branch> | switch [-c] <branch> | restore [--staged] <path>\n\
+             git>   reset [--soft|--mixed|--hard] [<rev>] | tag [<name>] | tag -d <name>\n\
+             git>   remote [-v|add|remove|rename|set-url|get-url|show] | config <name> [value]\n\
+             git>   worktree [list|add <path> [branch]|remove <path>]\n\
+             git>   clone <url> [dir] | fetch [remote] | pull [remote] | push [url]\n\
+             git>   rev-parse <rev> | ls-files | cat-file [-t|-s|-p] <object>"
         ),
         "init" => git_init(rest),
         "status" => git_status(rest),
@@ -585,6 +620,29 @@ pub fn command(args: &str) -> String {
         "checkout" => git_checkout(rest),
         "clone" => crate::remote::clone(rest),
         "push" => crate::remote::push(rest),
+        "fetch" => crate::remote::fetch(rest),
+        "pull" => crate::remote::pull(rest),
+        "remote" => crate::porcelain::remote(rest),
+        "worktree" => crate::porcelain::worktree(rest),
+        "config" => crate::porcelain::config_cmd(rest),
+        "diff" => crate::porcelain::diff(rest),
+        "rm" => crate::porcelain::rm(rest),
+        "mv" => crate::porcelain::mv(rest),
+        "reset" => crate::porcelain::reset(rest),
+        "restore" => crate::porcelain::restore(rest),
+        "clean" => crate::porcelain::clean(rest),
+        "show" => crate::porcelain::show(rest),
+        "tag" => crate::porcelain::tag(rest),
+        "rev-parse" => crate::porcelain::rev_parse(rest),
+        "ls-files" => crate::porcelain::ls_files(rest),
+        "cat-file" => crate::porcelain::cat_file(rest),
+        "switch" => git_switch(rest),
+        // Named explicitly rather than falling into "unknown": a user who types
+        // one of these wants to know it is absent, not to wonder whether they
+        // misspelled it. Each needs a three-way merge, which this does not have.
+        "merge" | "rebase" | "cherry-pick" | "revert" | "stash" | "bisect" | "submodule" => {
+            alloc::format!("error: /git {sub} is not implemented (no three-way merge yet)")
+        }
         other => alloc::format!("git> unknown subcommand '{other}' (try /git help)"),
     }
 }
