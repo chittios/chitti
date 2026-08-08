@@ -100,8 +100,27 @@ rand_chacha = { version = "0.3", default-features = false }
 # ECDSA P-256 signature verification for signed agent packages from a public
 # registry (skills::crypto::verify_p256). Pure-Rust no_std RustCrypto, verify
 # path only (no RNG needed), same curve family the TLS client already uses.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "alloc"] }
 sha2 = { version = "0.10", default-features = false }
+
+# --- SSH client (net::ssh) ------------------------------------------------
+# All already in the lockfile via embedded-tls, so adding them as direct
+# dependencies costs no new resolution: `aes-gcm` brings AES + GCM (the
+# `aes256-gcm@openssh.com` cipher), `hmac` the `hmac-sha2-*` MACs, `ctr` the
+# `aes*-ctr` ciphers every SSH server still offers.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes = { version = "0.8", default-features = false }
+ctr = { version = "0.9", default-features = false }
+hmac = { version = "0.12", default-features = false }
+# curve25519 is the kex and host-key algorithm SSH actually uses — OpenSSH has
+# preferred `curve25519-sha256` for a decade and `ssh-ed25519` is the default
+# key type `ssh-keygen` now emits, so a client without them can neither pick the
+# preferred kex nor read most users' `~/.ssh/id_ed25519`. Both are pure-Rust
+# no_std (the `ring` trap does not apply); `signature` is the trait crate their
+# verify/sign APIs are spelled in.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+signature = { version = "2", default-features = false }
 # X.509 certificate-chain validation for the TLS trust store (net::x509 +
 # net::ca_roots). All pure-Rust no_std RustCrypto — same der/spki 0.7 +
 # elliptic-curve 0.13 generation as p256, so no version split, and NO ring
