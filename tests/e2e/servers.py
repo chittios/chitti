@@ -15,6 +15,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -30,6 +31,13 @@ GIT_PACK = os.path.join(
     os.path.dirname(__file__), "..", "..", "tools", "git-wasm", "tests", "ref-delta.pack"
 )
 GIT_HEAD = "35528a725a8925975d241e31a82755548dced31f"
+
+
+# Where the `ssh_client` scenario puts the keypair it generates for the real
+# `sshd` it starts. Served over plain HTTP so the guest can fetch its own
+# identity with `/http -O` — the same path `http_download` already proves. It is
+# a throwaway key for a loopback sshd, generated per run and deleted after.
+SSH_DIR = os.path.join(tempfile.gettempdir(), "chitti-e2e-ssh")
 
 
 def _pktline(payload: bytes) -> bytes:
@@ -164,7 +172,19 @@ def _handle(conn):
             _ws_send_text(conn, b"echo:" + payload)
             time.sleep(0.3)
             return
-        if path.startswith("/repo.git/info/refs"):
+        if path == "/id_ed25519":
+            # The guest fetches its own SSH identity here.
+            try:
+                with open(os.path.join(SSH_DIR, "client"), "rb") as f:
+                    body = f.read()
+            except OSError:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                return
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                b"Content-Length: %d\r\n\r\n%s" % (len(body), body)
+            )
+        elif path.startswith("/repo.git/info/refs"):
             body = _git_advertisement()
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\n"

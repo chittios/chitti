@@ -65,8 +65,12 @@ impl Client {
     /// key, whether to prompt) is policy rather than protocol.
     pub fn connect(host: &str, port: u16) -> Result<Self, String> {
         let deadline = crate::arch::now_ms() + CONNECT_TIMEOUT_MS;
-        let ip = crate::net::resolve_any(host, CONNECT_TIMEOUT_MS)
-            .map_err(|e| alloc::format!("cannot resolve {host}: {e}"))?;
+        // **`host_addr`, not `resolve_any`** — the latter goes straight to DNS,
+        // so a literal address (`10.0.2.2`, `::1`) and `localhost` are looked up
+        // as if they were names and fail with a DNS error naming the address you
+        // just typed. `host_addr` recognises literals first, exactly as the HTTP
+        // client does; there is one resolver and this is it.
+        let ip = crate::net::http::host_addr(host).map_err(|e| alloc::format!("cannot resolve {host}: {e}"))?;
         let sock = crate::net::http::tcp_connect_addr(ip, port, deadline)?;
         let mut c = Self {
             sock,
@@ -582,6 +586,174 @@ impl Client {
         Ok(ch.exit_status)
     }
 
+    /// `-L`: accept on `listener` and pump each connection through a
+    /// `direct-tcpip` channel to `host:port` on the server's side.
+    ///
+    /// Multiple connections are live at once, which is the whole reason SSH
+    /// multiplexes: a browser opens six sockets to one forwarded port. So this
+    /// keeps a table keyed by our channel number and never blocks on any single
+    /// one — a read that would wait is simply skipped until the next turn.
+    ///
+    /// Runs until Ctrl+C; returns how many connections it served.
+    pub fn forward(
+        &mut self,
+        listener: crate::net::ListenerId,
+        host: &str,
+        port: u16,
+    ) -> Result<usize, String> {
+        let mut live: Vec<Forwarded> = Vec::new();
+        let mut served = 0usize;
+        let mut buf = [0u8; 8192];
+
+        loop {
+            // A new local connection opens a new channel.
+            if let Some(sock) = crate::net::try_accept(listener) {
+                let id = self.next_channel;
+                self.next_channel += 1;
+                self.send_packet(&channel::open_direct_tcpip(
+                    id, host, port, "127.0.0.1", 0,
+                ))?;
+                live.push(Forwarded {
+                    ch: channel::Channel::new(id),
+                    sock,
+                    open: false,
+                    local_eof: false,
+                });
+                served += 1;
+                crate::ktrace::log_fmt(format_args!("ssh: forward channel {id} -> {host}:{port}"));
+            }
+
+            // Local → remote.
+            for f in live.iter_mut() {
+                if !f.open || f.local_eof {
+                    continue;
+                }
+                match crate::net::tcp_recv(f.sock, &mut buf) {
+                    Some(0) | None => {
+                        if !crate::net::tcp_may_recv(f.sock) {
+                            f.local_eof = true;
+                        }
+                    }
+                    Some(n) => {
+                        let mut off = 0;
+                        while off < n {
+                            let take = f.ch.sendable(n - off);
+                            if take == 0 {
+                                break; // window closed; the rest waits
+                            }
+                            let msg = channel::data(f.ch.remote_id, &buf[off..off + take]);
+                            self.send_packet(&msg)?;
+                            f.ch.sent(take);
+                            off += take;
+                        }
+                    }
+                }
+                if f.local_eof {
+                    let msg = channel::eof(f.ch.remote_id);
+                    self.send_packet(&msg)?;
+                }
+            }
+
+            // Remote → local. Only read when a packet is actually waiting, or a
+            // quiet forward would block here instead of accepting.
+            while self.packet_ready() {
+                let p = self.recv_packet()?;
+                match channel::parse(&p) {
+                    Some(channel::Event::OpenConfirmation {
+                        local_id,
+                        remote_id,
+                        window,
+                        max_packet,
+                    }) => {
+                        if let Some(f) = live.iter_mut().find(|f| f.ch.local_id == local_id) {
+                            f.ch.confirm(remote_id, window, max_packet);
+                            f.open = true;
+                        }
+                    }
+                    Some(channel::Event::OpenFailure {
+                        local_id,
+                        description,
+                        ..
+                    }) => {
+                        if let Some(i) = live.iter().position(|f| f.ch.local_id == local_id) {
+                            crate::serial_println!("ssh> forward refused: {description}");
+                            crate::net::tcp_close(live[i].sock);
+                            live.remove(i);
+                        }
+                    }
+                    Some(channel::Event::Data { local_id, data }) => {
+                        if let Some(f) = live.iter_mut().find(|f| f.ch.local_id == local_id) {
+                            let _ = crate::net::tcp_send(f.sock, &data);
+                            if let Some(extra) = f.ch.consume(data.len()) {
+                                let msg = channel::window_adjust(f.ch.remote_id, extra);
+                                self.send_packet(&msg)?;
+                            }
+                        }
+                    }
+                    Some(channel::Event::WindowAdjust { local_id, extra }) => {
+                        if let Some(f) = live.iter_mut().find(|f| f.ch.local_id == local_id) {
+                            f.ch.grant(extra);
+                        }
+                    }
+                    Some(channel::Event::Eof { local_id }) | Some(channel::Event::Close { local_id }) => {
+                        if let Some(i) = live.iter().position(|f| f.ch.local_id == local_id) {
+                            let remote = live[i].ch.remote_id;
+                            let _ = self.send_packet(&channel::close(remote));
+                            crate::net::tcp_close(live[i].sock);
+                            live.remove(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if crate::shell::poll_interrupt() {
+                for f in &live {
+                    let _ = self.send_packet(&channel::close(f.ch.remote_id));
+                    crate::net::tcp_close(f.sock);
+                }
+                return Ok(served);
+            }
+            crate::shell::upkeep();
+            crate::sched::yield_now();
+        }
+    }
+
+    /// Whether a whole packet is already buffered or readable without waiting.
+    ///
+    /// Forwarding must not block in `recv_packet` — a quiet tunnel would stop
+    /// accepting new local connections entirely.
+    fn packet_ready(&mut self) -> bool {
+        let mut buf = [0u8; 4096];
+        if let Some(n) = crate::net::tcp_recv(self.sock, &mut buf) {
+            if n > 0 {
+                self.inbuf.extend_from_slice(&buf[..n]);
+            }
+        }
+        let need = match self.rx.as_ref() {
+            Some(d) => d.length_prefix(),
+            None => 4,
+        };
+        if self.inbuf.len() < need {
+            return false;
+        }
+        // For an encrypted length we cannot peek without consuming keystream, so
+        // fall back to "there is at least a minimum packet's worth buffered".
+        match self.rx.as_ref() {
+            Some(d) if d.length_prefix() == 4 => {
+                let len = u32::from_be_bytes([
+                    self.inbuf[0],
+                    self.inbuf[1],
+                    self.inbuf[2],
+                    self.inbuf[3],
+                ]) as usize;
+                self.inbuf.len() >= 4 + len + d.tag_len()
+            }
+            Some(d) => self.inbuf.len() >= 4 + 16 + d.tag_len(),
+            None => true,
+        }
+    }
+
     pub fn disconnect(&mut self) {
         let mut w = wire::Writer::msg(1); // SSH_MSG_DISCONNECT
         w.put_u32(11); // SSH_DISCONNECT_BY_APPLICATION
@@ -590,6 +762,15 @@ impl Client {
         let _ = self.send_packet(&w.into_vec());
         crate::net::tcp_close(self.sock);
     }
+}
+
+/// One live forwarded connection: a local socket paired with its channel.
+struct Forwarded {
+    ch: channel::Channel,
+    sock: TcpHandle,
+    /// Set once the server confirms the channel; data before that is dropped.
+    open: bool,
+    local_eof: bool,
 }
 
 enum AuthReply {

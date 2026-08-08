@@ -35,7 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from guest import Guest  # noqa: E402
-from servers import Server, tls_context  # noqa: E402
+from servers import SSH_DIR, Server, tls_context  # noqa: E402
 
 HOST = "10.0.2.2"  # QEMU user-net alias for the host
 PLAIN_PORT = 8100
@@ -43,6 +43,7 @@ TLS_PORT = 9100
 SVC_PORT = 7099  # guest echo-service listener, reachable via slirp hostfwd
 SVC_HTTP_PORT = 7100  # guest http-doc-service listener
 SVC_SSH_PORT = 7101  # guest ssh-service listener
+SSHD_PORT = 2223     # a real OpenSSH sshd the `ssh_client` scenario starts
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CERT = os.path.join(HERE, "certs", "ec.pem")
@@ -1746,6 +1747,144 @@ def s_http_post(g):
     g.send(f'/http -X POST -H "X-Test: yes" -d payload-9182 http://{HOST}:{PLAIN_PORT}/echo')
     ok = g.wait_for("payload-9182", 20, m)
     return ok, "POST body echoed" if ok else "body not echoed"
+
+
+def _start_sshd():
+    """Start a **real OpenSSH sshd** on 127.0.0.1:2223 with a throwaway keypair.
+
+    Nothing about the machine is changed: the daemon runs as the invoking user
+    from a temp directory, on a high port, with its own host key, its own
+    `authorized_keys` and no PAM. The guest reaches it at 10.0.2.2:2223 the same
+    way it reaches every other harness server.
+
+    Returns `(proc, user)` or `None` when sshd is unavailable — in which case the
+    scenario skips rather than fails, since not every machine has one.
+    """
+    import getpass
+    import shutil
+
+    sshd = "/usr/sbin/sshd" if os.path.exists("/usr/sbin/sshd") else shutil.which("sshd")
+    keygen = shutil.which("ssh-keygen")
+    if not sshd or not keygen:
+        return None
+    d = SSH_DIR
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    for name in ("hostkey", "client"):
+        subprocess.run(
+            [keygen, "-t", "ed25519", "-f", os.path.join(d, name), "-N", "", "-q"],
+            check=True,
+        )
+    shutil.copy(os.path.join(d, "client.pub"), os.path.join(d, "authorized_keys"))
+    os.chmod(os.path.join(d, "authorized_keys"), 0o600)
+    cfg = os.path.join(d, "sshd_config")
+    with open(cfg, "w") as f:
+        f.write(
+            f"Port {SSHD_PORT}\nListenAddress 127.0.0.1\n"
+            f"HostKey {d}/hostkey\nPidFile {d}/sshd.pid\n"
+            f"AuthorizedKeysFile {d}/authorized_keys\n"
+            # StrictModes off because the temp dir is not mode 700, and PAM off
+            # because it would want a real login session.
+            "StrictModes no\nUsePAM no\n"
+            "PasswordAuthentication no\nPubkeyAuthentication yes\n"
+        )
+    proc = subprocess.Popen(
+        [sshd, "-f", cfg, "-D", "-e"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    # Wait for the port rather than sleeping a fixed time.
+    for _ in range(50):
+        try:
+            with socket.create_connection(("127.0.0.1", SSHD_PORT), timeout=0.5):
+                return proc, getpass.getuser()
+        except OSError:
+            if proc.poll() is not None:
+                return None
+            time.sleep(0.2)
+    proc.terminate()
+    return None
+
+
+def s_ssh_client(g):
+    """**The SSH client against a real OpenSSH server.**
+
+    Everything below `net::ssh` is unit-tested, but the pure layers cannot prove
+    the one thing that matters: that the *ordering* is right and that a real
+    server accepts what we send. Almost every SSH mistake produces bytes as
+    random-looking as the correct ones, so the only honest check is a real sshd —
+    real curve25519 kex, a real ed25519 host key, real publickey auth over the
+    session-id-prefixed signature, and a real `exec` channel.
+
+    The guest fetches its own identity over HTTP (the `http_download` path) since
+    there is no other way to get a file with content into the store.
+    """
+    started = _start_sshd()
+    if started is None:
+        return None, "no sshd on this host (skipping)"
+    proc, user = started
+    try:
+        # The guest needs the private key; `-O` names it from the URL.
+        m = g.mark()
+        g.send(f"/http -O http://{HOST}:{PLAIN_PORT}/id_ed25519")
+        if not g.wait_for("http> saved", 25, m):
+            return False, "could not deliver the SSH identity to the guest"
+
+        # Put it where an identity is looked for by default, so the connection
+        # below also proves the default-identity path and not just `-i`.
+        m = g.mark()
+        g.send("/cp /downloads/id_ed25519 /configs/core/id_ed25519")
+        if not g.wait_for("cp>", 15, m):
+            return False, "could not install the identity"
+
+        # It must parse as a usable identity before any connection is attempted —
+        # otherwise a key problem reads as a handshake problem.
+        m = g.mark()
+        g.send("/ssh keys")
+        if not g.wait_for("ssh-ed25519", 15, m):
+            return False, "the fetched key did not parse: " + g.text()[m:][:300]
+
+        # The real thing: connect, verify the host key, authenticate, run a command.
+        m = g.mark()
+        # The marker must differ from the *typed* text, or the guest's own echo of
+        # the command line satisfies the assertion and the test proves nothing.
+        # `CHITTI''_SSH_OK` is typed, `CHITTI_SSH_OK` is what the remote prints.
+        g.send(f"/ssh {user}@{HOST}:{SSHD_PORT} echo CHITTI''_SSH_OK")
+        if not g.wait_for("CHITTI_SSH_OK", 60, m):
+            return False, "no output from the remote command: " + g.text()[m:][:400].replace("\n", " | ")
+        out = g.text()[m:]
+        if "host key ssh-ed25519 SHA256:" not in out:
+            return False, "the host key was not reported: " + out[:500].replace("\n", " | ")
+        if "authenticated as" not in out:
+            return False, "publickey authentication did not complete"
+
+        # The host key is now trusted, and recorded the way OpenSSH records it.
+        m = g.mark()
+        g.send("/ssh known-hosts")
+        if not g.wait_for("ssh-ed25519", 15, m):
+            return False, "the host key was not recorded in known_hosts"
+
+        # A second connection reuses the recorded key — which exercises the
+        # `Known` branch, the one a first connection cannot reach.
+        m = g.mark()
+        g.send(f"/ssh {user}@{HOST}:{SSHD_PORT} echo SECOND''_OK")
+        if not g.wait_for("SECOND_OK", 60, m):
+            return False, "the second connection failed (known-host path)"
+
+        # A command's exit status comes back, so a failing remote command is
+        # distinguishable from one that produced no output.
+        m = g.mark()
+        g.send(f"/ssh {user}@{HOST}:{SSHD_PORT} exit 3")
+        if not g.wait_for("exited 3", 60, m):
+            return False, "the remote exit status was not reported"
+        return True, "real sshd: curve25519 kex, ed25519 host key, publickey auth, exec + exit status"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
 
 def s_http_download(g):
@@ -4507,7 +4646,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("keyboard_shortcuts", s_keyboard_shortcuts),
 ]
 AGENTS = [("agents_services", s_agents_services), ("agents_switch_caps", s_agents_switch_caps), ("agents_install", s_agents_install), ("agents_uninstall", s_agents_uninstall), ("agent_fs_consent", s_agent_fs_consent), ("agents_search", s_agents_search), ("agents_install_registry", s_agents_install_registry), ("system_agents", s_system_agents), ("doc_pipeline", s_doc_pipeline), ("ssh_agent", s_ssh_agent), ("surface", s_surface), ("package_apps", s_package_apps), ("mcp_manifest", s_mcp_manifest)]
-NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
+NET = [("nic_dispatch", s_nic_dispatch), ("wifi_psk", s_wifi_psk), ("network", s_network), ("ping", s_ping), ("http_get", s_http_get), ("http_post", s_http_post), ("http_download", s_http_download), ("git_clone", s_git_clone), ("ssh_client", s_ssh_client), ("http_stream", s_http_stream), ("browse", s_browse), ("browse_runaway", s_browse_runaway), ("browse_samples", s_browse_samples), ("engine_ab", s_engine_ab), ("ws", s_ws), ("mcp_connect", s_mcp_connect), ("cancel", s_cancel)]
 # Runs after every other group: kills the guest (QEMU -no-reboot → exit).
 FINAL = [("restart", s_restart)]
 

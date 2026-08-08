@@ -30,6 +30,7 @@ mod media;
 mod notify;
 mod pdf;
 mod schedule;
+mod ssh;
 pub mod record;
 mod system;
 mod tooljson;
@@ -429,6 +430,7 @@ pub fn run() -> ! {
                 "model" => run_model(arg, &mut remote_on, &mut remote_cfg, &mut remote_chat, &mut chat),
                 "http" => run_http(arg),
                 "ws" => run_ws(arg),
+                "ssh" => ssh::run_ssh(arg),
                 "mcp" => run_mcp(arg),
                 // The login commands live **here**, in the interactive-only match,
                 // and must never move down into `dispatch_system`.
