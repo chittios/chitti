@@ -4913,6 +4913,16 @@ fn run_test_binary_aarch64(elf: &Path) -> Result<(), String> {
         }
     }
     cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
+    // `-net none`, or QEMU creates a **default NIC** we never asked for and then
+    // refuses to start because it cannot find that NIC's PXE boot ROM:
+    // `failed to find romfile "efi-virtio.rom"`, exit 1, no guest at all. The ROM
+    // lives in Ubuntu's `ipxe-qemu`, which `qemu-system-x86` depends on and
+    // `qemu-system-arm` does not — so this reproduces only on the aarch64 CI leg
+    // and never on a Mac, where Homebrew's QEMU bundles the ROMs. Declining the
+    // device is better than installing its ROM: the unit suite is pure logic and
+    // has no network tests (those are e2e), so the NIC was pure boot cost.
+    // Deliberately not added to the x86 runner, which is green as it stands.
+    cmd.args(["-net", "none"]);
     cmd.arg("-kernel").arg(elf);
     cmd.arg("-fw_cfg").arg(format!("name=opt/chitti/ramsize,string={}", mem_bytes(TEST_MEM)));
 
@@ -4947,10 +4957,16 @@ fn run_test_binary_aarch64(elf: &Path) -> Result<(), String> {
     use std::io::BufRead as _;
     let mut passed = false;
     let mut failed = false;
+    // Whether the *guest* ever ran, as opposed to QEMU failing on the host side.
+    // Without this, a host-side refusal is reported as "the guest died or hung",
+    // which sends you looking at the kernel for something that never booted — the
+    // first CI run failed exactly that way on a missing `efi-virtio.rom`.
+    let mut guest_spoke = false;
     if let Some(out) = child.stdout.take() {
         for line in std::io::BufReader::new(out).lines() {
             let Ok(line) = line else { break };
             println!("{line}");
+            guest_spoke = true;
             if line.contains("CHITTI-TEST: ALL PASS") {
                 passed = true;
             }
@@ -4967,6 +4983,16 @@ fn run_test_binary_aarch64(elf: &Path) -> Result<(), String> {
     }
     if failed {
         return Err("a test failed (see the log above)".to_string());
+    }
+    // "qemu would not start" and "the guest died" are different facts and lead to
+    // different places, so they get different messages. QEMU writes its own reason
+    // to stderr, which is inherited and so already on the console above.
+    if !guest_spoke {
+        return Err(format!(
+            "qemu-system-aarch64 produced no guest output and exited ({status}) -- \
+             it failed on the host side before the kernel ran (see its error above; \
+             a missing romfile or an unsupported -M/-accel option looks like this)"
+        ));
     }
     if !passed {
         return Err(format!(
