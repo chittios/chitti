@@ -170,6 +170,20 @@ impl MmioTransport {
 
     /// Find the `n`th virtio-mmio slot presenting `device_id`, skipping any
     /// base in `skip` (a second device of the same kind already claimed).
+    ///
+    /// **aarch64 only, and that is not a feature gate.** [`MMIO_BASE`] is a
+    /// *physical* address dereferenced directly, which is only meaningful under
+    /// aarch64's flat identity map. On x86 the kernel lives in the higher half
+    /// and nothing maps virtual `0x0a00_0000`, so the first probing read is an
+    /// unrecoverable page fault — `idt: PAGE FAULT accessing 0xa000000 -- page
+    /// fault not isolatable, halting`, roughly eight seconds into boot, before
+    /// the shell exists.
+    ///
+    /// No capability diverges by arch as a result: virtio-mmio at a fixed window
+    /// is a property of QEMU's `virt` machine, and x86 presents the very same
+    /// devices over PCI, which [`find_any`] tries next. The gate is here rather
+    /// than at the call sites so a future caller cannot reintroduce the fault.
+    #[cfg(target_arch = "aarch64")]
     pub fn find(device_id: u32, skip: &[usize]) -> Option<MmioTransport> {
         for slot in 0..MMIO_SLOTS {
             let base = MMIO_BASE + slot * MMIO_STRIDE;
@@ -178,6 +192,7 @@ impl MmioTransport {
             }
             // SAFETY: probing the fixed virtio-mmio window with 32-bit reads.
             // An absent slot reads as zeroes, which the magic check rejects.
+            // Identity-mapped on this arch, per the gate above.
             unsafe {
                 if read_volatile((base + M_MAGIC) as *const u32) != MMIO_MAGIC {
                     continue;
@@ -192,6 +207,13 @@ impl MmioTransport {
                 return Some(MmioTransport { base, version });
             }
         }
+        None
+    }
+
+    /// There is no virtio-mmio window on this architecture — see the aarch64
+    /// twin for why probing one is fatal rather than merely fruitless.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn find(_device_id: u32, _skip: &[usize]) -> Option<MmioTransport> {
         None
     }
 }
@@ -543,6 +565,10 @@ impl Transport for PciTransport {
 ///
 /// `skip_mmio` lets a caller pass over mmio bases already claimed by another
 /// instance of the same device kind.
+///
+/// On x86 the mmio arm is compiled out entirely rather than merely finding
+/// nothing: see [`MmioTransport::find`] — probing a window that does not exist
+/// there is a fatal page fault, not a miss.
 pub fn find_any(device_id: u32, n: usize, skip_mmio: &[usize]) -> Option<alloc::boxed::Box<dyn Transport>> {
     if let Some(t) = MmioTransport::find(device_id, skip_mmio) {
         return Some(alloc::boxed::Box::new(t));
