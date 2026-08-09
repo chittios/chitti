@@ -1,6 +1,6 @@
 //! **Does the boundary hold, what does it refuse that it shouldn't, and do
 //! cheaper designs do the same job?** — the harness behind experiments E2, E3
-//! and E4 in `paper/` (`/redteam`).
+//! and E4 in the design paper (`/redteam`).
 //!
 //! Three things it measures, on the running kernel, through the **real tool
 //! router** rather than by calling the executor directly — the justification for

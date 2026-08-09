@@ -18,7 +18,7 @@
 //!
 //! **This is not a fifth Synapse gate.** The four gates — grammar, capability,
 //! taint, scope — are the capability/provenance architecture, and
-//! `paper/main.tex` publishes them by number: a figure with four boxes, an attack
+//! the design paper publishes them by number: a figure with four boxes, an attack
 //! table citing "Gate 3 (taint)" and "Gate 4 (scope)", and a cost methodology
 //! measuring cumulative prefixes 1, 1--2, 1--3, 1--4. Numbering this check into
 //! that chain would invalidate all three. It is human policy layered over the

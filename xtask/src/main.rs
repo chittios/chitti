@@ -3,7 +3,6 @@
 //! `cargo xtask <cmd>` (see CHITTI_OS_HANDOFF.md Part 7).
 
 use std::env;
-mod paper;
 mod rings;
 mod entry;
 use std::fs;
@@ -909,9 +908,6 @@ fn main() {
         // Phase 3 parity gate: build the kernel with the `refcheck` feature,
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(arch, model),
-        // Verify the quantitative claims in `paper/main.tex` against the tree.
-        // Reports and exits non-zero on drift; never edits the paper.
-        "paper-check" => cmd_paper_check(&rest),
         "ring-check" => cmd_ring_check(),
         "imgdec" => cmd_imgdec(),
         // Print host USB vid:pid candidates for BT/camera (used by `make usb-list`).
@@ -1582,40 +1578,6 @@ fn cmd_ring_check() -> Result<(), String> {
     println!("them through `synapse::tenant::invoke_in_userspace` (passing the justification");
     println!("the in-kernel path used), or add the file to `rings::ALLOWED` with a reason.");
     Err(format!("ring-check: {} bypass(es) of the ring-3 rule", hits.len()))
-}
-
-/// `cargo xtask paper-check [--ran N]` — compare the paper's derivable claims
-/// with the tree. `--ran N` supplies the number of tests the x86 suite executed
-/// (from `cargo xtask test`); without it that one claim is skipped rather than
-/// guessed at.
-fn cmd_paper_check(rest: &[String]) -> Result<(), String> {
-    let ran = rest
-        .iter()
-        .position(|a| a == "--ran")
-        .and_then(|i| rest.get(i + 1))
-        .and_then(|v| v.parse::<u64>().ok());
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or("cannot locate the repo root")?
-        .to_path_buf();
-    let claims = paper::check(&repo, ran).map_err(|e| format!("paper-check: {e}"))?;
-    if claims.is_empty() {
-        return Err("paper-check: found no claims to check -- has the prose changed?".into());
-    }
-    println!("paper-check: {} derivable claim(s)", claims.len());
-    for c in &claims {
-        println!("{c}");
-    }
-    if ran.is_none() {
-        println!("  skipped  unit tests run (x86): pass --ran N from `cargo xtask test`");
-    }
-    println!("  unchecked measured figures (tok/s, gate ns, attack rates) -- these come from");
-    println!("            running the kernel (/perf, /bench synapse, /redteam), not the source.");
-    let bad = claims.iter().filter(|c| !c.ok()).count();
-    if bad > 0 {
-        return Err(format!("paper-check: {bad} claim(s) no longer match the code"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

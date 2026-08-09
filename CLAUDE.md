@@ -121,12 +121,12 @@ there without mapping device memory into a tenant, which destroys the isolation.
 correct shape is always **driver in ring 0, effect requested from ring 3 through a
 Synapse primitive** — so "migrate X" for such a command means *designing a primitive*,
 not moving code. That is a real design act: each primitive is a new gated, audited
-authority surface, it moves the paper's primitive count (which `cargo xtask paper-check`
-pins), and it adds an entry to the `security::redteam` census.
+authority surface, it moves the primitive count the design paper states, and it adds an
+entry to the `security::redteam` census.
 
 **The other half of ring 3 is the parsers, and they are the cheap case: a decoder needs no
 authority at all.** It reads a byte buffer, writes a pixel buffer, exits — zero Synapse
-calls, so no new primitive, no gate change, nothing in the `paper-check` count or the
+calls, so no new primitive, no gate change, nothing in the primitive count or the
 `redteam` census. That is the exact opposite of `/http` or MCP, and it is why the largest
 attacker-reachable code in the OS is also the easiest thing to confine. **`/open` decodes
 PNG and JPEG in ring 3** (`userspace/imgdec/`, driven by `synapse::tenant::ImageTenant`):
@@ -1006,7 +1006,7 @@ FDT claims a GICv3 but carries no readable `reg`.
   `/js call <module.wasm> <tool> '<args json>'`.
   **There is deliberately no new `ToolBinding`, no `js` manifest field and no
   second kind of agent** — JavaScript is a source language, the artifact and the
-  manifest are the ordinary ones, so `effect_of`/`origin_of`/`paper-check`/the
+  manifest are the ordinary ones, so `effect_of`/`origin_of`/the primitive count/the
   `redteam` census are untouched. Seven things this path pins down:
   - **`compile-src` returns bytecode, not a module**, so `jsmod::emit` writes the
     wasm itself. It is a fixed template decoded from `javy build -C dynamic`: three
@@ -1323,7 +1323,7 @@ FDT claims a GICv3 but carries no readable `reg`.
   `CNTVCT_EL0` on Apple silicon), so the rate is printed beside every figure. A
   non-positive marginal cost prints "below noise floor" — a saturating
   subtraction is not evidence that a gate is free. The design write-up lives in
-  [`paper/`](paper/).
+  a separate repository and is not part of this tree.
   **The taint policy is enforced at EIGHT sites, not one, and `/redteam`
   (`security::redteam`) is the census.** The Synapse executor gates destructive
   primitives; the tool router *separately* gates destructive shell commands,

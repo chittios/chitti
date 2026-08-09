@@ -98,7 +98,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     // **Approval check** — deliberately *not* one of the four gates. The four
     // (grammar, capability, taint, scope) are the capability/provenance
     // architecture; this is human policy layered over it, and conflating the two
-    // would renumber a chain that `paper/main.tex` publishes by number.
+    // would renumber a chain that the design paper publishes by number.
     //
     // It is here rather than in the tool layer because that layer is the thing
     // being governed. `tools::permissions` and the approval modal were consulted
@@ -203,7 +203,7 @@ pub const GATE_SCOPE: u8 = 4;
 /// How many gates guard the boundary. Bumping this is the deliberate edit a new
 /// gate requires (see [`gate_prefix`]).
 ///
-/// **This number is published.** `paper/main.tex` states "four gates in a fixed
+/// **This number is published.** The design paper states "four gates in a fixed
 /// order", draws them, and prices them as cumulative prefixes 1, 1--2, 1--3,
 /// 1--4; the attack table cites "Gate 3 (taint)" and "Gate 4 (scope)" by number.
 /// Renumbering these silently invalidates a figure, a table and a measurement
@@ -276,7 +276,7 @@ mod gate_contract_tests {
 
     #[test_case]
     fn gate_numbering_is_the_published_contract() {
-        // `paper/main.tex` publishes these by number: a figure with four boxes,
+        // The design paper publishes these by number: a figure with four boxes,
         // an attack table citing "Gate 3 (taint)" and "Gate 4 (scope)", and a cost
         // methodology measuring cumulative prefixes 1, 1--2, 1--3, 1--4.
         // Renumbering them invalidates a figure, a table and a measurement — so a
@@ -290,7 +290,7 @@ mod gate_contract_tests {
         assert_eq!(GATE_CAPABILITY, 2);
         assert_eq!(GATE_TAINT, 3);
         assert_eq!(GATE_SCOPE, 4);
-        assert_eq!(GATE_COUNT, 4, "four gates: see paper/main.tex");
+        assert_eq!(GATE_COUNT, 4, "four gates: see the design paper");
         assert_eq!(
             gate_of_outcome(&Invocation::NeedsApproval { primitive: "x" }),
             0,

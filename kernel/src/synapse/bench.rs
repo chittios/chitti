@@ -6,7 +6,7 @@
 //! of inference costs tens of milliseconds (`/perf`); the claim this module
 //! exists to check is that the whole four-gate authorization decision costs
 //! *microseconds*, i.e. that there is no security/performance tradeoff here to
-//! argue about. It is the harness behind experiment E1 in `paper/`.
+//! argue about. It is the harness behind experiment E1 in the design paper.
 //!
 //! Method, and why it is shaped this way — three of these are corrections, and
 //! each was a wrong number before it was a rule:

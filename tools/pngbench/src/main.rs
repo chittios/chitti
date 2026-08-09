@@ -32,7 +32,7 @@ pub mod png;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).cloned().unwrap_or_else(|| "paper/figures/desktop.png".into());
+    let path = args.get(1).cloned().unwrap_or_else(|| "assets/samples/images/sudoku.png".into());
     let wasm_path = args
         .get(2)
         .cloned()
