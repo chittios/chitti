@@ -708,6 +708,34 @@ loader's framebuffer — the position Linux is in with `efifb`/`simpledrm`
 legibility via font size. Still absent: real-hardware GPU drivers (i915/AMD/AGX) —
 see the note on why there is no display equivalent of xHCI/AHCI.
 
+**The identity map reaches 512 GiB, and QEMU `virt` puts its 64-bit PCIe window at
+exactly that address.** `T0SZ=25` gives a 39-bit VA with a single-level L1 of 512
+one-GiB blocks, so `map_device_gib` could not describe `0x8000000000` — and it
+returned *silently*, leaving `map_mmio` to hand back an unmapped physical address.
+A driver then wrote to it: `ESR 0x96000044` (data abort, DFSC 0x4 — translation
+fault at level 0), `FAR 0x8000008014`, immediately after "virtio-pci enabled".
+Firmware only puts a BAR there when it has the room: TCG does, Apple's hypervisor
+has a smaller guest physical space and does not, so **the same image booted under
+HVF and died under TCG** — and it would die the same way on any machine that
+assigns 64-bit BARs high. High windows are now **aliased** into spare L1 slots
+(`mmu::map_device_va`, which `map_mmio` returns), *not* identity-mapped: reaching
+past 512 GiB otherwise means a 48-bit VA and an L0 root, and ring-3 tenants switch
+`TTBR0` to roots sharing this table, so it would change every tenant address space
+on a path that has already faulted real Apple cores over a live table edit. Nothing
+needs high memory identity-mapped — `map_mmio` results are CPU register accesses,
+while anything a *device* dereferences comes from `alloc_dma` off the heap.
+
+**Three copies of the virtio-pci capability walk mapped a fixed 16 KiB and then
+added an unbounded offset** (`kms/virtio_gpu`, `drivers/virtio/transport`,
+`arch/aarch64/virtio_pci` — the last did not map at all, it added to the physical
+BAR). `offset` is a byte offset *within* the BAR and the capability carries its own
+`length` at `cap+12`; a fixed span is right only until a device puts a structure
+past it, which QEMU's virtio-gpu does at `0x8014`. On aarch64 whole-GiB mapping hid
+it; on x86 `map_mmio` is page-granular, so it was a latent page fault there too.
+Each fault had to be found by resolving the faulting PC against the kernel's symbol
+table (`nm` + the load base), which is the fastest tool here by a wide margin —
+three different call sites, identical syndrome.
+
 **The boot-info page is built even when there is no display, and that coupling was
 a boot failure.** The stub's GOP capture and the boot-info page used to be one
 closure: `no GOP handle`, a refused `open_protocol`, or a blt-only mode returned

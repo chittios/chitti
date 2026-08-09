@@ -118,10 +118,23 @@ impl VirtioBlkPci {
         let common_cap = d.find_virtio_cap(CFG_COMMON)?;
         let notify_cap = d.find_virtio_cap(CFG_NOTIFY)?;
         let device_cap = d.find_virtio_cap(CFG_DEVICE)?;
+        // **Map the BAR; do not just add to its physical address.** This relied
+        // on the identity map, which only reaches 512 GiB — and QEMU `virt` puts
+        // its 64-bit PCIe window at exactly that address, so firmware that
+        // assigns a BAR there (TCG does) left this dereferencing unmapped memory:
+        // `ESR 0x96000044`, a level-0 translation fault, inside `probe_nth`.
+        // `map_mmio` returns the address to use, aliasing the window when it is
+        // above the identity map.
         let cap_region = |cap: u16| -> u64 {
             let bar = pci::read8(d.bus, d.dev, d.func, cap + 4);
             let off = pci::read32(d.bus, d.dev, d.func, cap + 8) as u64;
-            d.bar(bar) + off
+            let len = pci::read32(d.bus, d.dev, d.func, cap + 12) as u64;
+            let phys = d.bar(bar);
+            if phys == 0 {
+                return 0;
+            }
+            let span = off.saturating_add(len.max(1)) as usize;
+            crate::mm::map_mmio(phys, span) + off
         };
         let common = cap_region(common_cap);
         let notify_base = cap_region(notify_cap);

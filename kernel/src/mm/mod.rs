@@ -675,8 +675,11 @@ pub fn alloc_dma(bytes: usize) -> Option<(u64, u64)> {
 /// `phys` is Device-mapped, then return the identity-mapped virtual address.
 #[cfg(target_arch = "aarch64")]
 pub fn map_mmio(phys: u64, _bytes: usize) -> u64 {
-    crate::arch::aarch64::mmu::map_device_gib(phys);
-    phys
+    // Returns the VA to use, which is `phys` for everything inside the 512 GiB
+    // identity map and an alias above it (a 64-bit PCI BAR in QEMU `virt`'s high
+    // window lands at exactly 512 GiB). Callers must use the returned address —
+    // they already do, since that is what this has always returned.
+    crate::arch::aarch64::mmu::map_device_va(phys)
 }
 
 /// aarch64 counterpart of [`map_mmio_page`].

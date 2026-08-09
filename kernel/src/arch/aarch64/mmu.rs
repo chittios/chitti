@@ -417,10 +417,101 @@ pub fn have_bootinfo() -> bool {
 /// Add a 1 GiB **Device** identity mapping for the block containing `pa`, live.
 /// Used to reach PCIe ECAM config space (discovered from ACPI MCFG at a
 /// high physical address outside the initial low identity map). Idempotent.
+/// How many 1 GiB windows above 512 GiB can be aliased at once. QEMU `virt`
+/// needs one; a machine with several 64-bit BARs spread across GiB blocks needs
+/// a few. Bounded because each costs an L1 slot.
+const MAX_HIGH_ALIAS: usize = 8;
+/// `(physical GiB index, aliased VA GiB index)` for each high window mapped.
+static mut HIGH_ALIAS: [(usize, usize); MAX_HIGH_ALIAS] = [(0, 0); MAX_HIGH_ALIAS];
+static mut N_HIGH_ALIAS: usize = 0;
+
+/// Map a device window and return the **virtual address to use for it**.
+///
+/// Identity below 512 GiB, which is everything the single-level L1 can address.
+/// At or above it the physical GiB is **aliased** into a spare L1 slot and the
+/// returned VA is *not* the physical address.
+///
+/// That case is not hypothetical: QEMU `virt` puts its 64-bit PCIe MMIO window at
+/// exactly `0x8000000000` — 512 GiB, the first address one level past the end of
+/// the table — so firmware that assigns a 64-bit BAR there (TCG does; Apple's
+/// hypervisor has a smaller guest physical space and does not) produced a driver
+/// writing to an address nothing mapped: `ESR 0x96000044` (translation fault,
+/// level 0), `FAR 0x8000008014`, straight after "virtio-pci enabled". The old code
+/// returned silently, so the mapping simply did not happen and the abort was the
+/// first anyone heard of it.
+///
+/// **Aliasing rather than widening the address space** is deliberate. Reaching
+/// past 512 GiB means a 48-bit VA (`T0SZ=16`) and an L0 root, and ring-3 tenants
+/// switch `TTBR0` to roots that share this table — so it would change every
+/// tenant address space, on a code path that has already faulted real Apple cores
+/// once over a live table edit. Nothing needs high memory to be identity-mapped:
+/// `map_mmio` results are CPU register accesses, while anything a *device*
+/// dereferences comes from `alloc_dma`, which allocates from the heap and is
+/// unaffected. Breaking VA==PA here costs nothing and touches nothing else.
+pub fn map_device_va(pa: u64) -> u64 {
+    let idx = (pa >> 30) as usize;
+    if idx < 512 {
+        map_device_gib(pa);
+        return pa;
+    }
+    let off = pa & 0x3fff_ffff;
+    // SAFETY: single-threaded device bring-up; L1 is the live TTBR0 table.
+    unsafe {
+        let l1 = core::ptr::addr_of_mut!(L1) as *mut u64;
+        for i in 0..N_HIGH_ALIAS {
+            let (p, v) = HIGH_ALIAS[i];
+            if p == idx {
+                return ((v as u64) << 30) | off;
+            }
+        }
+        if N_HIGH_ALIAS >= MAX_HIGH_ALIAS {
+            crate::ktrace::log_fmt(format_args!(
+                "mmu: no alias slot left for device GiB {idx} ({pa:#x}) -- refusing"
+            ));
+            return 0;
+        }
+        // A spare VA slot, taken from the top: RAM and identity-mapped devices
+        // occupy low indices, so the highest invalid entry is the safest to
+        // borrow. An entry that is already a table (a split mixed block) or a
+        // block is in use and must not be stolen.
+        let mut slot = None;
+        for v in (0..512).rev() {
+            if *l1.add(v) == 0 {
+                slot = Some(v);
+                break;
+            }
+        }
+        let Some(v) = slot else {
+            crate::ktrace::log_fmt(format_args!(
+                "mmu: no free L1 slot to alias device GiB {idx} ({pa:#x}) -- refusing"
+            ));
+            return 0;
+        };
+        // Invalid -> valid, so no break-before-make is required (unlike the
+        // identity path below, which edits a live entry).
+        *l1.add(v) = ((idx as u64) << 30) | (1u64 << 2) | (1 << 10) | 0b01;
+        asm!("dsb ish", "isb", options(nostack));
+        HIGH_ALIAS[N_HIGH_ALIAS] = (idx, v);
+        N_HIGH_ALIAS += 1;
+        crate::ktrace::log_fmt(format_args!(
+            "mmu: device GiB {idx} ({:#x}) aliased at VA {:#x}",
+            (idx as u64) << 30,
+            (v as u64) << 30
+        ));
+        ((v as u64) << 30) | off
+    }
+}
+
 pub fn map_device_gib(pa: u64) {
     let idx = (pa >> 30) as usize;
     if idx >= 512 {
-        return; // beyond the single-level L1 (512 GiB)
+        // Callers that ignore the return value cannot be served here — the
+        // window is unreachable from a 39-bit table. Loud, because silence made
+        // an unmapped write the first symptom.
+        crate::ktrace::log_fmt(format_args!(
+            "mmu: {pa:#x} is beyond the 512 GiB identity map; use map_device_va"
+        ));
+        return;
     }
     // SAFETY: L1 is the live TTBR0 table; writing one block descriptor + a TLB
     // invalidate publishes the new Device mapping. Device attr_idx=1, non-shareable.

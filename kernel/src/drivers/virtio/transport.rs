@@ -415,11 +415,16 @@ impl PciTransport {
                 let cfg_type = cfg8(&d, cap as u16 + 3);
                 let bar = cfg8(&d, cap as u16 + 4);
                 let offset = cfg32(&d, cap as u16 + 8) as u64;
+                // The capability's length, so the mapping covers `offset` --
+                // see the note in `kms::virtio_gpu`; a fixed size is only right
+                // until a device puts a structure past it.
+                let length = cfg32(&d, cap as u16 + 12) as u64;
                 let bar_phys = d.bar(bar);
                 if bar_phys != 0 {
                     // x86 reaches a BAR through the HHDM; aarch64 identity-maps
                     // it. `map_mmio` is the arch-neutral form of both.
-                    let virt = crate::mm::map_mmio(bar_phys, 0x4000) + offset;
+                    let span = offset.saturating_add(length.max(1)) as usize;
+                    let virt = crate::mm::map_mmio(bar_phys, span) + offset;
                     match cfg_type {
                         CFG_COMMON => common = virt,
                         CFG_NOTIFY => {

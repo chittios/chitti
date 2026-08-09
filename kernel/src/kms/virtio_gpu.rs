@@ -310,9 +310,18 @@ impl VirtioGpu {
                 let cfg_type = cfg_read8(&d, cap as u16 + 3);
                 let bar = cfg_read8(&d, cap as u16 + 4);
                 let offset = cfg_read32_at(&d, cap as u16 + 8);
+                // **The capability's own length, not a fixed guess.** `offset` is
+                // a byte offset *within* the BAR with no bound: mapping a flat
+                // 16 KiB from the BAR base and adding it lands outside the
+                // mapping the moment a device puts its common config higher --
+                // QEMU `virt` under TCG puts virtio-gpu's at 0x8014, and the
+                // write faulted. On x86 `map_mmio` is page-granular so this is a
+                // page fault; on aarch64 it maps whole GiB blocks, which hid it.
+                let length = cfg_read32_at(&d, cap as u16 + 12);
                 let bar_phys = d.bar(bar);
                 if bar_phys != 0 {
-                    let virt = crate::mm::map_mmio(bar_phys, 0x4000) + offset as u64;
+                    let span = (offset as usize).saturating_add(length.max(1) as usize);
+                    let virt = crate::mm::map_mmio(bar_phys, span) + offset as u64;
                     match cfg_type {
                         CFG_COMMON => common = virt,
                         CFG_NOTIFY => {

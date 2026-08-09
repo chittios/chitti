@@ -209,7 +209,12 @@ impl VirtioSndPci {
                 let offset = cfg_read32_at(&d, cap as u16 + 8);
                 let bar_phys = d.bar(bar);
                 if bar_phys != 0 {
-                    let virt = crate::mm::map_mmio(bar_phys, 0x4000) + offset as u64;
+                    // Size the mapping by the capability's own length: `offset`
+                    // is unbounded within the BAR, and a fixed span stops
+                    // covering it as soon as a device puts a structure higher.
+                    let length = cfg_read32_at(&d, cap as u16 + 12);
+                    let span = (offset as usize).saturating_add(length.max(1) as usize);
+                    let virt = crate::mm::map_mmio(bar_phys, span) + offset as u64;
                     match cfg_type {
                         CFG_COMMON => common = virt,
                         CFG_NOTIFY => {
