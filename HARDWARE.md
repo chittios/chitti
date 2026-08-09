@@ -22,6 +22,22 @@ specification or from Linux's own headers, with every wait bounded and every
 refusal logged. It has just never been proven. Treat it the way we treat
 `r8169` — plausible, and unproven.
 
+### How a ✅ was earned
+
+The marks are not judgement calls. Each one has a specific thing behind it:
+
+| Kind of evidence | Example |
+|---|---|
+| An **independent published vector** — the strongest, because our encoder and decoder share every table and would round-trip a wrong answer perfectly | CCMP against RFC 3610 packet vector 1; WPA2 against the 802.11i vectors; the PNG encoder against our own separately-written inflater |
+| A **real boot with the device attached**, asserted against a known value | SD/eMMC: `CHITTI_DISK_IF=sd` reports 8192 blocks against a backing image that is exactly 4 MiB. USB audio: `CHITTI_USB=audio` reaches `tone done` through an isochronous endpoint |
+| A **second implementation** disagreeing or not | video decoders frame-for-frame against PyAV/FFmpeg; `browser::flex` against taffy to within 1 px |
+| The **e2e suite** driving the real shell over serial | the `agents`, `net` and `os` groups |
+| **Header arithmetic only** — this is what ⚠️ means for a driver written from a spec | every Intel WiFi command: offsets checked against Linux's `fw/api/*.h` field lists and against nothing else |
+
+The last row is the one to keep in mind. Sixty correct offsets do not add up to
+a working driver, because the failures in that class are commands the hardware
+*accepts*.
+
 ---
 
 ## Summary — booting a typical laptop today
@@ -35,6 +51,7 @@ refusal logged. It has just never been proven. Treat it the way we treat
 | **WiFi** | ❌ **no machine can join a network** (USB tether works) |
 | **Bluetooth peripherals** | ❌ won't pair (no SSP, no BLE) |
 | Audio | ✅ stereo (WAV/MP3), ✅ USB headsets; ⚠️ AAC mono; ❌ no jack detect |
+| USB peripherals | ✅ hubs to 5 tiers, storage, keyboard/mouse, audio out, CDC-ECM + RNDIS tethering |
 | Screen brightness | ❌ |
 | Suspend / lid close | ⚠️ unverified (devices do come back) / ❌ no lid switch |
 | Battery + charger reporting | ⚠️ unverified |
@@ -308,7 +325,9 @@ class triple, because its data interface is class `0x0A` exactly like CDC-ECM's.
 
 ### WiFi — ❌ no machine can join a network
 
-This is the largest gap in the OS. The parts that exist are real and complete:
+Still the largest gap, but it has moved: everything **above** the radio is now
+built and verified off-hardware, and the Intel driver has every command it needs
+— none of them proven. The parts that exist:
 
 | Layer | Status |
 |---|---|
@@ -340,13 +359,53 @@ The radios are what is missing:
 | Qualcomm Atheros ath10k/11k/12k | ❌ |
 
 Bring-up is **command-driven** (`/wifi up`), never automatic at boot: an
-untested driver should not touch a device just because the machine started. The
-missing pieces for Intel are the receive path, the command round-trip, and then
-802.11 association — each of which needs a machine with the part in it, because
-no emulator provides one and code written from memory would send well-formed
-garbage to a real radio and report success.
+untested driver should not touch a device just because the machine started.
 
-**Plan for a wireless machine: use Ethernet, or a USB Ethernet dongle
+#### What "written but unverified" means for Intel specifically
+
+Every command an association needs now exists, in the order it goes out
+([`iwl/assoc.rs`](kernel/src/drivers/wifi/iwl/assoc.rs)):
+
+```text
+PHY_CONTEXT -> MAC_CONTEXT -> BINDING -> ADD_STA
+  -> (802.11 auth + assoc) -> MAC_CONTEXT again, with the AID
+  -> (four-way handshake) -> ADD_STA_KEY
+```
+
+That is roughly **sixty struct offsets and a dozen enum values**, every one
+taken from Linux's `fw/api/*.h` and checked against the header's own field list
+— and against nothing else. No emulator provides an Intel WiFi part, so not one
+byte of it has reached silicon.
+
+The reason to be blunt about that: **almost every mistake in this area produces
+a command the firmware accepts.** The ones already found and fixed, each of
+which would have looked entirely correct in review:
+
+- `flags` and `offload_assist` **swap position and width** between the AX200 and
+  AX210 transmit layouts. Both are bitmasks of small numbers.
+- `PHY_BAND_5` is **0** and `PHY_BAND_24` is **1** — the intuitive reading tunes
+  the radio to a 5 GHz channel number on the 2.4 GHz band.
+- `FW_CTXT_ACTION_ADD` is **1**, and these commands are built by zeroing a
+  buffer, which lands on `INVALID`.
+- An unused binding slot must be `FW_CTXT_INVALID`, **not zero** — zero is a
+  valid id/colour pair, so a zeroed array binds contexts that were never
+  configured.
+- `STA_KEY_FLG_KEY_32BYTES` shares bit 12 with `WEP_13BYTES`; set on a 16-byte
+  CCMP key the firmware reads 32 bytes out of a 16-byte field.
+- The RX descriptor is 48 or 64 bytes by hardware generation, with no marker in
+  the frame. Wrong, the 802.11 frame is read a few bytes inside itself and
+  `parse_beacon` returns a plausible network with a wrong BSSID.
+
+So the honest expectation is that driving this end to end on real hardware will
+surface **two or three more of the same kind**. That work is a boot on an
+Intel laptop, not more code.
+
+If you have an AX200/AX201 or AX210 machine, `/wifi up` then a scan is the first
+thing to try: the version gate reports immediately whether your firmware speaks
+a `SCAN_REQ_UMAC` layout that is implemented, and every refusal names itself in
+the ktrace.
+
+**Until then, plan for a wireless machine to use Ethernet, a USB Ethernet dongle
 (CDC-ECM), or an iPhone tether.**
 
 ### Protocols — ✅
@@ -541,5 +600,31 @@ silence. When filing an issue please include:
    vendor:device ID from `/lspci`.
 
 An unrecognised PCI ID is the single most useful thing you can send: several
-families here (`e1000e` in particular) grow by ID and the log prints the ID it
+families here (`e1000e` in particular) grow by ID, and the log prints the one it
 guessed at.
+
+### Reproducing a claim in QEMU
+
+Most of the ✅ marks above can be re-checked without hardware. The device a run
+attaches is chosen by environment variable:
+
+| Knob | What it attaches |
+|---|---|
+| `CHITTI_DISK_IF=ahci\|nvme\|virtio-blk\|sd` | the storage controller — `sd` builds an `sdhci-pci` with a card in it |
+| `CHITTI_NIC=e1000\|e1000e\|igb\|rtl8139\|virtio-net-pci` | the NIC, so the by-device-ID dispatch can be exercised against every family QEMU emulates |
+| `CHITTI_USB=audio` | a UAC1 `usb-audio` device; with `CHITTI_AUDIO=off` it becomes the machine's only sound device, which is the configuration USB audio exists for |
+| `CHITTI_AUDIO=coreaudio\|pa\|none\|off` | the host audio backend, or none at all |
+| `CHITTI_SHARE=<dir>` | a host folder over virtio-9p |
+| `CHITTI_RESOLUTION=WxH` | the framebuffer geometry the loader asks for |
+
+For example, the SD/eMMC and USB-audio claims in this file were established
+with:
+
+```sh
+CHITTI_DISK_IF=sd cargo xtask run -arch x86_64 --release
+CHITTI_AUDIO=off CHITTI_USB=audio cargo xtask run -arch x86_64 --release
+```
+
+The pure layers — CCMP, the 802.11 data path, every Intel command's offsets,
+the codecs — are covered by `cargo xtask test`, which needs no devices at all.
+
