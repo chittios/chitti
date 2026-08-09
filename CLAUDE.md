@@ -1775,7 +1775,22 @@ FDT claims a GICv3 but carries no readable `reg`.
   `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
   data partition — destructive actions confirm via the permission modal),
-  durable agent state on ext4. **Every disk is enumerated, across controllers and
+  durable agent state on ext4. **A *fresh* install carries the live store onto
+  the new data partition** rather than formatting it empty
+  (`install::plan_carry` + `format_data_with_carry`): installing is something you
+  do *after* setting a machine up, so an empty volume threw away the theme, the
+  login password, the shell history, saved sessions and every config of the
+  system you were installing from — which is what "/install overwrote my configs"
+  turns out to mean. Two things make it work and are easy to get wrong.
+  `Ext4Store` keeps synapse keys as **flat** root-level files with `/`
+  percent-encoded, so the seed must be written through `key_encode` — the ext4
+  *writer* has no directory support at all. And the migration must hold
+  `synapse::fs::CredentialAccess` for the whole walk: `list` filters the login
+  record out and `read` refuses it, so the obvious implementation copies
+  everything *except* the password and hands you a machine you cannot log into,
+  silently. `/samples/**` is deliberately left behind (boot re-seeds it), the
+  carry is bounded by `CARRY_BUDGET` because every file is held in RAM at once,
+  and anything dropped is **named** rather than counted. **Every disk is enumerated, across controllers and
   ports**: `ahci::probe_nth` indexes AHCI *disks* — each HBA on the bus × each
   port that is implemented *and* populated (`Ahci::present_count` counts without
   allocating, so skipping past a disk doesn't bring a port up and leak its DMA;

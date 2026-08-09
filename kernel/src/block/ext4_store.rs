@@ -35,8 +35,11 @@ struct CryptoState {
 /// (e.g. `/sessions/5/cmp/26`, `skills/1/body.md`), but `/` is the path separator
 /// and is illegal inside an ext4 directory-entry name. Percent-encode `/` (and
 /// `%` itself, so the mapping is reversible) into a legal single-component
-/// filename — used only by the full-format fallback and legacy migration.
-fn key_encode(key: &str) -> String {
+/// filename — used by the full-format fallback, legacy migration, and
+/// `/install`, which seeds a freshly formatted data partition with the live
+/// store's contents and therefore has to write exactly the names a later
+/// [`Ext4Store::mount`] will decode.
+pub fn key_encode(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for c in key.chars() {
         match c {

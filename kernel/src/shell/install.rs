@@ -8,7 +8,146 @@
 //! with `pub(crate) use install::*`.
 
 use super::*;
+// Explicit, because `use super::*` glob-imports a private `Vec` from
+// `framebuffer::views` that shadows the prelude's. An explicit import wins over
+// a glob, so this is what makes `Vec` mean `alloc::vec::Vec` in this file.
+use alloc::string::String;
+use alloc::vec::Vec;
 
+// ── Carrying the live system onto a freshly formatted data partition ──────
+//
+// A **fresh** `/install` used to format the data partition with `&[]` — an empty
+// volume — so everything the human had set up on the machine they were installing
+// *from* was discarded: their theme, their login password, shell history, saved
+// sessions, agent memory, permissions, downloads. The installed system booted
+// blank, and from the outside that reads exactly as "/install overwrote my
+// configs". (The *update* path never had this problem: it leaves the existing
+// data partition alone.)
+//
+// `Ext4Store` keeps synapse keys as flat root-level ext4 files with `/`
+// percent-encoded, so a fresh volume can be seeded through `Ext4Writer::format`
+// by writing `key_encode(key)` names — exactly what a later `Ext4Store::mount`
+// decodes back.
+
+/// How many bytes of live store a fresh install will carry across.
+///
+/// A bound rather than "everything", because every carried file has to be held
+/// in RAM at once while the volume is formatted, and this kernel's allocator is
+/// a first-fit list sharing a heap with a loaded model. Sixteen mebibytes is far
+/// above the things people actually lose (`/configs/**` and the credential are
+/// kilobytes; history and sessions are small) and well below trouble.
+pub(super) const CARRY_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Why a key was not carried. Reported, never silent — a migration that quietly
+/// drops half your files is worse than one that refuses.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum Dropped {
+    /// `/samples/**` is re-seeded from the image on the next boot, so copying it
+    /// would spend most of the budget on files the installed system recreates.
+    Regenerated,
+    /// Carrying it would exceed [`CARRY_BUDGET`].
+    OverBudget,
+}
+
+/// Decide what a fresh install carries, given every store key and its size.
+///
+/// Pure, so the policy is testable without a disk. Smallest first, which is not
+/// a micro-optimisation: it means the small files people care about — the theme,
+/// the login record, shell history, permissions — are carried even when one huge
+/// download would otherwise have eaten the whole budget. Ties break on the key so
+/// two runs of the same store produce the same volume.
+pub(super) fn plan_carry(
+    entries: &[(String, usize)],
+    budget: usize,
+) -> (Vec<String>, Vec<(String, Dropped)>) {
+    let mut keep = Vec::new();
+    let mut drop = Vec::new();
+    let mut ordered: Vec<&(String, usize)> = Vec::new();
+    for e in entries {
+        if e.0.starts_with("/samples/") {
+            drop.push((e.0.clone(), Dropped::Regenerated));
+        } else {
+            ordered.push(e);
+        }
+    }
+    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let mut used = 0usize;
+    for (key, size) in ordered {
+        if used.saturating_add(*size) > budget {
+            drop.push((key.clone(), Dropped::OverBudget));
+            continue;
+        }
+        used += *size;
+        keep.push(key.clone());
+    }
+    keep.sort();
+    drop.sort();
+    (keep, drop)
+}
+
+/// Read the live store into the `(encoded name, bytes)` pairs a fresh data
+/// partition is formatted with, and report what was left behind.
+///
+/// **Holds [`CredentialAccess`] for the whole walk**, and that is the load-bearing
+/// line here. `synapse::fs::list` filters the login credential record out and
+/// `read` refuses it — deliberately, so no agent can enumerate or exfiltrate the
+/// verifier — which means a migration written the obvious way copies everything
+/// *except* the password and silently produces a machine whose owner cannot log
+/// in. The guard is exactly what it is for: kernel-side code, on a path a human
+/// typed, that legitimately needs the record.
+fn read_carry() -> (Vec<(String, Vec<u8>)>, Vec<(String, Dropped)>) {
+    let _access = crate::synapse::fs::CredentialAccess::new();
+    let keys = crate::synapse::fs::list();
+    let mut sized: Vec<(String, usize)> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        let n = crate::synapse::fs::size_of(k).unwrap_or(0);
+        sized.push((k.clone(), n));
+    }
+    let (keep, dropped) = plan_carry(&sized, CARRY_BUDGET);
+    let mut out = Vec::with_capacity(keep.len());
+    for k in keep {
+        if let Some(bytes) = crate::synapse::fs::read(&k) {
+            out.push((crate::block::ext4_store::key_encode(&k), bytes));
+        }
+    }
+    (out, dropped)
+}
+
+/// Format `data` as the new store, carrying the live one across, and say what
+/// happened. Used only on a **fresh** install; an update never reaches here.
+fn format_data_with_carry<D: crate::block::BlockDevice>(data: &mut D) -> Result<(), crate::block::BlockError> {
+    use crate::block::ext4::{Ext4Writer, FileSpec};
+    let (carried, dropped) = read_carry();
+    let bytes: usize = carried.iter().map(|(_, v)| v.len()).sum();
+    let files: Vec<FileSpec> = carried
+        .iter()
+        .map(|(name, data)| FileSpec { name, data })
+        .collect();
+    Ext4Writer::format(data, &files)?;
+    serial_println!(
+        "install> data partition formatted, carrying {} file(s) ({} KiB) from this system \
+         — theme, login password, history, sessions and agent state come with it.",
+        files.len(),
+        bytes / 1024
+    );
+    let regen = dropped.iter().filter(|(_, d)| *d == Dropped::Regenerated).count();
+    if regen > 0 {
+        serial_println!("install>   {regen} sample file(s) not copied — the installed system re-seeds them at boot.");
+    }
+    let over: Vec<&(String, Dropped)> = dropped.iter().filter(|(_, d)| *d == Dropped::OverBudget).collect();
+    if !over.is_empty() {
+        // Named, not counted: "3 files were too big" tells you nothing about
+        // whether you just lost something you needed.
+        serial_println!("install>   {} file(s) exceeded the {} MiB migration budget and were NOT copied:", over.len(), CARRY_BUDGET / 1024 / 1024);
+        for (k, _) in over.iter().take(8) {
+            serial_println!("install>     {k}");
+        }
+        if over.len() > 8 {
+            serial_println!("install>     … and {} more", over.len() - 8);
+        }
+    }
+    Ok(())
+}
 
 /// Parse `/install` arguments into [`InstallArgs`].
 /// Tokens in any order: an optional numeric disk index, `yes` (skip the
@@ -329,18 +468,23 @@ pub(super) fn disk_install(arg: &str) {
     }
     serial_println!("install> ext4 OS partition written: limine.conf + kernel + {} model part(s).", parts.len());
     if let Some(layout) = fresh_layout {
-        // Fresh install only: an empty ext4 data partition for durable agent
-        // state (synapse::fs mounts it at boot, since it holds no *.gguf). An
-        // update never touches it — the user home, agent state and user files
-        // all survive `/install`. (The home's `.keep` markers are seeded by
-        // `agent::home::ensure_user_home` on first boot, after the store
-        // mounts this partition.)
+        // Fresh install only: the ext4 data partition for durable agent state
+        // (synapse::fs mounts it at boot, since it holds no *.gguf). An update
+        // never touches it — the user home, agent state and user files all
+        // survive `/install`.
+        //
+        // Seeded with the live store rather than formatted empty. Installing is
+        // something you do *after* setting a machine up, so an empty volume threw
+        // away the theme, the login password, the history and every config of the
+        // system you were installing from. (The home's `.keep` markers are still
+        // seeded by `agent::home::ensure_user_home` on first boot for the case
+        // where there was nothing to carry.)
         let mut data = Partition::new(&mut dev, layout.data_first, layout.data_last - layout.data_first + 1);
-        if let Err(e) = Ext4Writer::format(&mut data, &[]) {
+        if let Err(e) = format_data_with_carry(&mut data) {
             serial_println!("install> ext4 data partition format failed: {:?}", e);
             return;
         }
-        serial_println!("install> ext4 data partition (lba {}..{}) formatted for durable agent state.", layout.data_first, layout.data_last);
+        serial_println!("install> data partition at lba {}..{}.", layout.data_first, layout.data_last);
     } else {
         serial_println!("install> data partition preserved (home + agent state intact).");
     }
@@ -512,15 +656,15 @@ pub(super) fn disk_install(arg: &str) {
     }
     serial_println!("install> ESP (FAT): BOOTAA64.EFI + kernel{} written.", if model.is_some() { " + model" } else { "" });
 
-    // 3. Fresh install only: an empty ext4 data partition for durable agent
-    //    state. An update never touches it.
+    // 3. Fresh install only: the ext4 data partition for durable agent state,
+    //    seeded with the live store rather than formatted empty (see the x86
+    //    path). An update never touches it.
     if let Some((first, last)) = fresh_data {
         let mut data = Partition::new(&mut target, first, last - first + 1);
-        if let Err(e) = Ext4Writer::format(&mut data, &[]) {
+        if let Err(e) = format_data_with_carry(&mut data) {
             serial_println!("install> ext4 data partition format failed: {:?}", e);
             return;
         }
-        serial_println!("install> ext4 data partition formatted for durable agent state.");
     } else {
         serial_println!("install> data partition preserved (agent state intact).");
     }
@@ -641,5 +785,179 @@ pub(super) fn disk_ext4read() {
         let n = r.read_root_file("big.bin", &mut big).unwrap_or(0);
         let ok = n == 200_000 && big.iter().enumerate().all(|(i, &b)| b == ((i as u32).wrapping_mul(7) & 0xff) as u8);
         serial_println!("ext4read> big.bin {} B, pattern match: {}", n, ok);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(k: &str, n: usize) -> (String, usize) {
+        (String::from(k), n)
+    }
+
+    /// The whole point of the migration: a fresh `/install` must carry the small
+    /// things a human actually configured. Before this, the data partition was
+    /// formatted with `&[]` and every one of these was silently gone on the
+    /// installed machine.
+    #[test_case]
+    fn a_fresh_install_carries_the_configs_the_credential_and_the_history() {
+        let store = alloc::vec![
+            e("/configs/core/ui.json", 900),
+            e("/configs/core/auth.json", 300),
+            e("/configs/core/display.json", 200),
+            e("/configs/core/panes.json", 200),
+            e("/configs/themes/mine.json", 1200),
+            e("/history", 4096),
+            e("/sessions/1", 20_000),
+            e("/agent/9001/memory/notes", 512),
+        ];
+        let (keep, dropped) = plan_carry(&store, CARRY_BUDGET);
+        assert!(dropped.is_empty(), "a tiny store dropped something: {dropped:?}");
+        for k in [
+            "/configs/core/ui.json",
+            "/configs/core/auth.json",
+            "/configs/themes/mine.json",
+            "/history",
+            "/sessions/1",
+            "/agent/9001/memory/notes",
+        ] {
+            assert!(keep.iter().any(|x| x == k), "{k} was not carried");
+        }
+    }
+
+    /// `/samples/**` is re-seeded from the image at boot, so copying it would
+    /// spend the budget recreating files the installed system recreates anyway.
+    #[test_case]
+    fn samples_are_left_behind_because_boot_re_seeds_them() {
+        let store = alloc::vec![
+            e("/samples/videos/big.mp4", 8_000_000),
+            e("/samples/images/fruits.jpg", 400_000),
+            e("/configs/core/ui.json", 900),
+        ];
+        let (keep, dropped) = plan_carry(&store, CARRY_BUDGET);
+        assert_eq!(keep, alloc::vec![String::from("/configs/core/ui.json")]);
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.iter().all(|(_, d)| *d == Dropped::Regenerated));
+        // A path that merely *mentions* samples is not a sample.
+        let (keep, _) = plan_carry(&alloc::vec![e("/home/chitti/samples-notes.md", 10)], CARRY_BUDGET);
+        assert_eq!(keep.len(), 1, "a file outside /samples/ was treated as one");
+    }
+
+    /// Smallest-first is the load-bearing part: one oversized download must not
+    /// cost the human their theme and their password.
+    #[test_case]
+    fn one_huge_file_cannot_crowd_out_the_small_ones() {
+        let store = alloc::vec![
+            e("/downloads/movie.mp4", 900),
+            e("/configs/core/ui.json", 100),
+            e("/configs/core/auth.json", 100),
+        ];
+        let (keep, dropped) = plan_carry(&store, 300);
+        assert!(keep.iter().any(|k| k == "/configs/core/ui.json"));
+        assert!(keep.iter().any(|k| k == "/configs/core/auth.json"));
+        assert_eq!(dropped, alloc::vec![(String::from("/downloads/movie.mp4"), Dropped::OverBudget)]);
+    }
+
+    /// Nothing is dropped without being reported, and the split is exhaustive —
+    /// every key ends up in exactly one of the two lists.
+    #[test_case]
+    fn every_key_is_either_carried_or_reported() {
+        let store = alloc::vec![
+            e("/a", 10),
+            e("/b", 10_000_000),
+            e("/samples/x", 5),
+            e("/c", 10),
+        ];
+        let (keep, dropped) = plan_carry(&store, 100);
+        assert_eq!(keep.len() + dropped.len(), store.len(), "a key vanished from both lists");
+        for (k, _) in &store {
+            let carried = keep.iter().any(|x| x == k);
+            let reported = dropped.iter().any(|(x, _)| x == k);
+            assert!(carried ^ reported, "{k} is in both lists or neither");
+        }
+    }
+
+    /// Same store in, same volume out — two installs of one machine must not
+    /// disagree about which files made it.
+    #[test_case]
+    fn the_selection_is_deterministic_including_size_ties() {
+        let a = alloc::vec![e("/z", 50), e("/a", 50), e("/m", 50)];
+        let b = alloc::vec![e("/m", 50), e("/z", 50), e("/a", 50)];
+        // Budget fits two of the three, so the tie-break actually decides.
+        assert_eq!(plan_carry(&a, 100).0, plan_carry(&b, 100).0);
+        assert_eq!(plan_carry(&a, 100).0, alloc::vec![String::from("/a"), String::from("/m")]);
+    }
+
+    /// An empty store is a fresh machine, not an error.
+    #[test_case]
+    fn an_empty_store_carries_nothing_and_reports_nothing() {
+        let (keep, dropped) = plan_carry(&[], CARRY_BUDGET);
+        assert!(keep.is_empty() && dropped.is_empty());
+    }
+
+    /// **The end-to-end proof**, against a real ext4 volume rather than the
+    /// selection policy alone: put files in the live store, run the exact code
+    /// `/install` runs on a fresh disk, then read the resulting volume back and
+    /// check every key is there under the name `Ext4Store` will decode.
+    ///
+    /// The credential is the case that matters. `synapse::fs::list` filters it
+    /// out and `read` refuses it, so a migration written without holding
+    /// `CredentialAccess` copies everything *except* the password — and produces
+    /// an installed machine its owner cannot log into, with no error anywhere.
+    #[test_case]
+    fn a_fresh_install_volume_round_trips_the_store_including_the_credential() {
+        use crate::block::ext4_rw::Ext4Rw;
+        use crate::block::ext4_store::key_encode;
+        use crate::block::ramdisk::RamDisk;
+
+        // A theme, a session, and the login record — the things the user said
+        // were being lost.
+        crate::synapse::fs::write("/configs/core/ui.json", b"{\"theme\":\"nord\"}");
+        crate::synapse::fs::write("/sessions/carry-probe", b"a saved session");
+        {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::write(crate::auth::PATH, b"{\"kdf\":\"pbkdf2-hmac-sha256\"}");
+        }
+
+        // 16 MiB volume — enough for ext4 metadata plus the payload.
+        let mut disk = RamDisk::new(32768);
+        format_data_with_carry(&mut disk).expect("format with carry failed");
+
+        let mut rw = Ext4Rw::open(&mut disk).expect("the written volume is not readable ext4");
+        for (key, want) in [
+            ("/configs/core/ui.json", &b"{\"theme\":\"nord\"}"[..]),
+            ("/sessions/carry-probe", &b"a saved session"[..]),
+            (crate::auth::PATH, &b"{\"kdf\":\"pbkdf2-hmac-sha256\"}"[..]),
+        ] {
+            let name = alloc::format!("/{}", key_encode(key));
+            let got = rw
+                .read(&name)
+                .unwrap_or_else(|e| panic!("{key} did not survive the install ({e:?})"));
+            assert_eq!(got, want, "{key} came across with the wrong bytes");
+        }
+
+        {
+            let _a = crate::synapse::fs::CredentialAccess::new();
+            crate::synapse::fs::delete(crate::auth::PATH);
+        }
+        crate::synapse::fs::delete("/configs/core/ui.json");
+        crate::synapse::fs::delete("/sessions/carry-probe");
+    }
+
+    /// The names written to the new volume must be exactly what `Ext4Store`
+    /// decodes back, or the installed system mounts a store full of keys nobody
+    /// asked for.
+    #[test_case]
+    fn carried_names_round_trip_through_the_store_encoding() {
+        use crate::block::ext4_store::{key_decode, key_encode};
+        for k in [
+            "/configs/core/auth.json",
+            "/agent/9001/memory/notes",
+            "/home/chitti/a%b",
+            "/history",
+        ] {
+            assert_eq!(key_decode(&key_encode(k)), k, "{k} did not round trip");
+        }
     }
 }
