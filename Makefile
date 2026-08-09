@@ -132,10 +132,11 @@ help:
 	@echo "  make run USB_BT=1 USB_CAM=1   # passthrough grepped BT dongle + webcam"
 	@echo "  make run USB_BT=0a12:0001     # or pass explicit vid:pid"
 
-## test: in-kernel test suite under QEMU (x86_64) — the gate, keep it 104/104
+## test: in-kernel test suite under QEMU for ARCH — the gate, keep it green
+## (ARCH defaults to aarch64 like every other target here; `make verify` runs both)
 .PHONY: test
 test:
-	$(XTASK) test
+	$(XTASK) test -arch $(ARCH)
 
 ## build: cross-build the kernel for ARCH
 .PHONY: build
@@ -334,13 +335,14 @@ fmt:
 	cargo fmt --manifest-path xtask/Cargo.toml
 	cargo fmt --manifest-path stub/Cargo.toml
 
-## verify: the standing-rule gate — x86 build + tests + aarch64 build
+## verify: the standing-rule gate — both arches build AND both unit suites pass
 .PHONY: verify
 verify:
 	$(XTASK) build -arch x86_64 -model $(MODEL)
-	$(XTASK) test
+	$(XTASK) test -arch x86_64
 	$(XTASK) build -arch aarch64 -model $(MODEL)
-	@echo "verify: both arches build and the test suite passed"
+	$(XTASK) test -arch aarch64
+	@echo "verify: both arches build and both unit suites passed"
 
 ## clean: remove build artifacts for all crates
 .PHONY: clean

@@ -897,7 +897,7 @@ fn main() {
         // proxy + machine DTB are configured via env) boot it on a tethered
         // Apple Silicon Mac. See `cmd_m1n1`.
         "m1n1" => cmd_m1n1(release),
-        "test" => cmd_test(),
+        "test" => cmd_test(arch),
         "voice-assets" => cmd_voice_assets(),
         // Fetch the `/samples/` corpus (images/videos/audios/misc). The build
         // paths call this for you when CHITTI_SAMPLE_FILES is set.
@@ -4784,25 +4784,207 @@ fn clean_nvram_txt(raw: &[u8]) -> Vec<u8> {
 /// `cargo xtask test`: run the in-kernel `custom_test_frameworks` test
 /// suite via `cargo test --lib`, which cross-compiles each test binary and
 /// hands it to the `runner` subcommand below to execute under QEMU.
-fn cmd_test() -> Result<(), String> {
+/// `cargo xtask test [-arch x86_64|aarch64]`: the in-kernel unit suite.
+///
+/// The `--target` is passed **explicitly** rather than left to `[build] target`
+/// in `kernel/.cargo/config.toml`, which is x86 — that default is exactly why
+/// this command was x86-only. Both arches have a `runner` registered for their
+/// target, so cargo hands each compiled test binary to [`cmd_runner`], which
+/// boots it (see there for how the two arches report a verdict differently).
+fn cmd_test(arch: Arch) -> Result<(), String> {
     let kdir = kernel_dir();
+    let target = match arch {
+        Arch::X86_64 => "../targets/x86_64-chitti.json",
+        Arch::Aarch64 => "../targets/aarch64-chitti.json",
+    };
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&kdir).args(["test", "--lib", "--quiet"]);
+    cmd.current_dir(&kdir).args(["test", "--lib", "--quiet", "--target", target]);
     run(&mut cmd)
 }
 
-/// Invoked by cargo (via the `runner` config) with the path to a compiled
-/// test binary. Boots it in QEMU headlessly and translates the
-/// isa-debug-exit exit code `(value << 1) | 1` into this process's exit
-/// status, which cargo interprets as the test outcome.
+/// How long a single test-binary boot may take before the runner kills it.
+/// Every wait in this tree is bounded; a hung guest must report *that* rather
+/// than sit until CI's job timeout, where the failure carries no information.
+const TEST_BOOT_TIMEOUT_SECS: u64 = 900;
+
+/// Read an ELF's `e_machine` (little-endian `u16` at offset 18). Cargo hands the
+/// runner nothing but a path, so this is how the runner learns which arch it is
+/// booting — more precise than matching the target triple in the path, which is
+/// a naming convention rather than a fact about the file.
+fn elf_machine(bin: &Path) -> Result<u16, String> {
+    let bytes = std::fs::read(bin).map_err(|e| format!("runner: cannot read {}: {e}", bin.display()))?;
+    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+        return Err(format!("runner: {} is not an ELF file", bin.display()));
+    }
+    Ok(u16::from_le_bytes([bytes[18], bytes[19]]))
+}
+
+const EM_X86_64: u16 = 0x3e;
+const EM_AARCH64: u16 = 0xb7;
+
+/// Invoked by cargo (via the `runner` config) with the path to a compiled test
+/// binary, for **either** arch — so it dispatches on the binary's own
+/// `e_machine`. The two arches cannot report a verdict the same way (see
+/// `kernel/src/qemu.rs`): x86 gets a real process exit status out of
+/// `isa-debug-exit`, aarch64 has no such device and must be judged from its
+/// serial output.
 fn cmd_runner(args: &[String]) -> Result<(), String> {
     let bin_path = args
         .first()
         .ok_or_else(|| "runner: missing test binary path argument".to_string())?;
+    let bin = Path::new(bin_path);
+    match elf_machine(bin)? {
+        EM_AARCH64 => run_test_binary_aarch64(bin),
+        EM_X86_64 => run_test_binary_x86(bin),
+        other => Err(format!("runner: unsupported ELF machine {other:#x} in {}", bin.display())),
+    }
+}
+
+/// Boot a compiled test binary under `qemu-system-aarch64 -M virt -kernel` and
+/// take the verdict from the serial log.
+///
+/// PSCI `SYSTEM_OFF` gives the host no status — QEMU exits 0 whether the suite
+/// passed or failed — so the pass sentinel is **required**, never merely checked
+/// for. A guest that data-aborts, resets, or hangs prints no sentinel at all, and
+/// every one of those must come out as a failure.
+fn run_test_binary_aarch64(elf: &Path) -> Result<(), String> {
+    // Flatten the ELF to an arm64 `Image` first, and this is load-bearing rather
+    // than tidiness: QEMU follows the **Linux** boot protocol (x0 = DTB) only for
+    // an Image/zImage, and for a raw ELF it just jumps to the entry with the
+    // registers zeroed. So `-kernel <elf>` yields `boot_x0 == 0`, `fdt::present`
+    // false, "gic: no device tree ... cannot locate a GIC", and a suite running
+    // cooperatively with interrupts masked — which is what every blocking
+    // scheduler test then trips over. `arch::aarch64::boot` already emits the
+    // 64-byte Image header (`_image_start`) for the m1n1 path, so this costs one
+    // objcopy and the DTB arrives. (Note this means the plain `-kernel <elf>` dev
+    // loop has never had a GIC either — see `arch::idle_halt_ok`.)
+    let img = elf.with_extension("Image");
+    let objcopy = find_objcopy()?;
+    run(Command::new(&objcopy).args(["-O", "binary", "--strip-all"]).arg(elf).arg(&img))?;
+    verify_image_header(&img)?;
+    let elf = img.as_path();
+    // 4 GiB, where the x86 runner gets away with 2 — and not because the suite
+    // needs more memory. On aarch64 the model region base is a fixed 2 GiB
+    // (`Model::aarch64_addr`) and `mm::init` places the heap at the *top* of RAM,
+    // so with `-m 2G` a 1 GiB heap starts at exactly 0x8000_0000 and `mm::init`
+    // correctly refuses to overlap the model region — a suite that loads no model
+    // at all would die in the allocator before running a single test. 3G is the
+    // minimum that works; 4G leaves headroom, and guest RAM is lazily backed so it
+    // costs nothing on a CI runner.
+    //
+    // `-smp 4` for the same reason the x86 runner uses it: the suite asserts on
+    // SMP bring-up. `-monitor none` so nothing but the guest writes to stdio.
+    const TEST_MEM: &str = "4G";
+    let mut cmd = Command::new("qemu-system-aarch64");
+    // `gic-version=3` is required, not a preference: `-M virt` defaults to GICv2
+    // under TCG, so the device tree then advertises `arm,gic-400` and
+    // `resolve_gic_bases` correctly reports "device tree advertises no GICv3" and
+    // stays cooperative. The kernel drives GICv3 only.
+    cmd.args(["-M", "virt,gic-version=3", "-smp", "4", "-m", TEST_MEM]);
+    // TCG, deliberately — this is the one place in the tree that does NOT want
+    // `accel_args`, and it is the second half of getting preemption here (the
+    // Image conversion above is the first). Under HVF on Apple Silicon the
+    // emulated GICv3 exposes no `ICC_*` system-register interface to a bare-metal
+    // EL1 guest, so `gic::init_bsp` declines even with a perfectly good device
+    // tree, `start_preemption` returns early leaving IRQs masked, and the kernel
+    // runs cooperatively. That is correct behaviour for the real OS and *wrong*
+    // for a test environment: the suite would run with interrupts disabled on a
+    // developer's Mac and enabled in CI, so `sched::block_on`'s lock-discipline
+    // assert (which uses interrupts-enabled as its proxy for "no `Locked` is
+    // held") would fail in one place and pass in the other. Under TCG the GIC is
+    // fully emulated and the environment matches the x86 suite's: timer IRQs
+    // delivered, interrupts enabled, preemption live.
+    // `CHITTI_ACCEL` still overrides, for anyone deliberately measuring.
+    // KVM is fine and fast (a real GICv3 with a real CPU interface); it is
+    // specifically HVF that cannot host this. So: an explicit `CHITTI_ACCEL`
+    // wins, else KVM where the host actually offers it, else TCG.
+    match env::var("CHITTI_ACCEL") {
+        Ok(a) if !a.trim().is_empty() => {
+            cmd.args(["-accel", a.trim(), "-cpu", "host"]);
+        }
+        _ if cfg!(target_os = "linux")
+            && std::env::consts::ARCH == "aarch64"
+            && std::path::Path::new("/dev/kvm").exists() =>
+        {
+            cmd.args(["-accel", "kvm", "-cpu", "host"]);
+        }
+        _ => {
+            cmd.args(["-cpu", "max"]);
+        }
+    }
+    cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
+    cmd.arg("-kernel").arg(elf);
+    cmd.arg("-fw_cfg").arg(format!("name=opt/chitti/ramsize,string={}", mem_bytes(TEST_MEM)));
+
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn qemu-system-aarch64: {e}"))?;
+
+    // Watchdog: a guest that never powers off would otherwise hold `cargo test`
+    // open indefinitely. Checks a done flag each second so it cannot kill a pid
+    // the OS has since recycled.
+    let pid = child.id();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done = done.clone();
+        let timed_out = timed_out.clone();
+        std::thread::spawn(move || {
+            for _ in 0..TEST_BOOT_TIMEOUT_SECS {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if done.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+            }
+            timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+        });
+    }
+
+    // Stream the log live (so a failing assertion is visible as it happens) while
+    // watching for the sentinel.
+    use std::io::BufRead as _;
+    let mut passed = false;
+    let mut failed = false;
+    if let Some(out) = child.stdout.take() {
+        for line in std::io::BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            println!("{line}");
+            if line.contains("CHITTI-TEST: ALL PASS") {
+                passed = true;
+            }
+            if line.contains("CHITTI-TEST: FAILED") {
+                failed = true;
+            }
+        }
+    }
+    let status = child.wait().map_err(|e| format!("waiting for qemu failed: {e}"))?;
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(format!("the guest never finished within {TEST_BOOT_TIMEOUT_SECS}s -- killed (hung test?)"));
+    }
+    if failed {
+        return Err("a test failed (see the log above)".to_string());
+    }
+    if !passed {
+        return Err(format!(
+            "the guest exited ({status}) without printing the pass sentinel -- \
+             it died or hung before finishing the suite"
+        ));
+    }
+    Ok(())
+}
+
+/// Boot a compiled test binary as a Limine ISO under `qemu-system-x86_64` and
+/// translate the isa-debug-exit code `(value << 1) | 1` into this process's exit
+/// status, which cargo interprets as the test outcome.
+fn run_test_binary_x86(bin: &Path) -> Result<(), String> {
     // Fast test suite: exclude the model so the ISO stays small and boots
     // quickly (the tensor-kernel tests validate against baked-in NumPy
     // reference vectors, not the real model).
-    let iso = assemble_image_opt(Path::new(bin_path), None)?;
+    let iso = assemble_image_opt(bin, None)?;
     let mut cmd = qemu_base_cmd(&iso, "2G");
     // The in-kernel test suite includes the Phase 7 SMP bring-up + spinlock
     // self-test, so the harness runs with four vCPUs.

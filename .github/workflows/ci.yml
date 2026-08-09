@@ -41,22 +41,23 @@ jobs:
   # aarch64, so each arch is its own matrix leg: they run in parallel and a
   # failure names the arch in the job title instead of being buried in one log.
   #
-  # `unit_suite` gates the in-kernel test suite, which is **x86-only by
-  # construction**, not by CI choice: the harness entry point is
-  # `#[cfg(test)] _start` in kernel/src/lib.rs (x86 SSE enable), `test_runner`/
-  # `test_panic_handler` are `#[cfg(target_arch = "x86_64")]`, the exit path is
-  # `isa-debug-exit`, and only `[target.x86_64-chitti]` has a `runner` in
-  # kernel/.cargo/config.toml. So the aarch64 leg is a build gate. Giving it a
-  # real suite means an aarch64 `_start` for the test build plus a PSCI-poweroff
-  # + serial-sentinel exit (the `xtask ref-check` pattern) — then flip this flag.
+  # **Both legs run the in-kernel unit suite.** They report a verdict by different
+  # means, because the hardware differs: x86 boots a Limine ISO and exits through
+  # `isa-debug-exit`, giving a real process status; aarch64 has no such device on
+  # `-M virt`, so it boots a flat arm64 `Image` with `-kernel` and the runner reads
+  # a sentinel line off the serial console (`kernel/src/qemu.rs`). Adding the
+  # aarch64 half needed a `cfg(test)` `aarch64_start` in lib.rs — the stub's
+  # `_start` branches to a symbol that otherwise only exists in `main.rs`.
   #
   # Both legs run on the ARM runner *on purpose*. `cargo xtask test` boots the
   # x86 guest under TCG (`-cpu max`) there, exactly as this job always has;
   # moving the x86 leg to `ubuntu-24.04` would let `xtask`'s `accel_args` pick
   # up `/dev/kvm` and run `-accel kvm -cpu host` instead, which is much faster
   # but changes the guest's CPU feature set (RDRAND et al.) and cannot be
-  # validated from an Apple-Silicon dev box. It's a one-line `runs-on` change
-  # here if you want to try it.
+  # validated from an Apple-Silicon dev box. It's a one-line `runner:` change
+  # here if you want to try it. The aarch64 leg picks up `/dev/kvm` by itself if
+  # the runner ever offers it (see `run_test_binary_aarch64`), since a real GICv3
+  # is all it needs — it is only HVF that cannot host that suite.
   unit:
     name: unit (${{ matrix.arch }})
     # NB `matrix.runner`, not `matrix.runs-on`: an expression property name with
@@ -70,27 +71,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `unit_suite` is a *string* and compared as one below: a matrix
-          # boolean loose-compared against `true` casts to NaN and is never
-          # equal, so a quoted flag is the only form that can't silently skip.
           - arch: x86_64
             runner: ubuntu-24.04-arm
-            unit_suite: 'true'
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            unit_suite: 'false'
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      # Only the leg that boots a guest needs QEMU or the ISO tools.
+      # The two legs boot their guest completely differently, so they need
+      # different packages: x86 wraps the test binary in a Limine ISO (hence
+      # xorriso + mtools), while aarch64 objcopies it to a flat arm64 `Image` and
+      # boots it with `-kernel` (no bootloader, no ISO). `llvm-objcopy` comes from
+      # the toolchain's `llvm-tools` component, which rust-toolchain.toml pins.
       - name: Install QEMU (x86 guest, via TCG) + ISO tools
-        if: matrix.unit_suite == 'true'
+        if: matrix.arch == 'x86_64'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso mtools
+
+      - name: Install QEMU (aarch64 guest)
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm
 
       # Ubuntu's apt `limine` is too old for the `limine.conf` (v8+) the kernel
       # uses, so clone a pinned Limine *binary* release and point xtask at it via
@@ -98,7 +104,7 @@ jobs:
       # secrets, pinned to a branch; the `limine` host tool is built with the
       # runner's cc.
       - name: Install Limine (pinned binary release for the x86 boot ISO)
-        if: matrix.unit_suite == 'true'
+        if: matrix.arch == 'x86_64'
         run: |
           git clone --depth 1 --branch v8.x-binary https://github.com/limine-bootloader/limine.git "$RUNNER_TEMP/limine"
           make -C "$RUNNER_TEMP/limine"
@@ -111,6 +117,5 @@ jobs:
       - name: Build (${{ matrix.arch }})
         run: cargo xtask build -arch ${{ matrix.arch }}
 
-      - name: Unit tests (in-kernel, x86 under QEMU/TCG)
-        if: matrix.unit_suite == 'true'
-        run: cargo xtask test
+      - name: Unit tests (in-kernel, ${{ matrix.arch }} guest under QEMU/TCG)
+        run: cargo xtask test -arch ${{ matrix.arch }}

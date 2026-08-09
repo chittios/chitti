@@ -23,6 +23,13 @@ runner = "../xtask/run-test-in-qemu.sh"
 # (no RELRO segment) keep it a plain flat image. On QEMU `-kernel` the image
 # loads at its link address so delta = 0 and the relocation pass is a no-op.
 [target.aarch64-chitti]
+# `cargo xtask test -arch aarch64` boots each compiled test binary through the
+# same runner the x86 target uses; it dispatches on the binary's own ELF
+# `e_machine`, since cargo passes it nothing but a path. NB the aarch64 test
+# binary has no `main.rs`, so `arch::aarch64::boot`'s `_start` branches to an
+# `aarch64_start` that `lib.rs` supplies under `cfg(test)` — without it this
+# target links only the real kernel, not the suite.
+runner = "../xtask/run-test-in-qemu.sh"
 rustflags = [
     "-C", "link-arg=-Tlinker-aarch64.ld",
     "-C", "link-arg=-pie",

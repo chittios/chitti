@@ -289,18 +289,29 @@ arch-specific (a driver, an instruction) — and then provide the equivalent for
 other arch behind the **same API**, never a stub that drops a feature. If a
 capability exists on one arch, it exists on the other.
 
-After any change, verify both:
+After any change, verify both — `make verify` runs exactly this:
 
-- `cargo xtask build -arch x86_64` **and** `cargo xtask test` (the in-kernel
-  unit suite — keep it green; add cases for new logic)
-- `cargo xtask build -arch aarch64` (and boot it via `cargo xtask run -arch aarch64`
-  when the change is boot-visible)
+- `cargo xtask build -arch x86_64` **and** `cargo xtask test -arch x86_64`
+- `cargo xtask build -arch aarch64` **and** `cargo xtask test -arch aarch64`
+  (and boot it via `cargo xtask run -arch aarch64` when the change is boot-visible)
+
+**The unit suite runs on BOTH arches**, and keeping both green is the gate. It was
+x86-only for a long time, which meant ~2400 test cases gated every x86 change and
+*nothing* gated aarch64 beyond "it compiles" — a divergence in the coverage that
+enforces this very rule. Turning it on immediately found a real one: aarch64's
+`switch_to` did not save/restore `DAIF`, the direct counterpart of x86's
+`pushfq`/`popfq` of RFLAGS.IF, so a preemptive switch out of the IRQ handler handed
+the incoming task a masked interrupt state that nothing ever cleared. aarch64
+preemption worked exactly **once** per boot, and the interactive shell hid it by
+yielding constantly. Expect more of these: a test that has only ever run on one
+arch is evidence about that arch alone.
 
 ## STANDING RULE — every feature/fix ships with tests
 
 Two layers, and new work adds to **both** where they apply:
 
-1. **Unit tests** (`cargo xtask test`, x86 under QEMU, no model/hardware) for
+1. **Unit tests** (`cargo xtask test [-arch …]`, both arches under QEMU, no
+   model/hardware) for
    the **pure logic** — parsers, decoders, codecs, format/build functions,
    capability math. The pattern that keeps us safe: pull the fiddly logic out
    of the hardware/IO path into a pure function and test it with cases (e.g.
@@ -336,8 +347,10 @@ Two layers, and new work adds to **both** where they apply:
    surfaces. A fix for something the harness could have caught gets a scenario
    too. Run `make e2e` before shipping boot-visible or networked changes.
 
-CI (`.github/workflows/ci.yml`) runs the `unit` job on every push/PR: it builds
-both arches + `cargo xtask test`. The e2e suite is **not** run in CI — boot it
+CI (`.github/workflows/ci.yml`) runs the `unit` job on every push/PR as a
+**matrix, one leg per arch** (`unit (x86_64)`, `unit (aarch64)`), each building its
+arch and running its unit suite, with `fail-fast: false` so a dual-arch divergence
+never hides which side broke. The e2e suite is **not** run in CI — boot it
 locally with `make e2e` before shipping boot-visible or networked changes.
 It is **fork-PR-safe** — `pull_request` (never `pull_request_target`),
 `contents: read`, no secrets, GitHub-hosted runners only. Keep it that way.
@@ -439,6 +452,26 @@ the `smp: N cores online` ktrace is the first thing to check when inference
 is inexplicably slow). QEMU vCPU count comes from `CHITTI_SMP` (default 8).
 Also NB: `make`'s `RELEASE` defaults to **1** — a dev kernel's unoptimized
 NEON is many times slower and reads as an inference bug.
+
+**The interrupt mask is per-task state, and on aarch64 it was not.** x86's
+`switch_to` has always done `pushfq`/`popfq` and seeded `INITIAL_RFLAGS` with IF
+set; aarch64's saved x19-x30 and d8-d15 and left `DAIF` as a *global* CPU
+property. IRQs are masked on exception entry, so when `sched::on_timer_tick`
+forced a switch from inside the IRQ handler, the incoming task resumed through
+`switch_to`'s `ret` rather than an `eret` and inherited the handler's masked DAIF,
+with nothing to ever clear it — **aarch64 preemption worked exactly once per
+boot**, and from then on the machine ran with interrupts disabled: a spinning task
+could never be descheduled, and every later `sched::block_on` tripped its own
+lock-discipline assert (which reads interrupts-enabled as "no `Locked` is held").
+The interactive shell hid it completely by yielding constantly. DAIF is now in the
+switch frame, and a fresh task's value is **derived, not hardcoded** the way x86's
+is (`context::initial_daif`): unmasked where `gic::init_bsp` succeeded and
+`start_preemption` committed, masked where the kernel is correctly cooperative
+(Apple-Silicon HVF exposes no `ICC_*` to a bare-metal EL1 guest), because
+unmasking on a machine with no usable CPU interface is its own hazard. One
+ordering constraint falls out: a task spawned **before** `start_preemption()` keeps
+a masked DAIF for life — true today on both paths, and worth not breaking.
+Found the day the aarch64 unit suite first ran, which is the argument for it.
 
 ## STANDING RULE — real hardware, nothing hardcoded to an emulator
 
@@ -1647,8 +1680,10 @@ FDT claims a GICv3 but carries no readable `reg`.
   pure + unit-tested); getting that wrong makes the firmware's page-table walk
   miss our PTEs (the buffer is then unreachable and it stalls silently). The
   pure wire protocol (`agx/proto.rs`) + UAT encoder (`agx/uat.rs`) are
-  **arch-neutral, unit-tested under `cargo xtask test`** (x86 — `arch::aarch64`
-  is cfg-gated out of the test build, so pure logic must live outside it); the
+  **arch-neutral, unit-tested under `cargo xtask test`** (`arch::aarch64` is
+  cfg-gated out of the *x86* test build, so pure logic still belongs outside it if
+  it is to be covered on both legs — but `-arch aarch64` does now compile and run
+  tests placed inside it); the
   ASC-mailbox MMIO (`agx/asc.rs`, single-`ldr x`/`str x` FIFO + `dsb`/`dmb`),
   GFXHandoff (`agx/handoff.rs`, Dekker lock + cache-maintained shared mem), and
   discovery/PMGR/orchestration (`agx/hw.rs`) are aarch64-only. Gated on
@@ -2839,10 +2874,12 @@ Four facts forced that shape, and each is a constraint on any change here:
   4-byte `Copy` struct into a fixed ring; `translate` (which allocates — one press
   can emit several characters) runs on the **drain** side, in `keymap::next_byte`.
   Do not move translation into a driver.
-- **`arch::aarch64` is `cfg`'d out of the test build**, exactly like `framebuffer/`
-  but from a different `cfg`. Anything left in `pl050.rs`/`virtio_input.rs` can
-  never carry a `#[test_case]`, which is why the set-2 and evdev cross-tables live
-  in `keymap` and not in the drivers that use them.
+- **`arch::aarch64` is `cfg`'d out of the *x86* test build**, from a different `cfg`
+  than `framebuffer/`'s. So anything left in `pl050.rs`/`virtio_input.rs` is covered
+  on **one leg only** — `cargo xtask test -arch aarch64` compiles and runs tests
+  placed there, `-arch x86_64` cannot see them at all. That is why the set-2 and
+  evdev cross-tables live in `keymap`: a table both arches use should be pinned by
+  both legs, not by whichever one happens to compile it.
 - **Dead keys, Compose and the IME are stateful across keystrokes**, and a machine
   can have a USB keyboard *and* a virtio-input window at once (`console.rs` polls
   both). Four states would mean `´` on one keyboard and `e` on the other fails to
@@ -2872,8 +2909,8 @@ and no layout lists a usage twice.
 **`us_layout_reproduces_the_legacy_*` are the migration gate.** The four old
 decoders' tables are copied verbatim into `keymap`'s tests and every
 scancode × modifier combination is asserted to produce the same byte. Two of those
-drivers cannot be compiled by the test build at all, so this is the only place
-their behaviour is pinned; do not delete these fixtures casually.
+drivers are invisible to the x86 leg, so this is the only place their behaviour is
+pinned on *both*; do not delete these fixtures casually.
 
 **Scancodes cannot be injected over serial**, so `/keyboard test <layout> <keys>`
 exists to make the tables assertable from a running kernel — and it calls the real
@@ -3098,7 +3135,12 @@ Everything goes through `cargo xtask`. Arch is chosen explicitly, never
 host-detected. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full setup.
 
 ```sh
-cargo xtask test                       # in-kernel unit suite under QEMU (x86) — pure logic, no model
+cargo xtask test [-arch x86_64|aarch64]  # in-kernel unit suite under QEMU (default x86) — pure
+                                       #   logic, no model. Keep BOTH arches green.
+                                       #   x86: Limine ISO + isa-debug-exit. aarch64: a flat arm64
+                                       #   `Image` (QEMU passes no DTB for an ELF, and no DTB means
+                                       #   no GIC) + `gic-version=3` + TCG, verdict via a serial
+                                       #   sentinel since `-M virt` has no isa-debug-exit.
 cargo xtask ring-check                 # enforce the ring-3 rule: no direct synapse::executor
                                        #   calls outside the allowlist (xtask/src/rings.rs)
  make e2e                               # end-to-end: boot the kernel, drive the shell over serial,

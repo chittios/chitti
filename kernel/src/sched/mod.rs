@@ -2052,13 +2052,29 @@ mod tests {
         let _ = kill(parked);
     }
 
+    /// An address guaranteed to take a translation fault. **This is arch-specific,
+    /// and the reason is worth stating because the obvious answer is wrong:**
+    /// address 0 faults on x86, but on aarch64 it does *not*. `mmu::init` builds an
+    /// identity map that covers the low GiB precisely because the platform's MMIO
+    /// lives down there (the GIC at 0x8000000, the PL011 at 0x9000000), so a read
+    /// of 0 is a mapped Device access that QEMU answers with zeroes. The task then
+    /// runs to completion and the test fails with "the fault must be counted, once,
+    /// left: 0" — which reads like broken fault *accounting* rather than a fault
+    /// that never happened.
+    #[cfg(target_arch = "x86_64")]
+    const FAULT_PROBE: usize = 0;
+    /// 1 TiB: past every mapped block, and past the VA range itself under a 39-bit
+    /// IAS. Either way it cannot translate, and it is nowhere near the stack guard
+    /// (which the sync handler checks first, and reports as an overflow instead).
+    #[cfg(target_arch = "aarch64")]
+    const FAULT_PROBE: usize = 1 << 40;
+
     /// Dereferences a deliberately unmapped address, taking a page fault.
-    /// Address 0 is never mapped, so this is a translation fault on either arch.
     extern "C" fn faulting_task(_arg: u64) {
         // SAFETY: intentionally unsound — the whole point is to fault. Volatile so
         // it cannot be optimised away, and `read` rather than `write` so nothing
         // could be forwarded from a store.
-        let v = unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()) };
+        let v = unsafe { core::ptr::read_volatile(FAULT_PROBE as *const u64) };
         // Unreachable; keeps the read live if the compiler ever proves otherwise.
         FAULT_SINK.store(v, Ordering::SeqCst);
     }

@@ -57,7 +57,7 @@ A [`Makefile`](Makefile) wraps the common flows (`make help` lists them);
 | `make build` / `make build-all` | `cargo xtask build -arch <arch> …` (build-all does both arches) |
 | `make run` / `make run-uefi` | `cargo xtask run -arch <arch> …` (run-uefi adds `--uefi`) |
 | `make image` | `cargo xtask image -arch <arch> …` |
-| `make test` | `cargo xtask test` (in-kernel unit suite) |
+| `make test` | `cargo xtask test -arch <arch>` (in-kernel unit suite; `ARCH` defaults to aarch64) |
 | `make e2e` / `make e2e-full` | boot the real kernel + drive the shell over serial (`--slow` adds model/voice) |
 | `make verify` | x86 build + `test` + aarch64 build (the standing-rule gate) |
 | `make vbox` / `make vbox-remote` | rebuild the aarch64 image and reload it into a VirtualBox VM (vbox boots the local GGUF; vbox-remote seeds `/model remote` from `REMOTE_RUN_URL`/`REMOTE_MODEL`/`REMOTE_KEY`) |
@@ -71,7 +71,7 @@ The underlying `cargo xtask` commands:
 | `cargo xtask build -arch <arch> [--release] [-model <m>]` | Cross-compile the kernel. |
 | `cargo xtask run   -arch <arch> [--release] [-model <m>]` | Build the image and boot it in QEMU (serial to stdio + a graphical window). |
 | `cargo xtask image -arch <arch> [-model <m>]` | Assemble a bootable image (x86: hybrid BIOS/UEFI ISO; aarch64: a GPT disk image that boots standalone via UEFI). |
-| `cargo xtask test` | Run the in-kernel `custom_test_frameworks` suite under `qemu-system-x86_64`, headless, asserting via serial + `isa-debug-exit`. **Keep it green** (currently ~420 cases). |
+| `cargo xtask test [-arch <arch>]` | Run the in-kernel `custom_test_frameworks` suite headless, on **either** arch (default x86_64). **Keep both green** (~2400 cases). x86 boots a Limine ISO and asserts via serial + `isa-debug-exit`; aarch64 boots a flat arm64 `Image` with `-kernel` and asserts via serial + a PSCI poweroff (`-M virt` has no `isa-debug-exit`). |
 | `cargo xtask sample-files [--refresh]` | Download the `/samples/` corpus into `assets/samples/` (cached). Called automatically by the build paths when `CHITTI_SAMPLE_FILES` is set. |
 
 `-model qwen3.5-0.8b` (the default), `-model qwen3.5-2b|4b|9b`, **or any
@@ -104,8 +104,8 @@ required bring-up tool for a new family or quant) and `cargo xtask ref-check`
 1. **Dual-arch parity.** A change must build and work on **both** arches.
    After any change run **all** of:
    ```sh
-   cargo xtask build -arch x86_64 && cargo xtask test      # keep it green
-   cargo xtask build -arch aarch64
+   cargo xtask build -arch x86_64  && cargo xtask test                 # keep it green
+   cargo xtask build -arch aarch64 && cargo xtask test -arch aarch64   # and this one
    cargo xtask run   -arch aarch64                         # if the change is boot-visible
    make e2e                                                # if the change is boot-visible or networked
    ```
@@ -120,15 +120,36 @@ required bring-up tool for a new family or quant) and `cargo xtask ref-check`
 ### The test suite
 
 ```sh
-cargo xtask test
+cargo xtask test                 # x86_64 (default)
+cargo xtask test -arch aarch64   # the same suite, on the other arch
 ```
 
-Cross-compiles the `--test` kernel and boots each test binary in QEMU headlessly,
-translating `isa-debug-exit` into a pass/fail exit code. Deterministic (fixed
-seeds, temperature 0). This is the gate — keep it green. It covers the **pure
-logic** (parsers, codecs, capability/scope math, the channel ring, the UI
-draw-op rasterizer, HTTP request parsing, P-256 verification, …); it never loads
-the model or touches hardware.
+Cross-compiles the `--test` kernel and boots each test binary in QEMU headlessly.
+Deterministic (fixed seeds, temperature 0). This is the gate — keep **both**
+green. It covers the **pure logic** (parsers, codecs, capability/scope math, the
+channel ring, the UI draw-op rasterizer, HTTP request parsing, P-256
+verification, …); it never loads the model or touches hardware.
+
+The two arches report a verdict differently, because the hardware differs:
+
+* **x86_64** wraps the test binary in a Limine ISO and exits through QEMU's
+  `isa-debug-exit` device, which becomes a real process exit code.
+* **aarch64** has no such device (`-M virt` has no I/O ports), and PSCI
+  `SYSTEM_OFF` tells the host nothing — QEMU exits 0 either way. So the guest
+  prints a sentinel line and the runner requires it; a guest that hangs or dies
+  prints none and is a failure. Three things about that boot are load-bearing and
+  easy to get wrong: it is booted as a flat arm64 **`Image`**, not the ELF (QEMU
+  only passes a DTB under the Linux boot protocol, and without a DTB there is no
+  GIC and no preemption); it needs **`gic-version=3`** (`-M virt` defaults to
+  GICv2, which this kernel does not drive); and it runs under **TCG rather than
+  HVF**, since HVF's emulated GICv3 exposes no `ICC_*` interface to a bare-metal
+  EL1 guest, so the suite would otherwise run cooperatively on an Apple-Silicon
+  dev box and preemptively in CI. KVM is used where a Linux host offers it.
+
+Most of the suite is arch-neutral; a handful of cases are genuinely per-arch
+(Limine's boot responses, the PIT vs the generic timer, `int3` vs the EL1
+vectors, the SMP self-test) and are `cfg`-split with a counterpart on the other
+side where one exists. See the notes on each in `kernel/src/lib.rs`.
 
 ### End-to-end tests
 

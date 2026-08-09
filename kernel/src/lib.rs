@@ -9,11 +9,20 @@
 // `vmmlaq_s32` (FEAT_I8MM int8 matrix-multiply) for the Q1_0/Q2_0 batched
 // matmul fast path — still unstable in core::arch::aarch64.
 #![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_i8mm))]
-// The custom_test_frameworks harness and the `x86-interrupt` ABI are x86-only
-// (tests boot via Limine + isa-debug-exit on qemu-system-x86_64).
+// The `x86-interrupt` ABI is x86-only.
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
-#![cfg_attr(target_arch = "x86_64", test_runner(crate::test_runner))]
-#![cfg_attr(target_arch = "x86_64", reexport_test_harness_main = "test_main")]
+// The custom_test_frameworks harness runs on BOTH arches (x86 boots a Limine ISO
+// and exits via isa-debug-exit; aarch64 boots `-kernel` and exits via PSCI with a
+// serial sentinel — see `qemu::exit_qemu`). These were `cfg_attr(x86_64)` while
+// only x86 had a runner, and the failure that caused is worth knowing: with the
+// attributes absent the harness generates no `test_main` at all, so the missing
+// entry point is reported as `cannot find function test_main`, and the
+// `#[test_case]` collection — having no `&dyn Testable` target type to coerce to
+// — fails to unify its fn items, surfacing as an `E0308: expected fn item, found
+// a different fn item` pointing at whichever test happens to be second in the
+// crate. One root cause, two errors that name neither the runner nor the arch.
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), test_runner(crate::test_runner))]
+#![cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), reexport_test_harness_main = "test_main")]
 extern crate alloc;
 
 /// Global allocation failure: reclaim caches, then OOM-kill the current
@@ -82,7 +91,6 @@ pub mod kms;
 pub mod panes_layout;
 pub mod pdf;
 pub mod pdfview;
-#[cfg(target_arch = "x86_64")]
 pub mod qemu;
 /// Bundled `/samples/` corpus: openable media/documents seeded into the store at
 /// boot (opt-in via `CHITTI_SAMPLE_FILES`; empty otherwise).
@@ -328,9 +336,10 @@ pub fn init() {
     // EL0 round trip. **Must come after `exceptions::init`**, which is what sets
     // `VBAR_EL1`: a tenant's `svc` lands at `VBAR + 0x400`, so running this from
     // `mm::init` (where it was first placed) sent the trap to whatever the boot
-    // firmware left in VBAR and hung the machine with no output at all. The
-    // aarch64 unit suite does not exist — `cargo xtask test` is x86 only — so this
-    // boot self-test is the only thing that ever exercises the path.
+    // firmware left in VBAR and hung the machine with no output at all. This boot
+    // self-test used to be the *only* thing that ever exercised the path, since
+    // `cargo xtask test` was x86-only; `cargo xtask test -arch aarch64` now runs
+    // the suite here too, and reaches this line on the way.
     match arch::aarch64::el0::self_test() {
         Ok(()) => ktrace::log("el0", "EL0 round-trip self-test ok"),
         Err(why) => ktrace::log_fmt(format_args!("el0: EL0 round-trip self-test FAILED: {why}")),
@@ -370,7 +379,6 @@ impl<T: Fn()> Testable for T {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn test_runner(tests: &[&dyn Testable]) {
     serial_println!("running {} test(s)", tests.len());
     for test in tests {
@@ -379,14 +387,36 @@ pub fn test_runner(tests: &[&dyn Testable]) {
     qemu::exit_qemu(qemu::QemuExitCode::Success);
 }
 
-#[cfg(target_arch = "x86_64")]
 pub fn test_panic_handler(info: &core::panic::PanicInfo) -> ! {
     serial_println!("[failed]");
     serial_println!("{}", info);
     qemu::exit_qemu(qemu::QemuExitCode::Failed);
 }
 
+/// Stack the suite runs on, on both arches. Limine's default 64 KiB boot stack
+/// (and the aarch64 stub's `__stack_top`) overflows on the ONNX interpreter's big
+/// debug stack frame; the real kernel runs inference on 256 KiB scheduler-task
+/// stacks. 8 MiB is ample headroom.
 #[cfg(test)]
+const TEST_STACK: usize = 8 * 1024 * 1024;
+
+/// Leak an 8 MiB heap block and return a stack top to switch to. 16-byte aligned,
+/// which is what **both** ABIs want here — but for opposite reasons, so do not
+/// "simplify" one of the callers into the other: x86-64 SysV wants `rsp % 16 == 8`
+/// at function entry and the `call` below supplies the missing 8 by pushing a
+/// return address, while AAPCS64 wants SP 16-aligned at all times and `bl` pushes
+/// nothing. Same number, different derivation.
+#[cfg(test)]
+fn test_stack_top() -> u64 {
+    let stack = alloc::vec![0u8; TEST_STACK].into_boxed_slice();
+    let top = (stack.as_ptr() as u64 + TEST_STACK as u64) & !0xf;
+    core::mem::forget(stack); // leaked for the rest of the run
+    top
+}
+
+// The x86 entry point IS `_start` (Limine calls it directly), so the test build
+// defines it here in place of `main.rs`'s.
+#[cfg(all(test, target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // First action: enable SSE at the hardware level before any SIMD
@@ -394,14 +424,7 @@ pub extern "C" fn _start() -> ! {
     arch::x86_64::fpu::enable_sse();
     serial::init();
     init();
-    // Run the suite on a large heap stack. Limine's default 64 KiB boot stack
-    // overflows on the ONNX interpreter's big debug stack frame (and the stack
-    // size request isn't honored by the bundled Limine); the real kernel runs
-    // inference on 256 KiB scheduler-task stacks. 8 MiB is ample headroom.
-    const TEST_STACK: usize = 8 * 1024 * 1024;
-    let stack = alloc::vec![0u8; TEST_STACK].into_boxed_slice();
-    let top = (stack.as_ptr() as u64 + TEST_STACK as u64) & !0xf;
-    core::mem::forget(stack); // leaked for the rest of the run
+    let top = test_stack_top();
     // SAFETY: switch RSP to the fresh stack top, then call the test harness
     // main (which exits QEMU when done and never returns).
     unsafe {
@@ -415,12 +438,64 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+/// The aarch64 entry point is **not** `_start`: `arch::aarch64::boot`'s
+/// `global_asm!` owns that symbol, and it lives in this crate rather than in
+/// `main.rs`, so the test binary already gets the Image header, the PIE
+/// relocation pass, the initial stack and the `.bss` zeroing for free. What it
+/// then branches to is `aarch64_start`, which is in `main.rs` and therefore
+/// absent from a `--lib` test build — an *undefined symbol at link time*, which
+/// is why this could never have worked by only fixing the harness attributes.
+///
+/// It mirrors `main.rs`'s prologue as far as `init()` and deliberately stops
+/// there: the suite is pure logic, so there is no framebuffer, no disk, no
+/// network and no model. Note `init()` on this arch already brings up the MMU's
+/// consumers, the scheduler, the SMP fleet, the EL1 vectors and the GIC, so the
+/// hardware the arch-specific tests below assert on is live by this point.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn aarch64_start() -> ! {
+    // MMU first, for the reason `main.rs` documents at length: with it off, RAM is
+    // Device memory, where the LL/SC exclusives behind `Locked` never succeed — so
+    // the first lock a test takes would spin forever.
+    arch::aarch64::mmu::init();
+    // No-op on QEMU (this selects Apple's s5l console from an m1n1 FDT), but it
+    // costs nothing and keeps a future `xtask test` on real hardware printable.
+    arch::aarch64::init_uart_apple();
+    serial::init();
+    init();
+    // `init()` *arms* the GICv3 timer but leaves IRQs masked — the real kernel
+    // defers the unmask until its devices are up, so that device bring-up runs
+    // exactly as in the cooperative path. The suite has no devices, so the
+    // equivalent point is here, and it is not optional: x86's `init()` ends with
+    // `interrupts::enable()`, so without this the two suites would run under
+    // different scheduler regimes. Concretely, `sched::block_on` asserts that
+    // interrupts are enabled (its proxy for "no `Locked` is held while another task
+    // runs"), and with IRQs still masked every blocking scheduler test trips that
+    // assert. See the runner's note on why the aarch64 suite pins TCG: under HVF
+    // this call legitimately declines and there would be no preemption to have.
+    arch::aarch64::gic::start_preemption();
+    let top = test_stack_top();
+    // SAFETY: switch SP to the fresh stack top, then branch to the test harness
+    // main (which powers the machine off when done and never returns).
+    unsafe {
+        core::arch::asm!(
+            "mov sp, {top}",
+            "bl {f}",
+            top = in(reg) top,
+            f = sym test_main_trampoline,
+            options(noreturn),
+        );
+    }
+}
+
 /// Wrapper so the `test_main` harness entry can be named as an asm `sym`.
 #[cfg(test)]
 extern "C" fn test_main_trampoline() -> ! {
     test_main();
+    // Unreachable: `test_runner` exits the machine. Via the neutral facade, so
+    // this needs no arch arm.
     loop {
-        arch::x86_64::hlt();
+        arch::hlt();
     }
 }
 
@@ -437,24 +512,55 @@ fn trivial_assertion() {
     assert_eq!(1 + 1, 2);
 }
 
+// The three tests below assert the **boot protocol**, which is the one thing here
+// that genuinely has no cross-arch equivalent: they check that Limine answered our
+// requests. The aarch64 suite boots `-kernel` through `arch::aarch64::boot`, where
+// there is no bootloader to answer anything — `FRAMEBUFFER_REQUEST`/`MEMMAP_REQUEST`
+// are not even declared (`cfg(any(x86_64, boot-limine))`), and `BASE_REVISION`,
+// which is, would simply read back unstamped. Its equivalent handoff check is
+// `aarch64_boot_handoff_discovered_ram` below.
+
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[test_case]
 fn base_revision_is_supported() {
     assert!(BASE_REVISION.is_supported());
 }
 
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[test_case]
 fn framebuffer_response_present() {
     assert!(FRAMEBUFFER_REQUEST.response().is_some());
 }
 
+#[cfg(any(target_arch = "x86_64", feature = "boot-limine"))]
 #[test_case]
 fn memmap_response_present() {
     assert!(MEMMAP_REQUEST.response().is_some());
 }
 
+/// The aarch64 counterpart to the three Limine-response tests: proof that the
+/// `-kernel` handoff produced a usable machine description. `mmu::init` derives
+/// the identity map from the RAM extents it discovered (FDT `/memory`, else the
+/// stub's boot-info), so a zero `ram_end` means it mapped nothing and every
+/// address below is luck.
+#[cfg(all(target_arch = "aarch64", not(feature = "boot-limine")))]
+#[test_case]
+fn aarch64_boot_handoff_discovered_ram() {
+    let end = arch::aarch64::mmu::ram_end();
+    assert!(end != 0, "mmu::init discovered no RAM extent -- the boot handoff was not understood");
+}
+
 // --- Phase 1 acceptance tests -------------------------------------------
 
 /// (a) the timer increments a counter over N ticks.
+///
+/// x86-specific because of *what it proves*, not which registers it touches:
+/// `pit::ticks()` is incremented by the IRQ0 handler, so this is an assertion that
+/// interrupts are being delivered. aarch64's counterpart reads a free-running
+/// counter, which advances with no interrupt at all — see
+/// `aarch64_generic_timer_advances` for that, and
+/// `aarch64_timer_preempts_a_spinning_task` for the delivery half.
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn timer_ticks_advance() {
     let start = arch::x86_64::pit::ticks();
@@ -469,6 +575,25 @@ fn timer_ticks_advance() {
         assert!(spins < 100_000_000, "timer did not advance -- IRQ0 is not firing");
     }
     assert!(arch::x86_64::pit::ticks() >= target);
+}
+
+/// (a), aarch64: the generic timer's virtual counter advances. Deliberately does
+/// **not** `wfi` the way the x86 version `hlt`s — `CNTVCT_EL0` is free-running, so
+/// a spin is the whole test, and a `wfi` here would hang wherever the GIC timer is
+/// not live (Apple-Silicon HVF exposes no `ICC_*` interface to a bare-metal EL1
+/// guest, so `gic::init_bsp` legitimately declines there and no interrupt would
+/// ever arrive to wake it).
+#[cfg(target_arch = "aarch64")]
+#[test_case]
+fn aarch64_generic_timer_advances() {
+    let start = arch::now_ms();
+    let mut spins = 0u64;
+    while arch::now_ms() == start {
+        core::hint::spin_loop();
+        spins += 1;
+        assert!(spins < 1_000_000_000, "CNTVCT_EL0 never advanced -- the generic timer is not running");
+    }
+    assert!(arch::now_ms() > start);
 }
 
 /// (b) heap alloc/free of varied sizes with no corruption.
@@ -513,6 +638,20 @@ fn heap_alloc_dealloc_varied_sizes() {
 /// triple fault: `int3` (breakpoint) is the safest exception to trigger
 /// from a running test, since the handler `iretq`s straight back to the
 /// next instruction rather than requiring any fault recovery.
+///
+/// x86-only, and the reason is a property of the aarch64 handler rather than an
+/// oversight: `aarch64_sync_dispatch` recovers a trapped instruction **only**
+/// while a probe is active (`gic::probing` / `uart_probing` / `agx_probing`), and
+/// otherwise contains the fault to the faulting task via
+/// `sched::fault_current_task` — which returns for the *bootstrap* task, where a
+/// fault is a kernel bug, and then halts. A `brk` raised from a test therefore
+/// would not fail the suite, it would **hang** it. The vectors themselves are
+/// asserted by `aarch64_exception_vectors_are_installed`, and the recovery and
+/// containment paths are exercised at boot by the GIC/UART probes and by
+/// `el0::self_test` / `synapse::tenant::self_test` in `init()`. Raising a
+/// deliberately recoverable trap from a test needs a bootstrap-safe recovery hook
+/// in that dispatcher first.
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn breakpoint_exception_is_caught_not_triple_faulted() {
     let hits_before = arch::x86_64::idt::BREAKPOINT_HITS.load(core::sync::atomic::Ordering::SeqCst);
@@ -575,6 +714,11 @@ fn cooperative_tasks_interleave_and_progress() {
 /// still gets interrupted and descheduled, proving the PIT tick hook
 /// (`sched::on_timer_tick`, wired from `pit::timer_handler`) actually
 /// forces a switch rather than only supporting voluntary cooperation.
+///
+/// The aarch64 counterpart is `aarch64_timer_preempts_a_spinning_task`, which
+/// proves the same property through the GICv3 + generic-timer path — and which
+/// found that `switch_to` was not carrying `DAIF` on that arch.
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn timer_preempts_a_non_yielding_task() {
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -597,6 +741,87 @@ fn timer_preempts_a_non_yielding_task() {
     // Reaching this line at all is the proof: `hog` never yields, so
     // control could only have returned here via `on_timer_tick` forcing
     // a switch back to this (bootstrap) task.
+}
+
+/// (c), aarch64: the same property, through the GICv3 + generic-timer path
+/// (`gic::init_bsp` -> `on_timer_tick`) instead of the PIT/APIC + IDT one.
+///
+/// **This test is the regression guard for a real bug it found.** Writing it is
+/// what exposed that `sched::context`'s aarch64 `switch_to` did not carry `DAIF`,
+/// so a preemptive switch out of the IRQ handler handed the incoming task a masked
+/// interrupt state that nothing ever cleared: aarch64 preemption worked exactly
+/// once, and this test hung the guest outright rather than failing. If it hangs
+/// again, look there first.
+///
+/// Conditional on `gic::timer_live()`, which is not a hedge: on Apple-Silicon HVF
+/// the emulated GICv3 exposes no `ICC_*` system-register interface to a bare-metal
+/// EL1 guest, so `init_bsp` declines and the scheduler is *documented* to stay
+/// cooperative. It reports which case it took, because "preemption works" and
+/// "there is no preemption to test" must not look identical in a log.
+#[cfg(target_arch = "aarch64")]
+#[test_case]
+fn aarch64_timer_preempts_a_spinning_task() {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    // Checks a flag so it can be told to finish, unlike x86's `hog`, which loops
+    // forever and stays runnable for the remainder of the suite. It still never
+    // *yields*, so it tests the same thing — but 2400 tests behind an immortal
+    // spinner is a real tax under TCG, and a task outliving its own test is a
+    // hazard for every test after it.
+    extern "C" fn hog(_arg: u64) {
+        while !STOP.load(Ordering::SeqCst) {
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    if !arch::aarch64::gic::timer_live() {
+        serial_println!("(no GICv3 timer on this platform -- cooperative scheduling, nothing to preempt)");
+        return;
+    }
+
+    sched::spawn("hog", hog, 0);
+
+    // Bounded on the **clock**, not on an iteration count. An iteration bound is
+    // meaningless across accelerators: the same 100M spins are milliseconds native
+    // and minutes under TCG, so a number tuned on one becomes a hang on the other.
+    // One second is ~100 ticks at the 100 Hz the GIC reports.
+    let deadline = arch::now_ms() + 1000;
+    while COUNTER.load(Ordering::SeqCst) < 1000 && arch::now_ms() < deadline {
+        core::hint::spin_loop();
+    }
+    let seen = COUNTER.load(Ordering::SeqCst);
+    STOP.store(true, Ordering::SeqCst);
+    // Give it a chance to observe the flag and exit before the next test runs.
+    for _ in 0..100 {
+        sched::yield_now();
+    }
+    // The count is in the message because the two failure modes need telling
+    // apart: 0 means this task was never preempted so the hog never ran at all,
+    // while a small non-zero count means preemption works and something starved it.
+    assert!(
+        seen >= 1000,
+        "timer preemption did not return control within 1s -- hog counted {seen} (0 = never scheduled)"
+    );
+}
+
+/// The aarch64 counterpart to `breakpoint_exception_is_caught_not_triple_faulted`,
+/// as far as is safe from a test (see that test's note): the kernel's own EL1
+/// vector table is installed, so a synchronous exception reaches
+/// `aarch64_sync_dispatch` rather than whatever the boot firmware left in
+/// `VBAR_EL1`. `exceptions::init` runs inside `init()`, so a zero here means every
+/// later fault would have gone somewhere unknown.
+#[cfg(target_arch = "aarch64")]
+#[test_case]
+fn aarch64_exception_vectors_are_installed() {
+    let vbar: u64;
+    // SAFETY: reading VBAR_EL1 is always valid at EL1.
+    unsafe { core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar, options(nomem, nostack)) };
+    assert!(vbar != 0, "VBAR_EL1 is zero -- exceptions::init did not install our vectors");
+    // The table must be 2 KiB aligned, or the CPU ignores the low bits and every
+    // vector lands at the wrong offset.
+    assert_eq!(vbar & 0x7ff, 0, "VBAR_EL1 {vbar:#x} is not 2 KiB aligned");
 }
 
 /// (b) an IPC round-trip delivers a message: the main test task sends a
@@ -658,9 +883,16 @@ fn capability_denial_is_refused_and_ktraced() {
     let denials_before = cap::denials();
     sched::spawn("unprivileged_sender", unprivileged_sender, 0);
 
+    // Wait by *yielding*, not by halting for a timer interrupt. This is a
+    // capability test, so its dependency on preemption was accidental — and on
+    // aarch64 it would have been fatal rather than slow: where `gic::init_bsp`
+    // declines (Apple-Silicon HVF exposes no `ICC_*` sysregs to a bare-metal EL1
+    // guest) the scheduler is cooperative, so a halt waits for an interrupt that
+    // never comes while the task that would set `DONE` never runs. Yielding hands
+    // the CPU over directly and works on both arches under either scheduler.
     let mut spins = 0u64;
     while !DONE.load(Ordering::SeqCst) {
-        arch::x86_64::hlt();
+        sched::yield_now();
         spins += 1;
         assert!(spins < 100_000_000, "the unprivileged task never ran to completion");
     }
@@ -1392,6 +1624,15 @@ fn phase6_stale_precondition_falls_back_to_replanning() {
 /// `init` (all cores hammering one `Locked` counter); here we check its
 /// result. The harness boots `-smp 4`, so multiple cores must have done work
 /// and the counter must be exact (no lost updates under contention).
+///
+/// x86-gated because `crate::smp` itself is (`cfg(target_arch = "x86_64")` at the
+/// module declaration) and because the counters it reads are produced by the x86
+/// boot self-test. aarch64's fleet lives at `arch::aarch64::smp` and publishes no
+/// equivalent stats, so its counterpart below can only assert bring-up. The real
+/// cross-arch version of *this* test — contended increments through one `Locked`
+/// driven from `arch::parallel_for`, the neutral facade — is the natural next
+/// addition and would supersede both.
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn phase7_smp_online_and_spinlock_has_no_lost_updates() {
     let s = smp::stats();
@@ -1413,4 +1654,24 @@ fn phase7_smp_online_and_spinlock_has_no_lost_updates() {
             s.cpus_that_worked
         );
     }
+}
+
+/// SMP, aarch64: PSCI bring-up produced a fleet, reported through the **neutral
+/// facade** (`arch::online_cpus`) rather than `arch::aarch64::smp` directly — the
+/// standing rule, since reaching past the facade is exactly how x86 came to run
+/// every parallel loop on one core.
+///
+/// Only bring-up is asserted, and the count is *reported* rather than required to
+/// exceed 1: `smp::init` degrades to single-core deliberately and correctly where
+/// a hypervisor parks a trapped `WFE` until an interrupt (VirtualBox-ARM does, and
+/// it used to hang the first prefill matvec forever), so demanding a fleet here
+/// would fail on a platform that is behaving as designed. What must hold is that
+/// the count is sane and the boot wake self-test did not leave us claiming cores
+/// that never answered.
+#[cfg(target_arch = "aarch64")]
+#[test_case]
+fn aarch64_smp_bringup_reports_a_sane_fleet() {
+    let n = arch::online_cpus();
+    assert!(n >= 1, "online_cpus() reported {n} -- not even the boot CPU is counted");
+    serial_println!("({n} core(s) online)");
 }
