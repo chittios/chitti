@@ -16,6 +16,8 @@ pub mod ntfs_read;
 pub mod usb_msc;
 pub mod volcrypto;
 pub mod esp;
+pub mod exfat;
+pub mod exfat_rw;
 pub mod fat32;
 pub mod fat_read;
 pub mod gpt;

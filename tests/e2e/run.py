@@ -1644,6 +1644,207 @@ def s_synapse_bench(g):
     return True, f"4 gates attributed correctly; full decision {ns} ns/call"
 
 
+def s_exfat(g):
+    """exFAT read/write on the real kernel, against a volume a real tool made.
+
+    Boots its own guest with a raw exFAT image attached (`CHITTI_EXFAT_DISK`;
+    built with the host's `mkfs.exfat` when present, otherwise blank). The guest
+    mounts it RW, copies the embedded sample corpus onto it, reads it back byte-
+    for-byte, and re-mounts to prove the data survives a fresh open — the
+    "lives in the device, not in filesystem memory" claim. A blank disk is
+    formatted **in-guest** by `/mkexfat` first, which is the self-hosting path.
+    If `fsck.exfat` exists on the host, the image is checked for corruption
+    after the guest's writes.
+
+    The value over the RamDisk unit tests is the independent implementation:
+    a volume `mkfs.exfat` formatted is a volume the Linux/Windows readers made,
+    and our writes must not make it unreadable (that is what fsck checks).
+    Auto-skips (like the x264 scenarios) when no exFAT tool is available.
+    """
+    import tempfile
+    import shutil
+
+    mkfs = shutil.which("mkfs.exfat")
+    fsck = shutil.which("fsck.exfat")
+    newfs = shutil.which("newfs_exfat")
+    fsck_mac = shutil.which("fsck_exfat")
+    img = os.path.join(tempfile.gettempdir(), f"chitti-e2e-exfat-{os.getpid()}.img")
+    with open(img, "wb") as f:
+        f.truncate(64 * 1024 * 1024)
+
+    def make_foreign_volume():
+        # Linux exfatprogs, or macOS's newfs_exfat on a raw CRawDiskImage
+        # attachment (the repo's model-disk pattern).
+        if mkfs:
+            r = subprocess.run([mkfs, "-n", "CHITTI", img], capture_output=True)
+            if r.returncode != 0:
+                print(f"    mkfs.exfat failed: {r.stderr.decode(errors='replace')}")
+            return r.returncode == 0
+        if newfs:
+            script = (
+                f'DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" '
+                f"| head -1 | awk '{{print $1}}') && "
+                f'{newfs} -v CHITTI "$DEV" > /dev/null && '
+                f'hdiutil detach "$DEV" > /dev/null'
+            )
+            r = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"    newfs_exfat failed: {r.stderr.strip()}")
+            return r.returncode == 0
+        return False
+
+    def check_volume():
+        # Return 0 if a fsck tool exists and the volume is clean; None if none
+        # is available (so the absence of a tool is not a failure).
+        if fsck:
+            r = subprocess.run([fsck, img], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"    fsck.exfat output:\n{r.stdout}{r.stderr}")
+            return r.returncode
+        if fsck_mac:
+            script = (
+                f'DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "{img}" '
+                f"| head -1 | awk '{{print $1}}') && "
+                f'{fsck_mac} "$DEV"; RC=$?; '
+                f'hdiutil detach "$DEV" > /dev/null 2>&1; exit $RC'
+            )
+            r = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"    fsck_exfat output:\n{r.stdout}{r.stderr}")
+            return r.returncode
+        return None
+
+    foreign = make_foreign_volume()
+    if foreign:
+        with open(img, "rb") as f:
+            hdr = f.read(16)
+        print(f"    foreign volume header: {hdr.hex()}")
+        if hdr[3:11] != b"EXFAT   ":
+            print("    !! newfs_exfat reported success but the image is not exFAT")
+
+    g2 = Guest(arch=RUN_ARCH, verbose=RUN_VERBOSE, no_model=True, audio="none", exfat_disk=img)
+    try:
+        if not g2.wait_for("net: configured", 180):
+            return False, "exFAT guest never booted"
+        # The attached image's disk index varies by arch/attach order (x86
+        # always has a boot drive at 0): mount each candidate, and format the
+        # one that mounts as nothing known (the blank self-hosting case).
+        mount_path = None
+        for d in range(4):
+            m = g2.mark()
+            g2.send(f"/mount {d} 0 /x{d} rw")
+            if g2.wait_for("(exFAT,", 8, m):
+                mount_path = f"/x{d}"
+                # The whole reply is asserted, not a second wait_for: the full
+                # line often arrives in one chunk, so a mark taken after the
+                # `exFAT` match can already be past the trailing `rw)`.
+                g2.wait_quiet(0.3, 10)
+                if ", rw)" not in g2.since(m):
+                    return False, "exFAT volume mounted read-only"
+                break
+            if foreign:
+                continue
+            g2.wait_quiet(0.4, 10)
+            out = g2.since(m)
+            # A successful mount prints `mount> /path -> disk N (FS, …)`; only
+            # that arrow means a real, non-exFAT volume we must never format.
+            # An `unsupported`/`no disk` reply is a blank or missing disk.
+            if "->" in out:
+                continue
+            m = g2.mark()
+            g2.send(f"/mkexfat {d} yes")
+            if not g2.wait_for("formatted disk", 15, m):
+                continue
+            m = g2.mark()
+            g2.send(f"/mount {d} 0 /x{d} rw")
+            if g2.wait_for("(exFAT,", 8, m):
+                mount_path = f"/x{d}"
+                g2.wait_quiet(0.3, 10)
+                if ", rw)" not in g2.since(m):
+                    return False, "exFAT volume mounted read-only"
+                break
+        if mount_path is None:
+            return False, "no disk mounted as exFAT"
+
+        # --- write (guest -> volume), then read it back --------------------
+        src = "/samples/README.md"
+        m = g2.mark()
+        g2.send(f"/cat {src}")
+        if not g2.wait_for(f"{src} (", 20, m):
+            return None, "skipped (no /samples corpus; needs CHITTI_SAMPLE_FILES=1)"
+        m2 = g2.mark()
+        g2.send(f"/cp {src} {mount_path}/copied.md")
+        if not g2.wait_for("cp>", 25, m2):
+            return False, "/cp onto the exFAT volume failed"
+        # mkdir on the volume, then a nested copy.
+        m3 = g2.mark()
+        g2.send(f"/mkdir {mount_path}/sub")
+        if not g2.wait_for("mkdir>", 15, m3):
+            return False, "/mkdir on the exFAT volume failed"
+        m4 = g2.mark()
+        g2.send(f"/cp {src} {mount_path}/sub/nested.md")
+        if not g2.wait_for("cp>", 25, m4):
+            return False, "nested /cp onto the exFAT volume failed"
+        # A zero-length file (the FAT-chain, size-0 case) also round-trips.
+        m5 = g2.mark()
+        g2.send(f"/touch {mount_path}/empty.txt")
+        if not g2.wait_for("touch>", 15, m5):
+            return False, "/touch on the exFAT volume failed"
+        # Byte counts must match the source exactly.
+        m6 = g2.mark()
+        g2.send(f"/cat {mount_path}/copied.md")
+        if not g2.wait_for("copied.md (", 15, m6):
+            return False, "copied file did not read back"
+        g2.wait_quiet(0.4, 10)
+        m7 = g2.mark()
+        g2.send(f"/cat {mount_path}/sub/nested.md")
+        if not g2.wait_for("nested.md (", 15, m7):
+            return False, "nested copied file did not read back"
+        g2.wait_quiet(0.4, 10)
+        # Parse the byte counts out of the cat headers and compare to the source.
+        def cat_bytes(path):
+            m = g2.mark()
+            g2.send(f"/cat {path}")
+            g2.wait_quiet(0.6, 10)
+            txt = g2.since(m)
+            import re
+            mm = re.search(rf"{re.escape(path)} \((\d+) bytes\)", txt)
+            return int(mm.group(1)) if mm else None
+        src_n = cat_bytes(src)
+        cop_n = cat_bytes(f"{mount_path}/copied.md")
+        nes_n = cat_bytes(f"{mount_path}/sub/nested.md")
+        if None in (src_n, cop_n, nes_n):
+            return False, f"could not read byte counts src={src_n} cop={cop_n} nes={nes_n}"
+        if cop_n != src_n or nes_n != src_n:
+            return False, f"byte counts differ after copy: src={src_n} cop={cop_n} nested={nes_n}"
+
+        # --- persistence: unmount, remount, read again ---------------------
+        m8 = g2.mark()
+        g2.send(f"/umount {mount_path}")
+        if not g2.wait_for("unmounted", 15, m8):
+            return False, "could not unmount the exFAT volume"
+        disk_idx = mount_path[2:] if mount_path.startswith("/x") else mount_path.strip("/")
+        m9 = g2.mark()
+        g2.send(f"/mount {disk_idx} 0 {mount_path} rw")
+        if not g2.wait_for("(exFAT,", 15, m9):
+            return False, "exFAT volume did not remount"
+        m10 = g2.mark()
+        g2.send(f"/cat {mount_path}/copied.md")
+        if not g2.wait_for("copied.md (", 15, m10):
+            return False, "copied file was not on disk after remount"
+        return True, f"exFAT rw round-trip on {'mkfs.exfat' if foreign else '/mkexfat'} volume ({src_n} bytes, remount persisted)"
+    finally:
+        g2.close()
+        if foreign:
+            rc = check_volume()
+            if rc is not None and rc != 0:
+                print(f"    fsck after guest writes: rc={rc}")
+        try:
+            os.unlink(img)
+        except OSError:
+            pass
+
+
 def s_redteam(g):
     """`/redteam` must block every injected attack, and must show that removing
     provenance is what lets them through.
@@ -5361,6 +5562,7 @@ OS = [(n, make_cmd_scenario(c, mk)) for (n, c, mk) in OS_CMDS] + [
     ("history_recall", s_history_recall),
     ("git", s_git),
     ("install_plan", s_install_plan),
+    ("exfat", s_exfat),
     ("synapse_bench", s_synapse_bench),
     ("heap_ab", s_heap_ab),
     ("redteam", s_redteam),

@@ -783,6 +783,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "channel" | "channels" => run_channel(arg),
         "install" => disk_install(arg),
         "mkext4" => disk_mkext4(arg),
+        "mkexfat" => disk_mkexfat(arg),
         "ext4read" => disk_ext4read(),
         "network" | "net" => net_cmd(arg),
         "ping" => net_ping(arg),
@@ -3740,7 +3741,7 @@ fn execute_chat_tool_inner(
                             matches!(d.binding, ToolBinding::Shell { destructive: true, .. })
                         })
                         .unwrap_or(false)
-                        || matches!(n.as_str(), "rm" | "mkext4" | "install")
+                        || matches!(n.as_str(), "rm" | "mkext4" | "mkexfat" | "install")
                 })
                 .unwrap_or(false);
             (alloc::format!("run_shell_command {cmd}"), dest, false)

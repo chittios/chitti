@@ -2307,6 +2307,29 @@ fn model_disk_from_env() -> Result<Option<PathBuf>, String> {
     }
 }
 
+/// `CHITTI_EXFAT_DISK=<path>`: attach a pre-built exFAT raw image (the e2e
+/// harness makes one with mkfs.exfat) so the guest can mount + read/write it.
+/// Attached as its own virtio-blk device, never the boot store.
+fn exfat_disk_from_env() -> Result<Option<PathBuf>, String> {
+    match env::var("CHITTI_EXFAT_DISK") {
+        Ok(p) if !p.trim().is_empty() => Ok(Some(PathBuf::from(p.trim()))),
+        _ => Ok(None),
+    }
+}
+
+fn attach_exfat_disk(qemu: &mut std::process::Command, pci: bool) -> Result<(), String> {
+    if let Some(xd) = exfat_disk_from_env()? {
+        qemu.arg("-drive").arg(format!("file={},if=none,id=exfatdisk,format=raw", xd.display()));
+        if pci {
+            qemu.args(["-device", "virtio-blk-pci,drive=exfatdisk,disable-modern=on"]);
+        } else {
+            qemu.args(["-device", "virtio-blk-device,drive=exfatdisk"]);
+        }
+        eprintln!("  exFAT disk attached ({})", xd.display());
+    }
+    Ok(())
+}
+
 /// Resolve the GGUF for a `run` (not `image`): require the file unless the
 /// caller passed `--no-model`. Silent model-less boots after `-model e4b` are
 /// how users end up with "no model bundled -- chat unavailable".
@@ -2535,6 +2558,8 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
         qemu.args(["-device", "virtio-blk-device,drive=modeldisk"]);
         eprintln!("  model disk attached (chat.gguf; load with /model load chat.gguf)");
     }
+    // Opt-in exFAT raw image (CHITTI_EXFAT_DISK=<path>; the e2e exfat scenario).
+    attach_exfat_disk(&mut qemu, false)?;
     // Place the GGUF in guest RAM at the model's load address (where the aarch64
     // `cortex::model_module` looks) -- the equivalent of the x86 Limine boot
     // module, so `infer` works natively. `--no-model` skips it (e.g. to prove
@@ -3515,6 +3540,8 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.args(["-device", "virtio-blk-pci,drive=modeldisk,disable-modern=on"]);
         eprintln!("  model disk attached (chat.gguf; load with /model load chat.gguf)");
     }
+    // Opt-in exFAT raw image (CHITTI_EXFAT_DISK=<path>; the e2e exfat scenario).
+    attach_exfat_disk(&mut cmd, true)?;
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);

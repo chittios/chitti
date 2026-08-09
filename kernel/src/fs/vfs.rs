@@ -3,8 +3,8 @@
 //!
 //! ## Layout
 //! - **Synapse store** (`crate::synapse::fs`) — agent homes, configs, sessions.
-//! - **Mounted volumes** — FAT16/32 and ext2/3/4 with optional **RW**; NTFS is
-//!   detected and mountable **read-only** (list + read files).
+//! - **Mounted volumes** — FAT16/32, exFAT and ext2/3/4 with optional **RW**;
+//!   NTFS is detected and mountable **read-only** (list + read files).
 //!
 //! Callers use [`read`] / [`write`] / [`readdir`] / [`mkdir`] / [`unlink`] rather
 //! than opening `ext4_*` / `fat_*` directly.
@@ -73,11 +73,24 @@ pub fn stat(path: &str) -> Result<FileStat, VfsError> {
     if super::host::is_host(&mt) {
         return super::host::stat(if rel.is_empty() { "/" } else { &rel });
     }
-    if !mt.writable || !matches!(mt.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4) {
+    if !mt.writable || !matches!(mt.fs, FsType::Ext2 | FsType::Ext3 | FsType::Ext4 | FsType::ExFat) {
         return Err(VfsError::Unsupported);
     }
     let mut dev = crate::block::probe_disk_nth(mt.disk).ok_or(VfsError::Io)?;
     let mut part = crate::block::Partition::new(&mut dev, mt.start_lba, mt.sectors);
+    if matches!(mt.fs, FsType::ExFat) {
+        let mut vol = crate::block::exfat_rw::ExfatRw::open(&mut part, false).map_err(|_| VfsError::Io)?;
+        let rel = if rel.is_empty() { "/" } else { rel.as_str() };
+        let s = vol.stat(rel).map_err(|_| VfsError::NotFound)?;
+        return Ok(FileStat {
+            mode: s.mode,
+            uid: 0,
+            size: s.size,
+            mtime: s.mtime,
+            ctime: s.mtime,
+            is_dir: s.is_dir,
+        });
+    }
     let mut vol = crate::block::ext4_rw::Ext4Rw::open(&mut part).map_err(|_| VfsError::Io)?;
     let rel = if rel.is_empty() { "/" } else { rel.as_str() };
     let s = vol.stat(rel).map_err(|_| VfsError::NotFound)?;
@@ -188,7 +201,15 @@ fn read_on_volume(mt: &MountEntry, rel: &str) -> Result<Vec<u8>, VfsError> {
                 .ok_or(VfsError::Unsupported)?;
             vol.read_file(rel).ok_or(VfsError::NotFound)
         }
-        FsType::ExFat => Err(VfsError::Unsupported),
+        FsType::ExFat => {
+            let mut vol = crate::block::exfat_rw::ExfatRw::open(&mut part, false)
+                .map_err(|_| VfsError::Unsupported)?;
+            vol.read(rel).map_err(|e| match e {
+                crate::block::exfat_rw::ExfatError::NotFound => VfsError::NotFound,
+                crate::block::exfat_rw::ExfatError::NotAFile => VfsError::NotAFile,
+                _ => VfsError::Io,
+            })
+        }
         _ => Err(VfsError::Unsupported),
     }
 }
@@ -239,7 +260,17 @@ pub fn write(path: &str, data: &[u8]) -> Result<(), VfsError> {
             let mut vol = crate::block::ext4_rw::Ext4Rw::open(&mut part).map_err(|_| VfsError::Io)?;
             vol.write(&rel, data).map_err(|_| VfsError::Io)
         }
-        FsType::Ntfs | FsType::ExFat => Err(VfsError::Unsupported), // NTFS write not implemented
+        FsType::ExFat => {
+            let mut vol = crate::block::exfat_rw::ExfatRw::open(&mut part, true)
+                .map_err(|_| VfsError::Io)?;
+            vol.write(&rel, data).map_err(|e| match e {
+                crate::block::exfat_rw::ExfatError::BadName => VfsError::Unsupported,
+                crate::block::exfat_rw::ExfatError::Full => VfsError::Io,
+                crate::block::exfat_rw::ExfatError::NotAFile => VfsError::NotAFile,
+                _ => VfsError::Io,
+            })
+        }
+        FsType::Ntfs => Err(VfsError::Unsupported), // NTFS write not implemented
         _ => Err(VfsError::Unsupported),
     }
 }
@@ -288,6 +319,15 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
             let mut vol = crate::block::ext4_rw::Ext4Rw::open(&mut part).map_err(|_| VfsError::Io)?;
             vol.mkdir(&rel).map_err(|_| VfsError::Io)
         }
+        FsType::ExFat => {
+            let mut vol = crate::block::exfat_rw::ExfatRw::open(&mut part, true).map_err(|_| VfsError::Io)?;
+            vol.mkdir(&rel).map_err(|e| match e {
+                crate::block::exfat_rw::ExfatError::Exists => VfsError::NotAFile, // already there
+                crate::block::exfat_rw::ExfatError::BadName => VfsError::Unsupported,
+                crate::block::exfat_rw::ExfatError::NotADir => VfsError::NotADir,
+                _ => VfsError::Io,
+            })
+        }
         _ => Err(VfsError::Unsupported),
     }
 }
@@ -325,6 +365,14 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
         FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
             let mut vol = crate::block::ext4_rw::Ext4Rw::open(&mut part).map_err(|_| VfsError::Io)?;
             vol.unlink(&rel).map_err(|_| VfsError::NotFound)
+        }
+        FsType::ExFat => {
+            let mut vol = crate::block::exfat_rw::ExfatRw::open(&mut part, true).map_err(|_| VfsError::Io)?;
+            vol.unlink(&rel).map_err(|e| match e {
+                crate::block::exfat_rw::ExfatError::NotFound => VfsError::NotFound,
+                crate::block::exfat_rw::ExfatError::NotAFile => VfsError::NotAFile,
+                _ => VfsError::Io,
+            })
         }
         _ => Err(VfsError::Unsupported),
     }
@@ -426,6 +474,24 @@ fn readdir_on_volume(mt: &MountEntry, rel: &str) -> Result<Vec<DirEntry>, VfsErr
                 .ok_or(VfsError::Unsupported)?;
             let rel = if rel == "/" { "" } else { rel };
             let ents = vol.readdir(rel).ok_or(VfsError::NotFound)?;
+            Ok(ents
+                .into_iter()
+                .map(|(name, size, is_dir)| DirEntry {
+                    name,
+                    is_dir,
+                    size,
+                })
+                .collect())
+        }
+        FsType::ExFat => {
+            let mut vol = crate::block::exfat_rw::ExfatRw::open(&mut part, false)
+                .map_err(|_| VfsError::Unsupported)?;
+            let rel = if rel == "/" { "" } else { rel };
+            let ents = vol.readdir(rel).map_err(|e| match e {
+                crate::block::exfat_rw::ExfatError::NotFound => VfsError::NotFound,
+                crate::block::exfat_rw::ExfatError::NotADir => VfsError::NotADir,
+                _ => VfsError::Io,
+            })?;
             Ok(ents
                 .into_iter()
                 .map(|(name, size, is_dir)| DirEntry {

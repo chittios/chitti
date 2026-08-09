@@ -730,7 +730,7 @@ real UEFI hardware.
 
 The mechanism this paper describes --- registry, grammar, executor, capability
 table and scope ledger, path normalization, provenance, object store, audit ---
-is \textbf{3{,}591 lines excluding its own tests}, against the $\sim$222{,}000
+is \textbf{3{,}813 lines excluding its own tests}, against the $\sim$222{,}000
 above. We report the non-test figure deliberately: it is the
 code that has to be right for the argument to hold, so counting the tests
 alongside it (which would give 3{,}240) inflates the number that matters
@@ -790,7 +790,7 @@ the ``Model'' slot on a model-loaded boot.}
 \paragraph{Testing posture.} Two layers, and the split reflects the
 determinism boundary itself. Pure logic --- grammar, provenance algebra,
 capability and scope arithmetic, path normalization, registry invariants --- is
-covered by 1{,}747 in-kernel unit tests that run without a model or hardware (1{,}997 are declared; the difference is aarch64-gated and does not run in the x86 suite).
+covered by 2{,}393 in-kernel unit tests that run without a model or hardware (2{,}413 are declared; the difference is aarch64-gated and does not run in the x86 suite).
 Anything that exists only on a running system is covered by an end-to-end
 harness that boots the real kernel under QEMU and drives the shell over
 serial. The gate logic is in the first category by construction, which is a
@@ -1634,7 +1634,7 @@ by the script in the artifact's \code{README} so the figure is reproducible
 rather than asserted; tests counted as \code{\#[test\_case]} attributes in the
 same files.
 
-\textbf{Result} (Table~\ref{tab:e5}). The enforcement path is 3{,}591 mechanism
+\textbf{Result} (Table~\ref{tab:e5}). The enforcement path is 3{,}813 mechanism
 lines against $\sim$222{,}000 for the OS around it. Two things in the table are worth
 more than the total.
 
@@ -1683,7 +1683,7 @@ Executor + primitive registry & 1{,}055 & 6 \\
 Audit log & 336 & 5 \\
 Object store & 574 & 4 \\
 \midrule
-\textbf{Total} & \textbf{3{,}591} & \textbf{52} \\
+\textbf{Total} & \textbf{3{,}813} & \textbf{52} \\
 \bottomrule
 \end{tabular}
 \caption{E5: the enforcement path, per component, excluding each file's own
@@ -2161,7 +2161,7 @@ decision. What remains, honestly, is that a fooled agent can still produce a
 fooled answer within its authority; we constrain power, not judgment.
 
 The design is running, dual-architecture, on real hardware, with the model
-inside the kernel and 3{,}591 lines of mechanism between it and every effect in
+inside the kernel and 3{,}813 lines of mechanism between it and every effect in
 the system. It costs 1.05\,$\mu$s per decision --- nothing, against a 43\,ms
 inference step --- and it refuses every attack in our corpus while the same
 corpus walks through the configurations that omit provenance or attenuation.

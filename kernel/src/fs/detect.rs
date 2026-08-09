@@ -78,6 +78,24 @@ fn trim_label(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// Decode a UTF-16 label (surrogate pairs handled) into a `String`.
+fn utf16_to_string(units: &[u16]) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xd800..=0xdbff).contains(&u) && i + 1 < units.len() && (0xdc00..=0xdfff).contains(&units[i + 1]) {
+            let cp = 0x1_0000 + (((u as u32) - 0xd800) << 10) + ((units[i + 1] as u32) - 0xdc00);
+            s.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+            i += 2;
+        } else {
+            s.push(char::from_u32(u as u32).unwrap_or('\u{fffd}'));
+            i += 1;
+        }
+    }
+    s
+}
+
 /// Probe a whole disk: parse GPT or MBR (or treat as a "super-floppy" with a
 /// filesystem directly at LBA 0), and classify each volume. Returns the list of
 /// detected volumes (may be empty).
@@ -95,6 +113,20 @@ pub fn probe<D: BlockDevice>(dev: &mut D) -> Vec<Volume> {
         if !out.is_empty() {
             return out;
         }
+    }
+
+    // A filesystem at LBA 0 (a "super-floppy") before the MBR interpretation.
+    // FAT/exFAT/NTFS boot sectors all carry the 0x55AA signature that also
+    // marks an MBR, so an MBR check here would misread a filesystem's boot
+    // code as partition entries: `newfs_exfat` fills bytes 446-509 with 0xF4,
+    // which classifies as an MBR with a garbage first partition and the volume
+    // comes out Unknown. Only the absence of any known filesystem at LBA 0
+    // lets the bytes be read as an MBR.
+    let total = dev.block_count();
+    let super_floppy = classify(dev, 0, total);
+    if super_floppy.fs != FsType::Unknown {
+        out.push(super_floppy);
+        return out;
     }
 
     // MBR partition table? (0x55AA signature + non-empty entries at 0x1BE.)
@@ -117,8 +149,7 @@ pub fn probe<D: BlockDevice>(dev: &mut D) -> Vec<Volume> {
 
     // No partition table: a filesystem may live directly on the device
     // (super-floppy, common on USB sticks). Classify LBA 0 as one volume.
-    let total = dev.block_count();
-    out.push(classify(dev, 0, total));
+    out.push(super_floppy);
     out
 }
 
@@ -168,6 +199,37 @@ fn classify<D: BlockDevice>(dev: &mut D, start_lba: u64, sectors: u64) -> Volume
     // exFAT / NTFS: OEM name at offset 3.
     if &b0[3..11] == b"EXFAT   " {
         vol.fs = FsType::ExFat;
+        // The label lives in a 0x83 volume-label entry in the root directory
+        // (its first cluster's first sector), not in the boot sector — two
+        // extra reads, so worth doing here where `/disks` lists labels.
+        let spc_bits = b0[109] as u64;
+        if spc_bits <= 12 {
+            let clu_offset = le32(&b0, 88) as u64;
+            let root_cluster = le32(&b0, 96) as u64;
+            if root_cluster >= 2 {
+                let spc = 1u64 << spc_bits;
+                let root_sec = start_lba + clu_offset + (root_cluster - 2) * spc;
+                let mut r = [0u8; BLOCK_SIZE];
+                if dev.read_block(root_sec, &mut r).is_ok() {
+                    // The label is normally the first root entry.
+                    for e in 0..16 {
+                        let o = e * 32;
+                        if r[o] == 0x00 {
+                            break;
+                        }
+                        if r[o] == 0x83 {
+                            let n = (r[o + 1] as usize).min(11);
+                            let mut units = alloc::vec![0u16; n];
+                            for (k, u) in units.iter_mut().enumerate() {
+                                *u = le16(&r, o + 2 + k * 2);
+                            }
+                            vol.label = Some(utf16_to_string(&units));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         return vol;
     }
     if &b0[3..11] == b"NTFS    " {
@@ -215,4 +277,50 @@ fn classify<D: BlockDevice>(dev: &mut D, start_lba: u64, sectors: u64) -> Volume
     }
 
     vol
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::ramdisk::RamDisk;
+
+    #[test_case]
+    fn an_exfat_super_floppy_beats_the_mbr_reading_of_its_boot_code() {
+        // `newfs_exfat` fills the boot-code region (bytes 446+, which overlap
+        // the MBR partition-entry area) with 0xF4. With the MBR check first,
+        // that reads as an MBR whose first partition is garbage and the volume
+        // comes out Unknown; the filesystem at LBA 0 must win over the MBR
+        // interpretation. Found by the e2e interop test against a real
+        // macOS-formatted volume.
+        let mut disk = RamDisk::new(16384);
+        crate::block::exfat_rw::format(&mut disk, "TEST").expect("format");
+        let mut sec = [0u8; BLOCK_SIZE];
+        disk.read_block(0, &mut sec).unwrap();
+        sec[446..510].fill(0xf4); // a real formatter's boot code
+        disk.write_block(0, &sec).unwrap();
+        let vols = probe(&mut disk);
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].fs, FsType::ExFat);
+        assert_eq!(vols[0].start_lba, 0);
+        assert_eq!(vols[0].label.as_deref(), Some("TEST"));
+    }
+
+    #[test_case]
+    fn a_real_mbr_still_parses_its_partitions() {
+        // The super-floppy-first order must not swallow a genuine MBR disk:
+        // LBA 0 is not a known filesystem, so the MBR interpretation applies.
+        let mut disk = RamDisk::new(4096);
+        let mut mbr = [0u8; BLOCK_SIZE];
+        mbr[510] = 0x55;
+        mbr[511] = 0xaa;
+        // Entry 0: type FAT32 (0x0b), start 64, count 100.
+        mbr[0x1be + 4] = 0x0b;
+        mbr[0x1be + 8..0x1be + 12].copy_from_slice(&64u32.to_le_bytes());
+        mbr[0x1be + 12..0x1be + 16].copy_from_slice(&100u32.to_le_bytes());
+        disk.write_block(0, &mbr).unwrap();
+        let vols = probe(&mut disk);
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].start_lba, 64);
+        assert_eq!(vols[0].sectors, 100);
+    }
 }

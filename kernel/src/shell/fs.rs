@@ -40,7 +40,7 @@ pub(super) fn disk_mount(arg: &str) {
     let Some(disk) = disk else {
         serial_println!(
             "mount> usage: /mount <disk> [vol] [/path] [rw|ro]\n\
-             mount> FAT/ext default rw; NTFS mounts read-only (writer not implemented)"
+             mount> FAT/ext/exFAT default rw; NTFS mounts read-only"
         );
         return;
     };
@@ -73,7 +73,7 @@ pub(super) fn disk_mount(arg: &str) {
         }
         Err(crate::fs::mount::MountError::Unsupported) => {
             serial_println!(
-                "mount> unsupported filesystem (FAT/ext: rw; NTFS: ro list+read; exFAT: detect only)"
+                "mount> unsupported filesystem (FAT/ext/exFAT: rw; NTFS: ro list+read)"
             );
         }
         Err(e) => serial_println!("mount> failed: {e:?}"),

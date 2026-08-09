@@ -1767,8 +1767,12 @@ FDT claims a GICv3 but carries no readable `reg`.
     Probing only ever **reads**; the first writes are behind `/vbox up`, gated
     exactly as `/wifi up` is.
 
-- **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4 detection,
-  ext4 (the default filesystem) + FAT, `/install` (self-hosting install to a
+- **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4/exFAT
+  detection, ext4 (the default filesystem) + FAT + **exFAT**
+  (`block/exfat_rw`: full read/write — format, create/replace/unlink/mkdir;
+  names are ASCII-only on write, full UTF-16 on read; allocation tracks the FAT
+  **and** the allocation bitmap, the exFAT analogue of "write every FAT copy"),
+  `/install` (self-hosting install to a
   disk; detects an existing Chitti GPT and **updates in place**, preserving the
   data partition — destructive actions confirm via the permission modal),
   durable agent state on ext4. **Every disk is enumerated, across controllers and

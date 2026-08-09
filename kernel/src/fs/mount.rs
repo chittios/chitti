@@ -117,15 +117,15 @@ pub fn mount(
     // FS types we can open at all.
     let can_rw = matches!(
         v.fs,
-        FsType::Fat16 | FsType::Fat32 | FsType::Ext2 | FsType::Ext3 | FsType::Ext4
+        FsType::Fat16 | FsType::Fat32 | FsType::Ext2 | FsType::Ext3 | FsType::Ext4 | FsType::ExFat
     );
-    let can_ro = can_rw || matches!(v.fs, FsType::Ntfs | FsType::ExFat);
+    let can_ro = can_rw || matches!(v.fs, FsType::Ntfs);
     if !can_ro {
         return Err(MountError::Unsupported);
     }
-    // NTFS/exFAT: mount allowed but never writable until a writer exists.
+    // NTFS: mount allowed but never writable until a writer exists.
     let wanted_rw = writable;
-    let writable = writable && can_rw && !matches!(v.fs, FsType::Ntfs | FsType::ExFat);
+    let writable = writable && can_rw && v.fs != FsType::Ntfs;
     let entry = MountEntry {
         path: path.clone(),
         disk,
@@ -145,7 +145,7 @@ pub fn mount(
         entry.sectors * 512 / 1024 / 1024,
         entry.writable
     ));
-    if wanted_rw && !writable && matches!(v.fs, FsType::Ntfs | FsType::ExFat) {
+    if wanted_rw && !writable && matches!(v.fs, FsType::Ntfs) {
         crate::ktrace::log_fmt(format_args!(
             "fs.mount: {} is {}; writes not implemented — mounted read-only",
             entry.fs.name(),

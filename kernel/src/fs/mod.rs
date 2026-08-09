@@ -11,6 +11,8 @@
 //! On-disk formats on **internal and external** disks (USB MSC included):
 //! - **FAT16/32** — full RW (create/write/unlink/mkdir; 8.3 create names)
 //! - **ext2/3/4** — full RW via [`crate::block::ext4_rw`] (journal when safe)
+//! - **exFAT** — full RW via [`crate::block::exfat_rw`] (ASCII names on write,
+//!   full UTF-16 names on read)
 //! - **NTFS** — detect + mount **read-only** (writer not implemented)
 //!
 //! Agent durable state still goes through `synapse::fs` (ext4-backed store).

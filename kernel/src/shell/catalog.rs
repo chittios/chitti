@@ -163,6 +163,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Storage", title: "Unmount", name: "umount", shortcut: "" },
     Entry { category: "Storage", title: "Install Chitti", name: "install", shortcut: "" },
     Entry { category: "Storage", title: "Format ext4", name: "mkext4", shortcut: "" },
+    Entry { category: "Storage", title: "Format exFAT", name: "mkexfat", shortcut: "" },
     // Network
     Entry { category: "Network", title: "Network Status", name: "network", shortcut: "" },
     Entry { category: "Network", title: "Ping Host", name: "ping", shortcut: "" },

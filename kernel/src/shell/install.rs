@@ -566,6 +566,56 @@ pub(super) fn disk_mkext4(arg: &str) {
     }
 }
 
+pub(super) fn disk_mkexfat(arg: &str) {
+    use crate::block::exfat_rw;
+    // `/mkexfat [<disk>] [yes|empty]` — the disk index defaults to 0 (the
+    // first block device, matching /mkext4); an explicit index lets a script
+    // format a *specific* attached disk (the e2e harness formats its own).
+    let mut words = arg.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let mut disk = 0usize;
+    let mut confirm = first;
+    if let Ok(n) = first.parse::<usize>() {
+        disk = n;
+        confirm = words.next().unwrap_or("");
+    }
+    // Destructive: confirmed via the permission modal ('yes'/'empty' inline
+    // still accepted as a scripted pre-confirmation).
+    if confirm != "yes" && confirm != "empty" {
+        let ok = crate::modal::confirm(
+            "Format disk as exFAT \u{2014} confirm?",
+            "This ERASES the whole disk and formats it exFAT. Proceed?",
+        );
+        if !ok {
+            serial_println!("mkexfat> aborted (not confirmed; scripted: /mkexfat yes | empty)");
+            return;
+        }
+    }
+    let Some(mut dev) = crate::block::probe_disk_nth(disk) else {
+        serial_println!("mkexfat> no block device at disk {disk}");
+        return;
+    };
+    // `empty` = no files written; otherwise write a hello + a larger file as a
+    // formatter smoke test, mirroring /mkext4.
+    let label = if confirm == "empty" { "" } else { "CHITTI" };
+    match exfat_rw::format(&mut dev, label) {
+        Ok(()) => {
+            serial_println!("mkexfat> formatted disk {disk} exFAT (label {:?}).", if label.is_empty() { "none" } else { label });
+            if confirm != "empty" {
+                let big: alloc::vec::Vec<u8> = (0..200_000u32).map(|i| ((i.wrapping_mul(7)) & 0xff) as u8).collect();
+                match exfat_rw::ExfatRw::open(&mut dev, true).and_then(|mut vol| {
+                    vol.write("hello.txt", b"hello from Chitti's exFAT writer\n")?;
+                    vol.write("big.bin", &big)
+                }) {
+                    Ok(()) => serial_println!("mkexfat> wrote hello.txt + big.bin (200000 B)."),
+                    Err(e) => serial_println!("mkexfat> format ok, smoke-test write failed: {:?}", e),
+                }
+            }
+        }
+        Err(e) => serial_println!("mkexfat> format failed: {:?}", e),
+    }
+}
+
 pub(super) fn disk_ext4read() {
     use crate::block::ext4_read::Ext4Reader;
     let Some(mut dev) = crate::block::probe_disk() else {

@@ -38,7 +38,8 @@ def _repo_root():
 
 class Guest:
     def __init__(self, arch="aarch64", model="qwen3.5-0.8b", verbose=False, audio="off", hostfwd=None,
-                 no_model=False, model_disk=None, release=False, disk=None, smp=None, share=None):
+                 no_model=False, model_disk=None, release=False, disk=None, smp=None, share=None,
+                 exfat_disk=None):
         self.verbose = verbose
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -97,6 +98,11 @@ class Guest:
             env["CHITTI_SHARE"] = str(share)
         if model_disk:
             env["CHITTI_MODEL_DISK"] = str(model_disk)
+        # Opt-in pre-built exFAT raw image (CHITTI_EXFAT_DISK; the exfat
+        # scenario). Like model_disk, it is a separate virtio-blk device —
+        # never the boot store — so the guest stays fast to boot.
+        if exfat_disk:
+            env["CHITTI_EXFAT_DISK"] = str(exfat_disk)
         if no_model:
             env["CHITTI_VOICE_DISK"] = "off"
         cmd = ["cargo", "xtask", "run", "-arch", arch, "-model", model]
