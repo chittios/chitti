@@ -243,6 +243,34 @@ pub fn is_up() -> bool {
     SND.with(|s| s.is_some())
 }
 
+/// Re-establish the sound device after a suspend.
+///
+/// Every backend here is **polled and stateful in the controller** — HDA's
+/// CORB/RIRB rings, the codec's widget power state and amp settings, virtio's
+/// negotiated queues. S3 resets all of it, so the retained handle keeps
+/// answering and simply never produces sound again: not an error, just silence,
+/// which is the hardest kind of resume failure to attribute.
+///
+/// So the device is dropped and re-probed from scratch rather than poked back
+/// into life. Re-probing is what every one of these drivers already does
+/// correctly at boot, and reusing that path is far safer than a second,
+/// resume-only bring-up sequence that nothing exercises.
+///
+/// **This leaks the previous instance's DMA pages** (the frame allocator has no
+/// free path for them). That is bounded — a few hundred KiB per resume — and is
+/// the honest trade against a silent audio device; a machine suspended enough
+/// times for it to matter has other problems.
+pub fn resume() {
+    let had = is_up();
+    SND.with(|s| *s = None);
+    autodetect();
+    crate::ktrace::log_fmt(format_args!(
+        "sound: resume re-probe {} (was {})",
+        if is_up() { "found a device" } else { "found nothing" },
+        if had { "up" } else { "down" }
+    ));
+}
+
 /// Discover and bring up the first available sound device: virtio-snd over
 /// mmio (aarch64 QEMU `-kernel`), virtio-snd over PCI (QEMU), then **Intel
 /// HDA** — VirtualBox (x86 + ARM) and real machines. No-op if none is present.

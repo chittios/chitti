@@ -21,6 +21,29 @@ pub fn init_global() -> bool {
     false
 }
 
+/// Re-initialise the controller after a suspend and re-enumerate its devices.
+///
+/// S3 resets the xHC: the DCBAA pointer, the command and event rings, every
+/// device slot and every endpoint context are gone. The retained `Xhci` keeps
+/// polling a halted controller and simply never reports another key — so a
+/// resumed laptop with a USB keyboard looks hung rather than broken, which is
+/// the same symptom as a failed resume and the reason this is worth doing
+/// before anything else on the resume path.
+///
+/// Re-probing from scratch reuses the boot path, which is the one bring-up
+/// sequence that is actually exercised. It **leaks the old instance's DMA**
+/// (rings, contexts, bounce buffers — the frame allocator has no free path);
+/// bounded per resume, and the alternative is a machine with no input.
+pub fn resume() -> bool {
+    XHCI.with(|s| *s = None);
+    let ok = init_global();
+    crate::ktrace::log_fmt(format_args!(
+        "xhci: resume re-init {}",
+        if ok { "ok -- devices re-enumerated" } else { "found no controller or no HID" }
+    ));
+    ok
+}
+
 /// Whether a USB HID keyboard was enumerated.
 pub fn has_keyboard() -> bool {
     XHCI.with(|s| s.as_ref().map(|x| x.has_keyboard()).unwrap_or(false))

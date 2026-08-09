@@ -474,6 +474,12 @@ pub(super) fn run_suspend(arg: &str) {
         None => serial_println!("suspend> this machine cannot suspend"),
     }
     if planning {
+        // Say what comes back and what does not, because the one thing a human
+        // needs to decide here is whether losing it is acceptable — and finding
+        // out after the machine has resumed is too late.
+        serial_println!("suspend> on resume: xHCI, the NIC and the sound device are re-probed;");
+        serial_println!("suspend>            disks re-probe on first access; the IP address is NOT");
+        serial_println!("suspend>            re-asserted -- run `/network dhcp` afterwards");
         serial_println!("suspend> `/suspend now` to actually suspend (`--yes` skips the prompt)");
         return;
     }

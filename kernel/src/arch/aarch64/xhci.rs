@@ -139,6 +139,27 @@ fn aa_alloc_apple(bytes: usize) -> Option<(u64, usize)> {
     })
 }
 
+/// Re-initialise every controller after a suspend and re-enumerate.
+///
+/// PSCI `SYSTEM_SUSPEND` resets the xHC exactly as S3 does on x86: the DCBAA,
+/// the command and event rings and every device slot are gone, and the retained
+/// instance goes on polling a halted controller without ever reporting another
+/// key. See the x86 twin for why this re-probes rather than patching state, and
+/// for the bounded DMA leak it accepts.
+///
+/// Note this clears **all** controllers (aarch64 keeps a list, unlike x86's
+/// single slot) before re-probing, so a machine with two xHCs does not end up
+/// with stale entries alongside fresh ones.
+pub fn resume() -> bool {
+    XHCI.with(|s| s.clear());
+    let ok = init_global();
+    crate::ktrace::log_fmt(format_args!(
+        "xhci: resume re-init {}",
+        if ok { "ok -- devices re-enumerated" } else { "found no controller or no HID" }
+    ));
+    ok
+}
+
 /// Probe + bring up the xHCI controller and enumerate HID keyboard + pointer.
 /// No-op if there is no PCIe bus (virtio-mmio-only QEMU) or no xHCI controller.
 /// Returns true when **at least one** of keyboard / mouse came up (boot

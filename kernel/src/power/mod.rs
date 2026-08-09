@@ -337,10 +337,19 @@ fn enter() -> Result<(), String> {
 /// broad re-probe would be slower *and* riskier — resume is not a good moment to
 /// discover a driver's init path is not idempotent.
 ///
-/// What is **not** restored yet is honestly incomplete: the NIC, xHCI, AHCI/NVMe and the
-/// sound device all lose their controller state, and a follow-up gives each driver a
-/// `resume` of its own. Until then a resumed machine has a working console and scheduler
-/// but may need `/network dhcp` to get back on the network.
+/// Beyond the arch-specific interrupt and input plumbing below, the polled
+/// subsystems that keep controller state across the transition are re-probed:
+/// **xHCI** (a resumed machine with a USB keyboard otherwise looks hung, not
+/// broken), the **NIC**, and the **sound device**. Block devices need nothing —
+/// `block::probe_disk_nth` re-probes on every call, so a disk re-establishes
+/// itself the first time anything reads.
+///
+/// Each of those re-probes rather than patching its registers back, because the
+/// boot bring-up is the one sequence that is actually exercised; each leaks its
+/// previous instance's DMA pages, which is bounded per resume and is the stated
+/// trade against a device that answers and never works. The NIC additionally
+/// comes back **unaddressed** — a pre-suspend DHCP lease is not re-asserted, so
+/// `/network dhcp` is still needed.
 fn resume_devices() {
     // aarch64 needs much less: the resume stub already put back the MMU registers, the
     // exception vectors and FP/SIMD, because nothing compiled can run without them. What
@@ -380,6 +389,17 @@ fn resume_devices() {
         x86_64::interrupts::enable();
         crate::ktrace::log("resume", "APIC timer, i8042 and interrupts re-armed");
     }
+
+    // The polled subsystems that hold controller state across the transition.
+    // Order matters only in that xHCI comes first: it is the one whose absence
+    // makes the machine look dead rather than degraded, so it should be back
+    // before anything below can fail and skip it.
+    #[cfg(target_arch = "x86_64")]
+    let _ = crate::arch::x86_64::xhci::resume();
+    #[cfg(target_arch = "aarch64")]
+    let _ = crate::arch::aarch64::xhci::resume();
+    crate::net::resume();
+    crate::sound::resume();
 
     // Re-authenticate, **last**: the gate needs a working console, and on x86 the
     // i8042 was only just re-initialised a few lines above (it comes back with its

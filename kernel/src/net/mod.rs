@@ -276,6 +276,31 @@ fn ipv6_link_local_eui64(mac: [u8; 6]) -> Ipv6Address {
 }
 
 /// True once a NIC has been brought up.
+/// Re-establish the network interface after a suspend.
+///
+/// The NIC loses its ring base addresses, its receive descriptors and its link
+/// state across S3, and every driver here is polled — so the retained interface
+/// keeps being polled, never receives a frame, and reports no error at all.
+///
+/// **This drops the IP configuration with it**, because the interface is rebuilt
+/// from scratch: a DHCP lease taken before the suspend is not re-asserted, and
+/// the caller has to re-acquire it. That is stated rather than papered over —
+/// silently keeping an address the network may have reassigned is worse than
+/// coming back unconfigured and saying so.
+pub fn resume() {
+    let had = is_up();
+    NET.with(|n| *n = None);
+    autodetect();
+    if is_up() {
+        crate::ktrace::log("net", "resume re-probe ok -- address must be re-acquired (/network dhcp)");
+    } else {
+        crate::ktrace::log_fmt(format_args!(
+            "net: resume re-probe found no NIC (was {})",
+            if had { "up" } else { "down" }
+        ));
+    }
+}
+
 pub fn is_up() -> bool {
     NET.with(|n| n.is_some())
 }
