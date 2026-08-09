@@ -197,13 +197,16 @@ firmware's SATA/NVMe mode to **AHCI**; there is no driver-side fix today.
 **SD/eMMC works**, so tablets, Chromebook-class machines and SBCs now have a
 disk. Exercise it with `CHITTI_DISK_IF=sd cargo xtask run -arch x86_64`. Only
 SDHCI-over-PCI is discovered; the memory-mapped SDHCI on many ARM SBCs comes
-from the device tree and is not wired up.
+from the device tree and is not wired up. **SDXC cards, which default to exFAT,
+mount read + write** (see [Filesystems](#filesystems)).
 
 ### USB external disks — ✅ with limits
 
 - LUN 0 only, and `probe_nth(0)` — **one** mass-storage device at a time.
 - 512-byte logical blocks only; a 4Kn drive is refused rather than mis-read.
 - No bulk-stall recovery: a stalled endpoint fails closed on the CSW.
+- ✅ **exFAT read + write** — the default filesystem on large sticks, so the
+  drive a dock usually holds just works (see [Filesystems](#filesystems)).
 - ✅ **USB hubs are enumerated to the full 5 tiers USB allows**, so a drive
   behind a dock behind a monitor's built-in hub is reached. A position the xHCI
   route string cannot express is refused and logged rather than truncated into
@@ -221,6 +224,36 @@ from the device tree and is not wired up.
 | 9P (host shared folder) | ✅ |
 | C4VE encrypted volumes | ✅ |
 | btrfs, XFS, APFS | ❌ |
+
+**exFAT is full read + write** — `block/exfat_rw` (format, create/replace,
+unlink/mkdir, readdir, stat) plus `/mkexfat` to format a disk from the shell.
+It is the format a large USB stick or an SDXC card is usually wearing, and it
+is verified against an **independent implementation**, not just itself: the e2e
+mounts a volume formatted by macOS's `newfs_exfat` or Linux's `mkfs.exfat` on
+the real kernel, writes to it, remounts (persistence), and then runs
+`fsck_exfat` over the image — clean after our writes. Two findings from that
+interop, each load-bearing:
+
+- **The allocation bitmap is not decorative.** exFAT allocates by bitmap and
+  the FAT only records chains; every allocation and free updates **both**, or a
+  reader that allocates from the bitmap would overwrite our data. A volume
+  without a bitmap entry is refused entirely.
+- **Stream flags: bit 0 is AllocationPossible, and "contiguous" is exactly
+  `0x03`.** Writing `0x00` for a file with data made `fsck_exfat` report
+  "File has no stream allocation" on a volume that read back perfectly. The
+  writer emits `0x01` (FAT chain); the reader treats only `0x03`
+  (Linux's `ALLOC_NO_FAT_CHAIN`) as contiguous and everything else as a FAT
+  chain.
+
+The same e2e caught a **detection** bug that a real tool's volume was needed to
+expose: a super-floppy exFAT was misread as an MBR, because FAT/exFAT boot
+sectors share MBR's `0x55AA` signature and `newfs_exfat` fills the boot-code
+region (which overlaps the MBR partition-entry area) with `0xF4`. Detection now
+recognises a filesystem at LBA 0 *before* the MBR interpretation.
+
+Names are **ASCII-only on write** — a non-ASCII name's hash cannot be
+reproduced by a reader folding with the volume's up-case table — while reading
+lists full UTF-16 names.
 
 `/install` writes a fresh GPT (whole-disk) or `/install alongside` adds a loader
 to an existing ESP without touching the partition table. `/install plan` is
@@ -300,7 +333,7 @@ The radios are what is missing:
 
 | Radio | Status |
 |---|---|
-| Intel `iwlwifi` (AX200 and later) | ⚠️ **partial.** Bring-up, firmware load, the *alive* notification, the MAC, and now `SCAN_REQ_UMAC` v17, the RX MPDU descriptor, `ADD_STA`/`ADD_STA_KEY` and `PHY_CONTEXT_CMD` — all built from Linux's headers and **unverified against a radio**. ❌ Still cannot associate: `MAC_CONTEXT_CMD`, `BINDING_CONTEXT_CMD` and `TX_CMD` are missing. A firmware whose scan version is not implemented is **refused with the version named** rather than sent a guess. |
+| Intel `iwlwifi` (AX200 and later) | ⚠️ **every command an association needs is now written** — bring-up, firmware load, *alive*, the MAC, `SCAN_REQ_UMAC` v17, the RX MPDU descriptor, PHY/MAC/binding contexts, `ADD_STA`, `ADD_STA_KEY` and `TX_CMD`. All from Linux's headers and **none of it verified against a radio**; nothing has driven the sequence end to end. A firmware whose scan version is not implemented is refused with the version named rather than sent a guess. |
 | Broadcom FullMAC (Apple Silicon) | ⚠️ blocked — BAR2/TCM reads take an external abort |
 | Realtek RTL8852 / RTL8821 | ❌ |
 | MediaTek MT7921 / MT7922 | ❌ |
