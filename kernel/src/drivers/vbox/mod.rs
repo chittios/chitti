@@ -58,8 +58,20 @@ pub const DEVICE: u16 = 0xcafe;
 pub const OFF_REQUEST: u64 = 0;
 pub const OFF_REQUEST_FAST: u64 = 8;
 
-/// `VMMDEV_VERSION` — the version every request header must carry.
+/// `VMMDEV_VERSION` — the **interface** version, reported inside
+/// `VBoxGuestInfo.interfaceVersion`. NOT what goes in a request header.
 pub const VMMDEV_VERSION: u32 = 0x0001_0004;
+
+/// `VMMDEV_REQUEST_HEADER_VERSION` — what `VMMDevRequestHeader.version` must
+/// be, and a **different constant** from [`VMMDEV_VERSION`].
+///
+/// Conflating the two is silent in the worst way. `vmmdevRequestHandler` checks
+/// this first and, on a mismatch, `return`s `VINF_SUCCESS` **without touching
+/// the request** — no `rc` is written, no log the guest can see. From the guest
+/// the write simply has no effect, which is indistinguishable from an
+/// unmapped register or a bad address, and is what sent this driver looking at
+/// the MMU and the physical address when the payload had never been read.
+pub const REQUEST_HEADER_VERSION: u32 = 0x0001_0001;
 
 /// `VMMDevRequestHeader`: `size, version, requestType, rc, reserved1,
 /// fRequestor` — six 32-bit fields, 24 bytes.
@@ -173,7 +185,7 @@ pub fn write_header(buf: &mut [u8], size: u32, req_type: u32) -> bool {
         return false;
     }
     buf[HDR_SIZE..HDR_SIZE + 4].copy_from_slice(&size.to_le_bytes());
-    buf[HDR_VERSION..HDR_VERSION + 4].copy_from_slice(&VMMDEV_VERSION.to_le_bytes());
+    buf[HDR_VERSION..HDR_VERSION + 4].copy_from_slice(&REQUEST_HEADER_VERSION.to_le_bytes());
     buf[HDR_TYPE..HDR_TYPE + 4].copy_from_slice(&req_type.to_le_bytes());
     // `rc` is an OUT field; the host overwrites it. Seeded with a value that
     // is not a success code so a request the host never touched cannot read as
@@ -296,6 +308,15 @@ fn submit(phys: u64) -> bool {
         ));
         return false;
     }
+    // **Order the request against the register write.** The request lives in
+    // Normal cacheable memory and the register is Device memory; without a
+    // barrier the CPU may still be holding those stores when the register write
+    // completes, so the host reads a stale — usually zeroed — header. It then
+    // fails its `size < sizeof(header)` check and `return`s **without writing
+    // rc**, which from the guest is indistinguishable from the register being
+    // wrong. Every virtio driver here does the same `dsb` before its doorbell,
+    // for exactly this reason.
+    crate::drivers::virtio::barrier();
     DEV.with(|d| {
         let Some(g) = d.as_ref() else {
             return false;
@@ -351,13 +372,18 @@ pub fn bring_up() -> Result<String, &'static str> {
     if !submit(phys) {
         return Err("the request register is unreachable");
     }
+    // The host wrote its answer into the same buffer while we were stopped in
+    // the register write; order that against reading it back.
+    crate::drivers::virtio::barrier();
     let rc = header_rc(buf);
     if rc == RC_UNSET {
         // The write reached the register but the host left `rc` alone, so it
         // never saw the request at all. A different fault from a refusal, and
         // pointing at the wrong one costs a debugging cycle.
         crate::ktrace::log("vbox", "ReportGuestInfo: the host did not process the request");
-        return Err("the host never processed the request (wrong register or address?)");
+        return Err(
+            "the host never processed the request (header version/size rejected before rc is written)",
+        );
     }
     if rc < 0 {
         crate::ktrace::log_fmt(format_args!("vbox: ReportGuestInfo rejected rc={rc}"));
@@ -374,7 +400,11 @@ pub fn bring_up() -> Result<String, &'static str> {
     if !submit(phys) {
         return Err("the request register is unreachable");
     }
+    crate::drivers::virtio::barrier();
     let rc = header_rc(buf);
+    if rc == RC_UNSET {
+        return Err("the host never processed the host-version request");
+    }
     if rc < 0 {
         return Err("the host would not report its version");
     }
@@ -504,7 +534,9 @@ mod tests {
         let mut buf = [0u8; 64];
         assert!(write_header(&mut buf, GUEST_INFO_LEN as u32, REQ_REPORT_GUEST_INFO));
         assert_eq!(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), 32);
-        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), VMMDEV_VERSION);
+        // The HEADER version, not the interface version — see
+        // `the_header_version_is_not_the_interface_version`.
+        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), REQUEST_HEADER_VERSION);
         assert_eq!(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]), REQ_REPORT_GUEST_INFO);
         // `rc` is seeded non-success, so a request the host never touched
         // cannot be read as having succeeded.
@@ -515,6 +547,28 @@ mod tests {
     /// away from what it will take.
     fn interface_version_is_ok(v: u32) -> bool {
         (v >> 16) == (VMMDEV_VERSION >> 16) && (v & 0xffff) <= (VMMDEV_VERSION & 0xffff)
+    }
+
+    #[test_case]
+    fn the_header_version_is_not_the_interface_version() {
+        // Two different constants, and mixing them up is silent: the host
+        // checks the header version FIRST and returns without touching the
+        // request at all — no rc, nothing. From the guest the write just has no
+        // effect, which reads as a bad register or a bad address, and is what
+        // sent this driver hunting through the MMU while the payload had never
+        // been read.
+        assert_eq!(REQUEST_HEADER_VERSION, 0x0001_0001);
+        assert_eq!(VMMDEV_VERSION, 0x0001_0004);
+        assert_ne!(REQUEST_HEADER_VERSION, VMMDEV_VERSION);
+
+        let mut buf = [0u8; 64];
+        assert!(write_header(&mut buf, GUEST_INFO_LEN as u32, REQ_REPORT_GUEST_INFO));
+        let v = u32::from_le_bytes(buf[HDR_VERSION..HDR_VERSION + 4].try_into().unwrap());
+        assert_eq!(v, REQUEST_HEADER_VERSION, "the header carries the HEADER version");
+        // And the size must be at least the header, or the host bails the same
+        // silent way.
+        let size = u32::from_le_bytes(buf[HDR_SIZE..HDR_SIZE + 4].try_into().unwrap()) as usize;
+        assert!(size >= REQ_HDR);
     }
 
     #[test_case]
@@ -627,6 +681,7 @@ fn submit_and_wait(phys: u64, buf: &[u8]) -> Result<(), &'static str> {
     if !submit(phys) {
         return Err("the request register is unreachable");
     }
+    crate::drivers::virtio::barrier();
     let rc = header_rc(buf);
     if rc == RC_UNSET {
         return Err("the host never processed the HGCM request");
@@ -637,7 +692,11 @@ fn submit_and_wait(phys: u64, buf: &[u8]) -> Result<(), &'static str> {
         return Err("the host rejected the HGCM request");
     }
     let mut spins = 0u64;
-    while !hgcm::is_done(buf) {
+    loop {
+        crate::drivers::virtio::barrier();
+        if hgcm::is_done(buf) {
+            break;
+        }
         spins += 1;
         if spins > HGCM_SPIN_LIMIT {
             return Err("the host never completed the HGCM call");
@@ -710,6 +769,10 @@ pub fn hgcm_post_message_wait(client: u32, function: u32, parms: &[hgcm::Parm]) 
 /// read of a flag word per UI pump.
 pub fn hgcm_take_message() -> Option<(u32, u32)> {
     let (_phys, buf) = msg_page();
+    // The host completes this one asynchronously, so the done flag and the
+    // parameters it published must be read after a barrier, not on the strength
+    // of a cached line.
+    crate::drivers::virtio::barrier();
     if !hgcm::is_done(buf) {
         return None;
     }
