@@ -159,19 +159,58 @@ fn latest_saved_session_id() -> Option<u64> {
     best
 }
 
+/// Apply everything that decides how the machine **looks**, and gate the
+/// console — both the moment the store holding them is readable.
+///
+/// Called from `main::run_os` immediately after `mount_persistent_store`, not
+/// from [`run`], and that placement is the whole point of this function.
+///
+/// **The theme.** `ui.json` lives on the store, so nothing can be themed before
+/// it mounts — but everything after it can be, and used to not be. The theme was
+/// applied at the top of `run`, which is the *last* thing boot does, so the
+/// entire boot log (drivers, network, the agent roster, bundled skills, the
+/// sample corpus, schedules) was drawn in the built-in palette at the default
+/// font scale and then recoloured and reflowed in one visible jump. Applying it
+/// here means the first line the machine ever prints is already in the user's
+/// theme, at the user's font scale.
+///
+/// **The gate.** Same reason, one step stronger: it now covers a desktop that
+/// has never shown any content. It used to sit near the end of `run`, after the
+/// banner, the mount line and the store-backend line had printed and the status
+/// bar was painted — so the machine showed you its disk, its size, whether its
+/// store was durable, and a live battery and clock, and only then asked who you
+/// were.
+///
+/// Order within: display geometry before the pane layout, because the desktop
+/// size determines every pane's cell grid and doing it after reflows twice.
+///
+/// No password enrolled means no gate, anywhere — which is also why the e2e
+/// harness needs no bypass flag: its guests run on a memfs store where nothing
+/// can ever have been enrolled.
+pub fn boot_appearance_and_gate() {
+    crate::clock::init();
+    crate::ui_config::load_and_apply();
+    // The bundled Noto script fonts, so Indic/emoji render glyphs not tofu.
+    crate::font_ttf::register_bundled_fallbacks();
+    #[cfg(all(not(feature = "server"), not(test)))]
+    {
+        load_display_config();
+        load_panes_config();
+    }
+    #[cfg(not(test))]
+    {
+        crate::auth::store::refresh();
+        if crate::auth::enrolled() {
+            crate::auth::prompt::gate(crate::auth::Reason::Boot);
+        }
+    }
+}
+
 pub fn run() -> ! {
     serial_println!("");
     serial_println!("Shell Agent. Type a message; the model replies (Ctrl+C to stop generating).");
     serial_println!("Commands start with '/': /help for the list.");
 
-    // Seed the wall clock (RTC or fallback), load the UI config from
-    // /configs/core/ui.json (applying pane layout + timezone), and paint the
-    // status bar once so the datetime is right immediately.
-    crate::clock::init();
-    crate::ui_config::load_and_apply();
-    // Register the bundled Noto script fonts as the system fallback chain so
-    // Indic/emoji web text renders real glyphs instead of tofu.
-    crate::font_ttf::register_bundled_fallbacks();
     if let Some(mt) = crate::fs::mount::auto_mount_data_root() {
         serial_println!(
             "Chitti: mounted / -> disk {} ({}, {} MiB, {}) [auto]",
@@ -197,41 +236,15 @@ pub fn run() -> ! {
     // allocator for many seconds, which would stall boot before the input loop.
     // Once loaded it joins the system fallback chain and is available OS-wide
     // (console/UI + browser), alongside the always-bundled Indic + emoji faces.
-    #[cfg(all(not(feature = "server"), not(test)))]
-    {
-        // Display first: the desktop size determines every pane's cell grid, so
-        // applying it after the pane layout would reflow everything twice.
-        load_display_config();
-        load_panes_config();
-    }
+    //
+    // Paint the status bar once here, after the gate, so the datetime is right
+    // immediately — and so a locked console never shows `${battery}`, the clock
+    // or the task-count chips, which are machine state it should not narrate.
     update_status();
     // Ask the host terminal to bracket pastes, so a host->guest paste arrives as
     // one `ESC[200~ … ESC[201~` block the line editor can capture (see
     // `crate::clipboard`). Copy-out uses OSC 52 from `clipboard::set`.
     crate::clipboard::enable_host_paste();
-
-    // ── The login gate ───────────────────────────────────────────────────
-    //
-    // Here, and not in `main.rs`: everything the prompt needs to look like part
-    // of this OS has just happened — theme and palette applied, the fallback
-    // fonts registered, the display resolution and font scale applied, the pane
-    // layout built. `run_os` runs before all of that, so a gate there would draw
-    // in the built-in palette at the wrong font scale on a high-DPI panel.
-    //
-    // And **before** the session resume below, which hydrates the previous
-    // conversation and prints its id and message count: that is disclosure before
-    // authentication.
-    //
-    // No password enrolled means no gate, anywhere — which is also why the e2e
-    // harness needs no bypass flag: its guests run on a memfs store where nothing
-    // can ever have been enrolled.
-    #[cfg(not(test))]
-    {
-        crate::auth::store::refresh();
-        if crate::auth::enrolled() {
-            crate::auth::prompt::gate(crate::auth::Reason::Boot);
-        }
-    }
 
     // The agent-layer orchestrator (session persistence for the shell agent —
     // `/session`, `/info`), reused across the session so its Session persists.

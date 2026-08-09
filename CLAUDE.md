@@ -2898,14 +2898,28 @@ implementation. NB it yields, so it must not be called with a `Locked` held.
 
 ## The login gate (`kernel/src/auth/`)
 
-Single-user, fixed user `chitti`, independent of the volume passphrase. Boot gate
-(in `shell::run`, after the theme/fonts/display/panes are applied so it looks like
-this OS, and **before** the session resume, which prints the previous session's id
-and message count — disclosure before authentication), `/lock`, idle auto-lock,
-and re-auth on resume from suspend. Pure logic in `auth/mod.rs`; the blocking
-screen is `auth/prompt.rs`, `#[cfg(not(test))]` with a **deny-by-default** stub.
+Single-user, fixed user `chitti`, independent of the volume passphrase. Boot gate,
+`/lock`, idle auto-lock, and re-auth on resume from suspend. Pure logic in
+`auth/mod.rs`; the blocking screen is `auth/prompt.rs`, `#[cfg(not(test))]` with a
+**deny-by-default** stub.
 
-Six things worth knowing before touching it:
+**The theme and the gate are applied together, as early as the store allows**
+(`shell::boot_appearance_and_gate`, called from all three `main.rs` arch entries
+immediately after `mount_persistent_store`). `ui.json`, `display.json`,
+`panes.json` and the credential record all live on the store, so nothing can be
+themed or unlocked before it mounts — but everything after it can be, and used
+not to be. Both started at the top of `shell::run`, which is the *last* thing boot
+does, and the result was visible twice over: the whole boot log (drivers, network,
+the agent roster, bundled skills, the sample corpus, schedules) was drawn in the
+built-in palette at the default font scale and then recoloured and reflowed in one
+jump, and the gate appeared only after the banner, the mount line and the
+store-backend line had printed and the status bar was painted — so the machine
+showed you its disk, its size, whether its store was durable, and a live battery
+and clock, and only then asked who you were. Keep them there; `run` now prints
+nothing before the console is unlocked, and the session resume (which prints the
+previous session's id and message count) is well after it.
+
+Seven things worth knowing before touching it:
 
 - **No record = no gate, anywhere.** One state, one `fs::exists`. That is also why
   the e2e harness needs no bypass flag: its guests run on a memfs store where

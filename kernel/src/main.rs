@@ -138,6 +138,11 @@ pub extern "C" fn _start() -> ! {
     // installed system), point synapse::fs at it so runtime writes persist
     // across reboots. No-op on the live ISO (no data partition).
     mount_persistent_store();
+    // The user's theme and the login gate, the moment the store that holds both
+    // is readable — so every line boot prints from here on is already in their
+    // palette at their font scale, and nothing is shown before the console is
+    // unlocked. See `shell::boot_appearance_and_gate` for why not later.
+    chitti_kernel::shell::boot_appearance_and_gate();
 
     // `ref-check` builds run the Phase 3 acceptance gate and exit QEMU.
     #[cfg(feature = "refcheck")]
@@ -227,6 +232,8 @@ pub extern "C" fn limine_start() -> ! {
         None => serial_println!("Chitti: no model.gguf (Limine module or ext4)"),
     }
     mount_persistent_store();
+    // Theme + login gate, as early as the store allows (see the x86 path).
+    chitti_kernel::shell::boot_appearance_and_gate();
     // Bring up networking (e1000 / virtio-net-pci over PCI). No-op if absent.
     chitti_kernel::net::autodetect();
     // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
@@ -401,6 +408,12 @@ pub extern "C" fn aarch64_start() -> ! {
     if !chitti_kernel::arch::aarch64::is_apple() {
         mount_persistent_store();
     }
+    // Theme + login gate, as early as the store allows (see the x86 path).
+    // Outside the `is_apple` guard on purpose: Apple Silicon has no store yet, so
+    // there is nothing to unlock and nothing themed to load — but the call is
+    // still correct there (defaults, and a gate that finds no record is inert),
+    // and a machine that skipped it would be the one divergence in this file.
+    chitti_kernel::shell::boot_appearance_and_gate();
     // `ref-check` builds run the acceptance gate and power off via PSCI (the
     // aarch64 analogue of the x86 isa-debug-exit path above); the host side
     // (`cargo xtask ref-check -arch aarch64`) greps serial for `ALL PASS`.
