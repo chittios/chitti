@@ -120,6 +120,22 @@ pub const RC_UNSET: i32 = -0x7000_0000;
 /// a real VirtualBox-ARM guest reported. `VBoxGuestInfo`'s own comment is the
 /// giveaway: "the VMMDev interface version expected by additions".
 pub const GUEST_INTERFACE_VERSION: u32 = VMMDEV_VERSION;
+
+/// `VMMDevReqHostVersion` = header + `{u16 major, u16 minor, u32 build,
+/// u32 revision, u32 features}` — **40** bytes, not 36.
+///
+/// The handler asserts `size == sizeof(*pReq)` exactly and returns
+/// `VERR_INVALID_PARAMETER` otherwise, so a request one field short is refused
+/// outright. Note the first two fields are `u16`s sharing one word: reading
+/// three `u32`s from here gives a major of `major | minor << 16`.
+pub const HOST_VERSION_LEN: usize = REQ_HDR + 16;
+
+/// `features` bits the host reports — which HGCM parameter kinds it accepts.
+/// Logged at bring-up because the next layer up depends on them.
+pub const HVF_HGCM_PHYS_PAGE_LIST: u32 = 1 << 0;
+pub const HVF_HGCM_EMBEDDED_BUFFERS: u32 = 1 << 1;
+pub const HVF_HGCM_CONTIGUOUS_PAGE_LIST: u32 = 1 << 2;
+pub const HVF_FAST_IRQ_ACK: u32 = 1 << 3;
 /// `VBOXOSTYPE_Linux26_x64` / `_Linux26` — "a modern Linux-ish guest", which is
 /// the closest published value and the one that unlocks the most services. The
 /// host uses it for presentation and service gating, not for behaviour we
@@ -458,7 +474,6 @@ pub fn bring_up() -> Result<String, &'static str> {
 
     // 2. Read something back, which is what proves the transport works in both
     //    directions rather than merely that a write was accepted.
-    const HOST_VERSION_LEN: usize = REQ_HDR + 12; // major, minor, build
     buf[..HOST_VERSION_LEN].fill(0);
     if !write_header(buf, HOST_VERSION_LEN as u32, REQ_GET_HOST_VERSION) {
         return Err("could not frame the host-version request");
@@ -474,8 +489,24 @@ pub fn bring_up() -> Result<String, &'static str> {
     if rc < 0 {
         return Err("the host would not report its version");
     }
-    let rd = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
-    let v = alloc::format!("{}.{}.{}", rd(REQ_HDR), rd(REQ_HDR + 4), rd(REQ_HDR + 8));
+    // major and minor are u16s sharing the first word; build/revision/features
+    // are u32s after them.
+    let rd16 = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
+    let rd32 = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+    let features = rd32(REQ_HDR + 12);
+    let v = alloc::format!(
+        "{}.{}.{} r{}",
+        rd16(REQ_HDR),
+        rd16(REQ_HDR + 2),
+        rd32(REQ_HDR + 4),
+        rd32(REQ_HDR + 8)
+    );
+    crate::ktrace::log_fmt(format_args!(
+        "vbox: host features {features:#x} (page-list {}, embedded {}, fast-irq {})",
+        features & HVF_HGCM_PHYS_PAGE_LIST != 0,
+        features & HVF_HGCM_EMBEDDED_BUFFERS != 0,
+        features & HVF_FAST_IRQ_ACK != 0
+    ));
     DEV.with(|d| {
         if let Some(g) = d.as_mut() {
             g.host_version = Some(v.clone());
@@ -645,6 +676,34 @@ mod tests {
     /// away from what it will take.
     fn interface_version_is_ok(v: u32) -> bool {
         (v >> 16) == (VMMDEV_VERSION >> 16) && (v & 0xffff) <= (VMMDEV_VERSION & 0xffff)
+    }
+
+    #[test_case]
+    fn every_request_declares_the_exact_size_its_handler_asserts() {
+        // VMMDev handlers assert `size == sizeof(the struct)` and return
+        // VERR_INVALID_PARAMETER on anything else — so a request one field
+        // short is refused outright. `GetHostVersion` is 24+16 and was declared
+        // 24+12, which is what "the host would not report its version" was.
+        assert_eq!(HOST_VERSION_LEN, 40);
+        assert_eq!(GUEST_INFO_LEN, 32);
+        // The HGCM requests have their own AssertCompileSize values.
+        assert_eq!(hgcm::CONNECT_LEN, 32 + 132 + 4);
+        assert_eq!(hgcm::DISCONNECT_LEN, 32 + 4);
+        assert_eq!(hgcm::call_len(2), 32 + 12 + 32);
+
+        // And the reply's first word is two u16s, not one u32: reading it wide
+        // gives a major of `major | minor << 16`.
+        let mut buf = [0u8; 64];
+        assert!(write_header(&mut buf, HOST_VERSION_LEN as u32, REQ_GET_HOST_VERSION));
+        buf[REQ_HDR..REQ_HDR + 2].copy_from_slice(&7u16.to_le_bytes());
+        buf[REQ_HDR + 2..REQ_HDR + 4].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(u16::from_le_bytes([buf[REQ_HDR], buf[REQ_HDR + 1]]), 7);
+        assert_eq!(u16::from_le_bytes([buf[REQ_HDR + 2], buf[REQ_HDR + 3]]), 2);
+        assert_ne!(
+            u32::from_le_bytes(buf[REQ_HDR..REQ_HDR + 4].try_into().unwrap()),
+            7,
+            "reading major as a u32 folds minor into it"
+        );
     }
 
     #[test_case]
