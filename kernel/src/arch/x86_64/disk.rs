@@ -8,6 +8,7 @@
 use crate::arch::x86_64::{ahci, nvme};
 use crate::block::ahci::Ahci;
 use crate::block::nvme::NvmeNamespace;
+use crate::block::sdhci::SdCard;
 use crate::block::usb_msc::UsbMsc;
 use crate::block::virtio::VirtioBlk;
 use crate::block::{BlockDevice, BlockError};
@@ -17,6 +18,9 @@ pub enum Disk {
     Virtio(VirtioBlk),
     Nvme(NvmeNamespace),
     Ahci(Ahci),
+    /// SD card / eMMC behind an SDHCI controller — the only storage on tablets,
+    /// Chromebook-class laptops and most SBCs.
+    Sd(SdCard),
     /// USB mass-storage stick (BOT); last so internal disks keep stable indices.
     Usb(UsbMsc),
 }
@@ -44,6 +48,9 @@ impl Disk {
         scan!(VirtioBlk::probe_nth, Disk::Virtio);
         scan!(nvme::probe_nth, Disk::Nvme);
         scan!(ahci::probe_nth, Disk::Ahci);
+        // SDHCI before USB for the same reason NVMe and AHCI are: it is an
+        // internal disk, and plugging in a stick must not renumber it.
+        scan!(crate::block::sdhci::probe_nth, Disk::Sd);
         scan!(UsbMsc::probe_nth, Disk::Usb);
         None
     }
@@ -55,6 +62,7 @@ macro_rules! dispatch {
             Disk::Virtio(d) => d.$m($($a),*),
             Disk::Nvme(d) => d.$m($($a),*),
             Disk::Ahci(d) => d.$m($($a),*),
+            Disk::Sd(d) => d.$m($($a),*),
             Disk::Usb(d) => d.$m($($a),*),
         }
     };

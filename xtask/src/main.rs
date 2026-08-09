@@ -243,8 +243,11 @@ fn user_netdev(id: &str) -> String {
 /// ~2016 on have), `virtio-blk` the default. Returns the `-device` arguments for
 /// drive id `id`; the caller has already added the matching `-drive ...,if=none`.
 ///
-/// `ahci` needs its HBA declared once, so this emits the controller too — pass
-/// `first` true for the first disk on the bus. Multiple disks land on separate
+/// `sd`/`emmc` builds an `sdhci-pci` host controller with an SD card in it —
+/// the storage on machines that have neither SATA nor NVMe.
+///
+/// `ahci` and `sdhci` each need their controller declared once, so this emits it
+/// too — pass `first` true for the first disk on the bus. Multiple disks land on separate
 /// AHCI ports, which is what exercises the multi-port enumeration.
 fn disk_device_args(id: &str, first: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -261,6 +264,18 @@ fn disk_device_args(id: &str, first: bool) -> Vec<String> {
         "nvme" => {
             out.push("-device".into());
             out.push(format!("nvme,drive={id},serial=chitti-{id}"));
+        }
+        // SD/eMMC behind an SDHCI controller — the storage on tablets,
+        // Chromebook-class laptops and most SBCs, and the only way to exercise
+        // `block::sdhci` without one of those machines. QEMU's `sdhci-pci`
+        // presents PCI class 08:05, which is what the driver matches on.
+        "sd" | "sdhci" | "emmc" => {
+            if first {
+                out.push("-device".into());
+                out.push("sdhci-pci,id=sdhci".into());
+            }
+            out.push("-device".into());
+            out.push(format!("sd-card,drive={id}{}", if kind == "emmc" { ",spec_version=3" } else { "" }));
         }
         _ => {
             out.push("-device".into());

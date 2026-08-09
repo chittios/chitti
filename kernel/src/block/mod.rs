@@ -20,6 +20,7 @@ pub mod fat32;
 pub mod fat_read;
 pub mod gpt;
 pub mod nvme;
+pub mod sdhci;
 pub mod ramdisk;
 #[cfg(target_arch = "x86_64")]
 pub mod virtio;

@@ -9,6 +9,7 @@ use crate::arch::aarch64::virtio_pci::VirtioBlkPci;
 use crate::arch::aarch64::{ahci, nvme};
 use crate::block::ahci::Ahci;
 use crate::block::nvme::NvmeNamespace;
+use crate::block::sdhci::SdCard;
 use crate::block::usb_msc::UsbMsc;
 use crate::block::{BlockDevice, BlockError};
 
@@ -22,6 +23,9 @@ pub enum Disk {
     Nvme(NvmeNamespace),
     Ahci(Ahci),
     Mmio(VirtioBlkMmio),
+    /// SD card / eMMC behind an SDHCI controller — the only storage on tablets
+    /// and most SBCs.
+    Sd(SdCard),
     Usb(UsbMsc),
 }
 
@@ -56,6 +60,9 @@ impl Disk {
         scan!(nvme::probe_nth, Disk::Nvme);
         scan!(ahci::probe_nth, Disk::Ahci);
         scan!(VirtioBlkMmio::probe_nth, Disk::Mmio);
+        // Internal storage, so ahead of USB: plugging in a stick must not
+        // renumber the disk the system was installed to.
+        scan!(crate::block::sdhci::probe_nth, Disk::Sd);
         scan!(UsbMsc::probe_nth, Disk::Usb);
         None
     }
@@ -68,6 +75,7 @@ macro_rules! dispatch {
             Disk::Nvme(d) => d.$m($($a),*),
             Disk::Ahci(d) => d.$m($($a),*),
             Disk::Mmio(d) => d.$m($($a),*),
+            Disk::Sd(d) => d.$m($($a),*),
             Disk::Usb(d) => d.$m($($a),*),
         }
     };
