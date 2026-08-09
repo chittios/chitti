@@ -2456,6 +2456,9 @@ fn cmd_run_aarch64_uefi(model: Model, disk: Option<PathBuf>, disk_only: bool, no
         qemu.args(["-device", "virtio-blk-device,drive=data"]);
         eprintln!("  data disk: {}", d.display());
     }
+    for a in qemu_extra_args() {
+        qemu.arg(a);
+    }
     run(&mut qemu)
 }
 
@@ -2573,6 +2576,9 @@ fn cmd_run_aarch64(release: bool, model: Model, disk: Option<PathBuf>, _disk_onl
         eprintln!("attaching {} at guest phys {}", model.gguf_rel(), model.aarch64_addr());
     }
     eprintln!("booting aarch64 Chitti ({}) natively via HVF (Ctrl-A X to quit qemu)...", model.label());
+    for a in qemu_extra_args() {
+        qemu.arg(a);
+    }
     run(&mut qemu)
 }
 
@@ -2739,6 +2745,25 @@ fn audio_args(device: &str) -> Vec<String> {
         "-device".into(),
         format!("{device},audiodev=chittiaudio"),
     ]
+}
+
+/// Extra QEMU arguments from `CHITTI_QEMU_EXTRA`, split on whitespace.
+///
+/// An escape hatch, and a deliberately blunt one: `xtask run` builds a long,
+/// carefully-ordered QEMU command (accel, machine, disks, net, share, display)
+/// and reconstructing it by hand to add one flag means reproducing all of it —
+/// which DEVELOPMENT.md used to tell people to do for a headless screendump.
+///
+/// Appended **last**, so it can add devices but not silently reorder what came
+/// before. Quoting is not supported: a value with spaces inside one argument
+/// needs a wrapper script rather than a more clever parser here.
+///
+///     CHITTI_QEMU_EXTRA="-qmp unix:/tmp/q.sock,server,nowait" cargo xtask run
+fn qemu_extra_args() -> Vec<String> {
+    match env::var("CHITTI_QEMU_EXTRA") {
+        Ok(v) if !v.trim().is_empty() => v.split_whitespace().map(str::to_string).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// QEMU display flags: Cocoa on macOS, GTK elsewhere (override: CHITTI_DISPLAY).
@@ -3498,6 +3523,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         }
         eprintln!("booting FROM DISK ONLY via UEFI (OVMF) -- no ISO; the installed Chitti boots itself");
         eprintln!("  disk: {}", disk.display());
+        for a in qemu_extra_args() {
+            cmd.arg(a);
+        }
         let status = cmd.status().map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
         eprintln!("qemu exited: {status}");
         return Ok(());
@@ -3576,6 +3604,9 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         "booting x86_64 Chitti ({}) under QEMU -m {mem} (close the window or Ctrl-A X to quit)",
         model.label()
     );
+    for a in qemu_extra_args() {
+        cmd.arg(a);
+    }
     let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn qemu-system-x86_64: {e}"))?;
