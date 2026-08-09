@@ -169,6 +169,33 @@ fn request_buffer() -> Option<(u64, u64)> {
     }
 }
 
+/// PCI COMMAND register bits.
+const CMD_IO_SPACE: u32 = 1 << 0;
+const CMD_MEM_SPACE: u32 = 1 << 1;
+const CMD_BUS_MASTER: u32 = 1 << 2;
+
+/// Enable the device's memory-space decoding, so its BARs actually respond.
+///
+/// **This is why every request vanished.** Firmware assigns the BAR addresses
+/// but leaves decoding off for a device no driver has claimed, so
+/// `COMMAND` read back `0x0010` — `mem=false`. Reads of the window returned
+/// all-ones because *nothing decoded there*, not because the device was
+/// answering, and the doorbell writes went into the void. Neither the header
+/// version nor a missing barrier could have mattered while this was off.
+///
+/// A **write**, so it lives here and not in [`probe`] — identification only
+/// ever reads, the rule the I2C and EC drivers follow and the one VMSVGA had to
+/// learn after a probe-time write moved a live display's scanout. `/vbox up`
+/// is the first thing that touches the device, and this is part of touching it.
+fn enable_decoding(bus: u8, dev: u8, func: u8) -> u32 {
+    let cmd = pci::read32(bus, dev, func, 0x04);
+    let want = cmd | CMD_MEM_SPACE | CMD_BUS_MASTER;
+    if want != cmd {
+        pci::write32(bus, dev, func, 0x04, want);
+    }
+    pci::read32(bus, dev, func, 0x04)
+}
+
 /// Write the request address as a **64-bit** store.
 ///
 /// `vmmdevMmioWrite` takes `cb == 4` or `cb == 8` at offset 0 and uses the value
@@ -367,6 +394,16 @@ pub fn bring_up() -> Result<String, &'static str> {
     if !present() && !probe() {
         return Err("no VirtualBox VMMDev device on this machine");
     }
+    // Turn the BARs on before using one. Firmware leaves decoding off for an
+    // unclaimed device, and an MMIO window that decodes nothing swallows every
+    // write in silence.
+    if let Some((bus, dev, func)) = DEV.with(|d| d.as_ref().map(|g| (g.bus, g.dev, g.func))) {
+        let cmd = enable_decoding(bus, dev, func);
+        crate::ktrace::log_fmt(format_args!("vbox: PCI command now {:#06x}", cmd & 0xffff));
+        if cmd & CMD_MEM_SPACE == 0 {
+            return Err("the device will not enable memory decoding");
+        }
+    }
     let Some((phys, virt)) = request_buffer() else {
         return Err("could not allocate a request buffer below 4 GiB");
     };
@@ -487,10 +524,14 @@ pub fn diag() -> String {
             // read, and a diagnostic must not change the device.
             // SAFETY: a 32-bit read of a mapped device register.
             let probe = unsafe { core::ptr::read_volatile(base as *const u32) };
+            // NOT decisive on its own: an address no device decodes also reads
+            // all-ones, which is exactly the case this driver spent four
+            // iterations mistaking for "the device answered". Read it together
+            // with the `mem=` line below.
             let verdict = match probe {
-                0xffff_ffff => "OK - the device answers (unimplemented regs read all-ones)",
-                0 => "BAD - reads as zero: the window is probably mapped cacheable, not Device",
-                _ => "BAD - unexpected value: this is not the VMMDev window",
+                0xffff_ffff => "all-ones - either the device answered, or NOTHING DECODES (see mem= below)",
+                0 => "reads as zero: the window is probably mapped cacheable, not Device",
+                _ => "unexpected value: this is not the VMMDev window",
             };
             let _ = writeln!(s, "  probe    read [0] = {probe:#010x}  {verdict}");
         }
@@ -509,6 +550,13 @@ pub fn diag() -> String {
         cmd & 2 != 0,
         cmd & 4 != 0
     );
+    if cmd & CMD_MEM_SPACE == 0 {
+        let _ = writeln!(
+            s,
+            "           ^ memory decoding is OFF, so the window above answers nothing;"
+        );
+        let _ = writeln!(s, "             /vbox up enables it (probing only ever reads)");
+    }
     for i in 0..6u16 {
         let raw = pci::read32(bus, dev, func, 0x10 + i * 4);
         if raw != 0 {
@@ -597,6 +645,26 @@ mod tests {
     /// away from what it will take.
     fn interface_version_is_ok(v: u32) -> bool {
         (v >> 16) == (VMMDEV_VERSION >> 16) && (v & 0xffff) <= (VMMDEV_VERSION & 0xffff)
+    }
+
+    #[test_case]
+    fn a_bar_is_useless_until_memory_decoding_is_on() {
+        // The bug that swallowed every request: firmware assigns BAR addresses
+        // but leaves COMMAND's memory-space bit clear for a device no driver
+        // has claimed, so the window decodes nothing — and an undecoded PCI
+        // address reads all-ones, which is indistinguishable from the device
+        // answering. `/vbox diag` reported exactly `command 0x0010`.
+        assert_eq!(CMD_MEM_SPACE, 0b10);
+        assert_eq!(CMD_BUS_MASTER, 0b100);
+        // The observed value had neither bit.
+        let observed = 0x0010u32;
+        assert_eq!(observed & CMD_MEM_SPACE, 0, "the VM reported memory decoding off");
+        // Enabling must SET bits, never replace the word: firmware may have set
+        // others (0x10 here is memory-write-and-invalidate) and clearing them
+        // is a different kind of breakage.
+        let after = observed | CMD_MEM_SPACE | CMD_BUS_MASTER;
+        assert_eq!(after, 0x0016);
+        assert_eq!(after & observed, observed, "existing bits must survive");
     }
 
     #[test_case]
