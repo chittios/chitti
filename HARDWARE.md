@@ -36,7 +36,7 @@ refusal logged. It has just never been proven. Treat it the way we treat
 | **Bluetooth peripherals** | ❌ won't pair (no SSP, no BLE) |
 | Audio | ✅ stereo (WAV/MP3); ⚠️ AAC mono; ❌ no USB headsets, ❌ no jack detect |
 | Screen brightness | ❌ |
-| Suspend / lid close | ⚠️ unverified / ❌ absent |
+| Suspend / lid close | ⚠️ unverified (devices do come back) / ❌ no lid switch |
 | Battery + charger reporting | ⚠️ unverified |
 
 The honest short version: on real hardware ChittiOS is a **wired-network console
@@ -416,10 +416,14 @@ the worst failure this kernel can have.
 
 ### Missing — ❌
 
-- ❌ **Resume does not restore most devices.** Only the APIC/GIC + timer, the
-  i8042 and the I2C-HID touchpad are re-initialised. The **NIC, xHCI, AHCI/NVMe
-  and the sound device are not** — so a resumed machine may have no USB
-  keyboard and possibly no disk. This is known and documented at the call site.
+- ⚠️ **Resume re-probes the polled subsystems**: xHCI (so a USB keyboard comes
+  back), the NIC, and the sound device, alongside the APIC/GIC + timer, the
+  i8042 and the I2C-HID touchpad. Disks need nothing — they re-probe on first
+  access. Two documented costs: each re-probe **leaks its previous instance's
+  DMA pages** (bounded per resume; the frame allocator has no free path), and
+  the NIC comes back **unaddressed**, so a pre-suspend DHCP lease is not
+  re-asserted and `/network dhcp` is needed. `/suspend plan` says so before you
+  commit. All of it is still **unverified on real hardware**.
 - ❌ **Lid switch** (`PNP0C0D`) — closing a laptop lid does nothing.
 - ❌ **Thermal zones** (`_TMP`), fan control, thermal throttling. Under
   sustained load the machine relies entirely on firmware and hardware thermal
