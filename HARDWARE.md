@@ -215,11 +215,12 @@ from the device tree and is not wired up.
 |---|---|
 | ext4 | ✅ read + write (the default filesystem) |
 | FAT12/16/32 | ✅ read + write |
+| exFAT | ✅ read + write (ASCII names on write; full UTF-16 names on read) |
 | NTFS | ⚠️ read only |
 | GPT / MBR | ✅ |
 | 9P (host shared folder) | ✅ |
 | C4VE encrypted volumes | ✅ |
-| btrfs, XFS, APFS, exFAT | ❌ |
+| btrfs, XFS, APFS | ❌ |
 
 `/install` writes a fresh GPT (whole-disk) or `/install alongside` adds a loader
 to an existing ESP without touching the partition table. `/install plan` is
@@ -280,13 +281,21 @@ This is the largest gap in the OS. The parts that exist are real and complete:
 |---|---|
 | WPA2-PSK supplicant (PBKDF2 → PMK → PTK, EAPOL MIC, RFC 3394 key unwrap) | ✅ pure, pinned to the published 802.11i vectors |
 | 802.11 frame + beacon + RSN element parsing | ✅ |
+| **CCMP** (AES-CTR + CBC-MAC) | ✅ pinned to RFC 3610's published packet vector |
+| **802.11 data path** (ToDS/FromDS addressing, LLC/SNAP, 802.11↔802.3) | ✅ |
+| **Association state machine** (auth → assoc → 4-way → keys) | ✅ pure, tested against a simulated AP |
+| **Scan aggregation** (dedupe by BSSID, strongest-first) | ✅ |
 | `/wifi psk <ssid> <passphrase>` — derive and print a key | ✅ (checkable against `wpa_passphrase` on any Linux box) |
+
+Everything **above** the radio is now complete and verified off-hardware — the
+cipher, the frame conversion, the join sequencer and the scan list. A driver's
+remaining job is to carry frames and run the commands.
 
 The radios are what is missing:
 
 | Radio | Status |
 |---|---|
-| Intel `iwlwifi` (AX200 and later) | ⚠️ **bring-up only** — resets the device, hands over firmware, waits for the *alive* notification and checks its status word, reads the MAC, sends one **read-only** command. ❌ **Cannot scan. Cannot associate.** No 802.11 data path. |
+| Intel `iwlwifi` (AX200 and later) | ⚠️ **bring-up only** — resets the device, hands over firmware, waits for the *alive* notification and checks its status word, reads the MAC, sends one **read-only** command. ❌ **Cannot scan. Cannot associate.** `SCAN_REQ_UMAC`'s request layout is versioned and none is implemented, so a scan is **refused with the firmware's version named** rather than sent as a guess. |
 | Broadcom FullMAC (Apple Silicon) | ⚠️ blocked — BAR2/TCM reads take an external abort |
 | Realtek RTL8852 / RTL8821 | ❌ |
 | MediaTek MT7921 / MT7922 | ❌ |
