@@ -73,6 +73,7 @@ pub mod ctxt;
 pub mod rx;
 pub mod scan;
 pub mod sta;
+pub mod tx;
 pub mod proto;
 
 use alloc::string::String;
