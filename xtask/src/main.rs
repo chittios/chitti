@@ -1232,11 +1232,35 @@ fn build_stub_aarch64() -> Result<PathBuf, String> {
     }
     let sdir = repo_root().join("stub");
     let mut cmd = Command::new("cargo");
-    // Do not pass `+stable` explicitly: the directory's rust-toolchain.toml
-    // selects it. Forcing `+nightly` here would reintroduce the old "nightly
-    // without the UEFI target" failure mode.
+    // **Clear the inherited toolchain pin, or `stub/rust-toolchain.toml` is
+    // ignored.** rustup's cargo shim exports `RUSTUP_TOOLCHAIN` to everything it
+    // launches so a whole build uses one toolchain — and that variable
+    // *outranks* a directory's `rust-toolchain.toml`. xtask is itself launched
+    // by `cargo`, which the repo root pins to nightly, so without this the stub
+    // is built with **nightly** however the stub directory is configured.
+    //
+    // That failed only on a clean machine: nightly here happens to have
+    // `aarch64-unknown-uefi` installed from some earlier `rustup target add`,
+    // so it built fine locally and died in CI with `can't find crate for core`
+    // — a message that points at a missing target rather than at the wrong
+    // toolchain looking for it.
+    //
+    // `RUSTC`/`RUSTDOC` go too: cargo sets them to the resolved compiler, which
+    // would pin nightly again by a different route.
+    cmd.env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .env_remove("RUSTDOC");
+    // Do not pass `+stable` explicitly either: the directory's
+    // rust-toolchain.toml selects it, and hardcoding a channel here would
+    // silently ignore a future change to that file.
     cmd.current_dir(&sdir).args(["build", "--release", "--target", "aarch64-unknown-uefi"]);
-    run(&mut cmd)?;
+    run(&mut cmd).map_err(|e| {
+        format!(
+            "{e}\n  the stub pins stable via stub/rust-toolchain.toml; if this says \
+             `can't find crate for core`, the UEFI target is missing from whichever \
+             toolchain actually ran (`cd stub && cargo --version` shows which)"
+        )
+    })?;
     let efi = sdir.join("target/aarch64-unknown-uefi/release/chitti-stub.efi");
     if !efi.exists() {
         return Err(format!("stub not found at {}", efi.display()));

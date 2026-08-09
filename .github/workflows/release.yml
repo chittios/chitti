@@ -51,6 +51,14 @@ jobs:
       # Root rust-toolchain.toml = nightly + rust-src + llvm-tools (kernel only:
       # custom targets + `-Z build-std`). The aarch64 UEFI stub pins *stable*
       # via stub/rust-toolchain.toml and is not built with nightly.
+      #
+      # That last sentence was false for a while, and this is where it bit:
+      # rustup's cargo shim exports RUSTUP_TOOLCHAIN to its children, and that
+      # variable outranks a directory's rust-toolchain.toml — so xtask (itself
+      # launched by the root nightly cargo) built the stub with *nightly*, which
+      # has no UEFI target here. `build_stub_aarch64` now clears it. Installing
+      # the target on nightly would "fix" the symptom while pinning the stub to
+      # the wrong toolchain, so do not do that.
       - name: Set up Rust (nightly for OS; stable UEFI target for stub)
         run: |
           rustup show
