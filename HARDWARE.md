@@ -34,7 +34,7 @@ refusal logged. It has just never been proven. Treat it the way we treat
 | Wired Ethernet | ✅ Intel, ⚠️ Realtek |
 | **WiFi** | ❌ **no machine can join a network** (USB tether works) |
 | **Bluetooth peripherals** | ❌ won't pair (no SSP, no BLE) |
-| Audio | ✅ stereo (WAV/MP3); ⚠️ AAC mono; ❌ no USB headsets, ❌ no jack detect |
+| Audio | ✅ stereo (WAV/MP3), ✅ USB headsets; ⚠️ AAC mono; ❌ no jack detect |
 | Screen brightness | ❌ |
 | Suspend / lid close | ⚠️ unverified (devices do come back) / ❌ no lid switch |
 | Battery + charger reporting | ⚠️ unverified |
@@ -349,7 +349,7 @@ the devices people own.
 | virtio-snd | QEMU (mmio + PCI) | ✅ |
 | AC'97 | x86 legacy | ✅ |
 | Sound Blaster 16 | x86 legacy | ✅ |
-| **USB Audio Class** | USB headsets, DACs | ❌ |
+| USB Audio Class (UAC1) | USB headsets, DACs | ✅ playback; ❌ capture — verified against QEMU's `usb-audio` |
 | Bluetooth A2DP | | ❌ |
 
 The HDA driver does a genuine codec-graph walk rather than guessing: it ranks
@@ -379,7 +379,15 @@ set to D0.
   backend gets it without per-driver wiring (↑/↓ on the media tabs, plus mute).
   The codec's own amps are set once to a 0 dB offset and never touched again, so
   there is no hardware mixer and no per-stream levels.
-- ❌ **No USB headsets or USB DACs** — the USB Audio Class is not implemented.
+- ✅ **USB headsets and DACs play** (UAC1, isochronous OUT). Tried **last** in
+  autodetect, deliberately: this implements output only, so adopting a headset
+  as *the* sound device would take the microphone away and `/voice` is a
+  mic-to-model loop. It therefore serves machines that would otherwise have no
+  audio at all, and stays out of the way where a full-duplex device exists.
+  `/voice test` reports what was found either way.
+- ❌ **No USB audio capture** — a UAC capture stream is a second
+  AudioStreaming interface with an isochronous IN endpoint. `capture_start`
+  refuses by name rather than delivering silence.
 
 ### Decoders — ✅
 
