@@ -3223,6 +3223,7 @@ impl Xhci {
 unsafe fn note_peripheral_classes(buf: usize, len: usize, root_port: u8, slot: u8) {
     let mut i = 0usize;
     let mut saw_uvc = false;
+    let mut saw_uac = false;
     while i + 9 <= len {
         let blen = unsafe { read_volatile((buf + i) as *const u8) } as usize;
         let btype = unsafe { read_volatile((buf + i + 1) as *const u8) };
@@ -3242,6 +3243,11 @@ unsafe fn note_peripheral_classes(buf: usize, len: usize, root_port: u8, slot: u
                 crate::drivers::uvc::note_usb_iface(root_port, slot, class, sub, proto);
                 saw_uvc = true;
             }
+            if crate::drivers::uac::is_audio_control(class, sub, proto)
+                || crate::drivers::uac::is_audio_streaming(class, sub, proto)
+            {
+                saw_uac = true;
+            }
         }
         i += blen.max(1);
     }
@@ -3249,6 +3255,11 @@ unsafe fn note_peripheral_classes(buf: usize, len: usize, root_port: u8, slot: u
         // SAFETY: config buffer is live for this enumeration step.
         let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
         crate::drivers::uvc::try_parse_config(slice);
+    }
+    if saw_uac {
+        // SAFETY: config buffer is live for this enumeration step.
+        let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+        crate::drivers::uac::note_usb_device(root_port, slot, slice);
     }
 }
 

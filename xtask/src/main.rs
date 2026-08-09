@@ -540,6 +540,28 @@ fn usb_host_requested() -> bool {
         || env_flag_or_value("CHITTI_USB_CAM").is_some()
 }
 
+/// Extra emulated USB peripherals from `CHITTI_USB`, comma-separated.
+///
+/// `audio` attaches `usb-audio` — a UAC1 device, which is what
+/// `drivers::uac`'s descriptor walk is written against and the only way to
+/// exercise it without physical hardware.
+fn usb_extra_device_args() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(list) = std::env::var("CHITTI_USB") else {
+        return out;
+    };
+    for want in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match want {
+            "audio" | "uac" => {
+                out.push("-device".into());
+                out.push("usb-audio,bus=xhci.0,audiodev=chittiaudio".into());
+            }
+            other => eprintln!("CHITTI_USB: unknown device '{other}' (known: audio)"),
+        }
+    }
+    out
+}
+
 /// QEMU `-device usb-host,…` args for passthrough onto bus `bus` (e.g. `xhci.0`).
 /// Empty when no CHITTI_USB_* is set. When requested but **nothing was found**,
 /// prints a clear warning and continues without attaching (QEMU still boots).
@@ -3427,6 +3449,13 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
         cmd.arg("-drive").arg(format!("file={},if=none,id=chittidisk,format=raw", disk.display()));
         cmd.args(["-device", "virtio-blk-pci,drive=chittidisk,disable-modern=on"]);
         cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
+    // Opt-in USB peripherals on the same xHCI, for exercising the class
+    // drivers: `CHITTI_USB=audio` attaches QEMU's `usb-audio` (UAC1), which is
+    // the only way to see `drivers::uac` meet a real descriptor set without a
+    // physical headset.
+    for a in usb_extra_device_args() {
+        cmd.arg(a);
+    }
         for a in usb_host_device_args("xhci.0") {
             cmd.arg(a);
         }
@@ -3482,6 +3511,13 @@ fn cmd_run(release: bool, arch: Arch, model: Model, uefi: bool, disk_only: bool,
     // A USB keyboard on an xHCI controller, so the xhci/HID driver drives the
     // shell (as a real USB keyboard would); PS/2 also still works.
     cmd.args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"]);
+    // Opt-in USB peripherals on the same xHCI, for exercising the class
+    // drivers: `CHITTI_USB=audio` attaches QEMU's `usb-audio` (UAC1), which is
+    // the only way to see `drivers::uac` meet a real descriptor set without a
+    // physical headset.
+    for a in usb_extra_device_args() {
+        cmd.arg(a);
+    }
     // Optional host BT dongle / UVC webcam passthrough (CHITTI_USB_BT / _CAM / _HOST).
     for a in usb_host_device_args("xhci.0") {
         cmd.arg(a);

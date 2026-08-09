@@ -573,10 +573,25 @@ pub(super) fn wav_to_pcm16(b: &[u8]) -> Option<(alloc::vec::Vec<i16>, u32)> {
 /// Sound self-test: play a short tone, then sample the mic for 2 s and report
 /// the peak level — proves playback and capture end-to-end.
 pub(super) fn voice_test() {
+    // A USB headset is the commonest reason someone expects audio and gets
+    // none, so say what was found on the bus before saying what plays. It is
+    // reported whether or not a device came up: a machine with *both* HDA and a
+    // USB headset plays through HDA, and knowing that is the difference between
+    // "no audio" and "audio, wrong output".
+    if crate::drivers::uac::present() {
+        serial_println!("voice> USB audio device on the bus:");
+        for line in crate::drivers::uac::status_lines() {
+            serial_println!("voice>   {line}");
+        }
+    }
     if !crate::sound::is_up() {
         serial_println!("voice> no sound device found");
         return;
     }
+    serial_println!(
+        "voice> output: {} channel(s)",
+        crate::sound::out_channels()
+    );
     serial_println!("voice> playing test tone\u{2026}");
     let tone = crate::sound::test_tone(440, 600, 16000);
     match crate::sound::play(&tone, 16000) {

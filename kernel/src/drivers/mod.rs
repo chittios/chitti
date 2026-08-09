@@ -27,6 +27,7 @@ pub mod ec;
 pub mod i2c;
 pub mod i2c_hid;
 pub mod pwrbtn;
+pub mod uac;
 pub mod uvc;
 pub mod vbox;
 pub mod virtio;
