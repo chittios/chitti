@@ -1,6 +1,6 @@
 name: ci
 
-# Build + unit tests.
+# Build + unit tests, one job per architecture (`unit (x86_64)`, `unit (aarch64)`).
 #
 # The end-to-end suite (`make e2e`) is deliberately NOT run here — it boots the
 # real kernel under QEMU and is run locally before shipping boot-visible or
@@ -37,33 +37,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Cross-build both arches and run the in-kernel unit suite (pure logic — no
-  # model/network/hardware). The suite is x86: `cargo xtask test` builds an
-  # x86_64-chitti kernel, wraps it in a Limine ISO, and boots it under
-  # qemu-system-x86_64. On this aarch64 runner the x86 build cross-compiles
-  # (rust-lld, no external toolchain) and QEMU runs the guest under TCG.
+  # The dual-arch rule (CLAUDE.md) says a change must build for BOTH x86_64 and
+  # aarch64, so each arch is its own matrix leg: they run in parallel and a
+  # failure names the arch in the job title instead of being buried in one log.
   #
-  # The x86 boot ISO needs Limine + xorriso (mtools too, for FAT paths). Ubuntu's
-  # apt `limine` is too old for the `limine.conf` (v8+) the kernel uses, so we
-  # clone a pinned Limine *binary* release and point xtask at it via
-  # CHITTI_LIMINE_SHARE/BIN. Fork-PR-safe: a public git clone over HTTPS, no
-  # secrets, pinned to a branch; the `limine` host tool is built with the runner's
-  # cc.
+  # `unit_suite` gates the in-kernel test suite, which is **x86-only by
+  # construction**, not by CI choice: the harness entry point is
+  # `#[cfg(test)] _start` in kernel/src/lib.rs (x86 SSE enable), `test_runner`/
+  # `test_panic_handler` are `#[cfg(target_arch = "x86_64")]`, the exit path is
+  # `isa-debug-exit`, and only `[target.x86_64-chitti]` has a `runner` in
+  # kernel/.cargo/config.toml. So the aarch64 leg is a build gate. Giving it a
+  # real suite means an aarch64 `_start` for the test build plus a PSCI-poweroff
+  # + serial-sentinel exit (the `xtask ref-check` pattern) — then flip this flag.
+  #
+  # Both legs run on the ARM runner *on purpose*. `cargo xtask test` boots the
+  # x86 guest under TCG (`-cpu max`) there, exactly as this job always has;
+  # moving the x86 leg to `ubuntu-24.04` would let `xtask`'s `accel_args` pick
+  # up `/dev/kvm` and run `-accel kvm -cpu host` instead, which is much faster
+  # but changes the guest's CPU feature set (RDRAND et al.) and cannot be
+  # validated from an Apple-Silicon dev box. It's a one-line `runs-on` change
+  # here if you want to try it.
   unit:
-    runs-on: ubuntu-24.04-arm
+    name: unit (${{ matrix.arch }})
+    # NB `matrix.runner`, not `matrix.runs-on`: an expression property name with
+    # a hyphen parses as a subtraction (`matrix.runs` - `on`), which evaluates
+    # to a number and leaves `runs-on` empty.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      # Report both arches every run — a divergence usually breaks exactly one,
+      # and cancelling the other leg hides whether it was arch-specific.
+      fail-fast: false
+      matrix:
+        include:
+          # `unit_suite` is a *string* and compared as one below: a matrix
+          # boolean loose-compared against `true` casts to NaN and is never
+          # equal, so a quoted flag is the only form that can't silently skip.
+          - arch: x86_64
+            runner: ubuntu-24.04-arm
+            unit_suite: 'true'
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            unit_suite: 'false'
     steps:
       - name: Checkout (no persisted credentials)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
+      # Only the leg that boots a guest needs QEMU or the ISO tools.
       - name: Install QEMU (x86 guest, via TCG) + ISO tools
+        if: matrix.unit_suite == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso mtools
 
+      # Ubuntu's apt `limine` is too old for the `limine.conf` (v8+) the kernel
+      # uses, so clone a pinned Limine *binary* release and point xtask at it via
+      # CHITTI_LIMINE_SHARE/BIN. Fork-PR-safe: a public git clone over HTTPS, no
+      # secrets, pinned to a branch; the `limine` host tool is built with the
+      # runner's cc.
       - name: Install Limine (pinned binary release for the x86 boot ISO)
+        if: matrix.unit_suite == 'true'
         run: |
           git clone --depth 1 --branch v8.x-binary https://github.com/limine-bootloader/limine.git "$RUNNER_TEMP/limine"
           make -C "$RUNNER_TEMP/limine"
@@ -73,11 +108,9 @@ jobs:
       - name: Rust toolchain (from rust-toolchain.toml — nightly + rust-src + llvm-tools)
         run: rustup show && rustc --version
 
-      - name: Build (x86_64)
-        run: cargo xtask build -arch x86_64
-
-      - name: Build (aarch64)
-        run: cargo xtask build -arch aarch64
+      - name: Build (${{ matrix.arch }})
+        run: cargo xtask build -arch ${{ matrix.arch }}
 
       - name: Unit tests (in-kernel, x86 under QEMU/TCG)
+        if: matrix.unit_suite == 'true'
         run: cargo xtask test
