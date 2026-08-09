@@ -8681,6 +8681,8 @@ pub fn upkeep() {
     // Host clipboard channel (SPICE agent over virtio-serial). Non-blocking;
     // a no-op when no such device is attached.
     crate::clipboard::tick();
+    // VirtualBox's shared clipboard, when its transport has been brought up.
+    crate::drivers::vbox::clipboard::tick();
     crate::service::supervise_tick();
     // External messaging channels (Telegram, …) — short non-blocking poll.
     crate::msgchan::tick();

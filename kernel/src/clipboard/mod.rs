@@ -60,6 +60,13 @@ pub fn set(text: String, linewise: bool) {
     if agent_ready() {
         let _ = crate::drivers::virtio_serial::write(&vdagent::grab(&[vdagent::FMT_UTF8_TEXT]));
     }
+    // Same announcement to VirtualBox, whose host process owns the clipboard
+    // itself — the route that reaches a Mac pasteboard from a VM window.
+    if crate::drivers::vbox::clipboard::connected() {
+        let _ = crate::drivers::vbox::clipboard::report_formats(
+            crate::drivers::vbox::clipboard::FMT_UNICODETEXT,
+        );
+    }
     CLIP.with(|c| *c = Some(Clip { text, linewise }));
 }
 
@@ -237,6 +244,11 @@ fn handle(m: vdagent::Incoming) {
 
 /// One line describing the host clipboard channel, for `/clip`.
 pub fn agent_status() -> String {
+    // VirtualBox first: where it is connected it is the route that actually
+    // reaches the host's own clipboard, including on macOS.
+    if let Some(s) = crate::drivers::vbox::clipboard::status() {
+        return s;
+    }
     if !crate::drivers::virtio_serial::present() {
         return "host channel: OSC-52 over serial only (no virtio-serial device)".to_string();
     }
