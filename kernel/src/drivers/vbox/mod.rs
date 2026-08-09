@@ -169,6 +169,19 @@ fn request_buffer() -> Option<(u64, u64)> {
     }
 }
 
+/// Write the request address as a **64-bit** store.
+///
+/// `vmmdevMmioWrite` takes `cb == 4` or `cb == 8` at offset 0 and uses the value
+/// as the address either way, so this is a legitimate second way to ring the
+/// same bell — worth having because a 32-bit store that never reaches the
+/// device and a request the host rejects silently look identical from here.
+fn submit_mmio64(base: u64, phys: u64) {
+    crate::drivers::virtio::barrier();
+    // SAFETY: `base` is this device's mapped MMIO request register.
+    unsafe { core::ptr::write_volatile(base as *mut u64, phys) };
+    crate::drivers::virtio::barrier();
+}
+
 /// Whether a request buffer's physical address fits the 32-bit register.
 ///
 /// A truncated address is not an error the host can report — it would read a
@@ -332,7 +345,9 @@ fn submit(phys: u64) -> bool {
             Window::Port(_) => false,
             Window::Mmio(base) => {
                 // SAFETY: `base` is this device's mapped MMIO BAR; the request
-                // register is 32-bit at offset 0.
+                // register takes a 32-bit **or** 64-bit write at offset 0
+                // (`vmmdevMmioWrite` accepts `cb == 4 || cb == 8` and uses the
+                // value as the request's guest-physical address either way).
                 unsafe {
                     core::ptr::write_volatile((base + OFF_REQUEST) as *mut u32, phys as u32)
                 };
@@ -375,14 +390,28 @@ pub fn bring_up() -> Result<String, &'static str> {
     // The host wrote its answer into the same buffer while we were stopped in
     // the register write; order that against reading it back.
     crate::drivers::virtio::barrier();
-    let rc = header_rc(buf);
+    let mut rc = header_rc(buf);
+    if rc == RC_UNSET {
+        // Nothing came back from the 32-bit store. Ring the same bell with a
+        // 64-bit one before concluding anything: the device accepts either, and
+        // "the store did not reach the device" and "the host read the request
+        // and rejected it silently" are indistinguishable from here.
+        if let Some(base) = DEV.with(|d| match d.as_ref().map(|g| g.window) {
+            Some(Window::Mmio(b)) => Some(b),
+            _ => None,
+        }) {
+            crate::ktrace::log("vbox", "ReportGuestInfo: no answer to a 32-bit doorbell; retrying 64-bit");
+            submit_mmio64(base, phys);
+            rc = header_rc(buf);
+        }
+    }
     if rc == RC_UNSET {
         // The write reached the register but the host left `rc` alone, so it
         // never saw the request at all. A different fault from a refusal, and
         // pointing at the wrong one costs a debugging cycle.
         crate::ktrace::log("vbox", "ReportGuestInfo: the host did not process the request");
         return Err(
-            "the host never processed the request (header version/size rejected before rc is written)",
+            "the host never processed the request (neither doorbell width got an answer)",
         );
     }
     if rc < 0 {
@@ -464,6 +493,27 @@ pub fn diag() -> String {
                 _ => "BAD - unexpected value: this is not the VMMDev window",
             };
             let _ = writeln!(s, "  probe    read [0] = {probe:#010x}  {verdict}");
+        }
+    }
+
+    // The probe above is NOT decisive on its own: an address no device decodes
+    // also reads all-ones. The PCI config is unambiguous, so dump it — COMMAND
+    // says whether memory decoding is even enabled, and the raw BARs say
+    // whether the window we picked is the one the firmware assigned.
+    let cmd = pci::read32(bus, dev, func, 0x04);
+    let _ = writeln!(
+        s,
+        "  command  {:#06x}  io={} mem={} busmaster={}",
+        cmd & 0xffff,
+        cmd & 1 != 0,
+        cmd & 2 != 0,
+        cmd & 4 != 0
+    );
+    for i in 0..6u16 {
+        let raw = pci::read32(bus, dev, func, 0x10 + i * 4);
+        if raw != 0 {
+            let kind = if raw & 1 != 0 { "io" } else { "mem" };
+            let _ = writeln!(s, "  bar{i}     {raw:#010x} ({kind})");
         }
     }
 
