@@ -206,6 +206,44 @@ pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
     XHCI.with(|s| s.as_mut().and_then(|x| x.bt_acl_recv(out, timeout_ms)))
 }
 
+// ── USB audio (UAC) ──────────────────────────────────────────────────────
+
+pub fn uac_available() -> bool {
+    XHCI.with(|s| s.as_ref().map(|x| x.uac_available()).unwrap_or(false))
+}
+
+pub fn uac_start(want_hz: u32) -> bool {
+    XHCI.with(|s| s.as_mut().map(|x| x.uac_start(want_hz)).unwrap_or(false))
+}
+
+pub fn uac_ready() -> bool {
+    XHCI.with(|s| s.as_ref().map(|x| x.has_uac()).unwrap_or(false))
+}
+
+pub fn uac_format() -> Option<(u32, u8)> {
+    XHCI.with(|s| s.as_ref().and_then(|x| x.uac_format()))
+}
+
+pub fn uac_queue(pcm: &[u8]) -> bool {
+    XHCI.with(|s| s.as_mut().map(|x| x.uac_queue(pcm)).unwrap_or(false))
+}
+
+pub fn uac_free_bytes() -> usize {
+    XHCI.with(|s| s.as_mut().map(|x| x.uac_free_bytes()).unwrap_or(0))
+}
+
+pub fn uac_busy() -> bool {
+    XHCI.with(|s| s.as_mut().map(|x| x.uac_busy()).unwrap_or(false))
+}
+
+pub fn uac_pump() {
+    XHCI.with(|s| {
+        if let Some(x) = s.as_mut() {
+            x.uac_pump();
+        }
+    });
+}
+
 pub fn uvc_ready() -> bool {
     XHCI.with(|s| s.as_ref().map(|x| x.has_uvc()).unwrap_or(false))
 }

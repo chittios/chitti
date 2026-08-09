@@ -553,8 +553,15 @@ fn usb_extra_device_args() -> Vec<String> {
     for want in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         match want {
             "audio" | "uac" => {
+                // Its own audiodev, so `CHITTI_AUDIO=off CHITTI_USB=audio`
+                // gives a machine whose *only* sound device is the USB one —
+                // which is the configuration UAC exists for, and the only way
+                // to exercise the claim path (`sound::autodetect` reaches USB
+                // audio last, after every other backend has declined).
+                out.push("-audiodev".into());
+                out.push("none,id=chittiusbaudio".into());
                 out.push("-device".into());
-                out.push("usb-audio,bus=xhci.0,audiodev=chittiaudio".into());
+                out.push("usb-audio,bus=xhci.0,audiodev=chittiusbaudio".into());
             }
             other => eprintln!("CHITTI_USB: unknown device '{other}' (known: audio)"),
         }

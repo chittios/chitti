@@ -402,6 +402,44 @@ pub fn bt_acl_recv(out: &mut [u8], timeout_ms: u64) -> Option<usize> {
     })
 }
 
+// ── USB audio (UAC) ──────────────────────────────────────────────────────
+
+pub fn uac_available() -> bool {
+    XHCI.with(|s| s.iter().any(|x| x.uac_available()))
+}
+
+pub fn uac_start(want_hz: u32) -> bool {
+    XHCI.with(|s| s.iter_mut().any(|x| x.uac_start(want_hz)))
+}
+
+pub fn uac_ready() -> bool {
+    XHCI.with(|s| s.iter().any(|x| x.has_uac()))
+}
+
+pub fn uac_format() -> Option<(u32, u8)> {
+    XHCI.with(|s| s.iter().find_map(|x| x.uac_format()))
+}
+
+pub fn uac_queue(pcm: &[u8]) -> bool {
+    XHCI.with(|s| s.iter_mut().any(|x| x.uac_queue(pcm)))
+}
+
+pub fn uac_free_bytes() -> usize {
+    XHCI.with(|s| s.iter_mut().map(|x| x.uac_free_bytes()).max().unwrap_or(0))
+}
+
+pub fn uac_busy() -> bool {
+    XHCI.with(|s| s.iter_mut().any(|x| x.uac_busy()))
+}
+
+pub fn uac_pump() {
+    XHCI.with(|s| {
+        for x in s.iter_mut() {
+            x.uac_pump();
+        }
+    });
+}
+
 pub fn uvc_ready() -> bool {
     XHCI.with(|s| s.iter().any(|x| x.has_uvc()))
 }

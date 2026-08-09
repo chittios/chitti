@@ -2,9 +2,11 @@
 //!
 //! A USB headset or DAC is the one audio device this OS could not use at all:
 //! HDA covers built-in codecs, but anything on a USB port was invisible. This
-//! is the pure layer — descriptors in, a [`StreamPlan`] out — mirroring
-//! [`crate::drivers::uvc`], which does the same job for video over the same
-//! isochronous transport.
+//! This module is the pure layer — descriptors in, a [`StreamPlan`] out —
+//! mirroring [`crate::drivers::uvc`], which does the same job for video over the
+//! same isochronous transport. The stream itself is configured and fed by
+//! `xhci::configure_uac` / `xhci::uac_pump`, and surfaced as a `SndDevice` by
+//! [`crate::sound::usb`].
 //!
 //! ## Alternate settings are the whole protocol
 //!
@@ -668,7 +670,7 @@ pub fn note_usb_device(root_port: u8, slot: u8, desc: &[u8]) {
     PLAN_BITS.store(p.bits, Ordering::Relaxed);
     PLAN_RATE.store(rate, Ordering::Relaxed);
     crate::ktrace::log_fmt(format_args!(
-        "uac: USB audio out on slot {slot} port {root_port} -- iface {} alt {} ep {:#04x}, {} ch {}-bit {} Hz, mps {} (playback not implemented yet)",
+        "uac: USB audio out on slot {slot} port {root_port} -- iface {} alt {} ep {:#04x}, {} ch {}-bit {} Hz, mps {}",
         p.iface, p.alt, p.ep, p.channels, p.bits, rate, p.mps
     ));
 }
@@ -705,6 +707,15 @@ pub fn status_lines() -> Vec<alloc::string::String> {
             PLAN_MPS.load(Ordering::Relaxed)
         ));
     }
-    v.push("playback: NOT implemented -- needs an isochronous OUT feed (see the module docs)".to_string());
+    v.push(alloc::format!(
+        "playback: {}",
+        if crate::arch::uac_ready() {
+            "streaming (isochronous OUT, pumped from the idle tick)"
+        } else if crate::arch::uac_available() {
+            "ready -- claimed only when this becomes the sound device (see sound::autodetect)"
+        } else {
+            "no stream could be configured -- see the ktrace for why"
+        }
+    ));
     v
 }

@@ -8658,6 +8658,12 @@ pub fn upkeep() {
     // Package-UI apps (chess, games…): surface events + guest tick.
     crate::service::package_ui::tick();
     crate::net::poll();
+    // USB audio: push one service interval to an isochronous OUT endpoint. This
+    // *must* be pumped from upkeep rather than from a play call — an isoc
+    // endpoint consumes a packet per interval whether or not the host supplied
+    // one, so a stream fed only when someone calls `play` gaps between chunks.
+    // A no-op when no UAC device is configured.
+    crate::arch::uac_pump();
     // Host clipboard channel (SPICE agent over virtio-serial). Non-blocking;
     // a no-op when no such device is attached.
     crate::clipboard::tick();

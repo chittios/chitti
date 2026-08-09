@@ -239,6 +239,59 @@ struct UvcCam {
     bulk: bool,
 }
 
+/// A UAC device that was enumerated and *could* play, but has not been claimed.
+///
+/// Held at alt 0 (no bandwidth, no endpoint) until something asks to play — see
+/// `classify_and_finish` for why claiming early is actively harmful.
+struct UacPending {
+    slot: u8,
+    root_port: u8,
+    ep0_va: usize,
+    ep0_pa: u64,
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    in_ctx_pa: u64,
+    in_ctx_va: usize,
+    dev_ctx_va: usize,
+    buf_va: usize,
+    buf_pa: u64,
+    plan: crate::drivers::uac::StreamPlan,
+}
+
+/// A UAC1 playback stream (isochronous OUT) on one device slot.
+///
+/// The OUT counterpart of [`UvcCam`], and it differs in the one way that
+/// matters: audio must be **fed continuously**. A capture path can idle between
+/// grabs, but an output endpoint starved of packets underruns, and a UAC device
+/// underrunning clicks rather than pausing. So `queued` holds PCM the shell has
+/// handed over and `uac_pump` drains it one service interval at a time from the
+/// idle tick.
+struct UacOut {
+    slot: u8,
+    root_port: u8,
+    ep0_va: usize,
+    ep0_pa: u64,
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    plan: crate::drivers::uac::StreamPlan,
+    /// The rate actually programmed into the device, which may not be the rate
+    /// asked for — the device chooses from what it offers.
+    hz: u32,
+    stream_dci: u8,
+    stream_ring_va: usize,
+    stream_ring_pa: u64,
+    stream_enq: usize,
+    stream_cycle: u32,
+    /// One service interval's worth of bytes.
+    pkt_buf_pa: u64,
+    pkt_buf_va: usize,
+    pkt_bytes: u32,
+    /// A transfer is queued and has not completed.
+    out_flight: bool,
+    /// PCM waiting to go out, already in device format.
+    queued: alloc::collections::VecDeque<u8>,
+}
+
 pub struct Xhci {
     mmio: usize,     // virtual base of the mapped register space
     op: usize,       // virtual base of operational registers
@@ -273,6 +326,10 @@ pub struct Xhci {
     bt: Option<BtHci>,
     /// USB Video Class still stream (isoc or bulk IN).
     uvc: Option<UvcCam>,
+    /// USB audio playback stream (isoc OUT), when a UAC device was claimed.
+    uac: Option<UacOut>,
+    /// A UAC device enumerated but deliberately not yet claimed.
+    uac_pending: Option<UacPending>,
     // Ports that already produced a working device. On an enumeration retry
     // (VirtualBox's async VUSB reset makes the *other* device time out) these
     // are skipped so we don't reset a port whose device already enumerated —
@@ -759,6 +816,8 @@ impl Xhci {
                 bulk: None,
                 bt: None,
                 uvc: None,
+                uac: None,
+                uac_pending: None,
                 done_ports: 0,
 
             })
@@ -1103,6 +1162,40 @@ impl Xhci {
                 if let Some(p) = unsafe { self.finish_pointer(c, iface, ep, mps, ivl, proto) } {
                     self.mouse = Some(p);
                     got = true;
+                }
+            }
+        }
+        // USB audio: **remember** a playable device, do not claim it yet.
+        //
+        // Selecting the streaming alt starts an isochronous OUT endpoint, and
+        // the xHC then services it every interval whether or not anything feeds
+        // it. Claiming at enumeration therefore leaves a permanently
+        // under-running endpoint on the bus from boot — which floods the event
+        // ring and made the whole shell crawl on a machine whose audio came
+        // from somewhere else entirely. Alt 0, where the device starts, exists
+        // precisely to claim no bandwidth; leaving it there is correct until
+        // someone actually wants to play.
+        if self.uac.is_none() && self.uac_pending.is_none() {
+            // SAFETY: `buf_va` holds `total` bytes of configuration descriptor.
+            let desc = unsafe { core::slice::from_raw_parts(c.buf_va as *const u8, c.total as usize) };
+            if let Some(plan) = crate::drivers::uac::find_output_stream(desc, 48_000, 2) {
+                // SET_CONFIGURATION now (idempotent, and every other class arm
+                // does it here); SET_INTERFACE is what waits.
+                if unsafe { self.ensure_configured(c) } {
+                    self.uac_pending = Some(UacPending {
+                        slot: c.slot,
+                        root_port: c.loc.root_port,
+                        ep0_va: c.ep0_va,
+                        ep0_pa: c.ep0_pa,
+                        ep0_enq: c.ep0_enq,
+                        ep0_cycle: c.ep0_cycle,
+                        in_ctx_pa: c.in_ctx_pa,
+                        in_ctx_va: c.in_ctx_va,
+                        dev_ctx_va: c.dev_ctx_va,
+                        buf_va: c.buf_va,
+                        buf_pa: c.buf_pa,
+                        plan,
+                    });
                 }
             }
         }
@@ -1854,6 +1947,7 @@ impl Xhci {
         let mut bulk = self.bulk.take();
         let mut bt = self.bt.take();
         let mut uvc = self.uvc.take();
+        let mut uac = self.uac.take();
         // SAFETY: rings/buffers are live for the controller's lifetime.
         unsafe {
             while let Some(ev) = self.next_event() {
@@ -1923,6 +2017,18 @@ impl Xhci {
                         let residual = (ev.status & 0x00ff_ffff) as usize;
                         u.in_flight = false;
                         u.in_ready = Some((u.in_req as usize).saturating_sub(residual));
+                        continue;
+                    }
+                }
+                if let Some(u) = uac.as_mut() {
+                    if u.slot == slot && dci == u.stream_dci {
+                        // An isochronous OUT completion carries no useful
+                        // length: the device consumed the interval whatever we
+                        // sent. Clearing the flag is the whole handling — and it
+                        // must happen even on a completion code that reports an
+                        // error, because a stream that never clears it stops
+                        // feeding and the track goes silent rather than glitching.
+                        u.out_flight = false;
                         continue;
                     }
                 }
@@ -2007,6 +2113,7 @@ impl Xhci {
         self.bulk = bulk;
         self.bt = bt;
         self.uvc = uvc;
+        self.uac = uac;
     }
 
     /// Bring up a UVC still stream: SET_INTERFACE → PROBE/COMMIT → configure ep.
@@ -2333,6 +2440,228 @@ impl Xhci {
                     }
                 }
             }
+        }
+    }
+
+    /// Claim a UAC1 device for playback: select the streaming alt setting, set
+    /// the sample rate on the endpoint, and configure the isochronous OUT ring.
+    ///
+    /// Order is not free. `SET_INTERFACE` to a non-zero alt is what makes the
+    /// endpoint exist at all, so it comes first; the sample rate is an
+    /// **endpoint** control and can only be set once that endpoint is there.
+    /// Doing it the other way round gets a request to an endpoint that does not
+    /// exist, which most firmware answers with a stall and some ignores.
+    unsafe fn configure_uac(&mut self, want_hz: u32) -> bool {
+        use crate::drivers::uac;
+        let Some(mut c) = self.uac_pending.take() else { return false };
+        let plan = c.plan.clone();
+        let Some(hz) = plan.pick_rate(want_hz) else { return false };
+        if !plan.fits(hz) {
+            crate::ktrace::log_fmt(format_args!(
+                "xhci: uac alt needs {} B/interval but the endpoint takes {} -- refusing",
+                plan.bytes_per_interval(hz),
+                plan.mps
+            ));
+            return false;
+        }
+        // SET_CONFIGURATION already happened at enumeration; a device in the
+        // *Address* state rejects SET_INTERFACE outright, because alternate
+        // settings only exist inside a configuration.
+        //
+        // 1. SET_INTERFACE(iface, alt) — claims the bandwidth and materialises
+        //    the endpoint.
+        let (bm, req, val, idx, _len) = uac::set_interface_setup(plan.iface, plan.alt);
+        if !unsafe {
+            self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle,
+                         setup(bm, req, val, idx, 0), 0, 0, false)
+        } {
+            crate::ktrace::log("xhci", "uac: SET_INTERFACE failed");
+            return false;
+        }
+
+        // 2. The isochronous OUT endpoint context.
+        let stream_dci = ((plan.ep & 0x0f) * 2) as u8; // OUT: no +1
+        let Some((ring_pa, ring_va)) = (self.alloc)(RING_TRBS * 16) else { return false };
+        let ring_va = ring_va as usize;
+        unsafe { self.init_link(ring_va, ring_pa) };
+        let mps = plan.mps as u32;
+        // `build_input_configure_stream` wants a `Common`; the pending record
+        // carries exactly the fields it reads, so a shim keeps one copy of the
+        // endpoint-context packing rather than a second, drifting one.
+        let mut shim = Common {
+            slot: c.slot,
+            dev_ctx_va: c.dev_ctx_va,
+            ep0_va: c.ep0_va,
+            ep0_pa: c.ep0_pa,
+            ep0_enq: c.ep0_enq,
+            ep0_cycle: c.ep0_cycle,
+            in_ctx_va: c.in_ctx_va,
+            in_ctx_pa: c.in_ctx_pa,
+            buf_va: c.buf_va,
+            buf_pa: c.buf_pa,
+            total: 0,
+            cfg_val: 0,
+            dev_class: 0,
+            loc: DevLoc { root_port: c.root_port, route: 0, speed: 0, parent_slot: 0, parent_port: 0, tt: false },
+            configured: true,
+        };
+        unsafe {
+            self.build_input_configure_stream(&shim, stream_dci, mps, plan.interval, ring_pa, EpType::IsochOut);
+        }
+        let _ = &mut shim;
+        let Some((cc, _)) = (unsafe {
+            self.command(c.in_ctx_pa, (TRB_CONFIGURE_ENDPOINT << 10) | ((c.slot as u32) << 24))
+        }) else {
+            return false;
+        };
+        if cc != CC_SUCCESS {
+            crate::ktrace::log_fmt(format_args!("xhci: uac configure ep failed cc={cc}"));
+            return false;
+        }
+
+        // 3. The sample rate, addressed to the **endpoint** now that it exists.
+        let ((bm, req, val, idx, len), data) = uac::set_sample_rate_setup(plan.ep, hz);
+        // SAFETY: `buf_va` is this device's live control bounce buffer.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), c.buf_va as *mut u8, data.len()) };
+        dma_clean(c.buf_va, data.len());
+        if !unsafe {
+            self.control(c.slot, c.ep0_va, c.ep0_pa, &mut c.ep0_enq, &mut c.ep0_cycle,
+                         setup(bm, req, val, idx, len), c.buf_pa, len as u32, false)
+        } {
+            // Not fatal: a device with a single fixed rate legitimately has no
+            // sampling-frequency control, and refusing here would reject it.
+            // The rate we play at is the one the plan chose either way.
+            crate::ktrace::log("xhci", "uac: SET_CUR sampling frequency refused (device may be fixed-rate)");
+        }
+
+        let pkt_bytes = plan.bytes_per_interval(hz) as u32;
+        let Some((pkt_pa, pkt_va)) = (self.alloc)(4096) else { return false };
+        crate::ktrace::log_fmt(format_args!(
+            "xhci: UAC stream up -- slot {} iface {} alt {} ep {:#04x} dci {stream_dci}, {} ch {} Hz, {pkt_bytes} B/interval",
+            c.slot, plan.iface, plan.alt, plan.ep, plan.channels, hz
+        ));
+        self.uac = Some(UacOut {
+            slot: c.slot,
+            root_port: c.root_port,
+            ep0_va: c.ep0_va,
+            ep0_pa: c.ep0_pa,
+            ep0_enq: c.ep0_enq,
+            ep0_cycle: c.ep0_cycle,
+            plan,
+            hz,
+            stream_dci,
+            stream_ring_va: ring_va,
+            stream_ring_pa: ring_pa,
+            stream_enq: 0,
+            stream_cycle: 1,
+            pkt_buf_pa: pkt_pa,
+            pkt_buf_va: pkt_va as usize,
+            pkt_bytes,
+            out_flight: false,
+            queued: alloc::collections::VecDeque::new(),
+        });
+        true
+    }
+
+    /// True once a UAC playback stream is configured.
+    pub fn has_uac(&self) -> bool {
+        self.uac.is_some()
+    }
+
+    /// A UAC device is present and could be claimed (or already has been).
+    pub fn uac_available(&self) -> bool {
+        self.uac.is_some() || self.uac_pending.is_some()
+    }
+
+    /// Claim the pending UAC device for playback, if there is one.
+    ///
+    /// Separate from enumeration on purpose: this is the moment bandwidth is
+    /// taken and the endpoint starts being serviced, so it happens when
+    /// something intends to play and not before.
+    pub fn uac_start(&mut self, want_hz: u32) -> bool {
+        if self.uac.is_some() {
+            return true;
+        }
+        // SAFETY: the pending record's handles belong to a device this
+        // controller enumerated and configured.
+        unsafe { self.configure_uac(want_hz) }
+    }
+
+    /// The rate and channel count the stream is actually running.
+    pub fn uac_format(&self) -> Option<(u32, u8)> {
+        self.uac.as_ref().map(|u| (u.hz, u.plan.channels))
+    }
+
+    /// Hand `pcm` (device-format bytes) to the playback queue.
+    ///
+    /// Bounded: a queue allowed to grow without limit turns a producer that
+    /// outruns the device into unbounded kernel heap, and the first-fit
+    /// allocator punishes exactly that. Roughly a second of audio is plenty —
+    /// the pump drains a millisecond per interval — and beyond it the write is
+    /// refused so the caller throttles rather than the kernel swelling.
+    pub fn uac_queue(&mut self, pcm: &[u8]) -> bool {
+        let Some(u) = self.uac.as_mut() else { return false };
+        let cap = (u.pkt_bytes as usize) * 1000;
+        if u.queued.len() + pcm.len() > cap {
+            return false;
+        }
+        u.queued.extend(pcm.iter().copied());
+        true
+    }
+
+    /// Bytes the queue can still accept.
+    pub fn uac_free_bytes(&mut self) -> usize {
+        let Some(u) = self.uac.as_mut() else { return 0 };
+        ((u.pkt_bytes as usize) * 1000).saturating_sub(u.queued.len())
+    }
+
+    /// True while queued audio is still draining.
+    pub fn uac_busy(&mut self) -> bool {
+        self.uac.as_ref().is_some_and(|u| u.out_flight || !u.queued.is_empty())
+    }
+
+    /// Push one service interval to the device if the previous one completed.
+    ///
+    /// Called from the idle tick. **An isochronous OUT endpoint is never told
+    /// to wait**: the device consumes a packet per interval whether or not we
+    /// supplied one, so falling behind is silence in the middle of a track
+    /// rather than a slower track. Sending a short packet is legal and is what
+    /// a partially-drained queue does; sending nothing is what an empty one
+    /// does, and both are better than blocking.
+    pub fn uac_pump(&mut self) {
+        // Cheap exit **before** draining the event ring. `pump_events` polls
+        // hot-plug and can re-enumerate, which is far too much work to do on
+        // every upkeep tick for a machine that has no USB audio at all — and
+        // doing it unconditionally made the shell crawl during playback on a
+        // machine whose sound came from somewhere else entirely.
+        match self.uac.as_ref() {
+            None => return,
+            Some(u) if !u.out_flight && u.queued.is_empty() => return,
+            Some(_) => {}
+        }
+        self.pump_events();
+        let Some(u) = self.uac.as_mut() else { return };
+        if u.out_flight || u.queued.is_empty() {
+            return;
+        }
+        let n = u.queued.len().min(u.pkt_bytes as usize);
+        // SAFETY: `pkt_buf_va` is a live 4 KiB DMA page and `n <= pkt_bytes`,
+        // which `configure_uac` bounded by the endpoint's max packet size.
+        unsafe {
+            let dst = u.pkt_buf_va as *mut u8;
+            for i in 0..n {
+                core::ptr::write(dst.add(i), u.queued.pop_front().unwrap_or(0));
+            }
+        }
+        dma_clean(u.pkt_buf_va, n);
+        let (va, pa, mut enq, mut cyc) = (u.stream_ring_va, u.stream_ring_pa, u.stream_enq, u.stream_cycle);
+        let (buf, slot, dci) = (u.pkt_buf_pa, u.slot, u.stream_dci);
+        u.out_flight = true;
+        // SAFETY: the ring and slot belong to this configured stream.
+        unsafe { self.arm_isoc(va, pa, &mut enq, &mut cyc, buf, n as u32, slot, dci) };
+        if let Some(u) = self.uac.as_mut() {
+            u.stream_enq = enq;
+            u.stream_cycle = cyc;
         }
     }
 

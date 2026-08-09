@@ -17,6 +17,8 @@ use crate::mm::Locked;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+pub mod usb;
+
 pub mod proto {
     //! virtio-snd control-plane constants + tiny message builders (all
     //! little-endian on the wire, which every supported target is).
@@ -278,6 +280,7 @@ pub fn autodetect() {
     if is_up() {
         return;
     }
+
     #[cfg(target_arch = "aarch64")]
     {
         if let Some(dev) = crate::arch::aarch64::virtio_snd::VirtioSndMmio::probe() {
@@ -304,6 +307,25 @@ pub fn autodetect() {
             init(dev);
             return;
         }
+    }
+    // **USB audio last, not first**, and the reason is a trade worth stating.
+    //
+    // A plugged-in headset is a deliberate act, so preferring it looks right —
+    // and it is what a desktop OS does. But this driver implements **output
+    // only**: adopting a headset as *the* sound device would take the
+    // microphone away, and `/voice` is a mic-to-model loop. On a laptop with
+    // both HDA and a USB headset that trades a working voice assistant for a
+    // different set of speakers, which is a bad deal.
+    //
+    // So USB audio serves the machines that would otherwise have **no** audio
+    // at all — a desktop whose only output is a USB DAC, a laptop with no
+    // codec — and stays out of the way where a full-duplex device exists.
+    // Revisit when the capture side lands: a UAC capture stream is a second
+    // AudioStreaming interface with an isochronous IN endpoint, at which point
+    // preferring the headset becomes the right default.
+    if let Some(dev) = usb::UsbAudio::probe() {
+        init(dev);
+        return;
     }
     // Nothing matched: dump the multimedia-class PCI devices so an unsupported
     // controller (or a PCI-discovery gap) is diagnosable from the boot log.

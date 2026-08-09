@@ -207,6 +207,37 @@ pub unsafe fn parallel_for(n: usize, _min_chunk: usize, f: unsafe fn(usize, usiz
     unsafe { f(0, n, ctx) }
 }
 
+// --- USB audio (UAC) playback ------------------------------------------
+
+macro_rules! uac_facade {
+    ($name:ident ( $($a:ident : $t:ty),* ) -> $r:ty, $default:expr) => {
+        #[cfg(target_arch = "x86_64")]
+        pub fn $name($($a: $t),*) -> $r { x86_64::xhci::$name($($a),*) }
+        #[cfg(target_arch = "aarch64")]
+        pub fn $name($($a: $t),*) -> $r { aarch64::xhci::$name($($a),*) }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        pub fn $name($(_: $t),*) -> $r { $default }
+    };
+}
+
+/// Whether a USB audio playback stream is configured.
+uac_facade!(uac_ready() -> bool, false);
+/// Whether a UAC device exists that could be claimed (or already has been).
+uac_facade!(uac_available() -> bool, false);
+/// Claim the pending UAC device for playback. Deliberately not done at
+/// enumeration — see `xhci`'s `classify_and_finish`.
+uac_facade!(uac_start(want_hz: u32) -> bool, false);
+/// The `(rate, channels)` the stream is actually running.
+uac_facade!(uac_format() -> Option<(u32, u8)>, None);
+/// Hand device-format PCM bytes to the playback queue; false when it is full.
+uac_facade!(uac_queue(pcm: &[u8]) -> bool, false);
+/// Bytes the playback queue can still accept.
+uac_facade!(uac_free_bytes() -> usize, 0);
+/// True while queued audio is still draining.
+uac_facade!(uac_busy() -> bool, false);
+/// Push one service interval to the device — called from the idle tick.
+uac_facade!(uac_pump() -> (), ());
+
 /// Whether a USB Ethernet adapter's bulk endpoints are configured.
 #[cfg(target_arch = "x86_64")]
 pub fn usb_bulk_ready() -> bool {
