@@ -30,7 +30,7 @@ refusal logged. It has just never been proven. Treat it the way we treat
 |---|---|
 | Console + shell | ✅ works, at the firmware's resolution |
 | Keyboard, trackpad | ✅ basic input works (no gestures, no media keys) |
-| Internal disk | ✅ **unless** the firmware is in Intel VMD / "RST" mode |
+| Internal disk | ✅ SATA / NVMe / SD / eMMC — **unless** the firmware is in Intel VMD / "RST" mode |
 | Wired Ethernet | ✅ Intel, ⚠️ Realtek |
 | **WiFi** | ❌ **no machine can join a network** (USB tether works) |
 | **Bluetooth peripherals** | ❌ won't pair (no SSP, no BLE) |
@@ -182,7 +182,7 @@ Console legibility on a high-resolution panel is handled by font size instead:
 | virtio-blk | ✅ mmio and PCI |
 | USB mass storage (BOT/SCSI) | ✅ read **and** write, hot-plug with mount prune |
 | Apple ANS2 NVMe (via DART) | ⚠️ Apple Silicon bare metal |
-| **SD / eMMC (SDHCI)** | ❌ |
+| SD / eMMC (SDHCI) | ✅ PCI class 08:05, PIO transfers; verified against QEMU's `sdhci-pci` |
 | Intel VMD / RST | ❌ |
 
 Exercise the real-hardware paths in QEMU with
@@ -194,8 +194,10 @@ bridge on a separate PCI domain that is not visible in the main ECAM. ChittiOS
 finds **no disk at all** on such a machine. The workaround is to switch the
 firmware's SATA/NVMe mode to **AHCI**; there is no driver-side fix today.
 
-**❌ No eMMC/SDHCI** means tablets, Chromebook-class machines and most SBCs have
-no storage under ChittiOS whatsoever.
+**SD/eMMC works**, so tablets, Chromebook-class machines and SBCs now have a
+disk. Exercise it with `CHITTI_DISK_IF=sd cargo xtask run -arch x86_64`. Only
+SDHCI-over-PCI is discovered; the memory-mapped SDHCI on many ARM SBCs comes
+from the device tree and is not wired up.
 
 ### USB external disks — ✅ with limits
 
