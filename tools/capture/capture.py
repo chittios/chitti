@@ -93,6 +93,13 @@ class Guest:
         env["CHITTI_QEMU_EXTRA"] = f"-qmp unix:{qmp_path},server,nowait"
         env["CHITTI_DISPLAY"] = "none"
         env.setdefault("CHITTI_SAMPLE_FILES", "1")
+        # A hosted model, seeded through fw_cfg by xtask and activated by the
+        # shell at boot. The demo is about the agent loop, so without this the
+        # interesting frames say "no model" — hence the warning rather than a
+        # silent, duller capture.
+        if not env.get("CHITTI_REMOTE_URL"):
+            print("capture: no CHITTI_REMOTE_URL — the chat frames will have no model",
+                  file=sys.stderr)
         cmd = ["cargo", "xtask", "run", "-arch", arch, "--release", "--no-model"]
         print("capture: " + " ".join(cmd), flush=True)
         self.proc = subprocess.Popen(
@@ -146,22 +153,37 @@ class Guest:
 # The session, as (label, keystrokes, settle seconds). `None` keystrokes means
 # "just wait and shoot" — used for the boot splash.
 #
-# Chosen to show what the OS actually is rather than what looks busiest: the
-# shell it boots to, that it explains itself, that it drives real hardware, and
-# that the agent's authority is gated and audited.
+# Chosen to show what ChittiOS *is* rather than what looks busiest. The middle
+# of the script is the whole point: a plain-English question reaches the model,
+# the model asks for a tool, the capability gate decides, and the audit log
+# shows it happened. A tour of `/`-commands would look like any terminal.
+#
+# Set CHITTI_REMOTE_URL / CHITTI_REMOTE_MODEL to give the guest a hosted model;
+# xtask seeds it through fw_cfg and the shell activates it at boot. Without one
+# the chat frames still capture, they just show the "no model" reply.
 SCRIPT: list[tuple[str, str | None, float]] = [
-    ("01-boot", None, 2.0),
-    ("02-help", "/help\n", 3.0),
-    ("03-about", "\x1b/about\n", 2.5),
-    ("04-disks", "/disks\n", 2.5),
-    ("05-lspci", "/lspci\n", 2.5),
-    ("06-network", "/network\n", 2.5),
-    ("07-samples", "/ls /samples\n", 2.5),
-    ("08-image", "/open /samples/images/fruits.jpg\n", 5.0),
-    ("09-close", "/close\n", 1.5),
-    ("10-audit", "/audit\n", 2.5),
-    ("11-agents", "/agents\n", 3.0),
-    ("12-top", "/top\n", 3.0),
+    ("01-boot", None, 2.5),
+    # The hosted backend, active from the fw_cfg seed.
+    ("02-model", "/model\n", 3.0),
+    # The agentic loop, end to end: a question in English, answered by the model
+    # calling a tool it had to be granted. Long settles because this is a real
+    # round trip to a real endpoint, not a canned reply.
+    ("03-ask", "what storage does this machine have? use a tool to check\n", 40.0),
+    ("04-answer", None, 25.0),
+    # The same work from the security side: every primitive the agent invoked.
+    ("05-audit", "/audit\n", 3.0),
+    # Hardware underneath it.
+    ("06-lspci", "/lspci\n", 2.5),
+    ("07-network", "/network\n", 2.5),
+    # In-kernel JPEG decode into a second pane.
+    ("08-image", "/open /samples/images/fruits.jpg\n", 6.0),
+    ("09-close", "/close\n", 2.0),
+    ("10-agents", "/agents\n", 3.0),
+    # The command browser last: it leaves a popup open, and the following `/`
+    # gets consumed closing it — which sent `/model` as the chat message
+    # "model" the first time this ran. Anything after it needs a flush.
+    ("11-help", "/help\n", 3.5),
+    ("12-close-help", "\x1b", 2.0),
 ]
 
 
