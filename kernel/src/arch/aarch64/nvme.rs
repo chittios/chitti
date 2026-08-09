@@ -33,8 +33,14 @@ pub fn probe_nth(n: usize) -> Option<NvmeNamespace> {
     if regs == 0 {
         return None;
     }
-    let _ = MMIO_SPAN; // the identity Device block covers the whole BAR window
-    crate::arch::aarch64::mmu::map_device_gib(regs);
+    // The identity Device block covers the BAR only below 512 GiB, which is
+    // where the identity map ends -- and QEMU `virt` puts its 64-bit PCIe
+    // window at exactly that address. `map_mmio` aliases such a window and
+    // returns the address to use, so take its result rather than the BAR.
+    let regs = crate::mm::map_mmio(regs, MMIO_SPAN);
+    if regs == 0 {
+        return None;
+    }
     // SAFETY: `regs` is the BAR-mapped NVMe register block (Device memory). The
     // controller is brought up once; this attaches namespace n+1 through it.
     unsafe { probe_namespace(regs, dma_alloc, n) }

@@ -479,6 +479,19 @@ fn discover() -> Option<usize> {
     if bar == 0 {
         return None;
     }
-    crate::arch::aarch64::mmu::map_device_gib(bar);
-    Some(bar as usize)
+    // **Use the address the mapper returns, not the BAR.** `map_device_gib` can
+    // only describe the 512 GiB the identity map reaches, and QEMU `virt` puts
+    // its 64-bit PCIe window at exactly that address — so on a machine whose
+    // firmware assigns the xHCI BAR high, this handed the core an unmapped
+    // pointer and the first register read aborted (`ESR 0x96000004`,
+    // `FAR 0x800000c000`). `map_mmio` aliases such a window and returns the VA.
+    //
+    // The whole register file has to be inside the mapping: an xHCI BAR is 64 KiB
+    // and the operational, runtime and doorbell blocks all live within it.
+    let virt = crate::mm::map_mmio(bar, 0x10000);
+    if virt == 0 {
+        crate::ktrace::log_fmt(format_args!("xhci: BAR {bar:#x} could not be mapped"));
+        return None;
+    }
+    Some(virt as usize)
 }

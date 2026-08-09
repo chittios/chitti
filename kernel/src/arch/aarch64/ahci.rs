@@ -34,8 +34,14 @@ pub fn probe_nth(n: usize) -> Option<Ahci> {
         if abar == 0 {
             continue;
         }
-        let _ = MMIO_SPAN; // the identity Device block covers the whole BAR window
-        crate::arch::aarch64::mmu::map_device_gib(abar);
+        // The identity Device block covers the BAR only below 512 GiB, which is
+        // where the identity map ends -- and QEMU `virt` puts its 64-bit PCIe
+        // window at exactly that address. `map_mmio` aliases such a window and
+        // returns the address to use, so take its result rather than the BAR.
+        let abar = crate::mm::map_mmio(abar, MMIO_SPAN);
+        if abar == 0 {
+            continue;
+        }
         // SAFETY: `abar` is the BAR-mapped HBA register block (Device memory).
         let count = unsafe { Ahci::present_count(abar) };
         if n < base + count {
