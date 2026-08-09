@@ -69,6 +69,7 @@ pub mod context;
 pub mod csr;
 pub mod device;
 pub mod fw;
+pub mod scan;
 pub mod proto;
 
 use alloc::string::String;
@@ -339,11 +340,6 @@ mod scan_gate_tests {
     /// read as different fields, and reported by nothing.
     #[test_case]
     fn an_unstated_scan_version_is_refused_rather_than_assumed() {
-        assert_eq!(
-            proto::SCAN_REQ_UMAC_VERSIONS,
-            &[] as &[u8],
-            "no scan layout is implemented yet; adding one means adding its struct too"
-        );
         let e = ScanUnsupported::Unstated;
         assert!(e.message().contains("not version 0"));
         let v = ScanUnsupported::Version(17);
@@ -355,11 +351,23 @@ mod scan_gate_tests {
     /// implemented passes and its neighbours do not. Pinned as a table rather
     /// than a behaviour so adding a layout to `SCAN_REQ_UMAC_VERSIONS` without
     /// adding the struct is caught here.
+    /// **Every listed version must have a builder.** Listing a version without
+    /// its struct is the failure this gate exists to prevent, wearing a
+    /// different hat: the refusal would pass and a wrong layout would go out.
     #[test_case]
-    fn only_versions_with_an_implemented_layout_are_accepted() {
+    fn every_listed_version_has_an_implemented_layout() {
+        for &v in proto::SCAN_REQ_UMAC_VERSIONS {
+            assert_eq!(v, scan::VERSION, "v{v} is listed but only v{} is built", scan::VERSION);
+        }
+        assert!(
+            proto::SCAN_REQ_UMAC_VERSIONS.contains(&scan::VERSION),
+            "the implemented version must be listed, or it is never used"
+        );
+        // Anything else is still refused.
         for v in 0u8..=20 {
-            let implemented = proto::SCAN_REQ_UMAC_VERSIONS.contains(&v);
-            assert!(!implemented, "v{v} is listed but no struct exists for it");
+            if v != scan::VERSION {
+                assert!(!proto::SCAN_REQ_UMAC_VERSIONS.contains(&v), "v{v}");
+            }
         }
     }
 }

@@ -51,11 +51,16 @@ pub const SCAN_REQ_UMAC: u8 = 0x0d;
 
 /// Versions of `SCAN_REQ_UMAC` whose layout this driver implements.
 ///
-/// Empty on purpose. Each entry is a struct that has to come from Linux's
-/// `fw/api/scan.h` at the matching kernel version and be verified against a
-/// radio — neither of which can be done from here, and a guess is worse than a
-/// refusal because the refusal names itself.
-pub const SCAN_REQ_UMAC_VERSIONS: &[u8] = &[];
+/// v17 is implemented in [`super::scan`], with every offset pinned against
+/// `scan.h`'s own field list. Adding another version means adding its struct
+/// too — the test in `super::scan` fails if this list names a version no
+/// builder exists for.
+///
+/// **Still unverified against a radio.** No emulator provides an Intel WiFi
+/// part, so the layout is checked against the header's arithmetic and nothing
+/// more; the refusal path above remains the honest answer for every other
+/// version.
+pub const SCAN_REQ_UMAC_VERSIONS: &[u8] = &[17];
 
 /// Firmware's first word after a successful load: it is alive.
 pub const UCODE_ALIVE_NTFY: u8 = 0x01;
