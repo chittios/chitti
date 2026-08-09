@@ -190,6 +190,18 @@ pub struct DisplayCfg {
     /// Physical mode for the loader to set on the next boot. `None` = auto, i.e.
     /// let the display's EDID decide (see [`crate::edid`]).
     pub boot_mode: Option<(u32, u32)>,
+    /// Physical mode programmed by a **display driver** (KMS), for this display.
+    ///
+    /// Distinct from `boot_mode`, which is a request to the *loader* and costs a
+    /// reboot, and from `logical`, which only letterboxes a smaller desktop
+    /// inside whatever the panel is doing. This is the one a KMS mode set
+    /// produces, and without it `/display set 1920x1080` lasted until the next
+    /// boot and then silently reverted — which only became visible once there was
+    /// a driver for the default adapter to bind.
+    ///
+    /// `None` = follow the display's own preference (its EDID), which is what
+    /// `/display set native` restores.
+    pub mode: Option<(u32, u32)>,
     /// Font scale; `0` = automatic from the desktop height
     /// ([`auto_font_scale`]). This is the knob that actually answers "everything
     /// is too small on a high-resolution screen" — a smaller *desktop* only
@@ -217,7 +229,15 @@ impl DisplayCfg {
             .and_then(|v| v.as_i64())
             .map(|n| clamp_font_scale(n.max(0) as u64))
             .unwrap_or(0);
-        DisplayCfg { logical: mode("logical"), boot_mode: mode("boot_mode"), font_scale }
+        DisplayCfg {
+            logical: mode("logical"),
+            boot_mode: mode("boot_mode"),
+            // Absent in a file written before this field existed, which reads as
+            // "no preference" — exactly the old behaviour, so an existing config
+            // is unchanged rather than migrated into a mode nobody chose.
+            mode: mode("mode"),
+            font_scale,
+        }
     }
 
     /// Serialize to the on-disk JSON text.
@@ -226,8 +246,9 @@ impl DisplayCfg {
             m.map(format_wxh).unwrap_or_else(|| String::from(dflt))
         };
         alloc::format!(
-            "{{\n  \"logical\": \"{}\",\n  \"boot_mode\": \"{}\",\n  \"font_scale\": {}\n}}\n",
+            "{{\n  \"logical\": \"{}\",\n  \"mode\": \"{}\",\n  \"boot_mode\": \"{}\",\n  \"font_scale\": {}\n}}\n",
             s(self.logical, "native"),
+            s(self.mode, "auto"),
             s(self.boot_mode, "auto"),
             self.font_scale
         )
@@ -272,7 +293,7 @@ impl DisplaySettings {
             None => {
                 // Legacy flat file: keep it, attributed to the display in use.
                 let flat = DisplayCfg::from_json(j);
-                if flat.logical.is_some() || flat.font_scale != 0 {
+                if flat.logical.is_some() || flat.mode.is_some() || flat.font_scale != 0 {
                     out.displays.push((String::from(key), flat));
                 }
             }
@@ -307,9 +328,10 @@ impl DisplaySettings {
                 s.push(',');
             }
             s.push_str(&alloc::format!(
-                "\n    \"{}\": {{ \"logical\": \"{}\", \"font_scale\": {} }}",
+                "\n    \"{}\": {{ \"logical\": \"{}\", \"mode\": \"{}\", \"font_scale\": {} }}",
                 k,
                 p.logical.map(format_wxh).unwrap_or_else(|| String::from("native")),
+                p.mode.map(format_wxh).unwrap_or_else(|| String::from("auto")),
                 p.font_scale
             ));
         }
@@ -320,6 +342,54 @@ impl DisplaySettings {
 
 #[cfg(test)]
 mod tests {
+    /// The driver-set physical mode round-trips, and is **separate from both**
+    /// `logical` (a letterboxed viewport) and `boot_mode` (a request to the
+    /// loader). Conflating any two of them was how `/display set` came to look
+    /// like it had persisted when it had not.
+    #[test_case]
+    fn the_driver_mode_round_trips_and_is_its_own_field() {
+        let cfg = DisplayCfg {
+            logical: None,
+            mode: Some((1920, 1080)),
+            boot_mode: Some((2560, 1440)),
+            font_scale: 2,
+        };
+        let back = DisplayCfg::from_json(&crate::json::Json::parse(&cfg.to_json_string()).unwrap());
+        assert_eq!(back, cfg);
+        assert_ne!(back.mode, back.boot_mode, "distinct fields, distinct meanings");
+        assert_eq!(back.logical, None, "a real mode set is not a viewport");
+    }
+
+    /// A config written before this field existed must read as "no preference",
+    /// not as a mode nobody chose — an existing machine must boot exactly as it
+    /// did.
+    #[test_case]
+    fn a_config_without_the_field_has_no_saved_mode() {
+        let old = r#"{"logical":"native","boot_mode":"auto","font_scale":3}"#;
+        let cfg = DisplayCfg::from_json(&crate::json::Json::parse(old).unwrap());
+        assert_eq!(cfg.mode, None);
+        assert_eq!(cfg.font_scale, 3, "the rest still parses");
+        // And "native"/"auto"/"" all mean no preference for the new field too.
+        for t in ["native", "auto", ""] {
+            let j = alloc::format!(r#"{{"mode":"{t}"}}"#);
+            assert_eq!(DisplayCfg::from_json(&crate::json::Json::parse(&j).unwrap()).mode, None);
+        }
+    }
+
+    /// It is stored **per display**, so plugging in a second monitor cannot move
+    /// the first one's mode — the whole reason the profile map exists.
+    #[test_case]
+    fn the_mode_is_remembered_per_display() {
+        let mut s = DisplaySettings::default();
+        s.set_profile("DEL-A1B2-00034F1C", DisplayCfg { logical: None, mode: Some((2560, 1440)), boot_mode: None, font_scale: 0 });
+        s.set_profile("APP-1234-00000000", DisplayCfg { logical: None, mode: Some((1280, 800)), boot_mode: None, font_scale: 0 });
+        let back = DisplaySettings::from_json(&crate::json::Json::parse(&s.to_json_string()).unwrap(), "DEL-A1B2-00034F1C");
+        assert_eq!(back.profile("DEL-A1B2-00034F1C").mode, Some((2560, 1440)));
+        assert_eq!(back.profile("APP-1234-00000000").mode, Some((1280, 800)));
+        // An unknown display gets the default, never another display's mode.
+        assert_eq!(back.profile("fb-1024x768").mode, None);
+    }
+
     use super::*;
 
     #[test_case]
@@ -435,7 +505,7 @@ mod tests {
 
     #[test_case]
     fn config_round_trips_through_json() {
-        let cfg = DisplayCfg { logical: Some((1920, 1080)), boot_mode: Some((2560, 1440)), font_scale: 2 };
+        let cfg = DisplayCfg { logical: Some((1920, 1080)), mode: None, boot_mode: Some((2560, 1440)), font_scale: 2 };
         let text = cfg.to_json_string();
         let back = DisplayCfg::from_json(&crate::json::Json::parse(&text).unwrap());
         assert_eq!(back, cfg);
@@ -450,15 +520,15 @@ mod tests {
     #[test_case]
     fn settings_keep_a_profile_per_display() {
         let mut s = DisplaySettings::default();
-        s.set_profile("DEL-A1B2-00034F1C", DisplayCfg { logical: None, boot_mode: None, font_scale: 2 });
-        s.set_profile("APP-1234-00000000", DisplayCfg { logical: Some((1280, 800)), boot_mode: None, font_scale: 3 });
+        s.set_profile("DEL-A1B2-00034F1C", DisplayCfg { logical: None, mode: None, boot_mode: None, font_scale: 2 });
+        s.set_profile("APP-1234-00000000", DisplayCfg { logical: Some((1280, 800)), mode: None, boot_mode: None, font_scale: 3 });
         s.boot_mode = Some((1920, 1080));
         // Each display gets its own answer; an unknown one gets defaults.
         assert_eq!(s.profile("DEL-A1B2-00034F1C").font_scale, 2);
         assert_eq!(s.profile("APP-1234-00000000").logical, Some((1280, 800)));
         assert_eq!(s.profile("nope"), DisplayCfg::default());
         // Re-setting replaces rather than duplicating.
-        s.set_profile("DEL-A1B2-00034F1C", DisplayCfg { logical: None, boot_mode: None, font_scale: 4 });
+        s.set_profile("DEL-A1B2-00034F1C", DisplayCfg { logical: None, mode: None, boot_mode: None, font_scale: 4 });
         assert_eq!(s.displays.len(), 2);
         assert_eq!(s.profile("DEL-A1B2-00034F1C").font_scale, 4);
         // Round-trips, and one display's change does not disturb the other.
@@ -548,7 +618,7 @@ mod tests {
         let j = crate::json::Json::parse("{\"logical\": \"1600x900\", \"boot_mode\": \"junk\"}").unwrap();
         assert_eq!(
             DisplayCfg::from_json(&j),
-            DisplayCfg { logical: Some((1600, 900)), boot_mode: None, font_scale: 0 }
+            DisplayCfg { logical: Some((1600, 900)), mode: None, boot_mode: None, font_scale: 0 }
         );
         // An out-of-range font scale clamps rather than producing a giant cell.
         let j = crate::json::Json::parse("{\"font_scale\": 99}").unwrap();

@@ -9739,7 +9739,15 @@ const DISPLAY_PATH: &str = "/configs/core/display.json";
 pub(crate) fn display_key() -> alloc::string::String {
     crate::display::profile_key(
         crate::display::edid_bytes().as_deref(),
-        crate::framebuffer::physical_size(),
+        // **The display's preferred mode, not the current one.** With no EDID the
+        // key falls back to `fb-<W>x<H>`, and the current framebuffer size is
+        // exactly what a mode set changes — so `/display set 1920x1080` saved
+        // itself under `fb-1920x1080`, a key that only exists *after* it has been
+        // applied and is therefore never looked up at boot. A display's preferred
+        // mode is a property of the display and stays put.
+        crate::kms::preferred_mode()
+            .map(|m| (m.w, m.h))
+            .or_else(crate::framebuffer::physical_size),
     )
 }
 
@@ -9790,6 +9798,28 @@ pub(crate) fn save_display_config(cfg: &crate::display::DisplayCfg) {
 #[cfg(all(not(feature = "server"), not(test)))]
 fn load_display_config() {
     let cfg = display_config();
+    // **The saved physical mode goes first**, because everything after it is
+    // sized against the framebuffer this produces: the font scale is derived
+    // from the desktop height and the logical viewport is clamped to the panel,
+    // so applying either against the pre-mode-set geometry then re-applying
+    // would reflow the console twice on every boot.
+    //
+    // Ordering is deliberate and matches the loader's (`edid::best_mode_for`):
+    // a mode a human chose outranks the display's own preference, which outranks
+    // whatever the firmware happened to leave. KMS binds before this runs on both
+    // arches; with no driver there is nothing to program and the mode is simply
+    // ignored rather than mistaken for a viewport request.
+    if let Some((w, h)) = cfg.mode {
+        if crate::kms::has_driver() {
+            match crate::kms::set_mode((w, h)) {
+                Some(m) => serial_println!("display> mode {}x{} restored on {}", m.w, m.h,
+                    crate::kms::driver_name().unwrap_or("?")),
+                // Said rather than swallowed: the saved mode is kept, because the
+                // display it was saved for may simply not be attached right now.
+                None => serial_println!("display> saved mode {w}x{h} not available on this display"),
+            }
+        }
+    }
     if cfg.font_scale > 0 {
         if let Some(n) = crate::framebuffer::set_font_scale(cfg.font_scale) {
             serial_println!("display> font scale {}", n);
@@ -9928,6 +9958,35 @@ fn run_display(arg: &str) {
                     }
                 }
             };
+            // `native`/`auto` with a driver bound means "stop overriding": forget
+            // the remembered mode and go back to whatever the display asks for.
+            // Falling through to `set_logical_size(None)` would only drop the
+            // letterbox and leave the overridden *physical* mode in place, so the
+            // command would not undo what its counterpart did.
+            if pref.is_none() && crate::kms::has_driver() {
+                let mut cfg = display_config();
+                let had = cfg.mode.take();
+                save_display_config(&cfg);
+                if let Some(m) = crate::kms::preferred_mode() {
+                    if let Some(applied) = crate::kms::set_mode((m.w, m.h)) {
+                        let _ = crate::framebuffer::set_logical_size(None);
+                        repaint_all_tabs();
+                        update_status();
+                        serial_println!("");
+                        serial_println!(
+                            "display> following the display: {}x{}",
+                            applied.w,
+                            applied.h
+                        );
+                        return;
+                    }
+                }
+                if had.is_some() {
+                    serial_println!(
+                        "display> forgot the saved mode; the display reports no preference, so this one stays until reboot"
+                    );
+                }
+            }
             // With a display driver bound, honour the request by programming the
             // hardware — the full panel, no letterbox. `set_logical_size` is the
             // `nomodeset` fallback for a firmware framebuffer.
@@ -9936,6 +9995,13 @@ fn run_display(arg: &str) {
                     if let Some(m) = crate::kms::set_mode(want) {
                         let mut cfg = display_config();
                         cfg.logical = None; // a real mode set replaces the viewport
+                        // **Remember the mode, or this lasts until the next boot.**
+                        // Only `logical` used to be persisted, so with a driver
+                        // bound the setting silently reverted on reboot — invisible
+                        // until there was a driver for the default adapter.
+                        // Recorded per display (`display_key`), so a second monitor
+                        // keeps its own.
+                        cfg.mode = Some((m.w, m.h));
                         save_display_config(&cfg);
                         repaint_all_tabs();
                         update_status();

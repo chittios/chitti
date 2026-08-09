@@ -160,10 +160,12 @@ pub fn probe_bind_only() {
     // that state makes a mode set silently do nothing.
     if let Some(v) = vmsvga::VmSvga::probe() {
         bind(Box::new(v));
+        publish_edid();
         return;
     }
     if let Some(g) = virtio_gpu::VirtioGpu::probe() {
         bind(Box::new(g));
+        publish_edid();
         return;
     }
     // Bochs VBE last: it is the *fallback* adapter. A machine that also has a
@@ -171,9 +173,29 @@ pub fn probe_bind_only() {
     // std VGA is what QEMU leaves in place when nobody asked for anything.
     if let Some(b) = bochs::Bochs::probe() {
         bind(Box::new(b));
+        publish_edid();
         return;
     }
     crate::ktrace::log("kms", "no display driver (firmware framebuffer only)");
+}
+
+/// Publish the bound driver's EDID as the active display's identity.
+///
+/// Without this, per-display settings on a platform with no firmware EDID handoff
+/// (x86 has no stub, so nothing called `display::set_edid`) fall back to a
+/// `fb-<W>x<H>` key derived from the *current* framebuffer — which a mode set
+/// changes. Settings then save under a key that only exists once they have been
+/// applied, and are never found again at boot. A driver that can read EDID is the
+/// natural source for the identity the profile map is keyed on.
+#[cfg(not(test))]
+fn publish_edid() {
+    let cs = connectors();
+    let Some(c) = cs.iter().find(|c| c.connected).or_else(|| cs.first()) else { return };
+    if let Some(e) = c.edid.as_deref() {
+        if crate::edid::is_valid(e) {
+            crate::display::set_edid(e);
+        }
+    }
 }
 
 /// If nothing has given us a framebuffer yet, this device *is* the display: set its
