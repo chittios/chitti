@@ -109,6 +109,44 @@ jobs:
       - name: Package with RUN.md
         run: |
           set -eux
+          # **Arch-specific**, and it has to be: an ISO is booted with `-cdrom`
+          # and a GPT disk image is attached as a drive behind UEFI firmware.
+          # A single generic section told whoever downloaded the ARM image to
+          # run `qemu-system-x86_64 -cdrom chitti-aarch64.iso`, which is the
+          # wrong emulator against a file that does not exist.
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            RUN_SECTION=$(cat <<'SECTION'
+          A hybrid ISO: boot it as optical media, or write it to a USB stick.
+
+              qemu-system-x86_64 -M q35 -cpu max -m 2G -cdrom chitti-x86_64.iso -serial stdio
+
+          On real hardware, write it with balenaEtcher or dd and pick the stick
+          from the firmware boot menu (F12 / F2 / Del / Esc at power-on). BIOS
+          and UEFI both work.
+          SECTION
+          )
+          else
+            RUN_SECTION=$(cat <<'SECTION'
+          A raw GPT disk image with its own EFI system partition — it boots
+          itself, so it needs UEFI firmware rather than a kernel loader.
+
+          Copy the firmware variables somewhere writable first (QEMU will not
+          boot with a read-only VARS file), then attach the image as a drive:
+
+              cp /usr/share/AAVMF/AAVMF_VARS.fd .
+
+              qemu-system-aarch64 -M virt -cpu max -m 2G -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd -drive if=pflash,format=raw,file=AAVMF_VARS.fd -drive if=none,id=hd,format=raw,file=chitti-aarch64.img -device virtio-blk-pci,drive=hd -device virtio-gpu-pci -device qemu-xhci -device usb-kbd -device usb-tablet -serial stdio
+
+          The firmware path differs by distribution: Debian and Ubuntu ship
+          /usr/share/AAVMF/, Fedora /usr/share/edk2/aarch64/.
+
+          Easier options: **UTM** on an Apple-silicon Mac (new VM, Virtualize,
+          attach the .img as a drive), **VirtualBox-ARM**, or write it to a USB
+          stick for real UEFI hardware. From a source checkout,
+          "cargo xtask run -arch aarch64 --uefi" does all of it for you.
+          SECTION
+          )
+          fi
           cat > "dist/${NAME}.RUN.md" <<EOF
           # ChittiOS ${CHITTI_VERSION} - ${{ matrix.arch }}
 
@@ -133,14 +171,7 @@ jobs:
 
           ## Run it
 
-          x86_64 (hybrid ISO, BIOS or UEFI):
-
-              qemu-system-x86_64 -M q35 -cpu max -m 2G -cdrom ${NAME}.iso -serial stdio
-
-          aarch64 (raw GPT disk image, boots standalone via UEFI):
-
-              write it to a USB stick with balenaEtcher or dd, or attach it as a
-              VM disk (UTM / VirtualBox-ARM / QEMU + AAVMF)
+          ${RUN_SECTION}
 
           In a VM, set the pointing device to **USB Tablet** and the keyboard to
           **USB** so the HID drivers pick them up, and enable EFI.
