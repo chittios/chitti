@@ -34,6 +34,29 @@ pub const GROUP_REGULATORY_NVM: u8 = 0xc;
 /// guess here can only be answered with an error.
 pub const NVM_GET_INFO: u8 = 0x02;
 
+/// `SCAN_REQ_UMAC` — start a scan. Group `LONG` (0x1), command 0x0d.
+///
+/// **Not sent by this driver**, and the reason is the point: the request
+/// structure is versioned and has changed repeatedly (adaptive dwell, then a
+/// v8 rewrite, then per-band channel configuration), so the *same* command id
+/// takes a different layout on different firmware. `SCAN_REQ_UMAC_VERSIONS`
+/// records which layouts are implemented here — currently none — and
+/// `iwl::scan_supported` refuses anything absent from it.
+///
+/// Sending a plausible-looking structure at the wrong version is the failure
+/// mode this whole module is written to avoid: the radio accepts the command,
+/// interprets our fields as different ones, and either scans nothing or
+/// configures itself in a way no host-visible error reports.
+pub const SCAN_REQ_UMAC: u8 = 0x0d;
+
+/// Versions of `SCAN_REQ_UMAC` whose layout this driver implements.
+///
+/// Empty on purpose. Each entry is a struct that has to come from Linux's
+/// `fw/api/scan.h` at the matching kernel version and be verified against a
+/// radio — neither of which can be done from here, and a guess is worse than a
+/// refusal because the refusal names itself.
+pub const SCAN_REQ_UMAC_VERSIONS: &[u8] = &[];
+
 /// Firmware's first word after a successful load: it is alive.
 pub const UCODE_ALIVE_NTFY: u8 = 0x01;
 /// Initialisation finished.

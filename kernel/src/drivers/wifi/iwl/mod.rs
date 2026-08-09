@@ -273,3 +273,93 @@ pub fn bring_up() -> Result<String, String> {
     report.push_str("; scan and associate need its configuration commands, which are not implemented.");
     Ok(report)
 }
+
+/// Whether this firmware's `SCAN_REQ_UMAC` layout is one this driver implements.
+///
+/// The command id is stable; **the request structure is not**. It has been
+/// rewritten several times (adaptive dwell, a v8 rewrite, per-band channel
+/// configuration), so the same command takes a different layout on different
+/// firmware, and the image itself says which it expects via the
+/// `IWL_UCODE_TLV_CMD_VERSIONS` table.
+///
+/// Returns `Err` with the version named when the firmware speaks a layout this
+/// driver has not been written against — which is currently every version, and
+/// is why `/wifi scan` reports that rather than transmitting.
+///
+/// This is the discipline the rest of the module already follows: a struct
+/// recalled rather than read produced a confident wrong answer once here
+/// (`NVM_GET_INFO`'s general section), and a scan request is far larger. A
+/// refusal that names the version is actionable; a well-formed guess sent to a
+/// real radio is not, because the radio accepts it, reads our fields as
+/// different ones, and reports nothing.
+pub fn scan_supported(fw: &fw::FirmwareImage, blob: &[u8]) -> Result<u8, ScanUnsupported> {
+    match fw.cmd_version(blob, proto::GROUP_LONG, proto::SCAN_REQ_UMAC) {
+        Some(v) if proto::SCAN_REQ_UMAC_VERSIONS.contains(&v.cmd_ver) => Ok(v.cmd_ver),
+        Some(v) => Err(ScanUnsupported::Version(v.cmd_ver)),
+        // Silence in the table is **not** version 0: older images omit the
+        // table entirely, and assuming a layout because nothing contradicted it
+        // is exactly the guess this function exists to prevent.
+        None => Err(ScanUnsupported::Unstated),
+    }
+}
+
+/// Why a scan cannot be started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanUnsupported {
+    /// The firmware named a request version this driver does not implement.
+    Version(u8),
+    /// The firmware's command-version table is absent or silent about scan.
+    Unstated,
+}
+
+impl ScanUnsupported {
+    pub fn message(self) -> alloc::string::String {
+        match self {
+            ScanUnsupported::Version(v) => alloc::format!(
+                "this firmware speaks SCAN_REQ_UMAC v{v}, which this driver does not implement \
+                 (the request layout differs per version; it must be taken from Linux's \
+                 fw/api/scan.h for a matching release and verified on the hardware)"
+            ),
+            ScanUnsupported::Unstated => alloc::string::String::from(
+                "this firmware does not state its SCAN_REQ_UMAC version, so no layout can be \
+                 assumed -- an unstated version is not version 0",
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_gate_tests {
+    use super::*;
+
+    /// **An unstated version is not version 0.** Older images omit the
+    /// command-version table entirely, and assuming a layout because nothing
+    /// contradicted it is exactly the guess this gate exists to prevent — a
+    /// well-formed scan request at the wrong version is accepted by the radio,
+    /// read as different fields, and reported by nothing.
+    #[test_case]
+    fn an_unstated_scan_version_is_refused_rather_than_assumed() {
+        assert_eq!(
+            proto::SCAN_REQ_UMAC_VERSIONS,
+            &[] as &[u8],
+            "no scan layout is implemented yet; adding one means adding its struct too"
+        );
+        let e = ScanUnsupported::Unstated;
+        assert!(e.message().contains("not version 0"));
+        let v = ScanUnsupported::Version(17);
+        assert!(v.message().contains("v17"), "the version must be named: {}", v.message());
+        assert!(v.message().contains("fw/api/scan.h"), "and where to get the layout");
+    }
+
+    /// The gate is driven by the firmware's own table, so a version that *is*
+    /// implemented passes and its neighbours do not. Pinned as a table rather
+    /// than a behaviour so adding a layout to `SCAN_REQ_UMAC_VERSIONS` without
+    /// adding the struct is caught here.
+    #[test_case]
+    fn only_versions_with_an_implemented_layout_are_accepted() {
+        for v in 0u8..=20 {
+            let implemented = proto::SCAN_REQ_UMAC_VERSIONS.contains(&v);
+            assert!(!implemented, "v{v} is listed but no struct exists for it");
+        }
+    }
+}

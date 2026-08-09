@@ -18,6 +18,7 @@ pub mod ccmp;
 pub mod data;
 pub mod ieee80211;
 pub mod link;
+pub mod scan;
 pub mod iwl;
 pub mod wpa;
 
