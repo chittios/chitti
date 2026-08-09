@@ -34,7 +34,7 @@ refusal logged. It has just never been proven. Treat it the way we treat
 | Wired Ethernet | ✅ Intel, ⚠️ Realtek |
 | **WiFi** | ❌ **no machine can join a network** (USB tether works) |
 | **Bluetooth peripherals** | ❌ won't pair (no SSP, no BLE) |
-| Audio | ⚠️ plays, in mono; ❌ no USB headsets, ❌ no jack detect |
+| Audio | ✅ stereo (WAV/MP3); ⚠️ AAC mono; ❌ no USB headsets, ❌ no jack detect |
 | Screen brightness | ❌ |
 | Suspend / lid close | ⚠️ unverified / ❌ absent |
 | Battery + charger reporting | ⚠️ unverified |
@@ -361,10 +361,16 @@ set to D0.
 
 ### The limits — ⚠️
 
-- ⚠️ **Everything is 16-bit mono.** The `SndDevice` contract is mono, and the
-  audio player downmixes every channel into it. Music, and the audio track of a
-  video, plays **in mono**. The voice pipeline is the design target and mono is
-  correct there.
+- ✅ **Stereo plays** on HDA for WAV and MP3 — the channel count rides on
+  `Audio` and the decoders keep their interleaving. Anything wider than stereo
+  is folded to stereo rather than to its first two channels, so a 5.1 track
+  keeps its centre.
+- ⚠️ **AAC still folds to mono**, so a video's audio track is mono. Its
+  downmix is a weighted BS.775 matrix rather than an average, so stereo means
+  writing a second matrix into a decoder that is bit-exact-validated against
+  Symphonia — deliberately not disturbed for a channel count.
+- ⚠️ Drivers other than HDA (virtio-snd, AC'97, SB16) fold to mono via the
+  default `SndDevice::play_ch`, so they are unchanged.
 - ❌ **No jack detection** (no unsolicited responses / pin sense). Plugging
   headphones in does not switch output away from the speakers.
 - ⚠️ **Volume is software-only** — a gain applied in `sound::play`, so every
