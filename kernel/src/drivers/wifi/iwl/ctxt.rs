@@ -137,6 +137,179 @@ fn w32(b: &mut [u8], at: usize, v: u32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+// --- MAC_CONTEXT_CMD ------------------------------------------------------
+//
+// The interface itself: our address, the BSSID we are joining, the rates, the
+// filters, and — once associated — the association id and beacon timing.
+
+/// `MAC_CONTEXT_CMD`, legacy group.
+pub const MAC_CONTEXT_CMD: u8 = 0x28;
+
+/// `iwl_ac_qos` — 8 bytes, five of them (`AC_NUM + 1`).
+const AC_QOS_LEN: usize = 8;
+const AC_COUNT: usize = 5;
+
+/// Offset of the interface-type union inside `iwl_mac_ctx_cmd`.
+pub const MAC_UNION_OFF: usize = 100;
+
+/// `iwl_mac_ctx_cmd` — 148 bytes.
+///
+/// **The size is the common part plus the union's *largest* arm**, not plus the
+/// arm being used. Linux sends `sizeof(*cmd)` whatever the interface type, and
+/// the largest is `iwl_mac_data_p2p_sta` (an `iwl_mac_data_sta` plus a
+/// `ctwin`), at 48. Sizing the command to the 44-byte station arm sends four
+/// bytes too few and the firmware rejects a command that is otherwise correct.
+pub const MAC_CTXT_LEN: usize = MAC_UNION_OFF + 48;
+
+// Offsets into the common part.
+const M_ID_AND_COLOR: usize = 0;
+const M_ACTION: usize = 4;
+const M_MAC_TYPE: usize = 8;
+const M_TSF_ID: usize = 12;
+const M_NODE_ADDR: usize = 16;
+const M_BSSID_ADDR: usize = 24;
+const M_CCK_RATES: usize = 32;
+const M_OFDM_RATES: usize = 36;
+const M_PROTECTION_FLAGS: usize = 40;
+const M_CCK_SHORT_PREAMBLE: usize = 44;
+const M_SHORT_SLOT: usize = 48;
+const M_FILTER_FLAGS: usize = 52;
+const M_QOS_FLAGS: usize = 56;
+const M_AC: usize = 60;
+
+// Offsets inside the `iwl_mac_data_sta` arm, relative to `MAC_UNION_OFF`.
+const STA_IS_ASSOC: usize = 0;
+const STA_DTIM_TIME: usize = 4;
+const STA_DTIM_TSF: usize = 8;
+const STA_BI: usize = 16;
+const STA_DTIM_INTERVAL: usize = 24;
+const STA_DATA_POLICY: usize = 28;
+const STA_LISTEN_INTERVAL: usize = 32;
+const STA_ASSOC_ID: usize = 36;
+
+/// `enum iwl_mac_types`. The enum starts at 1, so a zeroed `mac_type` is not a
+/// type at all.
+pub const MAC_TYPE_BSS_STA: u32 = 5;
+
+/// `enum iwl_mac_filter_flags`.
+pub const MAC_FILTER_ACCEPT_GRP: u32 = 1 << 2;
+pub const MAC_FILTER_IN_BEACON: u32 = 1 << 6;
+pub const MAC_FILTER_IN_PROBE_REQUEST: u32 = 1 << 12;
+
+/// Build `MAC_CONTEXT_CMD` for a client interface.
+///
+/// `assoc` is `None` before association and `Some((aid, beacon_interval,
+/// dtim_interval))` after — the same command carries both states, which is why
+/// it is sent twice during a join.
+pub fn mac_context_sta(
+    id: u8,
+    color: u8,
+    our_mac: &[u8; 6],
+    bssid: &[u8; 6],
+    action: u32,
+    assoc: Option<(u16, u16, u8)>,
+) -> Vec<u8> {
+    let mut b = alloc::vec![0u8; MAC_CTXT_LEN];
+    w32(&mut b, M_ID_AND_COLOR, id_and_color(id, color));
+    w32(&mut b, M_ACTION, action);
+    w32(&mut b, M_MAC_TYPE, MAC_TYPE_BSS_STA);
+    w32(&mut b, M_TSF_ID, id as u32);
+    b[M_NODE_ADDR..M_NODE_ADDR + 6].copy_from_slice(our_mac);
+    b[M_BSSID_ADDR..M_BSSID_ADDR + 6].copy_from_slice(bssid);
+    // Rate masks: the 4 CCK rates and the 8 OFDM rates, all of them. A zero
+    // mask is a station that may transmit at no rate, which associates and then
+    // sends nothing.
+    w32(&mut b, M_CCK_RATES, 0x0f);
+    w32(&mut b, M_OFDM_RATES, 0xff);
+    w32(&mut b, M_PROTECTION_FLAGS, 0);
+    w32(&mut b, M_CCK_SHORT_PREAMBLE, 0);
+    w32(&mut b, M_SHORT_SLOT, 0);
+    // Accept group-addressed frames (ARP and DHCP replies arrive that way) and
+    // beacons (the scan and the DTIM timing both need them). Without
+    // ACCEPT_GRP the link comes up and never resolves an address.
+    w32(&mut b, M_FILTER_FLAGS, MAC_FILTER_ACCEPT_GRP | MAC_FILTER_IN_BEACON);
+    w32(&mut b, M_QOS_FLAGS, 0);
+    // Five access categories with workable EDCA defaults. `fifos_mask` picks
+    // the transmit FIFO; zero would leave the category with none.
+    for i in 0..AC_COUNT {
+        let at = M_AC + i * AC_QOS_LEN;
+        w16(&mut b, at, 15); // cw_min
+        w16(&mut b, at + 2, 1023); // cw_max
+        b[at + 4] = 2; // aifsn
+        b[at + 5] = 1 << i; // fifos_mask
+        w16(&mut b, at + 6, 0); // edca_txop
+    }
+    // The station arm.
+    let u = MAC_UNION_OFF;
+    match assoc {
+        Some((aid, bi, dtim)) => {
+            w32(&mut b, u + STA_IS_ASSOC, 1);
+            w32(&mut b, u + STA_BI, bi as u32);
+            w32(&mut b, u + STA_DTIM_INTERVAL, (bi as u32) * (dtim.max(1) as u32));
+            w32(&mut b, u + STA_ASSOC_ID, aid as u32);
+        }
+        None => {
+            w32(&mut b, u + STA_IS_ASSOC, 0);
+        }
+    }
+    w32(&mut b, u + STA_DTIM_TIME, 0);
+    w64(&mut b, u + STA_DTIM_TSF, 0);
+    w32(&mut b, u + STA_DATA_POLICY, 0);
+    // How many beacon intervals we may sleep through. 10 is Linux's default and
+    // is policy rather than layout.
+    w32(&mut b, u + STA_LISTEN_INTERVAL, 10);
+    b
+}
+
+fn w16(b: &mut [u8], at: usize, v: u16) {
+    b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+fn w64(b: &mut [u8], at: usize, v: u64) {
+    b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+// --- BINDING_CONTEXT_CMD --------------------------------------------------
+
+/// `BINDING_CONTEXT_CMD`, legacy group.
+pub const BINDING_CONTEXT_CMD: u8 = 0x2b;
+
+/// `MAX_MACS_IN_BINDING`.
+pub const MAX_MACS_IN_BINDING: usize = 3;
+
+/// `iwl_binding_cmd` — 28 bytes: two words, a three-word array, then two more.
+pub const BINDING_LEN: usize = 4 + 4 + 4 * MAX_MACS_IN_BINDING + 4 + 4;
+/// `iwl_binding_cmd_v1`, without `lmac_id` — 24 bytes.
+pub const BINDING_LEN_V1: usize = BINDING_LEN - 4;
+
+const B_ID_AND_COLOR: usize = 0;
+const B_ACTION: usize = 4;
+const B_MACS: usize = 8;
+const B_PHY: usize = 8 + 4 * MAX_MACS_IN_BINDING; // 20
+const B_LMAC_ID: usize = B_PHY + 4; // 24
+
+/// `FW_CTXT_INVALID` — the value an unused context slot must hold.
+pub const CTXT_INVALID: u32 = 0xffff_ffff;
+
+/// Tie a MAC context to a PHY context.
+///
+/// **Unused MAC slots must be `FW_CTXT_INVALID`, not zero.** Zero is a
+/// perfectly valid context identifier — id 0, colour 0 — so a zeroed array
+/// binds three MACs, two of which are whatever happens to live at id 0. The
+/// binding is accepted and the radio serves a context we never configured.
+pub fn binding(id: u8, color: u8, mac_id_color: u32, phy_id_color: u32, action: u32) -> Vec<u8> {
+    let mut b = alloc::vec![0u8; BINDING_LEN];
+    w32(&mut b, B_ID_AND_COLOR, id_and_color(id, color));
+    w32(&mut b, B_ACTION, action);
+    for i in 0..MAX_MACS_IN_BINDING {
+        // Every slot starts invalid; only slot 0 is ours.
+        w32(&mut b, B_MACS + i * 4, CTXT_INVALID);
+    }
+    w32(&mut b, B_MACS, mac_id_color);
+    w32(&mut b, B_PHY, phy_id_color);
+    w32(&mut b, B_LMAC_ID, 0);
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +390,86 @@ mod tests {
         let c = phy_context_20mhz(3, 7, 1, ACTION_ADD);
         let v = u32::from_le_bytes(c[P_ID_AND_COLOR..P_ID_AND_COLOR + 4].try_into().unwrap());
         assert_eq!(v, id_and_color(3, 7));
+    }
+
+    /// **The command is the common part plus the union's LARGEST arm**, not the
+    /// arm in use. Linux sends `sizeof(*cmd)` whatever the interface type, and
+    /// four bytes too few makes the firmware reject a command that is otherwise
+    /// correct.
+    #[test_case]
+    fn the_mac_context_is_sized_for_the_largest_union_arm() {
+        assert_eq!(MAC_UNION_OFF, 100, "common part: 60 + five 8-byte AC entries");
+        assert_eq!(M_AC, 60);
+        assert_eq!(M_AC + AC_QOS_LEN * AC_COUNT, MAC_UNION_OFF);
+        // iwl_mac_data_sta is 44; iwl_mac_data_p2p_sta is that plus a ctwin.
+        assert_eq!(MAC_CTXT_LEN, 148, "100 + 48, not 100 + 44");
+        assert_ne!(MAC_CTXT_LEN, MAC_UNION_OFF + 44, "sizing to the sta arm is four short");
+    }
+
+    /// `iwl_mac_types` starts at 1, so a zeroed `mac_type` is not a type at all
+    /// — the same shape of bug as the zeroed action.
+    #[test_case]
+    fn the_mac_type_and_filters_are_set_rather_than_left_zero() {
+        let c = mac_context_sta(0, 1, &[2; 6], &[3; 6], ACTION_ADD, None);
+        assert_eq!(c.len(), MAC_CTXT_LEN);
+        let ty = u32::from_le_bytes(c[M_MAC_TYPE..M_MAC_TYPE + 4].try_into().unwrap());
+        assert_eq!(ty, MAC_TYPE_BSS_STA);
+        assert_ne!(ty, 0, "the enum starts at 1");
+
+        // Without ACCEPT_GRP the link comes up and never resolves an address:
+        // ARP and DHCP replies are group-addressed.
+        let f = u32::from_le_bytes(c[M_FILTER_FLAGS..M_FILTER_FLAGS + 4].try_into().unwrap());
+        assert_ne!(f & MAC_FILTER_ACCEPT_GRP, 0, "ARP/DHCP replies are group-addressed");
+        assert_ne!(f & MAC_FILTER_IN_BEACON, 0);
+
+        // A zero rate mask is a station that may transmit at no rate.
+        assert_ne!(u32::from_le_bytes(c[M_CCK_RATES..M_CCK_RATES + 4].try_into().unwrap()), 0);
+        assert_ne!(u32::from_le_bytes(c[M_OFDM_RATES..M_OFDM_RATES + 4].try_into().unwrap()), 0);
+        // Every access category gets a transmit FIFO; zero would leave it none.
+        for i in 0..AC_COUNT {
+            assert_ne!(c[M_AC + i * AC_QOS_LEN + 5], 0, "ac[{i}] fifos_mask");
+        }
+    }
+
+    /// The same command carries both states, which is why a join sends it
+    /// twice — before association and again with the AID.
+    #[test_case]
+    fn the_mac_context_carries_the_association_state() {
+        let before = mac_context_sta(0, 0, &[1; 6], &[2; 6], ACTION_ADD, None);
+        let u = MAC_UNION_OFF;
+        assert_eq!(u32::from_le_bytes(before[u..u + 4].try_into().unwrap()), 0, "not associated");
+
+        let after = mac_context_sta(0, 0, &[1; 6], &[2; 6], ACTION_MODIFY, Some((7, 100, 3)));
+        assert_eq!(u32::from_le_bytes(after[u..u + 4].try_into().unwrap()), 1, "associated");
+        let aid = u32::from_le_bytes(after[u + STA_ASSOC_ID..u + STA_ASSOC_ID + 4].try_into().unwrap());
+        assert_eq!(aid, 7);
+        let bi = u32::from_le_bytes(after[u + STA_BI..u + STA_BI + 4].try_into().unwrap());
+        assert_eq!(bi, 100);
+        // The DTIM interval is beacons x period, not the period alone.
+        let dtim = u32::from_le_bytes(after[u + STA_DTIM_INTERVAL..u + STA_DTIM_INTERVAL + 4].try_into().unwrap());
+        assert_eq!(dtim, 300);
+    }
+
+    /// **An unused MAC slot must be `FW_CTXT_INVALID`, not zero.** Zero is a
+    /// valid identifier — id 0, colour 0 — so a zeroed array binds three MACs,
+    /// two of them whatever lives at id 0. The binding is accepted and the radio
+    /// serves a context we never configured.
+    #[test_case]
+    fn unused_binding_slots_are_invalid_not_zero() {
+        assert_eq!(BINDING_LEN, 28, "macs[3] is three words, not one");
+        assert_eq!(BINDING_LEN_V1, 24);
+        assert_eq!(B_PHY, 20);
+
+        let mac = id_and_color(0, 0);
+        assert_eq!(mac, 0, "id 0 colour 0 really is the value zero");
+        let b = binding(0, 0, mac, id_and_color(1, 2), ACTION_ADD);
+        assert_eq!(u32::from_le_bytes(b[B_MACS..B_MACS + 4].try_into().unwrap()), mac);
+        for i in 1..MAX_MACS_IN_BINDING {
+            let v = u32::from_le_bytes(b[B_MACS + i * 4..B_MACS + i * 4 + 4].try_into().unwrap());
+            assert_eq!(v, CTXT_INVALID, "slot {i} must be invalid, not zero");
+            assert_ne!(v, 0);
+        }
+        let phy = u32::from_le_bytes(b[B_PHY..B_PHY + 4].try_into().unwrap());
+        assert_eq!(phy, id_and_color(1, 2));
     }
 }
