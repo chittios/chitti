@@ -661,6 +661,56 @@ impl IwlDevice {
     /// The notification's own status word is checked too, because firmware that comes up
     /// *unusable* still announces itself, and taking the announcement alone as success means
     /// the next command is sent into a dead device.
+    /// Start a scan.
+    ///
+    /// Consults the firmware's own `IWL_UCODE_TLV_CMD_VERSIONS` table first and
+    /// **refuses** rather than transmitting when it names a request layout this
+    /// driver does not implement — see [`super::scan_supported`]. That is the
+    /// difference between an actionable error and a radio that accepts a
+    /// well-formed guess, reads our fields as different ones, and reports
+    /// nothing.
+    ///
+    /// Returns the scan's uid, which the completion notification echoes back.
+    ///
+    /// **The results do not come back from this command.** `SCAN_REQ_UMAC`
+    /// answers with an acknowledgement; the networks arrive afterwards as
+    /// ordinary beacons and probe responses on the receive path, to be fed to
+    /// [`crate::drivers::wifi::scan::Scan`]. See its module docs — this surprised
+    /// me, and it changes what "implement scan" means on every chipset.
+    pub fn start_scan(
+        &mut self,
+        image: &fw::FirmwareImage,
+        blob: &[u8],
+        mac: &[u8; 6],
+        channels: &[super::scan::Channel],
+        passive: bool,
+    ) -> Result<u32, &'static str> {
+        let ver = super::scan_supported(image, blob).map_err(|e| match e {
+            super::ScanUnsupported::Version(_) => "firmware speaks a SCAN_REQ_UMAC version this driver does not implement",
+            super::ScanUnsupported::Unstated => "firmware does not state its SCAN_REQ_UMAC version",
+        })?;
+        debug_assert_eq!(ver, super::scan::VERSION);
+        // The uid identifies this scan in the completion notification. It is
+        // arbitrary but must be non-zero, since zero is what an uninitialised
+        // notification carries.
+        let uid = 1u32;
+        let (req, n) = super::scan::build_v17(uid, mac, channels, passive)
+            .ok_or("no channels to scan")?;
+        if n < channels.len() {
+            crate::ktrace::log_fmt(format_args!(
+                "iwl: scan truncated to {n} of {} channels (the request holds no more)",
+                channels.len()
+            ));
+        }
+        self.send_cmd(proto::GROUP_LONG, proto::SCAN_REQ_UMAC, &req)?;
+        crate::ktrace::log_fmt(format_args!(
+            "iwl: SCAN_REQ_UMAC v{ver} sent, uid {uid}, {n} channel(s), {} -- \
+             results arrive as beacons on the receive path",
+            if passive { "passive" } else { "active" }
+        ));
+        Ok(uid)
+    }
+
     pub fn wait_for_alive(&mut self) -> Result<(), &'static str> {
         if self.rings.is_none() {
             return Err("no receive ring; load firmware first");
