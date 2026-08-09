@@ -711,6 +711,46 @@ impl IwlDevice {
         Ok(uid)
     }
 
+    /// Collect scan results for up to `ms`, feeding every beacon into `out`.
+    ///
+    /// The networks arrive as `REPLY_RX_MPDU` notifications, each a descriptor
+    /// followed by the 802.11 frame — see [`super::rx`] for why the descriptor's
+    /// length is the whole risk. Anything that is not a beacon or probe response
+    /// is ignored by [`crate::drivers::wifi::scan::Scan`] itself, so this loop
+    /// hands over everything and lets one place decide.
+    ///
+    /// Bounded by time rather than by a result count: a scan of a quiet band
+    /// legitimately finds nothing, and waiting for a number that never arrives
+    /// would hang. Pumps `upkeep` and answers Ctrl+C, per the standing rule.
+    pub fn collect_scan(
+        &mut self,
+        out: &mut crate::drivers::wifi::scan::Scan,
+        ms: u64,
+    ) -> usize {
+        let start = crate::arch::now_ms();
+        let mut frames = 0usize;
+        while crate::arch::now_ms().saturating_sub(start) < ms {
+            crate::shell::upkeep();
+            if crate::shell::poll_interrupt() {
+                crate::ktrace::log("iwl", "scan cancelled");
+                break;
+            }
+            let Some(n) = self.poll_notification() else { continue };
+            if n.group_id != proto::GROUP_LEGACY || n.cmd != super::rx::REPLY_RX_MPDU {
+                continue;
+            }
+            if let Some(m) = super::rx::parse(&n.payload, self.family) {
+                frames += 1;
+                out.on_frame(m.frame, m.rssi);
+            }
+        }
+        crate::ktrace::log_fmt(format_args!(
+            "iwl: scan collected {frames} frame(s) -> {} network(s)",
+            out.len()
+        ));
+        frames
+    }
+
     pub fn wait_for_alive(&mut self) -> Result<(), &'static str> {
         if self.rings.is_none() {
             return Err("no receive ring; load firmware first");

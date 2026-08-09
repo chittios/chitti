@@ -69,6 +69,7 @@ pub mod context;
 pub mod csr;
 pub mod device;
 pub mod fw;
+pub mod rx;
 pub mod scan;
 pub mod proto;
 
