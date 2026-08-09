@@ -88,7 +88,21 @@ fn boot_seed() -> Option<(bool, Option<RemoteConfig>)> {
         let bytes = crate::arch::aarch64::ramfb::read_opt_file(b"opt/chitti/model")?;
         return parse_config_json(&bytes);
     }
-    #[cfg(not(all(target_arch = "aarch64", not(test))))]
+    // x86: the same seed, over fw_cfg's **port** interface rather than MMIO.
+    // This arm did not exist, so `xtask` wrote the file, passed
+    // `-fw_cfg name=opt/chitti/model,file=…`, and the kernel ignored it — the
+    // shell came up `local` with no indication why. A capability present on one
+    // arch and absent on the other is the divergence the standing rule forbids,
+    // and it was invisible precisely because "no seed" is a legitimate state.
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    {
+        let bytes = crate::arch::x86_64::fwcfg::read_opt_file(b"opt/chitti/model")?;
+        return parse_config_json(&bytes);
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", not(test)),
+        all(target_arch = "x86_64", not(test))
+    )))]
     {
         None
     }

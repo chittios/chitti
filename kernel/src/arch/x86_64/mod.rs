@@ -7,6 +7,7 @@ pub mod ahci;
 pub mod apic;
 pub mod disk;
 pub mod sb16;
+pub mod fwcfg;
 pub mod fpu;
 pub mod fastcall;
 pub mod gdt;
