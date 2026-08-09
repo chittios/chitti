@@ -4,9 +4,11 @@ Thanks for your interest! Chitti is an experimental, agent-native operating
 system. It moves fast and is not stable — but contributions, bug reports, and
 ideas are very welcome.
 
-Please read [CLAUDE.md](CLAUDE.md) first: it states the invariants and the two
+Please read [CLAUDE.md](CLAUDE.md) first: it states the invariants and the
 standing rules that every change must honour. [DEVELOPMENT.md](DEVELOPMENT.md)
-has the full local setup.
+has the full local setup, and [HARDWARE.md](HARDWARE.md) records what actually
+works on real hardware — including **how each claim was verified**, which is the
+standard a new driver is held to.
 
 ## Ground rules (non-negotiable)
 
@@ -54,6 +56,7 @@ Run all of these and make sure they pass:
 ```sh
 cargo xtask build -arch x86_64 && cargo xtask test    # keep the unit suite green
 cargo xtask build -arch aarch64
+cargo xtask ring-check                                 # agents/commands must not call the executor directly
 cargo xtask run   -arch aarch64                        # if the change is boot-visible, spot-check the boot
 make e2e                                               # if the change is boot-visible or networked
 ```

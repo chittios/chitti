@@ -2,6 +2,13 @@
 
 **An agentic operating system, built from scratch, where the agent is the driver.**
 
+[![CI](https://github.com/chittios/chitti/actions/workflows/ci.yml/badge.svg)](https://github.com/chittios/chitti/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+![ChittiOS running: split panes, the command browser, an in-kernel JPEG decode](docs/media/demo.webp)
+
+<sup>A real boot, captured with [`tools/capture/capture.py`](tools/capture/capture.py) — QMP screendumps of a scripted session, regenerated from the kernel rather than hand-taken.</sup>
+
 Chitti is a bare-metal OS (x86_64 and aarch64) whose fundamental unit of
 execution is an **AI agent**, not a compiled binary. There is no
 `exec(binary) → trap into syscalls`. Instead:
@@ -30,8 +37,9 @@ side effect directly.
 > and verified against QEMU, VirtualBox and UTM; several drivers are written from
 > a specification and have never met the silicon they target. In particular:
 > **there is no WiFi driver that can join a network**, Bluetooth will not pair
-> with modern devices (no SSP, no BLE), audio plays in mono, there is no screen
-> brightness control, and suspend/resume does not restore USB or disk.
+> with modern devices (no SSP, no BLE), there is no screen brightness control,
+> and there is no GPU driver — you get the firmware's framebuffer at the
+> firmware's resolution.
 > **[HARDWARE.md](HARDWARE.md) is the full support matrix** — what works, what is
 > unverified, and what is absent, per subsystem. Read it before booting on
 > anything you care about.
@@ -123,9 +131,9 @@ model from ever directly touching hardware.
   content agents (e.g. **doc**) are data + SOUL, not per-site Rust.
   `/agents start <name> [port]`; **ssh** agent for version exchange (transport
   evolving).
-- **Sound & voice.** virtio-snd / HDA (and legacy AC'97 / SB16); `/voice`
-  (VAD → STT → LLM → TTS) with ONNX models (silero, parakeet, KittenTTS).
-  Playback is 16-bit **mono** — the voice pipeline is the design target.
+- **Sound & voice.** virtio-snd / HDA / **USB Audio Class** (and legacy AC'97 /
+  SB16); `/voice` (VAD → STT → LLM → TTS) with ONNX models (silero, parakeet,
+  KittenTTS). **Stereo** playback for WAV and MP3; software volume and mute.
 - **Media.** In-kernel PNG/JPEG; WAV/MP3/AAC player; H.264 / H.265 / VP9 video
   player (`/open .mp4|.mov|.mkv|.webm|.ts|.m3u8`, including HLS VOD over the
   network) with streaming decode and transport controls.

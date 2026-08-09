@@ -171,6 +171,32 @@ To inspect the framebuffer without a display — and to drive keyboard/mouse
 programmatically — launch QEMU yourself with a QMP socket and use `screendump` +
 `input-send-event`. Example (aarch64 `-kernel`):
 
+**The easy way — `CHITTI_QEMU_EXTRA`.** Rather than reconstructing xtask's whole
+QEMU command (accel, machine, disks, net, share, display) to add one flag, hand
+it the extra arguments; they are appended last on every run path:
+
+```sh
+CHITTI_QEMU_EXTRA="-qmp unix:/tmp/q.sock,server,nowait" \
+  CHITTI_DISPLAY=none cargo xtask run -arch x86_64 --release
+# then over /tmp/q.sock: {"execute":"qmp_capabilities"}
+#                     → {"execute":"screendump","arguments":{"filename":"/tmp/fb.ppm"}}
+```
+
+**Or just run the capture tool**, which does exactly that plus a scripted shell
+session, and is what produces the README's screenshots and animation:
+
+```sh
+python3 tools/capture/capture.py --arch x86_64 --out docs/media
+# with a model, so the frames show the agent loop rather than static commands:
+CHITTI_REMOTE_URL=https://your-endpoint CHITTI_REMOTE_MODEL=your-model \
+  python3 tools/capture/capture.py --arch x86_64
+```
+
+Regenerating beats re-shooting: a hand-taken screenshot goes stale the moment
+the status bar or pane layout changes and nobody notices for months.
+
+**The manual way**, if you need a machine shape xtask does not build:
+
 ```sh
 ELF=kernel/target/aarch64-chitti/release/chitti-kernel
 qemu-system-aarch64 -M virt -cpu host -accel hvf -smp 4 -m 2G \
@@ -179,8 +205,12 @@ qemu-system-aarch64 -M virt -cpu host -accel hvf -smp 4 -m 2G \
   -serial unix:/tmp/ser.sock,server,nowait \
   -qmp unix:/tmp/qmp.sock,server,nowait \
   -display none -kernel "$ELF" &
-# then over /tmp/qmp.sock: {"execute":"qmp_capabilities"} → {"execute":"screendump","arguments":{"filename":"/tmp/fb.ppm"}}
 ```
+
+Note that a raw `-kernel` aarch64 boot has **no RAM extents** — those arrive in
+the UEFI stub's boot-info page — so the frame allocator never comes up and the
+heap OOMs during init. Use `cargo xtask run` unless you specifically need the
+bare path.
 
 - Drive the **keyboard** over the serial socket (bytes → the shell) or via QMP
   `send-key`.
