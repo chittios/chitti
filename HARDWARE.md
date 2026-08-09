@@ -287,15 +287,20 @@ This is the largest gap in the OS. The parts that exist are real and complete:
 | **Scan aggregation** (dedupe by BSSID, strongest-first) | ✅ |
 | `/wifi psk <ssid> <passphrase>` — derive and print a key | ✅ (checkable against `wpa_passphrase` on any Linux box) |
 
-Everything **above** the radio is now complete and verified off-hardware — the
+Everything **above** the radio is complete and verified off-hardware — the
 cipher, the frame conversion, the join sequencer and the scan list. A driver's
 remaining job is to carry frames and run the commands.
+
+Note that on a radio with **crypto offload — which Intel has — the hardware
+encrypts**: the driver installs the key and hands over plaintext. The software
+CCMP is what a SoftMAC part with no offload needs (`mac80211` carries the same
+code for the same reason) and what validates the key material.
 
 The radios are what is missing:
 
 | Radio | Status |
 |---|---|
-| Intel `iwlwifi` (AX200 and later) | ⚠️ **bring-up only** — resets the device, hands over firmware, waits for the *alive* notification and checks its status word, reads the MAC, sends one **read-only** command. ❌ **Cannot scan. Cannot associate.** `SCAN_REQ_UMAC`'s request layout is versioned and none is implemented, so a scan is **refused with the firmware's version named** rather than sent as a guess. |
+| Intel `iwlwifi` (AX200 and later) | ⚠️ **partial.** Bring-up, firmware load, the *alive* notification, the MAC, and now `SCAN_REQ_UMAC` v17, the RX MPDU descriptor, `ADD_STA`/`ADD_STA_KEY` and `PHY_CONTEXT_CMD` — all built from Linux's headers and **unverified against a radio**. ❌ Still cannot associate: `MAC_CONTEXT_CMD`, `BINDING_CONTEXT_CMD` and `TX_CMD` are missing. A firmware whose scan version is not implemented is **refused with the version named** rather than sent a guess. |
 | Broadcom FullMAC (Apple Silicon) | ⚠️ blocked — BAR2/TCM reads take an external abort |
 | Realtek RTL8852 / RTL8821 | ❌ |
 | MediaTek MT7921 / MT7922 | ❌ |
