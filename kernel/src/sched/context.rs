@@ -177,8 +177,23 @@ mod arm {
     pub unsafe fn restore_fpu(_area: *const FxArea) {}
 
     /// Switch from the current stack to `new_sp`, saving the current stack
-    /// pointer through `current_sp`. Saves the callee-saved GPRs (x19-x30) and
-    /// FP regs (d8-d15) onto the current stack, swaps `sp`, and restores.
+    /// pointer through `current_sp`. Saves the callee-saved GPRs (x19-x30), the
+    /// FP regs (d8-d15) and **DAIF** onto the current stack, swaps `sp`, and
+    /// restores.
+    ///
+    /// DAIF is in the frame because the interrupt mask is **per-task state**, the
+    /// direct analogue of x86 `switch_to`'s `pushfq`/`popfq` of RFLAGS.IF. It was
+    /// missing, and the consequence was that aarch64 preemption worked exactly
+    /// once: IRQs are masked on exception entry, so when `sched::on_timer_tick`
+    /// forces a switch from inside the IRQ handler, the incoming task resumes
+    /// through the `ret` below rather than through an `eret` — inheriting the
+    /// handler's masked DAIF, with nothing to ever clear it. The machine then ran
+    /// with interrupts disabled forever: a spinning task could never be preempted
+    /// again, and every later `sched::block_on` tripped its own lock-discipline
+    /// assert (which reads interrupts-enabled as "no `Locked` is held").
+    ///
+    /// Found by the aarch64 unit suite the day it first ran — the cooperative
+    /// shell yields constantly, which masked it in every interactive boot.
     ///
     /// # Safety
     /// `new_sp` must point at a stack laid out exactly as this leaves one (see
@@ -186,6 +201,10 @@ mod arm {
     #[unsafe(naked)]
     pub unsafe extern "C" fn switch_to(current_sp: *mut u64, new_sp: u64) {
         naked_asm!(
+            // Pushed first = highest address, so it is restored last, matching
+            // `init_stack`'s slot order. x2/x3 are caller-saved scratch.
+            "mrs x2, daif",
+            "stp x2, xzr, [sp, #-16]!",
             "stp x19, x20, [sp, #-16]!",
             "stp x21, x22, [sp, #-16]!",
             "stp x23, x24, [sp, #-16]!",
@@ -209,6 +228,10 @@ mod arm {
             "ldp x23, x24, [sp], #16",
             "ldp x21, x22, [sp], #16",
             "ldp x19, x20, [sp], #16",
+            // Restored last, mirroring the push order above. `msr daif` writes
+            // bits 9:6, exactly the field `mrs` read, so this round-trips.
+            "ldp x2, x3, [sp], #16",
+            "msr daif, x2",
             "ret",
         );
     }
@@ -220,13 +243,47 @@ mod arm {
         naked_asm!("mov x0, x20", "blr x19", "bl {exit}", exit = sym crate::sched::exit_current_task);
     }
 
-    /// Build the first-switch frame and return the initial `sp`. The 20 saved
+    /// A fresh task's `DAIF`. The x86 counterpart is `INITIAL_RFLAGS`, which
+    /// hardcodes IRQs on; here the value has to be *derived*, because unmasking on
+    /// a machine whose GIC never came up is its own hazard — an interrupt could be
+    /// taken with no CPU interface to acknowledge it. So a new task inherits
+    /// whatever regime the platform actually established: IRQs enabled where
+    /// `gic::init_bsp` succeeded and `start_preemption` committed to preemptive
+    /// scheduling, masked where the kernel is (correctly) cooperative — Apple
+    /// Silicon under HVF, and any board where the timer never delivered.
+    ///
+    /// Deliberately NOT "inherit the caller's current DAIF": `spawn` is routinely
+    /// called from inside a `Locked` or an interrupt handler, where the mask is set
+    /// for reasons that have nothing to do with the new task, and inheriting it
+    /// there is precisely the bug this whole slot exists to fix.
+    ///
+    /// The one ordering constraint this creates: a task spawned **before**
+    /// `gic::start_preemption()` commits keeps a masked DAIF for its whole life,
+    /// and would never be preempted even once preemption is live. That holds today
+    /// on both paths and is worth not breaking — `main.rs` calls
+    /// `start_preemption()` immediately before `run_os()`, so the pump and shell
+    /// tasks are spawned after it, and the self-test tenants inside `init()` are
+    /// `spawn_parked` cap-owners that are killed without ever being scheduled. The
+    /// unit suite does the same, unmasking at the end of its `aarch64_start` before
+    /// entering `test_main`. Move a real `spawn` earlier than that and it will run
+    /// cooperatively forever, silently.
+    fn initial_daif() -> u64 {
+        // DAIF bits are 9:6 = D,A,I,F. Unmask IRQ (I, bit 7) only where interrupts
+        // are actually being delivered; leave the rest as the boot state has them.
+        if crate::arch::aarch64::gic::timer_live() {
+            0
+        } else {
+            1 << 7
+        }
+    }
+
+    /// Build the first-switch frame and return the initial `sp`. The 22 saved
     /// slots mirror `switch_to`'s restore order (lowest address first):
     /// d14,d15,d12,d13,d10,d11,d8,d9, x29,x30, x27,x28,x25,x26,x23,x24,x21,x22,
-    /// x19,x20 -- so `x30`=trampoline, `x19`=entry, `x20`=arg.
+    /// x19,x20, daif,pad -- so `x30`=trampoline, `x19`=entry, `x20`=arg.
     ///
     /// # Safety
-    /// `stack_top` must top a fresh, owned, 16-byte-aligned stack >= 160 bytes.
+    /// `stack_top` must top a fresh, owned, 16-byte-aligned stack >= 176 bytes.
     pub unsafe fn init_stack(stack_top: u64, entry: extern "C" fn(u64), arg: u64) -> u64 {
         // SAFETY: caller guarantees `stack_top` sits atop an owned region.
         unsafe {
@@ -236,6 +293,8 @@ mod arm {
                 sp.write(value);
             };
             // Highest address first (reverse of the restore order).
+            push(0); // the `xzr` half of the DAIF pair (padding, keeps sp 16-aligned)
+            push(initial_daif()); // read back into x2 and written to DAIF
             push(arg); // x20
             push(entry as *const () as u64); // x19
             push(0); // x22
