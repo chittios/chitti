@@ -34,6 +34,13 @@ pub mod virtio_gpu;
 /// VMware SVGA II (`vmsvga`) — what VirtualBox and QEMU's `vmware-svga` present.
 #[cfg(not(test))]
 pub mod vmsvga;
+/// Bochs VBE (`dispi`) — QEMU's **standard VGA**, the default adapter.
+#[cfg(not(test))]
+pub mod bochs;
+
+/// Bochs VBE register layout and the pure logic over it, unit-tested off
+/// hardware — the `virtio_gpu_proto` split, for the same reason.
+pub mod bochs_regs;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -159,6 +166,13 @@ pub fn probe_bind_only() {
         bind(Box::new(g));
         return;
     }
+    // Bochs VBE last: it is the *fallback* adapter. A machine that also has a
+    // virtio-gpu or an SVGA II device is telling us which display it means, and
+    // std VGA is what QEMU leaves in place when nobody asked for anything.
+    if let Some(b) = bochs::Bochs::probe() {
+        bind(Box::new(b));
+        return;
+    }
     crate::ktrace::log("kms", "no display driver (firmware framebuffer only)");
 }
 
@@ -223,6 +237,19 @@ pub fn modes() -> Vec<Mode> {
         .or_else(|| cs.first())
         .map(|c| c.modes.clone())
         .unwrap_or_default()
+}
+
+/// The first connected output's **declared preferred mode**, if it declares one.
+///
+/// `None` is the common and honest answer: it means the display published no
+/// EDID, so nothing *prefers* anything and the largest mode we could program is
+/// just the largest mode we could program. `/display list` used to label the head
+/// of the list "(preferred)" whenever any driver was bound, which asserted a
+/// preference the display had never expressed — and read as "the OS knows you
+/// want 2560x1600 and booted at 1280x800 anyway".
+pub fn preferred_mode() -> Option<Mode> {
+    let cs = connectors();
+    cs.iter().find(|c| c.connected).or_else(|| cs.first()).and_then(|c| c.preferred)
 }
 
 /// Choose the mode to honour a `(w, h)` request from a connector's list.

@@ -630,6 +630,45 @@ VirtualBox display:
   wrong costs the console, not just a feature. Verify the layout on the target before
   flipping the flag.
 
+**Bochs VBE (`kms/bochs.rs`) is the backend for QEMU's *default* adapter** —
+`-vga std`, PCI `1234:1111`, Linux's `drivers/gpu/drm/tiny/bochs.c`. It matters more
+than its simplicity suggests: virtio-gpu and VMSVGA both have to be asked for, while
+this is what a plain `qemu-system-x86_64 -M q35` gives you, including from our own
+RUN.md, which names no display device. Without it that boot is Linux's `nomodeset`
+position — mode fixed by firmware, `/display` able only to letterbox something
+*smaller*. Verified by screendumping QEMU: 1280x800 -> 1920x1080 -> 2560x1440,
+console clean and full-panel at each. Four things it pins down:
+
+- **EDID is at the base of the MMIO window, not `0x600`.** `0x600` is the QEXT
+  region (Linux reads `qext_size` from exactly there); the EDID occupies 0 up to
+  the VGA register block at `0x400`. Written from memory as `0x600` it read a size
+  word, failed the header check, and reported "this device publishes no EDID" on
+  every configuration — including `edid=on,xres=…,yres=…`, where QEMU certainly
+  does publish one. A wrong offset that looks like an absent feature. Fetch these
+  from the Linux source, never recall them.
+- **That one offset also made `/display list` lie.** With no EDID the mode list is
+  just "everything that fits in VRAM, largest first", and the list labelled its
+  head `(preferred)` whenever *any* driver was bound — so a boot at the display's
+  real 1280x800 read as the OS knowing you wanted 2560x1600 and ignoring it. The
+  label now comes from the connector's own `preferred` (`kms::preferred_mode`), so
+  it appears only when a display actually asked for something.
+- **`ENABLE` must bracket the geometry writes** — cleared first, set last. Geometry
+  written to an enabled device leaves the scanout on the previous configuration
+  while the registers read back the new one, which is how VMSVGA in this tree once
+  drew the console four times side by side. `modeset_sequence` returns the writes
+  as *data* so the ordering is a unit test rather than a comment.
+- **`VIRT_WIDTH` is a stride in pixels, not bytes**, and an oversized mode is
+  refused rather than attempted — the device programs one happily and then scans
+  out memory that is not there.
+
+Its transport is chosen by **reading the id register back through it** rather than
+by measuring the BAR: sizing a BAR means writing all-ones into it, and at probe time
+the console is still drawing into the firmware's framebuffer. MMIO is preferred over
+the `0x01CE/0x01CF` ports because aarch64 has no ports at all. It claims **only**
+`1234:1111` — VirtualBox's `80ee:beef` implements the same registers, but mis-driving
+a real VirtualBox display is precisely what VMSVGA already did once, and that costs a
+console rather than a feature.
+
 Without a bound backend the whole module is inert and the compositor keeps the
 loader's framebuffer — the position Linux is in with `efifb`/`simpledrm`
 (`nomodeset`): mode fixed by firmware, `/display set` letterboxes instead, console

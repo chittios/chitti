@@ -9890,18 +9890,27 @@ fn run_display(arg: &str) {
                 serial_println!("display> no modes (console not up?)");
                 return;
             }
+            // **"(preferred)" must come from the display, not from the fact that a
+            // driver exists.** It marks the mode the panel's EDID asks for; when
+            // there is no EDID nothing is preferred, and labelling the head of the
+            // list anyway claims the machine knows a resolution you want and did
+            // not use it.
+            let pref = crate::kms::preferred_mode().map(|m| (m.w, m.h));
+            let head_is_native = !crate::kms::has_driver();
             for (i, m) in modes.iter().enumerate() {
+                let tag = if Some(*m) == pref {
+                    "  (preferred)"
+                } else if i == 0 && head_is_native {
+                    // No driver: the list is viewport sizes inside the firmware
+                    // framebuffer, whose head really is the native panel size.
+                    "  (native)"
+                } else {
+                    ""
+                };
                 serial_println!(
                     "display>   {}{}{}",
                     format_wxh(*m),
-                    // With a driver bound the list is the *display's*, so the head is
-                    // its preferred mode; without one it is viewport sizes inside the
-                    // firmware framebuffer, whose head really is native.
-                    if i == 0 {
-                        if crate::kms::has_driver() { "  (preferred)" } else { "  (native)" }
-                    } else {
-                        ""
-                    },
+                    tag,
                     if Some(*m) == cur { "  *current" } else { "" }
                 );
             }
