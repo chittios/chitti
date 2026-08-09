@@ -22,6 +22,38 @@ pub enum BlockKind {
 
 /// True if `[base, base+len)` lies entirely inside one of `regions`
 /// (`(base, size)` pairs; need not be sorted). Zero-size regions are ignored.
+/// The end of physical RAM, given the firmware's exact extents and a size-derived
+/// estimate to fall back on.
+///
+/// **The extents win outright when there are any.** They are a direct statement
+/// by the firmware about which addresses are DRAM; the estimate is arithmetic
+/// over a reported total, and arithmetic is what goes wrong. Taking the maximum
+/// of the two — which is what this did — means a too-large estimate can never be
+/// corrected by the truth, only raised by it.
+///
+/// That is not hypothetical. The aarch64 UEFI path computed
+/// `0x4000_0000 + total_ram`, and the stub's `total_ram` was a *span* from the
+/// lowest non-MMIO descriptor, which on QEMU `virt` starts near 0 rather than at
+/// the 1 GiB RAM base. On a 2 GiB machine that reported 3 GiB, the base was added
+/// a second time, and `ram_end` came out at exactly 4 GiB — one whole GiB past the
+/// real end. The identity map then typed that gap as Normal cacheable RAM and the
+/// first write into it took a synchronous external abort (`ESR 0x96000050`,
+/// `FAR 0x1_0000_0000`). Under HVF the syndrome carries `ISV=0`, so QEMU asserted
+/// in `hvf_handle_exception` instead of reporting a guest fault — two very
+/// different-looking failures, one cause. It made the released aarch64 image
+/// unbootable on QEMU `virt` at every `-m` size, because the error is a fixed
+/// +1 GiB rather than proportional.
+pub fn ram_end(regions: &[(u64, u64)], fallback_end: u64) -> u64 {
+    let mut end = 0u64;
+    for &(base, size) in regions {
+        if size == 0 {
+            continue;
+        }
+        end = end.max(base.saturating_add(size));
+    }
+    if end == 0 { fallback_end } else { end }
+}
+
 pub fn range_is_ram(base: u64, len: u64, regions: &[(u64, u64)]) -> bool {
     let end = match base.checked_add(len) {
         Some(e) => e,
@@ -203,6 +235,45 @@ pub fn carve_free(pool: &[(u64, u64)], reserved: &[(u64, u64)]) -> FreeRanges {
 
 #[cfg(test)]
 mod tests {
+    /// **The firmware's extents outrank a size-derived estimate, including when
+    /// the estimate is larger.** Taking the maximum is what let a bad total
+    /// survive: `ram_end` came out 1 GiB past real RAM and the map typed the gap
+    /// as Normal cacheable, so the first write there aborted.
+    #[test_case]
+    fn exact_extents_beat_an_overlarge_estimate() {
+        // QEMU virt, -m 2G: RAM is 0x40000000..0xC0000000.
+        let qemu = [(0x4000_0000u64, 2u64 << 30)];
+        // The estimate the broken path produced: 0x40000000 + (0xC0000000 - 0).
+        assert_eq!(ram_end(&qemu, 0x1_0000_0000), 0xC000_0000);
+        // The same at every memory size -- the old error was a fixed +1 GiB, so
+        // no `-m` value avoided it.
+        for gib in [1u64, 2, 4, 8] {
+            let r = [(0x4000_0000u64, gib << 30)];
+            let bogus = 0x4000_0000 + (0x4000_0000 + (gib << 30));
+            assert_eq!(ram_end(&r, bogus), 0x4000_0000 + (gib << 30));
+        }
+    }
+
+    /// Extents may sit above a hole, so the answer is the highest end, not the
+    /// first region's.
+    #[test_case]
+    fn ram_end_takes_the_highest_extent() {
+        let split = [(0x4000_0000u64, 0x4000_0000), (0x1_0000_0000u64, 0x8000_0000)];
+        assert_eq!(ram_end(&split, 0), 0x1_8000_0000);
+        // Order must not matter.
+        let rev = [(0x1_0000_0000u64, 0x8000_0000), (0x4000_0000u64, 0x4000_0000)];
+        assert_eq!(ram_end(&rev, 0), 0x1_8000_0000);
+    }
+
+    /// With no extents at all -- an older stub, or a boot path that reports none
+    /// -- the estimate is all there is, so it must still be used.
+    #[test_case]
+    fn without_extents_the_fallback_is_used() {
+        assert_eq!(ram_end(&[], 0xC000_0000), 0xC000_0000);
+        // Zero-sized entries are not extents.
+        assert_eq!(ram_end(&[(0x4000_0000, 0)], 0xC000_0000), 0xC000_0000);
+    }
+
     use super::*;
 
     /// The VirtualBox-ARM shape that broke: low RAM 0x4000_0000..0xD200_0000

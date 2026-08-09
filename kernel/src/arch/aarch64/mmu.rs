@@ -91,13 +91,24 @@ struct RamInfo {
 }
 
 impl RamInfo {
+    /// Adopt the firmware's exact RAM extents.
+    ///
+    /// **`ram_end` is then derived from the extents alone, not maxed with what it
+    /// already held.** The extents are the firmware stating which addresses are
+    /// DRAM; the previous value is arithmetic over a reported total. Taking the
+    /// larger of the two means a wrong estimate can only ever be raised by the
+    /// truth, never corrected — which is exactly how this shipped an aarch64
+    /// image that could not boot on QEMU `virt` at any memory size. The
+    /// derivation and the reasoning live in
+    /// [`crate::mm::ramlayout::ram_end`], where they can be tested; this file is
+    /// `cfg`'d out of the test build.
     fn with_regions(mut self, regs: &[(u64, u64)]) -> RamInfo {
         for &r in regs.iter().take(MAX_REGIONS) {
             self.regions[self.n_regions] = r;
             self.n_regions += 1;
-            // RAM above a hole can end past any size-derived estimate.
-            self.ram_end = self.ram_end.max(r.0.saturating_add(r.1));
         }
+        self.ram_end =
+            crate::mm::ramlayout::ram_end(&self.regions[..self.n_regions], self.ram_end);
         self
     }
     fn bare(ram_end: u64, uefi_heap_base: u64, uefi_model: (u64, u64)) -> RamInfo {
@@ -201,10 +212,21 @@ fn bootinfo_regions(bi: u64) -> Option<(u64, u64, u64, u64, u64)> {
         let b = unsafe { core::slice::from_raw_parts(p.add(off), 8) };
         u64::from_le_bytes(b.try_into().unwrap())
     };
+    // **A missing heap region must not discard the rest of the page.** This used
+    // to `return None` when the stub reported no heap, which threw away the RAM
+    // extents, the free extents, the RSDP and the clock along with it — the same
+    // coupling the stub had between the display and the whole handoff, and the
+    // same consequence: `detect` falls back to `FALLBACK_RAM_END` and `mm::init`
+    // puts a 1 GiB heap at 4 GiB, which is unbacked, and the first write aborts.
+    //
+    // The stub fails to reserve a heap on a machine too small to hold one — a
+    // 1 GiB guest, say. That deserves the existing "not enough memory" panic,
+    // which names the number and tells you to raise `-m`; instead it aborted
+    // inside the hypervisor with no message at all. A zero heap base is
+    // information (`mm::init` then places the heap itself, from RAM extents that
+    // are now correct), not a reason to disbelieve the page.
     let (hb, hs) = (rd(60), rd(68));
-    if hb == 0 || hs == 0 {
-        return None;
-    }
+    let (hb, hs) = if hb == 0 || hs == 0 { (0, 0) } else { (hb, hs) };
     Some((hb, hs, rd(76), rd(84), rd(92)))
 }
 

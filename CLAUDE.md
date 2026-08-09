@@ -675,6 +675,37 @@ loader's framebuffer — the position Linux is in with `efifb`/`simpledrm`
 legibility via font size. Still absent: real-hardware GPU drivers (i915/AMD/AGX) —
 see the note on why there is no display equivalent of xHCI/AHCI.
 
+**The boot-info page is built even when there is no display, and that coupling was
+a boot failure.** The stub's GOP capture and the boot-info page used to be one
+closure: `no GOP handle`, a refused `open_protocol`, or a blt-only mode returned
+`None` for the *whole* page, and the comment said so as if it were harmless
+("kernel falls back to ramfb/serial"). That was true when the page carried only a
+framebuffer. It has since grown the kernel heap region, the model region, the RAM
+and free extents, the ACPI RSDP and the wall clock — so "no boot-info" stopped
+meaning "no picture" and started meaning **"no memory map"**. `detect` then falls
+back to `FALLBACK_RAM_END` and `mm::init` places its 1 GiB heap at 4 GiB, which is
+unbacked on any machine with less than ~4 GiB: `ESR 0x96000050`, `FAR 0x1_0000_0000`,
+a synchronous external abort on the first write in `LinkedListAllocator::init`.
+Under HVF the syndrome carries `ISV=0`, so QEMU asserts in `hvf_handle_exception`
+rather than reporting a guest fault — two failures that look nothing alike, one
+cause. It made the released aarch64 image unbootable on QEMU `virt` (which reaches
+`no GOP handle`) while VirtualBox, which offers a normal GOP, was fine. Display
+acquisition is now its own step whose failure zeroes the framebuffer fields and
+nothing else. **The same coupling existed a second time on the kernel side** —
+`bootinfo_regions` returned `None` when the stub reported no heap, discarding the
+RAM extents with it, which is what a 1 GiB guest hits (the stub cannot reserve a
+1 GiB heap and says `OUT_OF_RESOURCES`). A zero heap base is now information, and
+that machine gets the existing "not enough memory, raise -m" panic instead of a
+hypervisor abort. Two rules fall out: **a handoff structure must not be
+all-or-nothing across independent fields**, and **`ram_end` comes from the
+firmware's exact extents, never maxed with a size-derived estimate**
+(`mm::ramlayout::ram_end`, pure and tested — `arch/aarch64/` is `cfg`'d out of the
+test build, so logic placed there cannot be). Related: the stub's `total_ram_bytes`
+spanned lowest-to-highest non-MMIO descriptor, which on QEMU `virt` starts near 0
+while RAM starts at 1 GiB, so a 2 GiB machine reported 3 GiB; it sums DRAM
+descriptors now, with the same filter `ram_regions` uses so the total and the
+extents describe the same memory.
+
 **A machine can have more than one display, so the stub enumerates every graphics
 output** (`locate_handle_buffer`, not `get_handle_for_protocol`) and picks one via
 `edid::pick_output`: the output carrying the firmware's **console-out marker**

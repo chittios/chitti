@@ -295,26 +295,28 @@ fn total_ram_bytes() -> u64 {
     let Ok(map) = boot::memory_map(MemoryType::LOADER_DATA) else {
         return 0;
     };
-    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    // **Sum the DRAM descriptors; do not span from the lowest one.** A span
+    // measures lowest-address to highest-address, and on QEMU `virt` the lowest
+    // non-MMIO descriptor sits near 0 while RAM starts at 1 GiB — so a 2 GiB
+    // machine reported 3 GiB. The kernel then added the RAM base to that figure
+    // and identity-mapped a gigabyte past the end of memory, which aborted on
+    // first write and made the released image unbootable there. A span also
+    // counts any MMIO hole *between* two RAM extents as installed memory.
+    //
+    // The filter matches `ram_regions` (which excludes RESERVED too) so the total
+    // and the extents describe the same memory; they disagreed before, and that
+    // is the kind of inconsistency nothing reports.
+    let mut total = 0u64;
     for d in map.entries() {
-        // Skip memory-mapped I/O (11) and I/O port space (12): not DRAM.
-        if matches!(d.ty, MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE) {
+        if matches!(
+            d.ty,
+            MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE | MemoryType::RESERVED
+        ) {
             continue;
         }
-        let start = d.phys_start;
-        let end = start + d.page_count * 4096;
-        if start < lo {
-            lo = start;
-        }
-        if end > hi {
-            hi = end;
-        }
+        total = total.saturating_add(d.page_count * 4096);
     }
-    if hi > lo {
-        hi - lo
-    } else {
-        0
-    }
+    total
 }
 
 /// The machine's actual RAM extents from the UEFI memory map: every DRAM-backed
@@ -504,12 +506,40 @@ fn main() -> Status {
         }
     };
 
-    // Capture the UEFI GOP framebuffer and publish it in a boot-info page at a
-    // fixed address the kernel checks. This is what makes Chitti's console
-    // visible on ANY UEFI platform (VirtualBox-ARM, UTM, real hardware) — the
-    // kernel's own ramfb device is QEMU-only. Best-effort: absent GOP or a
-    // blt-only mode just means no boot-info (kernel falls back to ramfb/serial).
-    let bootinfo: Option<u64> = (|| {
+    /// What the display half of the handoff produces. Separated from the page
+    /// itself because the two have completely different consequences when they
+    /// fail: no display costs a picture, no boot-info costs the machine.
+    struct Display {
+        fb: u64,
+        w: u64,
+        h: u64,
+        pitch: u64,
+        rs: u8,
+        gs: u8,
+        bs: u8,
+        edid: alloc::vec::Vec<u8>,
+    }
+
+    // Capture the UEFI GOP framebuffer, to be published in the boot-info page.
+    // This is what makes ChittiOS's console visible on ANY UEFI platform
+    // (VirtualBox-ARM, UTM, real hardware) — the kernel's own ramfb device is
+    // QEMU-only.
+    //
+    // **This may fail without taking the boot-info page down with it.** It used
+    // to be one closure: every graphics failure — no GOP handle, GOP open
+    // refused, a blt-only mode — returned `None` for the *whole* page, and the
+    // comment here said so as though it were harmless ("kernel falls back to
+    // ramfb/serial"). That was true when the page carried only a framebuffer.
+    // It has since grown the kernel heap region, the model region, the RAM and
+    // free extents, the ACPI RSDP and the wall clock, so "no boot-info" stopped
+    // meaning "no picture" and started meaning "no memory map" — the kernel then
+    // falls back to `FALLBACK_RAM_END` and puts its 1 GiB heap at 4 GiB, which is
+    // unbacked on any machine with less than ~4 GiB, and the first write aborts
+    // (`ESR 0x96000050`, `FAR 0x1_0000_0000`; under HVF the syndrome has `ISV=0`
+    // so QEMU asserts in `hvf_handle_exception` instead). That made the released
+    // aarch64 image unbootable on QEMU `virt` — which reaches the `no GOP handle`
+    // path — while VirtualBox, which gives a normal GOP, was fine.
+    let display: Option<Display> = (|| {
         use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
         // Enumerate **every** graphics output, not just the first. A real laptop
         // with an external monitor attached exposes one GOP handle per display, so
@@ -683,26 +713,57 @@ fn main() -> Status {
             PixelFormat::BltOnly => return None,
         };
         let fb = gop.frame_buffer().as_mut_ptr() as u64;
-        // Boot-info page: AnyPages (fixed low addresses aren't reliably
-        // allocatable — they vary per firmware/platform). Its address is passed
-        // to the kernel in x1 at handoff.
+        // The chosen output's EDID, copied now: the firmware's buffer is gone
+        // after ExitBootServices, so it is carried over here or not at all.
+        let edid_owned = blocks
+            .get(out_idx)
+            .and_then(|b| b.as_deref())
+            .unwrap_or(&[])
+            .to_vec();
+        Some(Display {
+            fb,
+            w: w as u64,
+            h: hgt as u64,
+            pitch,
+            rs,
+            gs,
+            bs,
+            edid: edid_owned,
+        })
+    })();
+    if display.is_none() {
+        log::info!(
+            "chitti-stub: no usable GOP — booting without a framebuffer (serial console); \
+             the boot-info page is still handed over"
+        );
+    }
+
+    // The boot-info page itself. Built **unconditionally**: everything else in it
+    // (heap, model, RAM extents, free extents, RSDP, clock) is what the kernel
+    // needs to come up at all, none of which has anything to do with a display.
+    let bootinfo: Option<u64> = (|| {
+        // AnyPages: fixed low addresses aren't reliably allocatable — they vary
+        // per firmware/platform. The address is passed to the kernel in x1.
         let p = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1).ok()?;
         let addr = p.as_ptr() as u64;
         let page = unsafe { core::slice::from_raw_parts_mut(p.as_ptr(), 4096) };
         page[0..8].copy_from_slice(b"CHITTIBI");
-        page[8..16].copy_from_slice(&fb.to_le_bytes());
-        page[16..24].copy_from_slice(&(w as u64).to_le_bytes());
-        page[24..32].copy_from_slice(&(hgt as u64).to_le_bytes());
-        page[32..40].copy_from_slice(&pitch.to_le_bytes());
+        // Zero framebuffer fields = "no display": the kernel already treats a
+        // zero base that way and comes up on serial.
+        let d = display.as_ref();
+        page[8..16].copy_from_slice(&d.map_or(0, |d| d.fb).to_le_bytes());
+        page[16..24].copy_from_slice(&d.map_or(0, |d| d.w).to_le_bytes());
+        page[24..32].copy_from_slice(&d.map_or(0, |d| d.h).to_le_bytes());
+        page[32..40].copy_from_slice(&d.map_or(0, |d| d.pitch).to_le_bytes());
         // ACPI RSDP (from the UEFI config table) at offset 40 — the kernel walks
         // it to find the PCIe ECAM base (MCFG), so PCIe is discovered, not
         // hardcoded. 0 if absent.
         let rsdp = acpi_rsdp();
         page[40..48].copy_from_slice(&rsdp.to_le_bytes());
         // Pixel format at 48..52: r_shift, g_shift, b_shift, bytes-per-pixel.
-        page[48] = rs;
-        page[49] = gs;
-        page[50] = bs;
+        page[48] = d.map_or(16, |d| d.rs);
+        page[49] = d.map_or(8, |d| d.gs);
+        page[50] = d.map_or(0, |d| d.bs);
         page[51] = 4;
         // Real wall-clock time (UTC Unix seconds) at 52..60, from UEFI GetTime.
         // This is the only reliable clock on VirtualBox-ARM, whose generic timer
@@ -746,10 +807,7 @@ fn main() -> Status {
         // settings, and its name to show which output it is talking about. The
         // firmware's buffer is gone after ExitBootServices, so it has to be copied
         // here or not at all. Zero length = this display published no EDID.
-        let edid_bytes: &[u8] = blocks
-            .get(out_idx)
-            .and_then(|b| b.as_deref())
-            .unwrap_or(&[]);
+        let edid_bytes: &[u8] = d.map_or(&[], |d| d.edid.as_slice());
         let elen = edid_bytes.len().min(edid::BASE_BLOCK_LEN);
         page[384..388].copy_from_slice(&(elen as u32).to_le_bytes());
         page[388..388 + elen].copy_from_slice(&edid_bytes[..elen]);
@@ -778,7 +836,20 @@ fn main() -> Status {
         let mlen = remote_cfg.len().min(2048);
         page[1024..1028].copy_from_slice(&(mlen as u32).to_le_bytes());
         page[1028..1028 + mlen].copy_from_slice(&remote_cfg[..mlen]);
-        log::info!("chitti-stub: GOP {w}x{hgt} at {fb:#x} (shifts {rs}/{gs}/{bs}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), free {} MiB in {fnum} extent(s), EDID {elen}B, remote-cfg {mlen}B -> boot-info {addr:#x}", ram >> 20, free_bytes >> 20);
+        match d {
+            Some(d) => log::info!(
+                "chitti-stub: GOP {}x{} at {:#x} (shifts {}/{}/{}), ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), free {} MiB in {fnum} extent(s), EDID {elen}B, remote-cfg {mlen}B -> boot-info {addr:#x}",
+                d.w, d.h, d.fb, d.rs, d.gs, d.bs, ram >> 20, free_bytes >> 20
+            ),
+            // Said explicitly rather than omitted: "no framebuffer" and "no
+            // boot-info" used to be the same event, and the whole point of the
+            // split is that they are now different. A reader of this log needs to
+            // see that the page was handed over anyway.
+            None => log::info!(
+                "chitti-stub: no framebuffer, ACPI RSDP {rsdp:#x}, heap {hb:#x}, model {mb:#x}, RAM {} MiB in {n} extent(s), free {} MiB in {fnum} extent(s), remote-cfg {mlen}B -> boot-info {addr:#x}",
+                ram >> 20, free_bytes >> 20
+            ),
+        }
         Some(addr)
     })();
 
