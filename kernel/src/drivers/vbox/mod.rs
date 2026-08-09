@@ -258,7 +258,10 @@ pub fn header_rc(buf: &[u8]) -> i32 {
     if buf.len() < REQ_HDR {
         return -1;
     }
-    i32::from_le_bytes([buf[HDR_RC], buf[HDR_RC + 1], buf[HDR_RC + 2], buf[HDR_RC + 3]])
+    // Volatile: the host writes this while the guest polls it. See
+    // `hgcm::host_u32` — `barrier()` orders the CPU, not the optimiser.
+    // SAFETY: `buf` is at least `REQ_HDR` bytes and `rc` is 4 of them.
+    unsafe { core::ptr::read_volatile(buf.as_ptr().add(HDR_RC) as *const i32) }
 }
 
 /// How the request register is reached on this VM.
@@ -858,24 +861,38 @@ fn submit_and_wait(phys: u64, buf: &[u8]) -> Result<(), &'static str> {
     if !submit(phys) {
         return Err("the request register is unreachable");
     }
-    crate::drivers::virtio::barrier();
-    let rc = header_rc(buf);
-    if rc == RC_UNSET {
-        return Err("the host never processed the HGCM request");
-    }
-    // VINF_HGCM_ASYNC_EXECUTE is a *success*: the call was accepted and will
-    // complete later. Any negative rc is a real refusal.
-    if rc < 0 {
-        return Err("the host rejected the HGCM request");
-    }
+    // **The DONE flag is the contract for an HGCM request, not `rc`.** The host
+    // writes `rc = VINF_HGCM_ASYNC_EXECUTE` before the handler runs and then
+    // sets NO_WRITE_OUT, so the header is not written back again until the call
+    // completes. Gating on `rc` here — as this did — turns a perfectly normal
+    // in-flight call into "the host never processed it", which is the same
+    // message a genuinely ignored request produces.
+    //
+    // So: poll DONE, and treat `rc` only as an *early failure* signal, which is
+    // what a negative value there means.
     let mut spins = 0u64;
     loop {
         crate::drivers::virtio::barrier();
         if hgcm::is_done(buf) {
             break;
         }
+        let rc = header_rc(buf);
+        if rc != RC_UNSET && rc < 0 {
+            crate::ktrace::log_fmt(format_args!("vbox: HGCM request refused rc={rc}"));
+            return Err("the host rejected the HGCM request");
+        }
         spins += 1;
         if spins > HGCM_SPIN_LIMIT {
+            // Dump the header so the next step is a measurement rather than a
+            // guess: `rc`, `fu32Flags` and `result` together say whether the
+            // host ever looked at this request.
+            crate::ktrace::log_fmt(format_args!(
+                "vbox: HGCM never completed: rc={} flags={:#x} result={} first16={:02x?}",
+                header_rc(buf),
+                hgcm::flags(buf),
+                hgcm::result(buf),
+                &buf[..16]
+            ));
             return Err("the host never completed the HGCM call");
         }
         if spins % 0x10_0000 == 0 && crate::shell::poll_interrupt() {
@@ -933,10 +950,11 @@ pub fn hgcm_post_message_wait(client: u32, function: u32, parms: &[hgcm::Parm]) 
     if !submit(phys) {
         return false;
     }
-    // A negative rc means the host refused it outright; anything else means it
-    // is either done already or pending, both of which `take` handles.
+    // A negative rc means the host refused it outright. RC_UNSET is NOT a
+    // failure here: for an HGCM request the host may leave `rc` alone until the
+    // call completes, and this one is meant to stay pending.
     let rc = header_rc(buf);
-    rc != RC_UNSET && rc >= 0
+    rc == RC_UNSET || rc >= 0
 }
 
 /// Collect the outstanding message-wait call if the host has completed it.

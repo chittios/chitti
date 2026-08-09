@@ -10321,8 +10321,12 @@ fn run_vbox(arg: &str) {
         }
         "up" => match crate::drivers::vbox::bring_up() {
             Ok(v) => serial_println!(
-                "vbox> transport up; host {v}.\n      HGCM is not implemented, so the shared \
-clipboard and shared folders are not available yet."
+                "vbox> transport up; host {v}.\n      {}",
+                crate::drivers::vbox::clipboard::status().unwrap_or_else(|| {
+                    alloc::string::String::from(
+                        "shared clipboard did not connect (shared folders are not implemented)",
+                    )
+                })
             ),
             Err(e) => serial_println!("vbox> {e}"),
         },

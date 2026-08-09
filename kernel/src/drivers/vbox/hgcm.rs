@@ -166,31 +166,36 @@ pub fn write_call(buf: &mut [u8], client: u32, function: u32, parms: &[Parm]) ->
     true
 }
 
-/// Read back parameter `i` as a `u32` (an output parameter after completion).
-pub fn parm_u32(buf: &[u8], i: usize) -> u32 {
-    let o = parm_at(i) + PARM_VALUE;
-    if o + 4 > buf.len() {
+/// Read a `u32` the **host** wrote into our request buffer.
+///
+/// Volatile, and that is not a formality. These words are modified by the host
+/// while the guest is looking at them, and the guest polls them in a tight
+/// loop. `barrier()` is `asm!("dsb sy", options(nomem, …))`, and `nomem` tells
+/// the *compiler* the asm touches no memory — so it is free to hoist an
+/// ordinary load out of the loop and spin forever on a register copy. A `dsb`
+/// orders the CPU; only a volatile read orders the optimiser.
+fn host_u32(buf: &[u8], off: usize) -> u32 {
+    if off + 4 > buf.len() {
         return 0;
     }
-    u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+    // SAFETY: `off + 4 <= buf.len()`, and a `u32` read of a byte buffer the
+    // host may be writing concurrently is exactly what volatile is for.
+    unsafe { core::ptr::read_volatile(buf.as_ptr().add(off) as *const u32) }
+}
+
+/// Read back parameter `i` as a `u32` (an output parameter after completion).
+pub fn parm_u32(buf: &[u8], i: usize) -> u32 {
+    host_u32(buf, parm_at(i) + PARM_VALUE)
 }
 
 /// The HGCM `fu32Flags` word — [`REQ_DONE`] tells you the reply is real.
 pub fn flags(buf: &[u8]) -> u32 {
-    if buf.len() < super::HGCM_HDR {
-        return 0;
-    }
-    let o = super::REQ_HDR;
-    u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+    host_u32(buf, super::REQ_HDR)
 }
 
 /// The HGCM `result` — the service's own status, valid only once [`REQ_DONE`].
 pub fn result(buf: &[u8]) -> i32 {
-    if buf.len() < super::HGCM_HDR {
-        return -1;
-    }
-    let o = super::REQ_HDR + 4;
-    i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+    host_u32(buf, super::REQ_HDR + 4) as i32
 }
 
 /// Whether the host has finished with this request.
@@ -203,8 +208,7 @@ pub fn connect_client_id(buf: &[u8]) -> u32 {
     if buf.len() < CONNECT_LEN {
         return 0;
     }
-    let o = CONNECT_CLIENT_ID;
-    u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+    host_u32(buf, CONNECT_CLIENT_ID)
 }
 
 #[cfg(test)]
