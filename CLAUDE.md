@@ -1748,24 +1748,63 @@ FDT claims a GICv3 but carries no readable `reg`.
     number. Queues must be configured before `DRIVER_OK` but the port number is
     only learned after, so several ports are prepared up front.
 
-  - **VirtualBox is staged, and only the transport exists** (`drivers/vbox.rs`,
-    `/vbox`). Its clipboard *and* its shared folders both ride HGCM, which rides
-    VMMDev (PCI `80ee:cafe`) — "write a request's physical address to one
-    register and the host fills it in". The device, the register and the request
-    framing are here with offsets pinned by tests; **HGCM and both services are
-    not**, the same staging `wifi/iwl` uses and for the same reason: nothing
-    here emulates the device, and code written from memory would look complete,
-    send well-formed garbage to a real hypervisor and report success. Three
-    things it does get right: **which window the register lives in is a property
-    of the VM, not the arch** (BAR0 is I/O space, BAR3 is MMIO with the *same*
-    offsets, and `VMMDev.cpp` creates BAR3 only under `if (pThis->fMmioReq)` —
-    so both are probed, and an ARM guest without it is reported *unreachable*,
-    a different fact from "no device"); the register takes a **32-bit** physical
-    address, so a buffer above 4 GiB is refused rather than truncated into a
-    request read from whatever lives at the low 32 bits; and `rc` is seeded to a
-    failure value so a request the host never touched cannot read as success.
-    Probing only ever **reads**; the first writes are behind `/vbox up`, gated
-    exactly as `/wifi up` is.
+  - **VirtualBox works: VMMDev + HGCM + `VBoxSharedClipboard`**
+    (`drivers/vbox/{mod,hgcm,clipboard}.rs`, `/vbox`, `/vbox up`, `/vbox diag`).
+    Verified on a real VirtualBox-ARM 7.2.12 guest — the host version it reports
+    matches `VBoxManage --version` exactly, and the service assigns a client id.
+    Shared **folders** are still not implemented. Probing only ever reads; the
+    first writes are behind `/vbox up`, gated exactly as `/wifi up` is.
+
+    **Seven bugs stood between "the code looks right" and "the wire carries a
+    message", and not one was findable without the VM.** They are listed because
+    every one is a class, not an instance:
+
+    1. **An undecoded PCI address reads all-ones — and so does a device
+       answering "unimplemented register".** They are byte-identical from the
+       guest. `COMMAND` had memory decoding *off* (firmware leaves it off for a
+       device no driver claimed), so nothing decoded and every write vanished;
+       a probe built on the all-ones read called that "the device answered" for
+       four iterations. **Any probe that infers presence from all-ones is not a
+       probe** — read the COMMAND register and the BARs instead.
+    2. **A `nomem` barrier does not order the compiler.** `barrier()` is
+       `asm!("dsb sy", options(nomem, …))`, so the optimiser may hoist a flag
+       load out of a poll loop and spin forever on a register copy. Every word
+       the *host* writes is read `read_volatile`. A `dsb` orders the CPU; only
+       volatile orders the optimiser — and the failure looks exactly like a
+       device that never answers.
+    3. **The DONE flag is HGCM's contract, not `rc`.** The host writes
+       `VINF_HGCM_ASYNC_EXECUTE` before the handler and then sets
+       `NO_WRITE_OUT`, so gating on `rc` after the doorbell reports a normal
+       in-flight call as "never processed".
+    4. **`VMMDevRequestHeader.version` is `VMMDEV_REQUEST_HEADER_VERSION`
+       (0x10001), not `VMMDEV_VERSION` (0x10004)** — which is the *interface*
+       version and belongs in `VBoxGuestInfo.interfaceVersion`. On a mismatch
+       the handler `return`s **without writing `rc`**: no error, nothing.
+    5. **Every request declares a size its handler asserts exactly.**
+       `GetHostVersion` is 24+16; declaring 24+12 is refused outright. Its first
+       two fields are `u16`s, so reading three `u32`s yields
+       `major | minor << 16` — a plausible number, not an error.
+    6. **Nothing ordered the request against the doorbell.** Normal cacheable
+       stores can still be in flight when the Device store lands, so the host
+       reads a zeroed header and bails silently. Every virtio driver here `dsb`s
+       before its doorbell; this one did not.
+    7. **aarch64 puts the heap at the top of RAM**, so on a >4 GiB guest every
+       `alloc_dma` is out of reach of a register that takes a 32-bit address.
+       The request page is `.bss` (loaded low, and VA == PA here).
+
+    Seeding `rc` with `-1` made this *worse*, because `-1` is
+    `VERR_GENERAL_FAILURE`: "the host rejected this" and "the host never saw
+    this" printed identically. The sentinel is now far outside the range VBox
+    statuses use. **`/vbox diag` is the lesson institutionalised** — the
+    `/wifi diag` pattern of one boot telling you which of several
+    indistinguishable causes you have, rather than one guess per iteration on
+    hardware you cannot drive.
+
+    Also: **which window the register lives in is a property of the VM, not the
+    arch** (BAR0 is I/O space, BAR3 is MMIO with the *same* register offsets,
+    and `VMMDev.cpp` creates BAR3 only under `if (pThis->fMmioReq)`), so both
+    are probed and an ARM guest without it is reported *unreachable* — a
+    different fact from "no device".
 
 - **Storage** — virtio/NVMe/AHCI block devices, GPT/MBR/FAT/ext4/exFAT
   detection, ext4 (the default filesystem) + FAT + **exFAT**
