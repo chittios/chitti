@@ -5,9 +5,9 @@
 [![CI](https://github.com/chittios/chitti/actions/workflows/ci.yml/badge.svg)](https://github.com/chittios/chitti/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-![ChittiOS running: split panes, the command browser, an in-kernel JPEG decode](docs/media/demo.webp)
+![ChittiOS booting on real hardware, then an agent answering, playing audio and H.264 video, rendering a 117-page PDF, and browsing a live web page](docs/media/demo.webp)
 
-<sup>A real boot, captured with [`tools/capture/capture.py`](tools/capture/capture.py) — QMP screendumps of a scripted session, regenerated from the kernel rather than hand-taken.</sup>
+<sup>A real 5-minute session on a VirtualBox guest, at ~12x — boot, a hosted model answering through tool calls, WAV and H.264 playback, a 117-page PDF rendered in-kernel, the editor, and the browser on a live page. Full-length, with sound: **[youtu.be/ShJQzv9BpVY](https://youtu.be/ShJQzv9BpVY)**. The stills under [`docs/media/`](docs/media/) come from [`tools/capture/capture.py`](tools/capture/capture.py) — QMP screendumps of a scripted session, regenerated from the kernel rather than hand-taken.</sup>
 
 Chitti is a bare-metal OS (x86_64 and aarch64) whose fundamental unit of
 execution is an **AI agent**, not a compiled binary. There is no
