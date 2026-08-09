@@ -788,6 +788,7 @@ pub fn decode_track(
     Ok(crate::audio::Audio {
         rate: asc.output_rate(),
         pcm,
+        channels: 1, // see `adts::decode_file` — AAC still folds to mono
     })
 }
 
@@ -806,6 +807,7 @@ pub fn decode_aus(
     Ok(crate::audio::Audio {
         rate: asc.output_rate(),
         pcm,
+        channels: 1, // see `adts::decode_file` — AAC still folds to mono
     })
 }
 

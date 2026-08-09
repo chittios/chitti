@@ -1312,9 +1312,10 @@ pub fn decode_frame(dec: &mut Mp3Dec, scratch: &mut Scratch, mp3: &[u8], pcm: &m
     }
 }
 
-/// Decode a whole MP3 stream to mono S16 at the stream's sample rate
-/// (stereo is downmixed `(l+r)/2`). ID3v2 tags are skipped; garbage between
-/// frames is resynced past; a rate change mid-stream ends the decode.
+/// Decode a whole MP3 stream to S16 at the stream's sample rate, **preserving
+/// stereo interleaved** as the synthesis filterbank produced it. ID3v2 tags are
+/// skipped; garbage between frames is resynced past; a rate *or channel-count*
+/// change mid-stream ends the decode.
 pub fn decode(bytes: &[u8]) -> Result<super::Audio, &'static str> {
     // ID3v2: "ID3" + version(2) + flags + syncsafe u28 size.
     let mut at = 0usize;
@@ -1331,6 +1332,11 @@ pub fn decode(bytes: &[u8]) -> Result<super::Audio, &'static str> {
     let mut pcm = [0i16; MAX_SAMPLES_PER_FRAME];
     let mut out: Vec<i16> = Vec::new();
     let mut rate: u32 = 0;
+    // Channel count of the stream, latched from the first decoded frame. A
+    // mid-stream change is treated exactly like a rate change — stop and keep
+    // what we have — because appending frames of a different width would
+    // silently reinterleave everything after the change.
+    let mut channels: u8 = 0;
     const MAX_SAMPLES: usize = 128 << 20; // ~48 min at 44.1 kHz — heap guard
 
     while at < bytes.len() {
@@ -1348,20 +1354,24 @@ pub fn decode(bytes: &[u8]) -> Result<super::Audio, &'static str> {
         } else if rate != info.hz {
             break; // rate change mid-stream: keep what we have
         }
-        if out.len() + samples > MAX_SAMPLES {
+        let nch = info.channels.max(1) as u8;
+        if channels == 0 {
+            channels = nch;
+        } else if channels != nch {
+            break; // channel-count change mid-stream: same rule as the rate
+        }
+        if out.len() + samples * nch as usize > MAX_SAMPLES {
             break;
         }
-        if info.channels == 2 {
-            out.extend(pcm[..samples * 2].chunks_exact(2).map(|c| ((c[0] as i32 + c[1] as i32) / 2) as i16));
-        } else {
-            out.extend_from_slice(&pcm[..samples]);
-        }
+        // Stereo is kept interleaved as the decoder produced it. Averaging here
+        // is what made every MP3 play in mono.
+        out.extend_from_slice(&pcm[..samples * nch as usize]);
     }
 
-    if out.is_empty() || rate == 0 {
+    if out.is_empty() || rate == 0 || channels == 0 {
         return Err("mp3: no decodable Layer III frames");
     }
-    Ok(super::Audio { rate, pcm: out })
+    Ok(super::Audio { rate, pcm: out, channels })
 }
 
 /// Fresh per-decode scratch (public so `decode_frame` is testable directly).
@@ -1376,12 +1386,24 @@ mod tests {
 
     /// Compare a decode against the pinned reference (minimp3 scalar output,
     /// stride-97 sampled), allowing ±2 for float association differences.
-    fn check(bytes: &[u8], rate: u32, len: usize, ref97: &[i16]) {
+    /// `len` and `ref97` are **mono** quantities: the reference samples were
+    /// captured against minimp3's scalar decode folded to one channel, and they
+    /// stay that way now that the decoder preserves stereo. So the comparison
+    /// runs on a mono fold — which reproduces the old numbers exactly, since
+    /// `audio::to_mono` averages with the same `(l + r) / 2` the decoder used to
+    /// apply inline — while the interleaved buffer is checked for width
+    /// separately. Re-capturing the reference against interleaved output would
+    /// throw away its provenance for no gain.
+    fn check(bytes: &[u8], rate: u32, len: usize, ref97: &[i16], channels: u8) {
         let a = decode(bytes).expect("decodes");
         assert_eq!(a.rate, rate);
-        assert_eq!(a.pcm.len(), len);
+        assert_eq!(a.channels, channels, "channel count");
+        assert_eq!(a.pcm.len(), len * channels as usize, "interleaved sample count");
+        assert_eq!(a.frames(), len, "frames are unchanged by the channel count");
+        let mono = crate::audio::to_mono(&a.pcm, a.channels);
+        assert_eq!(mono.len(), len);
         for (k, &want) in ref97.iter().enumerate() {
-            let got = a.pcm[k * 97];
+            let got = mono[k * 97];
             assert!((got as i32 - want as i32).abs() <= 2, "sample {}: got {} want {}", k * 97, got, want);
         }
     }
@@ -1390,13 +1412,13 @@ mod tests {
     fn joint_stereo_short_blocks_match_reference() {
         // lame -b 96 -m j over a sweep + click train: MS stereo, long and
         // short blocks, bit reservoir all exercised.
-        check(td::MP3_ST, td::MP3_ST_RATE, td::MP3_ST_LEN, td::MP3_ST_REF97);
+        check(td::MP3_ST, td::MP3_ST_RATE, td::MP3_ST_LEN, td::MP3_ST_REF97, 2);
     }
 
     #[test_case]
     fn mpeg2_lsf_16khz_matches_reference() {
         // MPEG-2 low-sample-rate profile (16 kHz mono): the LSF scalefactor path.
-        check(td::MP3_M16, td::MP3_M16_RATE, td::MP3_M16_LEN, td::MP3_M16_REF97);
+        check(td::MP3_M16, td::MP3_M16_RATE, td::MP3_M16_LEN, td::MP3_M16_REF97, 1);
     }
 
     #[test_case]
@@ -1408,6 +1430,7 @@ mod tests {
         b.extend_from_slice(td::MP3_M16);
         let a = decode(&b).expect("decodes past ID3");
         assert_eq!(a.rate, td::MP3_M16_RATE);
+        assert_eq!(a.channels, 1, "the LSF fixture is mono");
         assert_eq!(a.pcm.len(), td::MP3_M16_LEN);
     }
 

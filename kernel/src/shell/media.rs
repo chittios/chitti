@@ -164,8 +164,15 @@ pub(super) fn image_cmd(_c: u8) {}
 /// refreshes. `done` latches at end-of-track.
 #[cfg(not(feature = "server"))]
 pub(super) struct AudioPlayer {
+    /// Interleaved when `channels > 1`, so this is `frames * channels` long and
+    /// **is not a sample count you may divide by `rate`**.
     pcm: alloc::vec::Vec<i16>,
     rate: u32,
+    /// 1 = mono, 2 = stereo interleaved.
+    channels: u8,
+    /// Play cursor, an index into `pcm` — always a multiple of `channels`, so
+    /// it never lands mid-frame. A cursor that drifts off a frame boundary
+    /// swaps left and right for the rest of the track.
     at: usize,
     name: String,
     total_ms: u64,
@@ -215,9 +222,17 @@ pub(super) fn play_audio(path: &str) {
     }
     serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+Tab again returns to shell; Ctrl+C or /close stops");
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
-    let peaks = crate::audio::waveform_peaks(&audio.pcm, crate::audio::WAVEFORM_BINS);
+    // The waveform is one envelope for the whole track, so it is built from a
+    // mono fold rather than from the interleaved buffer — peaks taken straight
+    // off `L R L R` alternate between the channels and read as a rougher,
+    // noisier envelope than the audio actually has.
+    let peaks = crate::audio::waveform_peaks(
+        &crate::audio::to_mono(&audio.pcm, audio.channels),
+        crate::audio::WAVEFORM_BINS,
+    );
     AUDIO.with(|a| {
         *a = Some(AudioPlayer {
+            channels: audio.channels,
             pcm: audio.pcm,
             rate: audio.rate,
             at: 0,
@@ -272,9 +287,13 @@ pub(super) fn audio_toggle_pause() {
 pub(super) fn audio_seek(delta_ms: i64) {
     AUDIO.with(|a| {
         if let Some(p) = a.as_mut() {
-            let samples = delta_ms * p.rate as i64 / 1000;
+            let ch = p.channels.max(1) as i64;
+            // Frames, then scaled to samples — and snapped back to a frame
+            // boundary, since an odd offset in a stereo track plays the right
+            // channel into the left for the remainder.
+            let samples = delta_ms * p.rate as i64 / 1000 * ch;
             let n = (p.at as i64 + samples).clamp(0, p.pcm.len() as i64) as usize;
-            p.at = n;
+            p.at = n / ch as usize * ch as usize;
             if p.at < p.pcm.len() {
                 p.done = false;
                 p.finished_announced = false;
@@ -315,14 +334,15 @@ pub(super) fn pump_audio() {
             p.done = true;
             return None;
         }
-        let chunk = (p.rate as usize / 5).max(256); // ~200 ms
-        let end = (p.at + chunk).min(p.pcm.len());
+        let ch = p.channels.max(1) as usize;
+        let chunk = (p.rate as usize / 5).max(256) * ch; // ~200 ms of frames
+        let end = ((p.at + chunk).min(p.pcm.len())) / ch * ch;
         let slice = p.pcm[p.at..end].to_vec();
         p.at = end;
-        Some((slice, p.rate))
+        Some((slice, p.rate, p.channels))
     });
-    if let Some((slice, rate)) = next {
-        let _ = crate::sound::play(&slice, rate);
+    if let Some((slice, rate, ch)) = next {
+        let _ = crate::sound::play_ch(&slice, rate, ch);
     }
     // Announce end-of-track once.
     let finished = AUDIO.with(|a| a.as_mut().map(|p| p.done && !p.finished_announced && !crate::sound::playing()).unwrap_or(false));
@@ -343,7 +363,9 @@ pub(super) fn pump_audio() {}
 pub(super) fn repaint_audio() {
     AUDIO.with(|a| {
         if let Some(p) = a.as_ref() {
-            let pos_ms = p.at as u64 * 1000 / p.rate.max(1) as u64;
+            // Frames, not samples: on a stereo track the sample count runs at
+            // twice real time, so the clock would reach 2x the duration.
+            let pos_ms = (p.at / p.channels.max(1) as usize) as u64 * 1000 / p.rate.max(1) as u64;
             crate::framebuffer::draw_audio(&crate::framebuffer::AudioView {
                 name: &p.name,
                 pos_ms: pos_ms.min(p.total_ms),

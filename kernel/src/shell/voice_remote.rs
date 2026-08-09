@@ -304,7 +304,13 @@ pub fn synth(e: &Endpoint, text: &str) -> Result<Vec<i16>, String> {
             crate::net::ws::base64_decode(&b64).ok_or("remote tts: bad base64 audio")?
         }
     };
-    let audio = crate::audio::decode(&audio_bytes).map_err(|e| format!("remote tts: decode {e}"))?;
+    // **Mono, explicitly.** The speech pump, the mel front end and the VAD are
+    // all mono by construction, so a stereo reply (some providers return one)
+    // reaching them would be read as audio at twice the rate — speech at half
+    // pitch, which sounds like a broken decoder rather than a channel-count bug.
+    let audio = crate::audio::decode(&audio_bytes)
+        .map_err(|e| format!("remote tts: decode {e}"))?
+        .into_mono();
     let pcm = if audio.rate == crate::sound::tts::RATE {
         audio.pcm
     } else {

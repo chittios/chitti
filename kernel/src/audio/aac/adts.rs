@@ -190,6 +190,13 @@ pub fn decode_file(data: &[u8]) -> Result<crate::audio::Audio, &'static str> {
             dec.as_ref().map(|d| d.output_rate()).unwrap_or(44100)
         },
         pcm,
+        // **AAC is still decoded to mono.** `downmix_mono` folds through a
+        // weighted BS.775 matrix, so preserving stereo means a second matrix
+        // rather than deleting an average the way WAV and MP3 allowed — and
+        // this decoder is bit-exact-validated against Symphonia, which is not
+        // something to disturb for a channel count. Stated here rather than
+        // left to be discovered as "why is only AAC mono".
+        channels: 1,
     })
 }
 

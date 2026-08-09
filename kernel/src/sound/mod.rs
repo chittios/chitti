@@ -87,6 +87,35 @@ pub fn resample(pcm: &[i16], hz: u32, out_hz: u32) -> Vec<i16> {
     out
 }
 
+/// [`resample`] for interleaved multi-channel PCM: picks whole **frames**, so
+/// the channels stay in step.
+///
+/// Running interleaved stereo through the mono [`resample`] picks nearest
+/// *samples*, and whenever the chosen index has the opposite parity to its slot
+/// the two channels swap — so the image flips back and forth through the track
+/// and the sum is close enough to right that it reads as a bad encode rather
+/// than a resampler bug.
+pub fn resample_ch(pcm: &[i16], hz: u32, out_hz: u32, channels: u8) -> Vec<i16> {
+    let ch = channels.max(1) as usize;
+    if ch == 1 {
+        return resample(pcm, hz, out_hz);
+    }
+    if hz == out_hz || hz == 0 {
+        return pcm.to_vec();
+    }
+    let in_frames = pcm.len() / ch;
+    let out_frames = (in_frames as u64 * out_hz as u64 / hz as u64) as usize;
+    let mut out = Vec::with_capacity(out_frames * ch);
+    for f in 0..out_frames {
+        let src = (f as u64 * hz as u64 / out_hz as u64) as usize;
+        let src = src.min(in_frames.saturating_sub(1));
+        for c in 0..ch {
+            out.push(pcm[src * ch + c]);
+        }
+    }
+    out
+}
+
 /// A PCM sound device: play and capture 16-bit signed mono samples. Poll-driven.
 pub trait SndDevice {
     /// Start (or restart) the output stream at `hz`, then queue `pcm` for
@@ -95,6 +124,30 @@ pub trait SndDevice {
     /// [`resample`] to the device's fixed rate. Callers pass 16 kHz (mic/test
     /// tones) *and* 24 kHz (KittenTTS).
     fn play(&mut self, pcm: &[i16], hz: u32) -> Result<(), &'static str>;
+    /// Start (or restart) the output stream at `hz` with `channels` channels and
+    /// queue `pcm`, **interleaved** when `channels > 1`.
+    ///
+    /// The default folds to mono and calls [`Self::play`], so a driver that has
+    /// not been taught stereo keeps working byte-identically — and a caller
+    /// never has to ask whether the device can do it. Override this to run a
+    /// real multi-channel stream.
+    ///
+    /// A driver that overrides it **must still honour `channels == 1`** by
+    /// running a mono stream or duplicating: the voice pipeline plays mono into
+    /// the same device, and a mono buffer fed to a stereo stream plays at half
+    /// speed in the left channel, which sounds like a broken decoder rather
+    /// than a stream-format bug.
+    fn play_ch(&mut self, pcm: &[i16], hz: u32, channels: u8) -> Result<(), &'static str> {
+        if channels <= 1 {
+            return self.play(pcm, hz);
+        }
+        self.play(&crate::audio::to_mono(pcm, channels), hz)
+    }
+    /// Channels the device can actually run (1 or 2). Reported so `/voice` and
+    /// the players can say what they got rather than guessing.
+    fn out_channels(&self) -> u8 {
+        1
+    }
     /// How many PCM **bytes** [`Self::play`] can currently enqueue without
     /// blocking (free device periods). 0 = unknown/none — callers that need a
     /// non-blocking feed (the chunked-TTS speech pump) then only refill when
@@ -237,18 +290,32 @@ pub fn autodetect() {
 /// volume/mute (see [`volume`] / [`muted`]) so media-player ↑/↓/`m` take effect
 /// on every device backend.
 pub fn play(pcm: &[i16], hz: u32) -> Result<(), &'static str> {
+    play_ch(pcm, hz, 1)
+}
+
+/// Queue `pcm` (S16, `channels` interleaved, at `hz`) for playback.
+///
+/// The gain is applied per sample, so it is channel-agnostic and needs no
+/// separate stereo path — which is the reason volume/mute keep working
+/// unchanged for both.
+pub fn play_ch(pcm: &[i16], hz: u32, channels: u8) -> Result<(), &'static str> {
     SND.with(|s| match s.as_mut() {
         Some(d) => {
             if muted() || volume() < 100 {
                 let mut buf = pcm.to_vec();
                 apply_output_gain(&mut buf);
-                d.play(&buf, hz)
+                d.play_ch(&buf, hz, channels)
             } else {
-                d.play(pcm, hz)
+                d.play_ch(pcm, hz, channels)
             }
         }
         None => Err("no sound device"),
     })
+}
+
+/// Channels the active device will run (1 or 2); 1 when none is up.
+pub fn out_channels() -> u8 {
+    SND.with(|s| s.as_ref().map(|d| d.out_channels()).unwrap_or(1))
 }
 
 /// True while playback is draining. Poll this (with `sched::yield_now`) to wait.
@@ -338,6 +405,36 @@ pub fn test_tone(hz_tone: u32, ms: u32, rate: u32) -> Vec<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Interleaved stereo must be resampled by frame.** The mono resampler
+    /// picks nearest *samples*; whenever the chosen index has the opposite
+    /// parity to its slot, left and right swap — so the stereo image flips back
+    /// and forth through the track while the sum stays close enough to right
+    /// that it reads as a bad encode rather than a resampler bug.
+    #[test_case]
+    fn stereo_resampling_keeps_the_channels_in_step() {
+        // Left channel is always positive, right always negative, so a swap is
+        // unmistakable in the output's signs.
+        let src: Vec<i16> = (0..8).flat_map(|i| [100 + i, -(100 + i)]).collect();
+        let up = resample_ch(&src, 8000, 12000, 2);
+        assert_eq!(up.len() % 2, 0, "output must be whole frames");
+        for f in up.chunks_exact(2) {
+            assert!(f[0] > 0, "left stayed left: {up:?}");
+            assert!(f[1] < 0, "right stayed right: {up:?}");
+        }
+        // 1.5x the frames, not 1.5x the samples.
+        assert_eq!(up.len() / 2, 12);
+
+        // Downsampling too.
+        let down = resample_ch(&src, 12000, 8000, 2);
+        for f in down.chunks_exact(2) {
+            assert!(f[0] > 0 && f[1] < 0);
+        }
+
+        // Mono is delegated unchanged, and an equal rate is a passthrough.
+        assert_eq!(resample_ch(&[1, 2, 3], 8000, 16000, 1), resample(&[1, 2, 3], 8000, 16000));
+        assert_eq!(resample_ch(&src, 8000, 8000, 2), src);
+    }
 
     /// The resampler is what made "hello there" play as "helllloooo theeeere"
     /// when a driver ignored the rate — assert the exact-ratio behaviour.

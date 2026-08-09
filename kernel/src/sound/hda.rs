@@ -635,18 +635,28 @@ impl Hda {
 
 impl SndDevice for Hda {
     fn play(&mut self, pcm: &[i16], hz: u32) -> Result<(), &'static str> {
+        self.play_ch(pcm, hz, 1)
+    }
+
+    /// HDA runs a real stereo stream: the channel count is the low nibble of the
+    /// format word, and the codec is told the same word.
+    fn play_ch(&mut self, pcm: &[i16], hz: u32, channels: u8) -> Result<(), &'static str> {
         // Playback always runs the stream at 48 kHz (every codec's base rate)
         // and resamples the input to it — `hz` varies by caller: 16 kHz test
         // tones/mic loops, 24 kHz KittenTTS. (Capture keeps the native-16k
         // path; see `fmt`/`hw_rate`.)
         const PLAY_HZ: u32 = 48_000;
-        const PLAY_FMT: u16 = 1 << 4; // base 48 kHz, 16-bit, mono
+        // base 48 kHz, 16-bit; bits [3:0] are (channels - 1).
+        let ch = channels.clamp(1, 2);
+        let play_fmt: u16 = (1 << 4) | (ch as u16 - 1);
         // Single-shot DMA: refuse to start a new transfer while one is running
         // (speech_pump waits for !playing() via out_free_bytes).
         if self.playing() {
             return Err("hda: still playing");
         }
-        let samples: Vec<i16> = crate::sound::resample(pcm, hz, PLAY_HZ);
+        // Frame-aware: the mono resampler picks nearest *samples*, which swaps
+        // L and R whenever the chosen index has the opposite parity to its slot.
+        let samples: Vec<i16> = crate::sound::resample_ch(pcm, hz, PLAY_HZ, ch);
         let bytes = samples.len() * 2;
         if bytes == 0 {
             return Ok(());
@@ -656,8 +666,13 @@ impl SndDevice for Hda {
         // SAFETY: fresh DMA regions; stream registers are the device's.
         unsafe {
             core::ptr::copy_nonoverlapping(samples.as_ptr() as *const u8, buf.1 as *mut u8, bytes);
-            // Two BDL entries (the spec minimum), IOC on the last.
-            let half = (bytes / 2) & !1;
+            // Two BDL entries (the spec minimum), IOC on the last. The split
+            // must land on a **frame** boundary, not merely an even byte: a
+            // stereo frame is 4 bytes, and a split inside one makes the second
+            // buffer start on the right channel, so L and R swap halfway
+            // through every clip.
+            let frame_bytes = 2 * ch as usize;
+            let half = (bytes / 2) / frame_bytes * frame_bytes;
             let e = bdl.1;
             core::ptr::write_volatile(e as *mut u64, buf.0);
             core::ptr::write_volatile((e + 8) as *mut u32, half as u32);
@@ -672,15 +687,20 @@ impl SndDevice for Hda {
             w32(sd + SD_BDPU, (bdl.0 >> 32) as u32);
             w32(sd + SD_CBL, bytes as u32);
             w16(sd + SD_LVI, 1);
-            w16(sd + SD_FMT, PLAY_FMT);
+            w16(sd + SD_FMT, play_fmt);
             // Bind the converter to stream tag 1, channel 0 + format.
             self.verb(self.dac, V_SET_STREAM, 1 << 4);
-            self.verb16(self.dac, V_SET_FORMAT, PLAY_FMT as u32);
+            self.verb16(self.dac, V_SET_FORMAT, play_fmt as u32);
             // Tag 1 into CTL byte 2, IOC enable, run.
             w32(sd + SD_CTL, (1 << 20) | SDCTL_IOCE | SDCTL_RUN);
         }
         self.play_open = true;
         Ok(())
+    }
+
+    /// HDA runs stereo when asked.
+    fn out_channels(&self) -> u8 {
+        2
     }
 
     /// Free bytes the speech pump can enqueue: whole second when idle, 0 while

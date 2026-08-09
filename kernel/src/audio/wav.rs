@@ -64,27 +64,54 @@ pub fn decode(bytes: &[u8]) -> Result<Audio, &'static str> {
 
     let frame = bytes_per * channels;
     let n = data.len() / frame.max(1);
-    let mut pcm: Vec<i16> = Vec::with_capacity(n);
-    for f in 0..n {
-        let mut acc = 0i64;
-        for c in 0..channels {
-            let s = &data[f * frame + c * bytes_per..];
-            let v: i32 = match (format, bits) {
-                (FMT_PCM, 8) => (s[0] as i32 - 128) << 8, // u8 is unsigned, offset-binary
-                (FMT_PCM, 16) => i16::from_le_bytes([s[0], s[1]]) as i32,
-                (FMT_PCM, 24) => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) >> 8,
-                (FMT_PCM, 32) => i32::from_le_bytes([s[0], s[1], s[2], s[3]]) >> 16,
-                (FMT_FLOAT, 32) => {
-                    let x = f32::from_bits(le32(s));
-                    (x.clamp(-1.0, 1.0) * 32767.0) as i32
-                }
-                _ => 0,
-            };
-            acc += v as i64;
+    // Stereo is kept as-is (interleaved L R); anything wider is folded to
+    // stereo-from-mono, because the devices here run one or two channels and a
+    // 5.1 file dropped to its first two channels would lose the centre — which
+    // on a film is most of the dialogue.
+    let out_ch: usize = if channels == 1 { 1 } else { 2 };
+    let mut pcm: Vec<i16> = Vec::with_capacity(n * out_ch);
+    let sample = |s: &[u8]| -> i32 {
+        match (format, bits) {
+            (FMT_PCM, 8) => (s[0] as i32 - 128) << 8, // u8 is unsigned, offset-binary
+            (FMT_PCM, 16) => i16::from_le_bytes([s[0], s[1]]) as i32,
+            (FMT_PCM, 24) => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) >> 8,
+            (FMT_PCM, 32) => i32::from_le_bytes([s[0], s[1], s[2], s[3]]) >> 16,
+            (FMT_FLOAT, 32) => {
+                let x = f32::from_bits(le32(s));
+                (x.clamp(-1.0, 1.0) * 32767.0) as i32
+            }
+            _ => 0,
         }
-        pcm.push((acc / channels as i64).clamp(-32768, 32767) as i16);
+    };
+    for f in 0..n {
+        let at = |c: usize| sample(&data[f * frame + c * bytes_per..]);
+        match (channels, out_ch) {
+            (1, _) => pcm.push(at(0).clamp(-32768, 32767) as i16),
+            (2, _) => {
+                pcm.push(at(0).clamp(-32768, 32767) as i16);
+                pcm.push(at(1).clamp(-32768, 32767) as i16);
+            }
+            // More than two channels: average the odd-indexed into right and
+            // the even-indexed into left, so centre and LFE reach both sides
+            // rather than vanishing.
+            _ => {
+                let (mut l, mut r, mut nl, mut nr) = (0i64, 0i64, 0i64, 0i64);
+                for c in 0..channels {
+                    let v = at(c) as i64;
+                    if c % 2 == 0 {
+                        l += v;
+                        nl += 1;
+                    } else {
+                        r += v;
+                        nr += 1;
+                    }
+                }
+                pcm.push((l / nl.max(1)).clamp(-32768, 32767) as i16);
+                pcm.push((r / nr.max(1)).clamp(-32768, 32767) as i16);
+            }
+        }
     }
-    Ok(Audio { rate, pcm })
+    Ok(Audio { rate, pcm, channels: out_ch as u8 })
 }
 
 #[cfg(test)]
@@ -113,16 +140,56 @@ mod tests {
         b
     }
 
+    /// **Stereo survives decoding**, interleaved. It used to be averaged here,
+    /// which is what made every stereo file play in mono.
     #[test_case]
-    fn pcm16_stereo_downmix() {
-        // Frames: (1000, 3000) -> 2000; (-400, -600) -> -500.
+    fn pcm16_stereo_is_preserved_interleaved() {
         let mut d = Vec::new();
         for v in [1000i16, 3000, -400, -600] {
             d.extend_from_slice(&v.to_le_bytes());
         }
         let a = decode(&wav(1, 2, 44100, 16, &d)).unwrap();
         assert_eq!(a.rate, 44100);
-        assert_eq!(a.pcm, alloc::vec![2000, -500]);
+        assert_eq!(a.channels, 2);
+        assert_eq!(a.pcm, alloc::vec![1000, 3000, -400, -600]);
+        // Two frames, not four samples' worth of time — the distinction the
+        // whole `frames()` API exists for.
+        assert_eq!(a.frames(), 2);
+        // And folding down still gives what the old decoder produced.
+        let m = a.into_mono();
+        assert_eq!(m.channels, 1);
+        assert_eq!(m.pcm, alloc::vec![2000, -500]);
+    }
+
+    /// A mono file is byte-identical to before — the regression guard for every
+    /// caller that predates channels existing.
+    #[test_case]
+    fn mono_is_unchanged() {
+        let mut d = Vec::new();
+        for v in [1000i16, 3000, -400] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        let a = decode(&wav(1, 1, 44100, 16, &d)).unwrap();
+        assert_eq!(a.channels, 1);
+        assert_eq!(a.pcm, alloc::vec![1000, 3000, -400]);
+        assert_eq!(a.frames(), 3);
+    }
+
+    /// More than two channels folds to **stereo**, not to the first two: taking
+    /// channels 0 and 1 of a 5.1 stream drops the centre, which on a film is
+    /// most of the dialogue.
+    #[test_case]
+    fn more_than_two_channels_folds_to_stereo_without_losing_centre() {
+        // One 6-channel frame; the centre channel is the only loud one.
+        let mut d = Vec::new();
+        for v in [0i16, 0, 30000, 0, 0, 0] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        let a = decode(&wav(1, 6, 48000, 16, &d)).unwrap();
+        assert_eq!(a.channels, 2);
+        assert_eq!(a.frames(), 1);
+        assert_ne!(a.pcm[0], 0, "the centre channel must reach the left");
+        assert_eq!(a.pcm.len(), 2);
     }
 
     #[test_case]
