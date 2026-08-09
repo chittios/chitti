@@ -1928,14 +1928,28 @@ mod tests {
         let background = spawn("test-bg", idle_counter, 0);
         set_priority(background, Priority::Background);
         assert_eq!(priority_of(background), Some(Priority::Background));
-        // Zero the counter *after* the demotion, for the same reason the idle
-        // test zeroes after `set_idle`: `spawn` enqueues at `Normal`, so a timer
-        // tick landing between the spawn and the `set_priority` legitimately
-        // gives this task one Normal turn. Counting that as a Background turn
-        // would fail a test whose subject behaved correctly.
-        IDLE_TICKS.store(0, Ordering::SeqCst);
         let normal = spawn("test-normal", worker_counter, 0);
         assert_eq!(priority_of(normal), Some(Priority::Normal), "Normal is the default");
+        // Zero the counter only once a Normal task is *queued*, which is later
+        // than it looks. Two distinct windows before this point hand the subject
+        // a turn it is entitled to, and counting either as a violation fails a
+        // test whose subject behaved correctly:
+        //
+        //   * between `spawn` and `set_priority` it is still an ordinary Normal
+        //     task (the reason the idle test zeroes after `set_idle`), and
+        //   * after the demotion it is the *only* queued task until this
+        //     `spawn` returns — and `reschedule` picks before re-queueing the
+        //     outgoing task, so the running task's priority is never compared
+        //     against the queue. A timer tick there therefore switches to the
+        //     Background task because nothing Normal is ready, which is the
+        //     rule, not a breach of it.
+        //
+        // That second window is wide: `spawn` allocates and zeroes a 256 KiB
+        // stack, which under TCG is long enough for the 1 kHz tick to land in
+        // it. Zeroing before it made this a rare CI-only failure. From here on
+        // one of the two Normal tasks (this one and `normal`) is always queued
+        // while the other runs, so any Background turn is a real violation.
+        IDLE_TICKS.store(0, Ordering::SeqCst);
 
         for _ in 0..50 {
             yield_now();
