@@ -363,6 +363,8 @@ impl<'d, D: BlockDevice> Ext4Rw<'d, D> {
 
     /// Effective read: staged metadata if present, else disk.
     fn read_eblock(&mut self, eblk: u64, buf: &mut [u8; EBS]) -> Result<(), Ext4RwError> {
+        #[cfg(test)]
+        tests::count_eblock_read();
         if let Some(txn) = self.txn.as_ref() {
             if let Some(staged) = txn.staged.get(&eblk) {
                 *buf = *staged;
@@ -1071,10 +1073,52 @@ impl<'d, D: BlockDevice> Ext4Rw<'d, D> {
         Ok(out)
     }
 
+    /// Find one name in a directory, **without building the listing**.
+    ///
+    /// This used to be `list_dir_ino(dir).find(...)`, which allocates a `String`
+    /// per entry plus a growing `Vec` in order to match a single name and then
+    /// drops the lot. Resolving a path pays it per component, so a store that
+    /// reads every file at mount pays it per *file*: with 390 flat keys that is
+    /// ~152k `String`s through the kernel's first-fit free list, and it is
+    /// quadratic -- 4x the files measured 13x the allocations and 15x the
+    /// free-list scan steps. It cost ~16 s of boot on a real NVMe box.
+    ///
+    /// The block reads were never the problem (they measured linear, ~4 per
+    /// file), which is why this looked like an I/O bug and was not one.
+    ///
+    /// Comparing raw bytes rather than a lossy `String` is also the more
+    /// correct test: a directory entry that is not valid UTF-8 can never equal
+    /// a `&str`, where lossy conversion would map it to replacement characters.
     fn lookup_in_dir(&mut self, dir_ino: u64, name: &str) -> Result<Option<(u64, u8)>, Ext4RwError> {
-        for (n, ino, ft) in self.list_dir_ino(dir_ino)? {
-            if n == name {
-                return Ok(Some((ino, ft)));
+        let inode = self.read_inode(dir_ino)?;
+        if !inode.is_dir() {
+            return Err(Ext4RwError::NotADir);
+        }
+        let target = name.as_bytes();
+        let nblocks = (inode.size as usize).div_ceil(EBS);
+        let mut buf = [0u8; EBS];
+        for lb in 0..nblocks as u64 {
+            let Some(pb) = self.map_block(&inode, lb)? else {
+                break;
+            };
+            self.read_eblock(pb, &mut buf)?;
+            let mut off = 0usize;
+            while off + 8 <= EBS {
+                let ino = le32(&buf, off) as u64;
+                let rec_len = le16(&buf, off + 4) as usize;
+                let name_len = buf[off + 6] as usize;
+                let ftype = buf[off + 7];
+                if rec_len < 8 {
+                    break;
+                }
+                if ino != 0
+                    && name_len > 0
+                    && off + 8 + name_len <= EBS
+                    && &buf[off + 8..off + 8 + name_len] == target
+                {
+                    return Ok(Some((ino, ftype)));
+                }
+                off += rec_len;
             }
         }
         Ok(None)
@@ -1690,6 +1734,103 @@ mod tests {
     use crate::block::ext4_read::Ext4Reader;
     use crate::block::ramdisk::RamDisk;
     use alloc::vec;
+
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Effective-block reads since the last reset. The mount's cost is
+    /// dominated by metadata re-reads, and a wall-clock number in a VM is too
+    /// noisy to regress on — so the measurement counts reads.
+    static EBLOCK_READS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn count_eblock_read() {
+        EBLOCK_READS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn reads_since_reset() -> u64 {
+        EBLOCK_READS.swap(0, Ordering::Relaxed)
+    }
+
+    /// What `Ext4Store::mount_inner` does: enumerate, then read every file.
+    fn mount_style_read_all(vol: &mut Ext4Rw<RamDisk>) -> usize {
+        let files = vol.list_files_recursive("/").expect("list");
+        let mut bytes = 0;
+        for p in &files {
+            bytes += vol.read(p).expect("read").len();
+        }
+        bytes
+    }
+
+    fn volume_with_files(n: usize) -> RamDisk {
+        let mut d = fresh();
+        {
+            let mut vol = Ext4Rw::open(&mut d).expect("open");
+            for i in 0..n {
+                vol.write(&alloc::format!("k{i:04}"), b"payload").expect("write");
+            }
+        }
+        d
+    }
+
+    /// **Mounting must not allocate in proportion to the square of the file
+    /// count.** `Ext4Store::mount_inner` reads every file, `read` resolves each
+    /// path from the root, and `lookup_in_dir` used to build the whole
+    /// directory listing -- a `String` per entry plus a growing `Vec` -- to
+    /// match one name. So each extra file made every later lookup dearer.
+    ///
+    /// Measured before the fix, 40 -> 160 files: allocations 2057 -> 27703
+    /// (13x for 4x the files) and free-list scan steps 328 -> 5200 (15x). After:
+    /// 177 -> 663 and 8 -> 80. On a real NVMe box with 390 keys this was ~16 s
+    /// of boot between "found GPT" and "mounted".
+    ///
+    /// The assertion is on **allocations**, not wall time: the kernel allocator
+    /// is a first-fit free list, so churn is the cost that matters (performance
+    /// trap #3), and a millisecond figure inside a VM is far too noisy to
+    /// regress on. Block reads are asserted too, but they were never the
+    /// problem -- they measured linear throughout, which is exactly why this
+    /// presented as an I/O bug and was not one.
+    #[test_case]
+    fn mounting_cost_scales_with_file_count_not_its_square() {
+        fn cost(n: usize) -> (u64, u64) {
+            let mut d = volume_with_files(n);
+            let mut vol = Ext4Rw::open(&mut d).expect("open");
+            reads_since_reset();
+            let (a0, _) = crate::mm::heap::alloc_stats();
+            mount_style_read_all(&mut vol);
+            let (a1, _) = crate::mm::heap::alloc_stats();
+            (reads_since_reset(), a1 - a0)
+        }
+        let (reads_40, allocs_40) = cost(40);
+        let (reads_160, allocs_160) = cost(160);
+
+        // 4x the files: linear is ~4x, quadratic ~16x. The bound is generous
+        // (more files also means more data blocks and a longer directory) but
+        // nowhere near quadratic.
+        assert!(
+            allocs_160 < allocs_40 * 8,
+            "allocations grew {}x for 4x the files ({allocs_40} -> {allocs_160}) -- \
+             a lookup is materialising the whole directory again",
+            allocs_160 / allocs_40.max(1)
+        );
+        assert!(
+            reads_160 < reads_40 * 8,
+            "block reads grew {}x for 4x the files ({reads_40} -> {reads_160})",
+            reads_160 / reads_40.max(1)
+        );
+    }
+
+    /// The in-place name match must find every entry the listing does --
+    /// including the last one in a directory spanning several blocks, which a
+    /// premature `break` in the block walk would silently miss.
+    #[test_case]
+    fn lookup_agrees_with_the_full_listing_across_blocks() {
+        let mut d = volume_with_files(200);
+        let mut vol = Ext4Rw::open(&mut d).expect("open");
+        let listed = vol.list_files_recursive("/").expect("list");
+        assert_eq!(listed.len(), 200, "fixture should span multiple dir blocks");
+        for path in &listed {
+            assert_eq!(vol.read(path).expect("read by path"), b"payload");
+        }
+        assert!(vol.read("k9999").is_err(), "a name that is not there must not resolve");
+    }
 
     fn disk() -> RamDisk {
         // 8 MiB — matches the existing ext4 layout tests.
