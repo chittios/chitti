@@ -61,6 +61,12 @@ const SYNTAX_DEFAULTS: &[(&str, &str)] = &[
     ("code", "#5db8a6"),
 ];
 
+/// The product name, one word. See the naming rule in CLAUDE.md.
+pub const NAME: &str = "ChittiOS";
+/// The pre-rename spelling, kept only so a stale `ui.json` can be migrated off
+/// it. Nothing should ever *write* this.
+pub const STALE_NAME: &str = "Chitti OS";
+
 /// The persisted UI configuration.
 #[derive(Clone)]
 pub struct UiConfig {
@@ -117,7 +123,7 @@ impl Default for UiConfig {
             swap_panes: false,
             chat_title: "Shell Agent".to_string(),
             logs_title: "ktrace".to_string(),
-            status_left: "ChittiOS v${version}".to_string(),
+            status_left: alloc::format!("{NAME} v${{version}}"),
             // Compact macOS-style clock by default (`Tue Aug 4  19:45`); full
             // form stays available as `${datetime}` / `${tz}` if a user wants it.
             status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${recording}  ${datetime_short}".to_string(),
@@ -198,6 +204,22 @@ impl UiConfig {
             t if t == "chat" => d.chat_title.clone(),
             t => t,
         };
+        // **The product name is one word.** A `ui.json` written before the
+        // rename keeps `Chitti OS v${version}` and, because `ui.json` is the
+        // source of truth for the live look, carries it across every upgrade —
+        // so an installed machine still shows the two-word name in its status
+        // bar while a fresh boot shows the right one, and the difference looks
+        // like a bug in the status bar rather than a stale config. (Spotted in a
+        // demo recording, where it is then baked into the video.)
+        //
+        // Applied as a substring, not an exact-match ladder entry like the ones
+        // below: those forward-migrate defaults a user never chose, whereas this
+        // is a misspelling of the product name and is wrong wherever it appears,
+        // including inside a template someone customised. It rewrites nothing
+        // else in their line.
+        let fix_name = |t: String| -> String {
+            if t.contains(STALE_NAME) { t.replace(STALE_NAME, NAME) } else { t }
+        };
         let status_right = match s("status_right", &d.status_right) {
             // Forward-migrate the earlier built-in defaults to the current one.
             t if t == "${datetime}  ${tz}" => d.status_right.clone(),
@@ -220,6 +242,14 @@ impl UiConfig {
             }
             t => t,
         };
+        let status_right = fix_name(status_right);
+        // The left template had no migration at all. Forward-migrate the one
+        // stale default outright, so it also picks up any later change to it,
+        // and normalise the name in anything else.
+        let status_left = match s("status_left", &d.status_left) {
+            t if t == "Chitti OS v${version}" => d.status_left.clone(),
+            t => fix_name(t),
+        };
         UiConfig {
             chat_pct: j.get("chat_pct").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.chat_pct),
             font_scale: j.get("font_scale").and_then(|v| v.as_i64()).map(|n| n as u64).unwrap_or(d.font_scale),
@@ -227,7 +257,7 @@ impl UiConfig {
             swap_panes: j.get("swap_panes").and_then(|v| v.as_bool()).unwrap_or(d.swap_panes),
             chat_title,
             logs_title: s("logs_title", &d.logs_title),
-            status_left: s("status_left", &d.status_left),
+            status_left,
             status_right,
             // Normalise through the parser so an unrecognised value lands on the
             // default rather than being carried around as a string nothing honours.
@@ -717,6 +747,51 @@ pub fn shortcuts() -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    /// **A stale `ui.json` must stop showing the two-word name.** `ui.json` is
+    /// the source of truth for the live look, so a config written before the
+    /// rename carries `Chitti OS` across every upgrade — an installed machine
+    /// shows it in the status bar while a fresh boot shows the right name, which
+    /// reads as a status-bar bug rather than a stale file. (Found in a demo
+    /// recording, where it is then baked into the video.)
+    #[test_case]
+    fn a_stale_ui_json_is_migrated_to_the_one_word_name() {
+        let old = r#"{"status_left":"Chitti OS v${version}"}"#;
+        let cfg = UiConfig::from_json(&Json::parse(old).unwrap());
+        assert_eq!(cfg.status_left, UiConfig::default().status_left);
+        assert!(!cfg.status_left.contains(STALE_NAME));
+        assert!(cfg.status_left.contains(NAME));
+    }
+
+    /// The name is fixed wherever it appears, including inside a template
+    /// someone customised — it is a misspelling of the product, not a default
+    /// they chose. The rest of their line is left exactly as written.
+    #[test_case]
+    fn the_name_is_fixed_without_rewriting_the_rest_of_a_custom_template() {
+        let j = r#"{"status_left":"Chitti OS ${version} | ${mem}","status_right":"Chitti OS ${cpu}"}"#;
+        let cfg = UiConfig::from_json(&Json::parse(j).unwrap());
+        assert_eq!(cfg.status_left, "ChittiOS ${version} | ${mem}");
+        assert_eq!(cfg.status_right, "ChittiOS ${cpu}");
+    }
+
+    /// A template that never mentioned the product is untouched — the migration
+    /// must not be an excuse to reset someone's status bar.
+    #[test_case]
+    fn a_custom_template_without_the_name_is_left_alone() {
+        let j = r#"{"status_left":"my box ${version}"}"#;
+        let cfg = UiConfig::from_json(&Json::parse(j).unwrap());
+        assert_eq!(cfg.status_left, "my box ${version}");
+    }
+
+    /// Nothing may write the old spelling back out: a round-trip through the
+    /// serializer has to keep the corrected name, or the fix lasts one boot.
+    #[test_case]
+    fn the_migrated_name_survives_a_round_trip() {
+        let cfg = UiConfig::from_json(&Json::parse(r#"{"status_left":"Chitti OS v${version}"}"#).unwrap());
+        let back = UiConfig::from_json(&cfg.to_json());
+        assert_eq!(back.status_left, cfg.status_left);
+        assert!(!back.status_left.contains(STALE_NAME), "must not be re-emitted");
+    }
+
     use super::*;
 
     /// The default status-bar template, so the tests below exercise the real layout.
