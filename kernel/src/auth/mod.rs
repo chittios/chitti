@@ -92,7 +92,19 @@ pub const DEFAULT_ITERATIONS: u32 = 200_000;
 /// than reinterpreted.
 pub const KDF_PBKDF2_SHA256: &str = "pbkdf2-hmac-sha256";
 
-pub const MIN_PASSWORD_LEN: usize = 8;
+/// Shortest password that may be enrolled.
+///
+/// Four, not eight: this is a console lock on a single-user research OS, and the
+/// thing it is actually defending against is someone walking up to an unattended
+/// machine — where the ramping backoff (three free attempts, then 1s doubling to
+/// 30s) is the real bound, not the search space.
+///
+/// It buys nothing offline and is not pretended to: 4 printable-ASCII characters
+/// is ~81M candidates, minutes against a PBKDF2 digest on a GPU. But an attacker
+/// holding the record has already got the disk, and on an unencrypted volume the
+/// record can simply be deleted — which is why `/passwd` says in as many words
+/// that this is a console lock and `/encrypt` is what protects the data.
+pub const MIN_PASSWORD_LEN: usize = 4;
 pub const MAX_PASSWORD_LEN: usize = 128;
 
 /// Default idle timeout in minutes; 0 disables auto-lock.
@@ -353,7 +365,7 @@ pub fn validate_new(password: &str) -> Result<(), &'static str> {
         return Err("empty");
     }
     if password.chars().count() < MIN_PASSWORD_LEN {
-        return Err("too short (minimum 8 characters)");
+        return Err("too short (minimum 4 characters)");
     }
     if password.chars().count() > MAX_PASSWORD_LEN {
         return Err("too long (maximum 128 characters)");
@@ -703,11 +715,22 @@ mod tests {
 
     #[test_case]
     fn validate_new_rejects_short_empty_and_untypeable_passwords() {
+        // The boundary is derived from the constant, not spelled out, so moving
+        // the minimum cannot leave this test asserting the old one.
+        let at_min: alloc::string::String = core::iter::repeat('a').take(MIN_PASSWORD_LEN).collect();
+        let below: alloc::string::String = core::iter::repeat('a').take(MIN_PASSWORD_LEN - 1).collect();
         assert!(validate_new("").is_err());
-        assert!(validate_new("short").is_err(), "a 5-character password was accepted");
-        assert!(validate_new("1234567").is_err(), "a 7-character password was accepted");
-        assert!(validate_new("12345678").is_ok(), "an 8-character password was rejected");
+        assert!(validate_new(&below).is_err(), "a password one short of the minimum was accepted");
+        assert!(validate_new(&at_min).is_ok(), "a password of exactly the minimum was rejected");
         assert!(validate_new("a longer pass phrase!").is_ok());
+        // …and the refusal must name the *real* minimum. A stale number in an
+        // error message is worse than no number: it tells the human to type a
+        // length that is not what the code checks.
+        let msg = validate_new(&below).unwrap_err();
+        assert!(
+            msg.contains(&alloc::format!("{MIN_PASSWORD_LEN}")),
+            "the too-short message ({msg:?}) does not name MIN_PASSWORD_LEN ({MIN_PASSWORD_LEN})"
+        );
         // The whole printable-ASCII range is fine.
         assert!(validate_new("~!@#$%^&*()_+ 09azAZ").is_ok());
         // Anything the prompt cannot type is refused at enrolment.
