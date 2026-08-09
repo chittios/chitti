@@ -14,6 +14,8 @@
 //! SSID and connect runs DHCP on the virtio/e1000 NIC.
 
 pub mod brcm;
+pub mod ccmp;
+pub mod data;
 pub mod ieee80211;
 pub mod iwl;
 pub mod wpa;
