@@ -354,6 +354,17 @@ pub extern "C" fn aarch64_start() -> ! {
     chitti_kernel::kms::adopt_console_if_needed();
     if let Some((w, h)) = fb {
         serial_println!("Chitti: framebuffer TUI up ({}x{}) -- console mirrored to the window", w, h);
+    }
+    // **Input bring-up must not depend on the firmware framebuffer.** It used to
+    // live inside the `if let` above, which was harmless only while "no firmware
+    // framebuffer" meant "no console at all". A KMS driver now provides one
+    // (`adopt_console_if_needed`, just above), so a machine whose firmware
+    // publishes no GOP — QEMU `virt` under UEFI reaches exactly that path — comes
+    // up with a working screen on virtio-gpu and **no keyboard or mouse**, because
+    // the USB/PS-2/virtio-input probes never ran. Nothing here has anything to do
+    // with a framebuffer; the only reason it was nested is that it prints its
+    // summary for someone reading the screen.
+    {
         // Bring up USB HID keyboard + mouse (xHCI). On Apple Silicon the
         // controller is the on-SoC dwc3 (DART + ATC-PHY, via `apple_usb`); on
         // VirtualBox / real SBSA hardware it's an xHCI over PCIe. Both feed the
