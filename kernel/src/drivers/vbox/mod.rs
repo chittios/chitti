@@ -86,11 +86,28 @@ pub const HGCM_HDR: usize = REQ_HDR + 8;
 /// asynchronous HGCM request has completed.
 pub const HGCM_REQ_DONE: u32 = 1;
 
-/// `VMMDevReportGuestInfo` body: `additionsVersion`, `osType`.
+/// `VMMDevReportGuestInfo` body: `VBoxGuestInfo { interfaceVersion, osType }`.
 pub const GUEST_INFO_LEN: usize = REQ_HDR + 8;
-/// The additions version we claim. Reported so the host knows a guest agent is
-/// present at all; it gates whether the host offers HGCM services.
-pub const ADDITIONS_VERSION: u32 = 0x0006_0000; // 6.0
+
+/// Sentinel seeded into `rc` before a request is submitted.
+///
+/// It must be **negative** (so a request the host never touched cannot read as
+/// success) and must not collide with a real VBox status, which are small
+/// negatives — `-1` is `VERR_GENERAL_FAILURE`, and using it made "the host
+/// rejected this" and "the host never saw this" the same message.
+pub const RC_UNSET: i32 = -0x7000_0000;
+
+/// The VMMDev **interface** version this guest speaks — `VMMDEV_VERSION`.
+///
+/// **Not an additions version**, which is what the field's position next to
+/// `osType` suggests and what a first pass here put in it (`0x0006_0000`, for
+/// "6.0"). The host's own rule is
+/// `HIWORD(v) == HIWORD(VMMDEV_VERSION) && LOWORD(v) <= LOWORD(VMMDEV_VERSION)`
+/// (`VMMDEV_INTERFACE_VERSION_IS_OK`), so a major of 6 fails it and
+/// `ReportGuestInfo` comes back `VERR_VERSION_MISMATCH` — which is exactly what
+/// a real VirtualBox-ARM guest reported. `VBoxGuestInfo`'s own comment is the
+/// giveaway: "the VMMDev interface version expected by additions".
+pub const GUEST_INTERFACE_VERSION: u32 = VMMDEV_VERSION;
 /// `VBOXOSTYPE_Linux26_x64` / `_Linux26` — "a modern Linux-ish guest", which is
 /// the closest published value and the one that unlocks the most services. The
 /// host uses it for presentation and service gating, not for behaviour we
@@ -161,7 +178,7 @@ pub fn write_header(buf: &mut [u8], size: u32, req_type: u32) -> bool {
     // `rc` is an OUT field; the host overwrites it. Seeded with a value that
     // is not a success code so a request the host never touched cannot read as
     // having succeeded.
-    buf[HDR_RC..HDR_RC + 4].copy_from_slice(&(-1i32).to_le_bytes());
+    buf[HDR_RC..HDR_RC + 4].copy_from_slice(&RC_UNSET.to_le_bytes());
     buf[HDR_RESERVED1..HDR_RESERVED1 + 4].copy_from_slice(&0u32.to_le_bytes());
     buf[HDR_REQUESTOR..HDR_REQUESTOR + 4].copy_from_slice(&0u32.to_le_bytes());
     true
@@ -329,14 +346,21 @@ pub fn bring_up() -> Result<String, &'static str> {
     if !write_header(buf, GUEST_INFO_LEN as u32, REQ_REPORT_GUEST_INFO) {
         return Err("could not frame the guest-info request");
     }
-    buf[REQ_HDR..REQ_HDR + 4].copy_from_slice(&ADDITIONS_VERSION.to_le_bytes());
+    buf[REQ_HDR..REQ_HDR + 4].copy_from_slice(&GUEST_INTERFACE_VERSION.to_le_bytes());
     buf[REQ_HDR + 4..REQ_HDR + 8].copy_from_slice(&OS_TYPE_LINUX26.to_le_bytes());
     if !submit(phys) {
         return Err("the request register is unreachable");
     }
     let rc = header_rc(buf);
+    if rc == RC_UNSET {
+        // The write reached the register but the host left `rc` alone, so it
+        // never saw the request at all. A different fault from a refusal, and
+        // pointing at the wrong one costs a debugging cycle.
+        crate::ktrace::log("vbox", "ReportGuestInfo: the host did not process the request");
+        return Err("the host never processed the request (wrong register or address?)");
+    }
     if rc < 0 {
-        crate::ktrace::log_fmt(format_args!("vbox: ReportGuestInfo failed rc={rc}"));
+        crate::ktrace::log_fmt(format_args!("vbox: ReportGuestInfo rejected rc={rc}"));
         return Err("the host rejected our guest-info report");
     }
 
@@ -424,6 +448,44 @@ mod tests {
         assert!(header_rc(&buf) < 0);
     }
 
+    /// The host's own acceptance rule, so the version we send cannot drift
+    /// away from what it will take.
+    fn interface_version_is_ok(v: u32) -> bool {
+        (v >> 16) == (VMMDEV_VERSION >> 16) && (v & 0xffff) <= (VMMDEV_VERSION & 0xffff)
+    }
+
+    #[test_case]
+    fn the_guest_info_version_is_the_interface_version_not_an_additions_version() {
+        // `VBoxGuestInfo.interfaceVersion` sits next to `osType`, which makes it
+        // read like "which Guest Additions are these". It is not: the host
+        // applies VMMDEV_INTERFACE_VERSION_IS_OK to it, so a plausible
+        // "6.0" (0x0006_0000) has major 6, fails the check, and ReportGuestInfo
+        // comes back VERR_VERSION_MISMATCH. A real VirtualBox-ARM guest
+        // reported exactly that.
+        assert!(interface_version_is_ok(GUEST_INTERFACE_VERSION));
+        assert_eq!(GUEST_INTERFACE_VERSION, VMMDEV_VERSION);
+        assert!(!interface_version_is_ok(0x0006_0000), "the version this first sent");
+        // Major must match exactly; minor may only be lower or equal.
+        assert!(interface_version_is_ok(0x0001_0000));
+        assert!(!interface_version_is_ok(0x0002_0004));
+        assert!(!interface_version_is_ok(VMMDEV_VERSION + 1));
+    }
+
+    #[test_case]
+    fn an_untouched_request_is_distinguishable_from_a_rejected_one() {
+        // The seed used to be -1, which is VERR_GENERAL_FAILURE — so "the host
+        // said no" and "the host never saw this" produced the same message and
+        // pointed at the wrong half of the problem.
+        let mut buf = [0u8; 64];
+        assert!(write_header(&mut buf, GUEST_INFO_LEN as u32, REQ_REPORT_GUEST_INFO));
+        assert_eq!(header_rc(&buf), RC_UNSET);
+        // Still negative, so a stale read can never pass as success...
+        assert!(RC_UNSET < 0);
+        // ...but far outside the range real VBox statuses use.
+        assert!(RC_UNSET < -0x1000_0000, "must not collide with a VERR_ value");
+        assert_ne!(RC_UNSET, -1);
+    }
+
     #[test_case]
     fn a_request_that_does_not_fit_its_buffer_is_refused() {
         let mut small = [0u8; 16];
@@ -503,6 +565,9 @@ fn submit_and_wait(phys: u64, buf: &[u8]) -> Result<(), &'static str> {
         return Err("the request register is unreachable");
     }
     let rc = header_rc(buf);
+    if rc == RC_UNSET {
+        return Err("the host never processed the HGCM request");
+    }
     // VINF_HGCM_ASYNC_EXECUTE is a *success*: the call was accepted and will
     // complete later. Any negative rc is a real refusal.
     if rc < 0 {
@@ -571,7 +636,8 @@ pub fn hgcm_post_message_wait(client: u32, function: u32, parms: &[hgcm::Parm]) 
     }
     // A negative rc means the host refused it outright; anything else means it
     // is either done already or pending, both of which `take` handles.
-    header_rc(buf) >= 0
+    let rc = header_rc(buf);
+    rc != RC_UNSET && rc >= 0
 }
 
 /// Collect the outstanding message-wait call if the host has completed it.
