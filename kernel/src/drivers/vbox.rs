@@ -94,6 +94,42 @@ pub const ADDITIONS_VERSION: u32 = 0x0006_0000; // 6.0
 /// depend on.
 pub const OS_TYPE_LINUX26: u32 = 0x5_3100;
 
+/// One page of `.bss`, page-aligned, used as the request buffer on aarch64.
+///
+/// See [`request_buffer`] for why this is not a heap allocation.
+#[repr(C, align(4096))]
+struct ReqPage([u8; 4096]);
+static mut REQ_PAGE: ReqPage = ReqPage([0; 4096]);
+
+/// `(phys, virt)` of a request buffer the 32-bit request register can reach.
+///
+/// **The obvious `alloc_dma` does not work here, and it fails on a real VM.**
+/// aarch64 places its heap at the *top of discovered RAM*, so on a guest with
+/// more than 4 GiB every allocation is out of the register's reach — an 8 GiB
+/// VirtualBox-ARM guest reported exactly `request buffer landed above 4 GiB`
+/// and `/vbox up` could not make its first request. The kernel image is loaded
+/// low by the firmware and RAM is identity-mapped, so a page of `.bss` is both
+/// below the line and its own physical address.
+///
+/// x86 frame-allocates and *can* express the constraint, so it asks for it
+/// directly; the caller's [`request_addr_fits`] check still has the last word
+/// on either arch.
+fn request_buffer() -> Option<(u64, u64)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: taking the address of a static; no reference is created, and
+        // this driver is the only user of the page.
+        let p = core::ptr::addr_of_mut!(REQ_PAGE) as u64;
+        Some((p, p))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // A single 4 KiB page can never cross a 4 KiB boundary, so the boundary
+        // constraint is satisfied trivially.
+        crate::mm::alloc_dma_bounded(4096, u32::MAX as u64, 4096)
+    }
+}
+
 /// Whether a request buffer's physical address fits the 32-bit register.
 ///
 /// A truncated address is not an error the host can report — it would read a
@@ -268,8 +304,8 @@ pub fn bring_up() -> Result<String, &'static str> {
     if !present() && !probe() {
         return Err("no VirtualBox VMMDev device on this machine");
     }
-    let Some((phys, virt)) = crate::mm::alloc_dma(4096) else {
-        return Err("could not allocate a request buffer");
+    let Some((phys, virt)) = request_buffer() else {
+        return Err("could not allocate a request buffer below 4 GiB");
     };
     if !request_addr_fits(phys) {
         return Err("request buffer landed above 4 GiB (the register takes a 32-bit address)");
