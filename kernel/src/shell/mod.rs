@@ -10314,6 +10314,11 @@ fn run_vbox(arg: &str) {
             crate::drivers::vbox::probe();
             serial_println!("vbox> {}", crate::drivers::vbox::status());
         }
+        "diag" => {
+            crate::drivers::vbox::probe();
+            serial_println!("vbox> diagnosis:");
+            serial_print!("{}", crate::drivers::vbox::diag());
+        }
         "up" => match crate::drivers::vbox::bring_up() {
             Ok(v) => serial_println!(
                 "vbox> transport up; host {v}.\n      HGCM is not implemented, so the shared \
@@ -10321,7 +10326,7 @@ clipboard and shared folders are not available yet."
             ),
             Err(e) => serial_println!("vbox> {e}"),
         },
-        other => serial_println!("vbox> unknown argument '{other}' (try /vbox or /vbox up)"),
+        other => serial_println!("vbox> unknown argument '{other}' (try /vbox, /vbox up, /vbox diag)"),
     }
 }
 

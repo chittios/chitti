@@ -395,6 +395,69 @@ pub fn bring_up() -> Result<String, &'static str> {
     Ok(v)
 }
 
+/// `/vbox diag` — everything needed to tell the failure modes apart in **one
+/// boot**, the way `/wifi diag` does.
+///
+/// "The host never processed the request" has several causes that look
+/// identical from the guest: the MMIO window not really being mapped as device
+/// memory (so the write sits in a cache line), the address we hand the host not
+/// being a *guest physical* address, or the device not decoding at all. Each
+/// line below separates one of them.
+pub fn diag() -> String {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    let Some((window, bus, dev, func)) = DEV.with(|d| d.as_ref().map(|g| (g.window, g.bus, g.dev, g.func)))
+    else {
+        return String::from("no VMMDev device (run /vbox first)");
+    };
+    let _ = writeln!(s, "  device   {bus:02x}:{dev:02x}.{func} vendor {VENDOR:04x} device {DEVICE:04x}");
+
+    match window {
+        Window::Port(p) => {
+            let _ = writeln!(s, "  window   I/O port {p:#06x}");
+        }
+        Window::Mmio(base) => {
+            let _ = writeln!(s, "  window   MMIO {base:#x} (mapped)");
+            // Every register except REQUEST_FAST is unimplemented for reads and
+            // answers all-ones. So 0xffffffff here proves the window really is
+            // reaching the device; anything else means the write goes somewhere
+            // else — most likely a cacheable mapping, where a store never
+            // leaves the CPU.
+            //
+            // Offset 0 only: REQUEST_FAST (8) acknowledges an interrupt when
+            // read, and a diagnostic must not change the device.
+            // SAFETY: a 32-bit read of a mapped device register.
+            let probe = unsafe { core::ptr::read_volatile(base as *const u32) };
+            let verdict = match probe {
+                0xffff_ffff => "OK - the device answers (unimplemented regs read all-ones)",
+                0 => "BAD - reads as zero: the window is probably mapped cacheable, not Device",
+                _ => "BAD - unexpected value: this is not the VMMDev window",
+            };
+            let _ = writeln!(s, "  probe    read [0] = {probe:#010x}  {verdict}");
+        }
+    }
+
+    // The address the host is handed must be a guest *physical* address. On
+    // this arch RAM is identity-mapped, so a heap allocation reporting
+    // phys == virt is the evidence that assumption still holds for the page
+    // below it.
+    let (phys, _virt) = req_page();
+    let _ = writeln!(
+        s,
+        "  request  page at {phys:#x} ({}), fits the 32-bit register: {}",
+        if phys < 0x1_0000_0000 { "below 4 GiB" } else { "ABOVE 4 GiB" },
+        request_addr_fits(phys)
+    );
+    if let Some((hp, hv)) = crate::mm::alloc_dma(4096) {
+        let _ = writeln!(
+            s,
+            "  identity heap dma phys {hp:#x} virt {hv:#x} -> VA==PA is {}",
+            if hp == hv { "TRUE" } else { "FALSE (the page address above is not physical!)" }
+        );
+    }
+    s
+}
+
 /// One line for `/vbox`.
 pub fn status() -> String {
     DEV.with(|d| match d.as_ref() {
