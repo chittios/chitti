@@ -71,6 +71,7 @@ pub mod device;
 pub mod fw;
 pub mod rx;
 pub mod scan;
+pub mod sta;
 pub mod proto;
 
 use alloc::string::String;
