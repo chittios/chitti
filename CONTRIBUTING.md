@@ -55,7 +55,7 @@ Run all of these and make sure they pass:
 
 ```sh
 cargo xtask build -arch x86_64 && cargo xtask test    # keep the unit suite green
-cargo xtask build -arch aarch64
+cargo xtask build -arch aarch64 && cargo xtask test -arch aarch64 # keep the unit suite green
 cargo xtask ring-check                                 # agents/commands must not call the executor directly
 cargo xtask run   -arch aarch64                        # if the change is boot-visible, spot-check the boot
 make e2e                                               # if the change is boot-visible or networked
