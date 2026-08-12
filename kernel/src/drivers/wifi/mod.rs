@@ -17,9 +17,9 @@ pub mod brcm;
 pub mod ccmp;
 pub mod data;
 pub mod ieee80211;
+pub mod iwl;
 pub mod link;
 pub mod scan;
-pub mod iwl;
 pub mod wpa;
 
 /// Pure brcmfmac helpers (always available for unit tests).
@@ -59,9 +59,7 @@ pub fn power_on() -> Result<(), &'static str> {
         if !crate::arch::aarch64::is_apple() {
             return Err("not Apple Silicon");
         }
-        if !crate::arch::aarch64::apple_pcie::ready()
-            && !crate::arch::aarch64::apple_pcie::init()
-        {
+        if !crate::arch::aarch64::apple_pcie::ready() && !crate::arch::aarch64::apple_pcie::init() {
             return Err("PCIe init failed");
         }
         if !crate::arch::aarch64::apple_pcie::retry_wifi_power() {
@@ -91,8 +89,7 @@ pub fn hardware_present() -> bool {
             return true;
         }
         // PCIe host is up even if the endpoint BAR window failed.
-        return crate::arch::aarch64::is_apple()
-            && crate::arch::aarch64::apple_pcie::ready();
+        return crate::arch::aarch64::is_apple() && crate::arch::aarch64::apple_pcie::ready();
     }
     #[cfg(not(all(target_arch = "aarch64", not(test))))]
     {
@@ -138,12 +135,10 @@ pub fn info_lines() -> Vec<String> {
         // "wifi works" otherwise, and the gap between the two is the whole 802.11
         // configuration layer.
         lines.push(
-            "  /wifi up: resets the radio, loads firmware, reads the MAC, sends one command"
-                .into(),
+            "  /wifi up: resets the radio, loads firmware, reads the MAC, sends one command".into(),
         );
         lines.push(
-            "  scan/connect: NOT implemented for Intel -- the firmware configuration commands \
-             need a machine with the part in it to verify against"
+            "  /wifi scan: version-gated RF scan (SCAN_REQ_UMAC v17); /wifi connect is not yet available"
                 .into(),
         );
     }
@@ -163,9 +158,7 @@ pub fn info_lines() -> Vec<String> {
                     r.dart_sid
                 ));
             } else {
-                lines.push(
-                    "pcie: not ready — boot with `chitti.wifi` on bare m1n1".into(),
-                );
+                lines.push("pcie: not ready — boot with `chitti.wifi` on bare m1n1".into());
             }
 
             if let Some(()) = brcm::with_dev(|d| {
@@ -213,19 +206,14 @@ pub fn info_lines() -> Vec<String> {
                     );
                 } else {
                     lines.push(
-                        "  status: firmware up (shared-RAM handshake OK); rings/ioctl next"
-                            .into(),
+                        "  status: firmware up (shared-RAM handshake OK); rings/ioctl next".into(),
                     );
-                    lines.push(
-                        "  next: /wifi scan once common rings are wired".into(),
-                    );
+                    lines.push("  next: /wifi scan once common rings are wired".into());
                 }
             }) {
                 let _ = ();
             } else if r.ready {
-                lines.push(
-                    "adapter: not probed yet — run /wifi power".into(),
-                );
+                lines.push("adapter: not probed yet — run /wifi power".into());
             } else {
                 lines.push("adapter: none".into());
             }
@@ -295,6 +283,13 @@ pub fn diag() -> Vec<String> {
 
 /// Scan for networks (real radio) or return the facade list.
 pub fn scan() -> Result<Vec<proto::BssInfo>, &'static str> {
+    // Intel is the normal x86 laptop radio.  It has its own PCI transport,
+    // unlike the Apple FullMAC path below, so dispatch it before platform
+    // gating the latter.  Previously this fell through to the QEMU wired
+    // facade and printed a made-up SSID on real laptops.
+    if iwl::probe().is_some() {
+        return iwl::scan();
+    }
     #[cfg(all(target_arch = "aarch64", not(test)))]
     {
         if crate::arch::aarch64::is_apple() {
@@ -305,9 +300,7 @@ pub fn scan() -> Result<Vec<proto::BssInfo>, &'static str> {
                 return Err("WiFi PCIe link down — /wifi power failed");
             }
             if !radio_ready() {
-                return Err(
-                    "BAR MMIO not mapped yet — cannot RF scan (see /wifi info + ktrace)",
-                );
+                return Err("BAR MMIO not mapped yet — cannot RF scan (see /wifi info + ktrace)");
             }
             if brcm::with_dev(|d| !d.firmware_up).unwrap_or(true) {
                 match brcm::try_load_firmware() {
@@ -339,9 +332,7 @@ pub fn connect(ssid: &str, psk: &str) -> Result<(), &'static str> {
                 power_on()?;
             }
             if !radio_ready() {
-                return Err(
-                    "BAR MMIO not mapped yet — cannot associate (see /wifi info + ktrace)",
-                );
+                return Err("BAR MMIO not mapped yet — cannot associate (see /wifi info + ktrace)");
             }
             if brcm::with_dev(|d| !d.firmware_up).unwrap_or(true) {
                 brcm::try_load_firmware()?;

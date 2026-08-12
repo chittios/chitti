@@ -50,7 +50,9 @@ pub struct Scan {
 
 impl Scan {
     pub fn new() -> Scan {
-        Scan { entries: Vec::new() }
+        Scan {
+            entries: Vec::new(),
+        }
     }
 
     /// Feed a management frame. Returns true when it was a beacon or probe
@@ -121,7 +123,10 @@ impl Scan {
 
     /// Only the networks this kernel can actually join (WPA2-PSK/CCMP).
     pub fn joinable(&self) -> Vec<Entry> {
-        self.results().into_iter().filter(|e| e.bss.joinable()).collect()
+        self.results()
+            .into_iter()
+            .filter(|e| e.bss.joinable())
+            .collect()
     }
 
     /// Find a network by SSID, strongest first — what `/wifi connect <ssid>`
@@ -152,7 +157,7 @@ mod tests {
         f.extend_from_slice(&[0; 8]); // timestamp
         f.extend_from_slice(&100u16.to_le_bytes()); // beacon interval
         f.extend_from_slice(&(if wpa2 { 0x0011u16 } else { 0x0001 }).to_le_bytes()); // capability
-        // SSID element.
+                                                                                     // SSID element.
         f.push(0);
         f.push(ssid.len() as u8);
         f.extend_from_slice(ssid);
@@ -160,8 +165,8 @@ mod tests {
         f.extend_from_slice(&[3, 1, channel]);
         if wpa2 {
             let rsn: &[u8] = &[
-                0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01,
-                0x00, 0x00, 0x0f, 0xac, 0x02,
+                0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,
+                0x00, 0x0f, 0xac, 0x02,
             ];
             f.push(48);
             f.push(rsn.len() as u8);

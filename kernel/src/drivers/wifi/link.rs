@@ -245,7 +245,9 @@ impl Link {
                     // `wpa` distinguishes a MIC failure from every other
                     // problem precisely so this can say "wrong passphrase",
                     // which is the only actionable answer a human gets here.
-                    Err(e) if e.contains("MIC") => self.fail(Failure::WrongPassphrase).map(|_| None),
+                    Err(e) if e.contains("MIC") => {
+                        self.fail(Failure::WrongPassphrase).map(|_| None)
+                    }
                     Err(_) => self.fail(Failure::HandshakeFailed).map(|_| None),
                 }
             }
@@ -349,14 +351,21 @@ mod tests {
 
         // The AP authenticates us: algorithm, sequence 2, status 0.
         let ok = mgmt_frame(11, &[0, 0, 2, 0, 0, 0]);
-        let assoc = l.on_frame(&ok).expect("no error").expect("sends an assoc request");
+        let assoc = l
+            .on_frame(&ok)
+            .expect("no error")
+            .expect("sends an assoc request");
         assert_eq!(l.state(), State::Associating);
         let fc = u16::from_le_bytes([assoc[0], assoc[1]]);
         assert_eq!((fc >> 4) & 0xf, 0, "association request");
 
         // And associates us: capability, status 0, AID.
         let ok = mgmt_frame(1, &[0x31, 0x04, 0, 0, 0x01, 0xc0]);
-        assert_eq!(l.on_frame(&ok).expect("no error"), None, "now the AP speaks first");
+        assert_eq!(
+            l.on_frame(&ok).expect("no error"),
+            None,
+            "now the AP speaks first"
+        );
         assert_eq!(l.state(), State::Handshaking);
         assert!(!l.connected());
         assert!(l.keys().is_none(), "no keys until the handshake completes");
@@ -381,7 +390,11 @@ mod tests {
         l.on_frame(&mgmt_frame(11, &[0, 0, 2, 0, 0, 0])).unwrap();
         let full = mgmt_frame(1, &[0x31, 0x04, 17, 0, 0, 0]);
         assert_eq!(l.on_frame(&full), Err(Failure::AssocRefused(17)));
-        assert!(l.failure().unwrap().message().contains("refused association"));
+        assert!(l
+            .failure()
+            .unwrap()
+            .message()
+            .contains("refused association"));
     }
 
     /// An unsupported network is refused **before** authenticating, rather than
@@ -393,7 +406,11 @@ mod tests {
         let mut l = Link::new(open, US, "", [0; 32]);
         assert_eq!(l.start(), Err(Failure::Unsupported));
         assert_eq!(l.state(), State::Failed);
-        assert!(l.failure().unwrap().message().contains("WPA2-PSK/CCMP only"));
+        assert!(l
+            .failure()
+            .unwrap()
+            .message()
+            .contains("WPA2-PSK/CCMP only"));
     }
 
     /// **A wrong passphrase cannot be detected before the handshake**, because
@@ -406,7 +423,8 @@ mod tests {
         let mut l = Link::new(wpa2_bss(), US, "wrong passphrase", [0x11; 32]);
         l.start().unwrap();
         l.on_frame(&mgmt_frame(11, &[0, 0, 2, 0, 0, 0])).unwrap();
-        l.on_frame(&mgmt_frame(1, &[0x31, 0x04, 0, 0, 1, 0xc0])).unwrap();
+        l.on_frame(&mgmt_frame(1, &[0x31, 0x04, 0, 0, 1, 0xc0]))
+            .unwrap();
         // Both earlier rungs passed with the wrong passphrase — that is the
         // point of this test.
         assert_eq!(l.state(), State::Handshaking);
@@ -481,7 +499,10 @@ mod tests {
         let mut l = Link::new(wpa2_bss(), US, "pw", [0; 32]);
         // Drive it to Connected directly: the handshake itself is `wpa`'s to
         // test, and it has its own vectors.
-        l.keys = Some(Keys { tk: [0x33; 16], gtk: None });
+        l.keys = Some(Keys {
+            tk: [0x33; 16],
+            gtk: None,
+        });
         l.state = State::Connected;
         assert!(l.connected());
 
@@ -492,7 +513,10 @@ mod tests {
         eth.extend_from_slice(b"payload");
 
         let air = l.encrypt_tx(&eth).expect("encrypts");
-        assert!(!air.windows(7).any(|w| w == b"payload"), "must be encrypted");
+        assert!(
+            !air.windows(7).any(|w| w == b"payload"),
+            "must be encrypted"
+        );
 
         let back = l.decrypt_rx(&air).expect("decrypts");
         assert_eq!(&back[14..], b"payload");
@@ -514,7 +538,10 @@ mod tests {
         let mut l = Link::new(wpa2_bss(), US, "pw", [0; 32]);
         let auth = l.start().unwrap();
         assert_eq!(u16::from_le_bytes([auth[22], auth[23]]) >> 4, 0);
-        l.keys = Some(Keys { tk: [1; 16], gtk: None });
+        l.keys = Some(Keys {
+            tk: [1; 16],
+            gtk: None,
+        });
         l.state = State::Connected;
         let mut eth = Vec::new();
         eth.extend_from_slice(&[0xff; 6]);

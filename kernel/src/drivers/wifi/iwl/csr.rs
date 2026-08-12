@@ -263,7 +263,11 @@ mod tests {
         // A bare address in the prph write-address register makes the following data write
         // go nowhere, with nothing reported. The encoding is the whole difference between
         // a configured device and a silent one.
-        assert_ne!(prph_write_addr(0x1234) & PRPH_WRITE_ENABLE, 0, "access-size bits missing");
+        assert_ne!(
+            prph_write_addr(0x1234) & PRPH_WRITE_ENABLE,
+            0,
+            "access-size bits missing"
+        );
         assert_ne!(prph_read_addr(0x1234) & PRPH_READ_ENABLE, 0);
         // An address that already fits 20 bits survives intact.
         assert_eq!(prph_write_addr(0x0003_0b4) & PRPH_ADDR_MASK, 0x0003_0b4);
@@ -279,7 +283,10 @@ mod tests {
         assert_eq!(prph_write_addr(0x00a0_30b4) & PRPH_ADDR_MASK, 0x0003_0b4);
         assert_eq!(prph_read_addr(0x00a0_30b4) & PRPH_ADDR_MASK, 0x0003_0b4);
         // And nothing above the field ever reaches the control bits.
-        assert_eq!(prph_write_addr(0xffff_ffff), PRPH_ADDR_MASK | PRPH_WRITE_ENABLE);
+        assert_eq!(
+            prph_write_addr(0xffff_ffff),
+            PRPH_ADDR_MASK | PRPH_WRITE_ENABLE
+        );
     }
 
     #[test_case]
@@ -304,7 +311,11 @@ mod tests {
         // Both sources exist because either can be blank, so "unwritten" has to be
         // distinguishable from an address — otherwise the interface comes up as 00:00:00:…
         // and every frame it sends is dropped by the access point.
-        assert_eq!(mac_from_words(0, 0), None, "an unwritten address was accepted");
+        assert_eq!(
+            mac_from_words(0, 0),
+            None,
+            "an unwritten address was accepted"
+        );
         assert_eq!(
             mac_from_words(u32::MAX, u32::MAX),
             None,
@@ -378,7 +389,11 @@ mod tests {
         assert_eq!(ctxt_info_ba(0x1234_0000), Some(0x0123_4000));
         assert_eq!(ctxt_info_ba(0x10), Some(1));
         assert_eq!(ctxt_info_ba(0), None, "a null address is not a location");
-        assert_eq!(ctxt_info_ba(0x1234_0008), None, "unaligned address accepted");
+        assert_eq!(
+            ctxt_info_ba(0x1234_0008),
+            None,
+            "unaligned address accepted"
+        );
         // The shifted value still has to fit the register: 36 bits of address does, more
         // does not, and a wrapped write is another wrong address.
         assert_eq!(ctxt_info_ba(0xf_ffff_fff0), Some(0xffff_ffff));

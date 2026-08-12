@@ -205,7 +205,10 @@ mod tests {
     #[test_case]
     fn the_layouts_match_the_header() {
         assert_eq!(ADD_STA_LEN, 48, "iwl_mvm_add_sta_cmd");
-        assert_eq!(KEY_COMMON_LEN, 52, "sta_id, key_offset, flags, key[32], rx_seq[16]");
+        assert_eq!(
+            KEY_COMMON_LEN, 52,
+            "sta_id, key_offset, flags, key[32], rx_seq[16]"
+        );
         assert_eq!(ADD_STA_KEY_LEN, 76, "common + three u64s");
         assert_eq!(K_KEY, 4);
         assert_eq!(K_RX_SECUR_SEQ, 36);
@@ -226,9 +229,16 @@ mod tests {
         let flags = u16::from_le_bytes([k[K_KEY_FLAGS], k[K_KEY_FLAGS + 1]]);
         assert_eq!(flags & KEY_FLG_EN_MSK, KEY_FLG_CCM, "cipher is CCMP");
         assert_eq!(flags & KEY_FLG_KEY_32BYTES, 0, "16-byte key");
-        assert_eq!(flags & KEY_NOT_VALID, 0, "set, the key installs and is ignored");
+        assert_eq!(
+            flags & KEY_NOT_VALID,
+            0,
+            "set, the key installs and is ignored"
+        );
         assert_eq!(&k[K_KEY..K_KEY + 16], &tk[..], "the key itself");
-        assert!(k[K_KEY + 16..K_KEY + 32].iter().all(|&b| b == 0), "the tail stays zero");
+        assert!(
+            k[K_KEY + 16..K_KEY + 32].iter().all(|&b| b == 0),
+            "the tail stays zero"
+        );
     }
 
     /// **A pairwise key must not carry the multicast bit** — that installs it as
@@ -265,7 +275,9 @@ mod tests {
         assert_eq!(pn, 0x1234_5678_9abc);
         // Receive counters start at zero, so the peer's first frame must
         // advance past them.
-        assert!(k[K_RX_SECUR_SEQ..K_RX_SECUR_SEQ + 16].iter().all(|&b| b == 0));
+        assert!(k[K_RX_SECUR_SEQ..K_RX_SECUR_SEQ + 16]
+            .iter()
+            .all(|&b| b == 0));
     }
 
     /// **A station flag set without its mask bit is ignored** — the quiet way
@@ -275,7 +287,11 @@ mod tests {
         let bssid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
         let c = add_ap(1, 3, &bssid, 0x0007, 0xff);
         let flags = u32::from_le_bytes(c[S_STATION_FLAGS..S_STATION_FLAGS + 4].try_into().unwrap());
-        let msk = u32::from_le_bytes(c[S_STATION_FLAGS_MSK..S_STATION_FLAGS_MSK + 4].try_into().unwrap());
+        let msk = u32::from_le_bytes(
+            c[S_STATION_FLAGS_MSK..S_STATION_FLAGS_MSK + 4]
+                .try_into()
+                .unwrap(),
+        );
         assert_ne!(flags & STA_FLG_CLASS_AUTH, 0);
         assert_ne!(flags & STA_FLG_CLASS_ASSOC, 0);
         assert_eq!(flags & msk, flags, "every flag set is also in the mask");
@@ -286,7 +302,10 @@ mod tests {
         assert_eq!(u16::from_le_bytes([c[S_ASSOC_ID], c[S_ASSOC_ID + 1]]), 7);
         // The TID field is a *disable* mask: zero is permissive, and 0xffff
         // would silence the station while every command still succeeded.
-        assert_eq!(u16::from_le_bytes([c[S_TID_DISABLE_TX], c[S_TID_DISABLE_TX + 1]]), 0);
+        assert_eq!(
+            u16::from_le_bytes([c[S_TID_DISABLE_TX], c[S_TID_DISABLE_TX + 1]]),
+            0
+        );
     }
 
     /// **A context is identified by id *and* colour.** The colour changes when
@@ -297,9 +316,17 @@ mod tests {
     fn the_mac_context_carries_a_colour_not_just_an_id() {
         assert_eq!(mac_id_n_color(1, 0), 1);
         assert_eq!(mac_id_n_color(1, 3), 1 | (3 << 8));
-        assert_ne!(mac_id_n_color(1, 3), mac_id_n_color(1, 4), "the colour is part of it");
+        assert_ne!(
+            mac_id_n_color(1, 3),
+            mac_id_n_color(1, 4),
+            "the colour is part of it"
+        );
         let c = add_ap(2, 5, &[0; 6], 1, 1);
-        let v = u32::from_le_bytes(c[S_MAC_ID_N_COLOR..S_MAC_ID_N_COLOR + 4].try_into().unwrap());
+        let v = u32::from_le_bytes(
+            c[S_MAC_ID_N_COLOR..S_MAC_ID_N_COLOR + 4]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(v, mac_id_n_color(2, 5));
     }
 }

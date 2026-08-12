@@ -128,13 +128,22 @@ pub fn parse(payload: &[u8], family: fw::Family) -> Option<Mpdu<'_>> {
     }
     let d = &payload[..dlen];
     let mpdu_len = u16::from_le_bytes([d[OFF_MPDU_LEN], d[OFF_MPDU_LEN + 1]]) as usize;
-    let status = u32::from_le_bytes([d[OFF_STATUS], d[OFF_STATUS + 1], d[OFF_STATUS + 2], d[OFF_STATUS + 3]]);
+    let status = u32::from_le_bytes([
+        d[OFF_STATUS],
+        d[OFF_STATUS + 1],
+        d[OFF_STATUS + 2],
+        d[OFF_STATUS + 3],
+    ]);
     // A frame the hardware says is corrupt must not become a network.
     if status & STATUS_CRC_OK == 0 {
         return None;
     }
     let frame = payload.get(dlen..dlen + mpdu_len)?;
-    let e = if dlen == DESC_LEN_V3 { V3_ENERGY } else { V1_ENERGY };
+    let e = if dlen == DESC_LEN_V3 {
+        V3_ENERGY
+    } else {
+        V1_ENERGY
+    };
     Some(Mpdu {
         frame,
         rssi: signal_dbm(d[e], d[e + 1]),
@@ -162,19 +171,33 @@ mod tests {
         // AX210 and later are the long descriptor; everything older is short.
         assert_eq!(desc_len(fw::Family::Ax210), DESC_LEN_V3);
         assert_eq!(desc_len(fw::Family::Be200), DESC_LEN_V3);
-        assert_eq!(desc_len(fw::Family::Ax200), DESC_LEN_V1, "AX200 is 22000-family, not AX210");
+        assert_eq!(
+            desc_len(fw::Family::Ax200),
+            DESC_LEN_V1,
+            "AX200 is 22000-family, not AX210"
+        );
         assert_eq!(desc_len(fw::Family::Iwl9000), DESC_LEN_V1);
         assert_eq!(desc_len(fw::Family::Iwl8000), DESC_LEN_V1);
         assert_eq!(desc_len(fw::Family::Iwl7000), DESC_LEN_V1);
     }
 
     /// Build a payload: descriptor of `dlen` bytes then `frame`.
-    fn payload(dlen: usize, frame: &[u8], energy: (u8, u8), channel: u8, crc_ok: bool) -> alloc::vec::Vec<u8> {
+    fn payload(
+        dlen: usize,
+        frame: &[u8],
+        energy: (u8, u8),
+        channel: u8,
+        crc_ok: bool,
+    ) -> alloc::vec::Vec<u8> {
         let mut p = alloc::vec![0u8; dlen];
         p[OFF_MPDU_LEN..OFF_MPDU_LEN + 2].copy_from_slice(&(frame.len() as u16).to_le_bytes());
         let status: u32 = if crc_ok { STATUS_CRC_OK } else { 0 };
         p[OFF_STATUS..OFF_STATUS + 4].copy_from_slice(&status.to_le_bytes());
-        let e = if dlen == DESC_LEN_V3 { V3_ENERGY } else { V1_ENERGY };
+        let e = if dlen == DESC_LEN_V3 {
+            V3_ENERGY
+        } else {
+            V1_ENERGY
+        };
         p[e] = energy.0;
         p[e + 1] = energy.1;
         p[e + 2] = channel;
@@ -188,10 +211,17 @@ mod tests {
     #[test_case]
     fn the_frame_is_found_after_the_right_descriptor() {
         let frame: alloc::vec::Vec<u8> = (0..40u8).collect();
-        for (family, dlen) in [(fw::Family::Ax200, DESC_LEN_V1), (fw::Family::Ax210, DESC_LEN_V3)] {
+        for (family, dlen) in [
+            (fw::Family::Ax200, DESC_LEN_V1),
+            (fw::Family::Ax210, DESC_LEN_V3),
+        ] {
             let p = payload(dlen, &frame, (60, 70), 11, true);
             let m = parse(&p, family).expect("parses");
-            assert_eq!(m.frame, &frame[..], "the frame, whole and from the right offset");
+            assert_eq!(
+                m.frame,
+                &frame[..],
+                "the frame, whole and from the right offset"
+            );
             assert_eq!(m.channel, 11);
             assert_eq!(m.rssi, Some(-60), "the stronger antenna: -min(60,70)");
         }

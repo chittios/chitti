@@ -84,8 +84,20 @@ const CHANNEL_CFG_LEN: usize = 8;
 /// `iwl_scan_channel_params_v7`.
 const CHANNEL_PARAMS_LEN: usize = 1 + 1 + 2 + CHANNEL_CFG_LEN * SCAN_MAX_NUM_CHANS_V3; // 540
 /// `iwl_scan_general_params_v11`.
-const GENERAL_PARAMS_LEN: usize = 2 + 1 + 1 + SCAN_TWO_LMACS + 1 + 1 + 1 + 1 + 2
-    + 4 * SCAN_TWO_LMACS + 4 * SCAN_TWO_LMACS + 4 + SCAN_TWO_LMACS + SCAN_TWO_LMACS; // 36
+const GENERAL_PARAMS_LEN: usize = 2
+    + 1
+    + 1
+    + SCAN_TWO_LMACS
+    + 1
+    + 1
+    + 1
+    + 1
+    + 2
+    + 4 * SCAN_TWO_LMACS
+    + 4 * SCAN_TWO_LMACS
+    + 4
+    + SCAN_TWO_LMACS
+    + SCAN_TWO_LMACS; // 36
 
 // --- offsets into the request --------------------------------------------
 
@@ -208,7 +220,12 @@ pub fn probe_template(mac: &[u8; 6], ssid: Option<&[u8]>) -> (Vec<u8>, (u16, u16
 /// non-empty and is truncated to what the structure holds — silently scanning
 /// fewer channels than asked is better than overrunning the array, but the
 /// caller is told by the returned count.
-pub fn build_v17(uid: u32, mac: &[u8; 6], channels: &[Channel], passive: bool) -> Option<(Vec<u8>, usize)> {
+pub fn build_v17(
+    uid: u32,
+    mac: &[u8; 6],
+    channels: &[Channel],
+    passive: bool,
+) -> Option<(Vec<u8>, usize)> {
     if channels.is_empty() {
         return None;
     }
@@ -302,10 +319,18 @@ pub fn build_v17(uid: u32, mac: &[u8; 6], channels: &[Channel], passive: bool) -
 pub fn default_channels() -> Vec<Channel> {
     let mut v = Vec::new();
     for n in 1..=13u8 {
-        v.push(Channel { number: n, band: Band::Band2Ghz, iter_count: 1 });
+        v.push(Channel {
+            number: n,
+            band: Band::Band2Ghz,
+            iter_count: 1,
+        });
     }
     for n in [36u8, 40, 44, 48, 149, 153, 157, 161, 165] {
-        v.push(Channel { number: n, band: Band::Band5Ghz, iter_count: 1 });
+        v.push(Channel {
+            number: n,
+            band: Band::Band5Ghz,
+            iter_count: 1,
+        });
     }
     v
 }
@@ -350,9 +375,21 @@ mod tests {
     #[test_case]
     fn the_band_lives_in_the_flags_word_at_v17() {
         let chans = [
-            Channel { number: 6, band: Band::Band2Ghz, iter_count: 1 },
-            Channel { number: 36, band: Band::Band5Ghz, iter_count: 1 },
-            Channel { number: 5, band: Band::Band6Ghz, iter_count: 2 },
+            Channel {
+                number: 6,
+                band: Band::Band2Ghz,
+                iter_count: 1,
+            },
+            Channel {
+                number: 36,
+                band: Band::Band5Ghz,
+                iter_count: 1,
+            },
+            Channel {
+                number: 5,
+                band: Band::Band6Ghz,
+                iter_count: 2,
+            },
         ];
         let (b, n) = build_v17(1, &[2; 6], &chans, false).unwrap();
         assert_eq!(n, 3);
@@ -383,7 +420,11 @@ mod tests {
         assert_eq!(mac_seg.0, 0);
         assert_eq!(mac_seg.1, 24, "a probe request MAC header");
         // The header really is a probe request from us to the broadcast address.
-        assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), 0x0040, "probe request");
+        assert_eq!(
+            u16::from_le_bytes([buf[0], buf[1]]),
+            0x0040,
+            "probe request"
+        );
         assert_eq!(&buf[4..10], &[0xff; 6], "broadcast destination");
         assert_eq!(&buf[10..16], &mac[..], "our address");
         // Common data is the SSID element, and a wildcard scan's is empty.
@@ -412,11 +453,23 @@ mod tests {
         assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), 0x1234, "uid");
 
         let pr = OFF_PROBE;
-        assert_eq!(u16::from_le_bytes([b[pr], b[pr + 1]]), 0, "mac_header offset");
-        assert_eq!(u16::from_le_bytes([b[pr + 2], b[pr + 3]]), 24, "mac_header len");
+        assert_eq!(
+            u16::from_le_bytes([b[pr], b[pr + 1]]),
+            0,
+            "mac_header offset"
+        );
+        assert_eq!(
+            u16::from_le_bytes([b[pr + 2], b[pr + 3]]),
+            24,
+            "mac_header len"
+        );
         // The buffer follows five segment descriptors (header + 3 bands + common).
         let buf_at = pr + PROBE_SEGMENT_LEN * 5;
-        assert_eq!(u16::from_le_bytes([b[buf_at], b[buf_at + 1]]), 0x0040, "the frame is there");
+        assert_eq!(
+            u16::from_le_bytes([b[buf_at], b[buf_at + 1]]),
+            0x0040,
+            "the frame is there"
+        );
         assert_eq!(&b[buf_at + 10..buf_at + 16], &mac[..], "with our address");
         // Wildcard: no named SSIDs, no BSSIDs.
         assert_eq!(b[pr + P_SHORT_SSID_NUM], 0);
@@ -447,12 +500,20 @@ mod tests {
     #[test_case]
     fn too_many_channels_are_truncated_not_overrun() {
         let many: Vec<Channel> = (0..200)
-            .map(|i| Channel { number: (i % 200) as u8, band: Band::Band2Ghz, iter_count: 1 })
+            .map(|i| Channel {
+                number: (i % 200) as u8,
+                band: Band::Band2Ghz,
+                iter_count: 1,
+            })
             .collect();
         let (b, n) = build_v17(1, &[0; 6], &many, false).unwrap();
         assert_eq!(n, SCAN_MAX_NUM_CHANS_V3, "the caller learns the real count");
         assert_eq!(b[OFF_CHANNEL + C_COUNT], SCAN_MAX_NUM_CHANS_V3 as u8);
-        assert_eq!(b.len(), REQ_LEN, "and the request is still exactly one struct");
+        assert_eq!(
+            b.len(),
+            REQ_LEN,
+            "and the request is still exactly one struct"
+        );
         // An empty list is refused rather than sent as a scan of nothing.
         assert!(build_v17(1, &[0; 6], &[], false).is_none());
     }
@@ -465,7 +526,8 @@ mod tests {
         assert!(ch.iter().all(|c| c.number != 14), "14 is Japan-only");
         // No DFS channels (52-144) in the 5 GHz part.
         assert!(
-            !ch.iter().any(|c| c.band == Band::Band5Ghz && (52..=144).contains(&c.number)),
+            !ch.iter()
+                .any(|c| c.band == Band::Band5Ghz && (52..=144).contains(&c.number)),
             "DFS channels must not be probed actively"
         );
         assert!(ch.len() <= SCAN_MAX_NUM_CHANS_V3);

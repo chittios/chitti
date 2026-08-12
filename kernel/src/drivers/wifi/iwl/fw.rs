@@ -112,7 +112,9 @@ impl Family {
 // part whose register interface differs.
 const IDS_7000: &[u16] = &[0x08b1, 0x08b2, 0x08b3, 0x08b4, 0x095a, 0x095b];
 const IDS_8000: &[u16] = &[0x24f3, 0x24f4, 0x24fd, 0x24f5, 0x24f6];
-const IDS_9000: &[u16] = &[0x2526, 0x271b, 0x271c, 0x30dc, 0x31dc, 0x9df0, 0xa370, 0x9df1];
+const IDS_9000: &[u16] = &[
+    0x2526, 0x271b, 0x271c, 0x30dc, 0x31dc, 0x9df0, 0xa370, 0x9df1,
+];
 const IDS_AX200: &[u16] = &[0x2723, 0x02f0, 0x4df0, 0x34f0, 0xa0f0, 0x43f0, 0x3df0];
 const IDS_AX210: &[u16] = &[0x2725, 0x7a70, 0x7af0, 0x51f0, 0x54f0, 0x7e40, 0x2726];
 const IDS_BE200: &[u16] = &[0x272b];
@@ -255,7 +257,10 @@ pub struct FirmwareImage {
 impl FirmwareImage {
     /// The payload range of the first record of `kind`.
     pub fn section(&self, kind: u32) -> Option<core::ops::Range<usize>> {
-        self.sections.iter().find(|s| s.kind == kind).map(|s| s.range.clone())
+        self.sections
+            .iter()
+            .find(|s| s.kind == kind)
+            .map(|s| s.range.clone())
     }
 
     /// Whether the image carries anything that could be loaded as runtime firmware.
@@ -316,7 +321,11 @@ pub fn parse_image(d: &[u8]) -> Option<FirmwareImage> {
     for &c in &human[..end] {
         // The field is documented as printable ASCII; anything else is a corrupt
         // download, and substituting a placeholder keeps the string safe to log.
-        version.push(if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' });
+        version.push(if c.is_ascii_graphic() || c == b' ' {
+            c as char
+        } else {
+            '?'
+        });
     }
     let ver = le32(d, OFF_HUMAN + HUMAN_LEN)?;
     let build = le32(d, OFF_HUMAN + HUMAN_LEN + 4)?;
@@ -388,20 +397,32 @@ mod tests {
             0x02, 0x0c, 0x04, 0x00, // NVM_GET_INFO in the regulatory group, request v4
             0x0d, 0x01, 0x0e, 0x02, // SCAN_REQ_UMAC in the long group, request v14
         ];
-        let d = image("v", &[(TLV_SEC_RT, &[1, 2, 3, 4]), (TLV_CMD_VERSIONS, table)]);
+        let d = image(
+            "v",
+            &[(TLV_SEC_RT, &[1, 2, 3, 4]), (TLV_CMD_VERSIONS, table)],
+        );
         let img = parse_image(&d).unwrap();
         let v = img.cmd_versions(&d).expect("the table must parse");
         assert_eq!(v.len(), 2);
         assert_eq!(
             img.cmd_version(&d, 0x0c, 0x02),
-            Some(CmdVersion { cmd: 0x02, group: 0x0c, cmd_ver: 4, notif_ver: 0 })
+            Some(CmdVersion {
+                cmd: 0x02,
+                group: 0x0c,
+                cmd_ver: 4,
+                notif_ver: 0
+            })
         );
         assert_eq!(img.cmd_version(&d, 0x01, 0x0d).unwrap().cmd_ver, 14);
 
         // Silence about a command is not version 0 — a caller must be able to tell "this
         // firmware wants v0" from "it did not say", or it will send the layout it happens to
         // implement and be read as something else.
-        assert_eq!(img.cmd_version(&d, 0x01, 0x02), None, "cmd/group were matched crosswise");
+        assert_eq!(
+            img.cmd_version(&d, 0x01, 0x02),
+            None,
+            "cmd/group were matched crosswise"
+        );
         let bare = image("v", &[(TLV_SEC_RT, &[1])]);
         let bare_img = parse_image(&bare).unwrap();
         assert!(bare_img.cmd_versions(&bare).is_none());
@@ -416,7 +437,10 @@ mod tests {
 
     #[test_case]
     fn parses_a_tlv_image_and_finds_its_sections() {
-        let d = image("iwlwifi-cc-a0-77", &[(TLV_SEC_RT, &[1, 2, 3, 4]), (TLV_PHY_SKU, &[9])]);
+        let d = image(
+            "iwlwifi-cc-a0-77",
+            &[(TLV_SEC_RT, &[1, 2, 3, 4]), (TLV_PHY_SKU, &[9])],
+        );
         let img = parse_image(&d).unwrap();
         assert_eq!(img.version, "iwlwifi-cc-a0-77");
         assert_eq!((img.ver, img.build), (7, 99));
@@ -498,7 +522,11 @@ mod tests {
         // The Ethernet dispatcher's lesson, and worse here: the wrong firmware fails a
         // signature check *inside* the device, with no error the host can read.
         assert_eq!(family_for(VENDOR_INTEL, 0xffff), None);
-        assert_eq!(family_for(VENDOR_INTEL, 0x2724), None, "adjacent id must not be claimed");
+        assert_eq!(
+            family_for(VENDOR_INTEL, 0x2724),
+            None,
+            "adjacent id must not be claimed"
+        );
         // And another vendor's device is never ours, whatever its id.
         assert_eq!(family_for(0x10ec, 0x2723), None);
     }
@@ -507,7 +535,9 @@ mod tests {
     fn no_device_id_belongs_to_two_families() {
         // A duplicate would make the family depend on table order, which is exactly the
         // kind of thing that works until the tables are reordered.
-        let all = [IDS_7000, IDS_8000, IDS_9000, IDS_AX200, IDS_AX210, IDS_BE200];
+        let all = [
+            IDS_7000, IDS_8000, IDS_9000, IDS_AX200, IDS_AX210, IDS_BE200,
+        ];
         for (i, a) in all.iter().enumerate() {
             for b in all.iter().skip(i + 1) {
                 for id in a.iter() {

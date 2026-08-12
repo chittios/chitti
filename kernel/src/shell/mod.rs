@@ -1635,7 +1635,11 @@ fn wifi_cmd(arg: &str) {
         Some((s, r)) => (s, r.trim()),
         None => (arg.trim(), ""),
     };
-    let real = crate::drivers::wifi::hardware_present();
+    // `hardware_present` reports the Apple FullMAC path. Intel is a regular
+    // PCIe endpoint and is discovered independently, so include it here or a
+    // successful Intel RF scan is mislabeled as the QEMU wired facade.
+    let intel = crate::drivers::wifi::iwl::probe().is_some();
+    let real = crate::drivers::wifi::hardware_present() || intel;
     let radio = crate::drivers::wifi::radio_ready();
     match sub {
         "" | "info" => {
@@ -1776,7 +1780,7 @@ fn wifi_cmd(arg: &str) {
                     }
                     if !real {
                         serial_println!("wifi>   (wired-facade SSID — not an RF scan)");
-                    } else if !radio {
+                    } else if !radio && !intel {
                         serial_println!(
                             "wifi>   note: real RF scan needs BAR MMIO + firmware (/wifi power, /wifi load)"
                         );

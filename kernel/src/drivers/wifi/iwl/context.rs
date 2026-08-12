@@ -188,7 +188,14 @@ mod tests {
         // makes the device read past the buffer, and nothing on the host notices.
         let list = build_section_list(&[(0x1000, 64), (0x2000, 128)]);
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0], SectionEntry { addr: 0x1000, size: 64, _rsvd: 0 });
+        assert_eq!(
+            list[0],
+            SectionEntry {
+                addr: 0x1000,
+                size: 64,
+                _rsvd: 0
+            }
+        );
         assert_eq!(list[1].addr, 0x2000);
         assert_eq!(list[1].size, 128);
         assert!(build_section_list(&[]).is_empty());

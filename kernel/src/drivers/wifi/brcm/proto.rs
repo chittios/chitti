@@ -348,7 +348,8 @@ pub fn pack_ioctl_request(
 /// True when the shared-info header has enough structure to attempt ring
 /// init (version OK + non-zero ring_info pointer). Does not touch hardware.
 pub fn rings_locatable(shared_flags: u32, shared_header: &[u8]) -> bool {
-    shared_version_ok(shared_version(shared_flags)) && shared_ring_info_addr(shared_header).is_some()
+    shared_version_ok(shared_version(shared_flags))
+        && shared_ring_info_addr(shared_header).is_some()
 }
 
 /// Build firmware search paths for a stem (with Asahi alternate names). Pure.
@@ -455,7 +456,11 @@ pub const BCMA_CORE_INTERNAL_MEM: u16 = 0x80e;
 
 /// Walk a PL-368 EROM, calling `read32(addr)` for each word. Pure relative to
 /// the reader. Caps at `max_cores` to bound work.
-pub fn erom_scan(mut read32: impl FnMut(u32) -> u32, erom_base: u32, max_cores: usize) -> alloc::vec::Vec<EromCore> {
+pub fn erom_scan(
+    mut read32: impl FnMut(u32) -> u32,
+    erom_base: u32,
+    max_cores: usize,
+) -> alloc::vec::Vec<EromCore> {
     use alloc::vec::Vec;
     let mut cores = Vec::new();
     let mut erom = erom_base;
@@ -617,9 +622,15 @@ mod tests {
     #[test_case]
     fn ioctl_ptr_layout() {
         let p = pack_ioctl_ptr_req(BRCMF_C_GET_VERSION, 7, 0, 64, 0x10_0000_4000);
-        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), BRCMF_C_GET_VERSION);
+        assert_eq!(
+            u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+            BRCMF_C_GET_VERSION
+        );
         assert_eq!(u16::from_le_bytes([p[4], p[5]]), 7);
-        assert_eq!(u64::from_le_bytes(p[16..24].try_into().unwrap()), 0x10_0000_4000);
+        assert_eq!(
+            u64::from_le_bytes(p[16..24].try_into().unwrap()),
+            0x10_0000_4000
+        );
     }
 
     #[test_case]
@@ -678,10 +689,8 @@ mod tests {
     fn fw_ramsize_and_rstvec() {
         let mut fw = [0u8; RAMSIZE_OFFSET + 8];
         fw[0..4].copy_from_slice(&0x0010_0200u32.to_le_bytes()); // fake rstvec
-        fw[RAMSIZE_OFFSET..RAMSIZE_OFFSET + 4]
-            .copy_from_slice(&RAMSIZE_MAGIC.to_le_bytes());
-        fw[RAMSIZE_OFFSET + 4..RAMSIZE_OFFSET + 8]
-            .copy_from_slice(&0x28_0000u32.to_le_bytes());
+        fw[RAMSIZE_OFFSET..RAMSIZE_OFFSET + 4].copy_from_slice(&RAMSIZE_MAGIC.to_le_bytes());
+        fw[RAMSIZE_OFFSET + 4..RAMSIZE_OFFSET + 8].copy_from_slice(&0x28_0000u32.to_le_bytes());
         assert_eq!(fw_reset_vector(&fw), Some(0x0010_0200));
         assert_eq!(fw_embedded_ramsize(&fw), Some(0x28_0000));
         // wrong magic
@@ -709,8 +718,12 @@ mod tests {
     #[test_case]
     fn firmware_paths_include_alts() {
         let paths = firmware_search_paths("brcmfmac4388-pcie.apple,miyake");
-        assert!(paths.iter().any(|p| p == "/brcm/brcmfmac4388-pcie.apple,miyake.bin"));
-        assert!(paths.iter().any(|p| p == "/brcm/brcmfmac4387c2-pcie.apple,miyake.bin"));
+        assert!(paths
+            .iter()
+            .any(|p| p == "/brcm/brcmfmac4388-pcie.apple,miyake.bin"));
+        assert!(paths
+            .iter()
+            .any(|p| p == "/brcm/brcmfmac4387c2-pcie.apple,miyake.bin"));
         assert!(paths.iter().any(|p| p.contains("/vendorfw/")));
         let nv = nvram_paths_for_fw("/brcm/brcmfmac4388-pcie.apple,miyake.bin");
         assert!(nv.iter().any(|p| p.ends_with(".txt")));
@@ -730,9 +743,7 @@ mod tests {
         // component desc 1: valid|component, partnum 0x83e
         push(
             &mut words,
-            DMP_DESC_VALID
-                | DMP_DESC_COMPONENT
-                | ((0x83eu32) << DMP_COMP_PARTNUM_S),
+            DMP_DESC_VALID | DMP_DESC_COMPONENT | ((0x83eu32) << DMP_COMP_PARTNUM_S),
         );
         // component desc 2: nmw=1, nsw=1, rev=4
         push(

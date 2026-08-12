@@ -317,7 +317,10 @@ pub fn probe() -> bool {
     DEV.with(|d| *d = None);
 
     let Some(pci_dev) = find_wifi_pci() else {
-        crate::ktrace::log("wifi", "no Broadcom FullMAC PCI function (14e4:4434/…) found");
+        crate::ktrace::log(
+            "wifi",
+            "no Broadcom FullMAC PCI function (14e4:4434/…) found",
+        );
         stash_fdt_only("PCI scan found nothing on bus 1");
         return false;
     };
@@ -342,13 +345,12 @@ pub fn probe() -> bool {
     ));
 
     let Some((bar0, bar2, pci_base)) = crate::arch::aarch64::apple_pcie::find_working_bar_window(
-        &pci_dev,
-        bar0_size,
-        bar0_type,
-        bar2_size,
-        bar2_type,
+        &pci_dev, bar0_size, bar0_type, bar2_size, bar2_type,
     ) else {
-        crate::ktrace::log("wifi", "no working BAR outbound window (all candidates aborted)");
+        crate::ktrace::log(
+            "wifi",
+            "no working BAR outbound window (all candidates aborted)",
+        );
         return false;
     };
     crate::ktrace::log_fmt(format_args!(
@@ -372,14 +374,20 @@ pub fn probe() -> bool {
     } else {
         board
     };
-    let stem = proto::firmware_stem(&board, if chip_id != 0 && chip_id != 0xffff {
-        chip_id
-    } else {
-        0x4387
-    });
+    let stem = proto::firmware_stem(
+        &board,
+        if chip_id != 0 && chip_id != 0xffff {
+            chip_id
+        } else {
+            0x4387
+        },
+    );
 
     if !cal.is_empty() {
-        crate::ktrace::log_fmt(format_args!("wifi: cal-blob {} bytes (from FDT/ADT)", cal.len()));
+        crate::ktrace::log_fmt(format_args!(
+            "wifi: cal-blob {} bytes (from FDT/ADT)",
+            cal.len()
+        ));
     }
 
     // Clear host-side interrupt mask for now (poll path later).
@@ -637,12 +645,7 @@ fn tcm_copy_bar2_verified(tcm: u64, rambase: u32, data: &[u8]) -> Result<u32, &'
 
 /// Copy firmware through BAR0 window sliding (4 KiB at a time). Verifies the
 /// first and last word of each page. Returns bytes written.
-fn tcm_bp_copy(
-    bar0: u64,
-    pci: &PciDevice,
-    rambase: u32,
-    data: &[u8],
-) -> Result<u32, &'static str> {
+fn tcm_bp_copy(bar0: u64, pci: &PciDevice, rambase: u32, data: &[u8]) -> Result<u32, &'static str> {
     let mut i = 0usize;
     while i + 4 <= data.len() {
         let addr = rambase + i as u32;
@@ -730,13 +733,7 @@ fn handshake_off(rambase: u32, fw_len: u32) -> u32 {
 /// handshake always stay inside the firmware image (see [`handshake_off`]).
 ///
 /// Priority for the *reported* size: valid SYS_MEM → SMAR → in-image span.
-fn choose_ramsize(
-    chip: u16,
-    fw: &[u8],
-    sysmem_size: u32,
-    bar2_size: u64,
-    rambase: u32,
-) -> u32 {
+fn choose_ramsize(chip: u16, fw: &[u8], sysmem_size: u32, bar2_size: u64, rambase: u32) -> u32 {
     let fw_len = fw.len() as u32;
     let in_image = fw_span(fw_len);
     let mut size = in_image;
@@ -850,9 +847,8 @@ fn arm_halt(bar0: u64, pci: &PciDevice, arm_wrap: u32) {
         return;
     }
     // clear all IOCTL bits except HALT, then reset with HALT held
-    let val = bp_read32_probe(bar0, pci, arm_wrap + BCMA_IOCTL)
-        .unwrap_or(0)
-        & ARMCR4_BCMA_IOCTL_CPUHALT;
+    let val =
+        bp_read32_probe(bar0, pci, arm_wrap + BCMA_IOCTL).unwrap_or(0) & ARMCR4_BCMA_IOCTL_CPUHALT;
     ai_core_reset(
         bar0,
         pci,
@@ -868,14 +864,7 @@ fn arm_halt(bar0: u64, pci: &PciDevice, arm_wrap: u32) {
 fn arm_run(bar0: u64, pci: &PciDevice, tcm: u64, arm_wrap: u32, rstvec: u32) {
     tcm_write32(tcm, 0, rstvec);
     if arm_wrap != 0 {
-        ai_core_reset(
-            bar0,
-            pci,
-            arm_wrap,
-            ARMCR4_BCMA_IOCTL_CPUHALT,
-            0,
-            0,
-        );
+        ai_core_reset(bar0, pci, arm_wrap, ARMCR4_BCMA_IOCTL_CPUHALT, 0, 0);
     }
 }
 
@@ -910,8 +899,7 @@ fn discover_cores(bar0: u64, pci: &PciDevice) -> ChipCores {
         pcie2_rev: 0,
         pcie2_base: 0,
     };
-    let erom_ptr = bp_read32_probe(bar0, pci, proto::SI_ENUM_BASE + proto::CC_EROMPTR)
-        .unwrap_or(0);
+    let erom_ptr = bp_read32_probe(bar0, pci, proto::SI_ENUM_BASE + proto::CC_EROMPTR).unwrap_or(0);
     if erom_ptr == 0 || erom_ptr == 0xffff_ffff {
         crate::ktrace::log("wifi", "EROM pointer unreadable — ARM wrap unknown");
         return out;
@@ -1023,7 +1011,6 @@ fn chip_subsystem_reset(bar0: u64, pci: &PciDevice, pcie2_rev: u8) {
         "wifi: subsystem SSRESET (mask={mask:#x} pcie2_rev={pcie2_rev} lsc={lsc:#x} aspm_ok={aspm_ok})"
     ));
 }
-
 
 // SYS_MEM / SOCRAM register offsets (Linux `sbsocramregs`).
 const SYSMEM_COREINFO: u32 = 0x00;
@@ -1250,7 +1237,9 @@ fn download_fw_nvram(
             "wifi: partial firmware write {written:#x}/{copy_len:#x}"
         ));
     } else {
-        crate::ktrace::log_fmt(format_args!("wifi: firmware copied+verified ({written} bytes)"));
+        crate::ktrace::log_fmt(format_args!(
+            "wifi: firmware copied+verified ({written} bytes)"
+        ));
     }
     if written < 64 {
         return Err("TCM rejected firmware write (almost nothing written)");
@@ -1279,9 +1268,7 @@ fn download_fw_nvram(
                 ));
                 0
             } else {
-                crate::ktrace::log_fmt(format_args!(
-                    "wifi: handshake clear failed — seed={v:#x}"
-                ));
+                crate::ktrace::log_fmt(format_args!("wifi: handshake clear failed — seed={v:#x}"));
                 v
             }
         }
@@ -1443,10 +1430,7 @@ pub fn try_load_firmware() -> Result<(), &'static str> {
                 bytes.len()
             ));
             // Seed the synapse store so subsequent reads hit /brcm/.
-            crate::synapse::fs::write(
-                "/brcm/brcmfmac4388-pcie.apple,miyake.bin",
-                &bytes,
-            );
+            crate::synapse::fs::write("/brcm/brcmfmac4388-pcie.apple,miyake.bin", &bytes);
             found_path = String::from("/brcm/brcmfmac4388-pcie.apple,miyake.bin");
             fw = Some(bytes);
         }
@@ -1465,7 +1449,10 @@ pub fn try_load_firmware() -> Result<(), &'static str> {
     let mut nvram: Option<Vec<u8>> = None;
     if let Some(n) = embedded_nvram() {
         if n.len() > 8 {
-            crate::ktrace::log_fmt(format_args!("wifi: using embedded NVRAM ({} bytes)", n.len()));
+            crate::ktrace::log_fmt(format_args!(
+                "wifi: using embedded NVRAM ({} bytes)",
+                n.len()
+            ));
             nvram = Some(n.to_vec());
         }
     }
@@ -1491,16 +1478,12 @@ pub fn try_load_firmware() -> Result<(), &'static str> {
                 "wifi: found NVRAM on disk ({} bytes)",
                 bytes.len()
             ));
-            crate::synapse::fs::write(
-                "/brcm/brcmfmac4388-pcie.apple,miyake.txt",
-                &bytes,
-            );
+            crate::synapse::fs::write("/brcm/brcmfmac4388-pcie.apple,miyake.txt", &bytes);
             nvram = Some(bytes);
         }
     }
 
-    with_dev(|dev| download_fw_nvram(dev, &fw, nvram.as_deref()))
-        .unwrap_or(Err("no wifi device"))
+    with_dev(|dev| download_fw_nvram(dev, &fw, nvram.as_deref())).unwrap_or(Err("no wifi device"))
 }
 
 fn read_file_bytes(path: &str) -> Result<Vec<u8>, ()> {
@@ -1539,8 +1522,10 @@ fn ai_iscoreup(bar0: u64, pci: &PciDevice, wrap: u32) -> Option<bool> {
     }
     let ioctl = bp_read32_probe(bar0, pci, wrap + BCMA_IOCTL)?;
     let rst = bp_read32_probe(bar0, pci, wrap + BCMA_RESET_CTL)?;
-    Some((ioctl & (BCMA_IOCTL_FGC | BCMA_IOCTL_CLK)) == BCMA_IOCTL_CLK
-        && (rst & BCMA_RESET_CTL_RESET) == 0)
+    Some(
+        (ioctl & (BCMA_IOCTL_FGC | BCMA_IOCTL_CLK)) == BCMA_IOCTL_CLK
+            && (rst & BCMA_RESET_CTL_RESET) == 0,
+    )
 }
 
 /// **Decisive BAR2/TCM read-abort diagnostic** — resolves the two candidate
@@ -1559,7 +1544,9 @@ fn ai_iscoreup(bar0: u64, pci: &PciDevice, wrap: u32) -> Option<bool> {
 /// All access is recoverable + bounded; safe to run anytime after `/wifi power`.
 pub fn diag() -> Vec<String> {
     with_dev(diag_inner).unwrap_or_else(|| {
-        alloc::vec![String::from("no wifi device probed — run /wifi power first")]
+        alloc::vec![String::from(
+            "no wifi device probed — run /wifi power first"
+        )]
     })
 }
 
@@ -1603,8 +1590,12 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
     let cores = discover_cores(bar0, &pci);
     out.push(format!(
         "cores: arm id={:#x} wrap={:#x} | sysmem base={:#x} wrap={:#x} rev={} | pcie2_rev={}",
-        cores.arm_id, cores.arm_wrap, cores.sysmem_base, cores.sysmem_wrap,
-        cores.sysmem_rev, cores.pcie2_rev,
+        cores.arm_id,
+        cores.arm_wrap,
+        cores.sysmem_base,
+        cores.sysmem_wrap,
+        cores.sysmem_rev,
+        cores.pcie2_rev,
     ));
 
     // ── 2. Power up the RAM domain on a CLEAN bus (no aborting read yet) ────

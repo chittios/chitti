@@ -82,7 +82,13 @@ pub fn parse_eth(frame: &[u8]) -> Option<EthFrame<'_>> {
 ///
 /// A1 is the **BSSID**, not the destination — the frame is addressed to the
 /// access point, which forwards it. The real destination rides in A3.
-pub fn uplink_header(bssid: &[u8; 6], src: &[u8; 6], dst: &[u8; 6], seq: u16, protected: bool) -> Vec<u8> {
+pub fn uplink_header(
+    bssid: &[u8; 6],
+    src: &[u8; 6],
+    dst: &[u8; 6],
+    seq: u16,
+    protected: bool,
+) -> Vec<u8> {
     let mut fc = FC_TYPE_DATA | FC_TO_DS;
     if protected {
         fc |= FC_PROTECTED;
@@ -93,7 +99,7 @@ pub fn uplink_header(bssid: &[u8; 6], src: &[u8; 6], dst: &[u8; 6], seq: u16, pr
     h.extend_from_slice(bssid); // A1 = receiver = the AP
     h.extend_from_slice(src); // A2 = transmitter = us
     h.extend_from_slice(dst); // A3 = final destination
-    // Sequence Control: 12-bit sequence number, 4-bit fragment number.
+                              // Sequence Control: 12-bit sequence number, 4-bit fragment number.
     h.extend_from_slice(&(seq << 4).to_le_bytes());
     h
 }
@@ -124,11 +130,23 @@ pub fn addresses(hdr: &[u8]) -> Option<Addresses> {
     let from_ds = fc & FC_FROM_DS != 0;
     match (to_ds, from_ds) {
         // AP → station: A1 is us, A2 is the AP, A3 is who sent it.
-        (false, true) => Some(Addresses { dst: a1, src: a3, bssid: a2 }),
+        (false, true) => Some(Addresses {
+            dst: a1,
+            src: a3,
+            bssid: a2,
+        }),
         // Station → AP: A1 is the AP, A2 is the sender, A3 is the destination.
-        (true, false) => Some(Addresses { dst: a3, src: a2, bssid: a1 }),
+        (true, false) => Some(Addresses {
+            dst: a3,
+            src: a2,
+            bssid: a1,
+        }),
         // Ad-hoc / management.
-        (false, false) => Some(Addresses { dst: a1, src: a2, bssid: a3 }),
+        (false, false) => Some(Addresses {
+            dst: a1,
+            src: a2,
+            bssid: a3,
+        }),
         // Four-address WDS — a different header length entirely.
         (true, true) => None,
     }
@@ -186,7 +204,10 @@ pub fn to_air(
 /// data frame — including a frame whose Protected bit is set when no key is
 /// supplied, which is the case that must never fall through to "treat the
 /// ciphertext as a payload".
-pub fn from_air(frame: &[u8], tk: Option<&[u8; 16]>) -> Option<(Vec<u8>, Option<[u8; ccmp::PN_LEN]>)> {
+pub fn from_air(
+    frame: &[u8],
+    tk: Option<&[u8; 16]>,
+) -> Option<(Vec<u8>, Option<[u8; ccmp::PN_LEN]>)> {
     if frame.len() < HDR_LEN {
         return None;
     }
@@ -405,7 +426,11 @@ mod tests {
         let air = to_air(&eth, &AP, 1, Some((&tk, &pn, 0))).unwrap();
 
         assert_eq!(from_air(&air, None), None, "no key, no packet");
-        assert_eq!(from_air(&air, Some(&[0x00; 16])), None, "wrong key fails the MIC");
+        assert_eq!(
+            from_air(&air, Some(&[0x00; 16])),
+            None,
+            "wrong key fails the MIC"
+        );
 
         // A single flipped ciphertext byte must fail too.
         let mut bad = air.clone();
