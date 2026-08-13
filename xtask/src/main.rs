@@ -1054,7 +1054,9 @@ fn verify_image_header(img: &Path) -> Result<(), String> {
 /// the custom arg parser stays untouched:
 ///
 ///   CHITTI_M1N1      path to your m1n1 checkout (uses proxyclient/tools/linux.py)
-///   CHITTI_DTB       machine device tree (e.g. apple/t8112-j473.dtb) — required to boot
+///                    — defaults to the in-tree `third_party/m1n1` when it holds one
+///   CHITTI_DTB       machine device tree (e.g. apple/t8112-j473.dtb) — required to
+///                    boot; defaults to the single *.dtb in `third_party/dtb/`
 ///   CHITTI_INITRD    optional initramfs / model blob (Stage 1: the GGUF)
 ///   CHITTI_BOOTARGS  optional kernel bootargs (e.g. "chitti.epoch=1752345600")
 ///   CHITTI_M1N1_TTY  secondary UART tty for the payload's console after handoff
@@ -1092,8 +1094,11 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
     };
     println!("m1n1: arm64 Image {} ({img_len} bytes); payload {}", img.display(), payload.display());
 
-    let m1n1 = env::var("CHITTI_M1N1").ok();
-    let dtb = env::var("CHITTI_DTB").ok();
+    // Empty reads as unset: `make` passes these through unconditionally, so an
+    // unset `CHITTI_M1N1=` in the environment must not look like a configured
+    // checkout (the same trap `CHITTI_RESOLUTION` hit).
+    let m1n1 = env::var("CHITTI_M1N1").ok().filter(|p| !p.is_empty()).or_else(default_m1n1_dir);
+    let dtb = env::var("CHITTI_DTB").ok().filter(|p| !p.is_empty()).or_else(default_dtb);
     match (m1n1, dtb) {
         (Some(m1n1), Some(dtb)) => {
             let linuxpy = Path::new(&m1n1).join("proxyclient/tools/linux.py");
@@ -1185,7 +1190,22 @@ fn cmd_m1n1(release: bool) -> Result<(), String> {
             println!("m1n1: booting over the proxy ({:?})…", c);
             run_tee(&mut c, serial_log)
         }
-        _ => {
+        (m1n1, dtb) => {
+            // Say which half is missing, and where the in-tree default was
+            // looked for: "you did not configure it" and "the checkout is not
+            // there" are different problems with the same symptom.
+            if m1n1.is_none() {
+                println!(
+                    "m1n1: no proxy checkout — CHITTI_M1N1 unset and {} has no proxyclient/tools/linux.py",
+                    repo_root().join(IN_TREE_M1N1).display()
+                );
+            }
+            if dtb.is_none() {
+                println!(
+                    "m1n1: no device tree — CHITTI_DTB unset and {} holds no single *.dtb",
+                    repo_root().join(IN_TREE_DTB).display()
+                );
+            }
             println!(
                 "m1n1: to boot on hardware, set CHITTI_M1N1 (+ CHITTI_DTB, optional \
                  CHITTI_INITRD/CHITTI_BOOTARGS, M1N1DEVICE; CHITTI_SERIAL_LOG=<path> \
@@ -2625,6 +2645,83 @@ fn repo_root() -> PathBuf {
 
 fn kernel_dir() -> PathBuf {
     repo_root().join("kernel")
+}
+
+/// Where an in-tree m1n1 checkout and the machine device trees live, so a
+/// tethered boot needs no env plumbing at all when they are present.
+const IN_TREE_M1N1: &str = "third_party/m1n1";
+const IN_TREE_DTB: &str = "third_party/dtb";
+
+/// `CHITTI_M1N1`'s default: the in-tree checkout, but only once it really holds
+/// the proxyclient — a bare (unsubmoduled) directory must read as "not
+/// configured" and take the print-the-manual-command path, not fail the boot.
+fn default_m1n1_dir() -> Option<String> {
+    let dir = repo_root().join(IN_TREE_M1N1);
+    dir.join("proxyclient/tools/linux.py")
+        .exists()
+        .then(|| dir.to_string_lossy().into_owned())
+}
+
+/// `CHITTI_DTB`'s default: the one device tree in `third_party/dtb/`. With
+/// several, **do not guess** — booting the wrong machine's dtb on real hardware
+/// is not a recoverable mistake, and it is a human's choice which Mac this is.
+fn default_dtb() -> Option<String> {
+    let dir = repo_root().join(IN_TREE_DTB);
+    let entries: Vec<PathBuf> =
+        std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    match pick_dtb(&entries) {
+        Ok(p) => Some(p.to_string_lossy().into_owned()),
+        Err(0 | 1) => None, // 0: none present. (1 is unreachable — Ok covers it.)
+        Err(n) => {
+            println!(
+                "m1n1: {n} device trees in {} — set CHITTI_DTB to pick one (never guessed: \
+                 the wrong machine's dtb is not a recoverable boot)",
+                dir.display()
+            );
+            None
+        }
+    }
+}
+
+/// The choose-one-dtb rule, pure so it is testable: `Ok(path)` for exactly one
+/// `*.dtb` among `entries`, else `Err(count)`. Non-dtb files are ignored (the
+/// directory carries a README), and the result is order-independent — a
+/// `read_dir` order is not stable across machines.
+fn pick_dtb(entries: &[PathBuf]) -> Result<PathBuf, usize> {
+    let mut dtbs: Vec<&PathBuf> =
+        entries.iter().filter(|p| p.extension().is_some_and(|e| e == "dtb")).collect();
+    dtbs.sort();
+    match dtbs.len() {
+        1 => Ok(dtbs[0].clone()),
+        n => Err(n),
+    }
+}
+
+#[cfg(test)]
+mod dtb_tests {
+    use super::*;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|n| PathBuf::from("third_party/dtb").join(n)).collect()
+    }
+
+    #[test]
+    fn the_single_dtb_is_taken_and_the_readme_ignored() {
+        let got = pick_dtb(&paths(&["README.md", "t8112-j473.dtb"])).unwrap();
+        assert_eq!(got, PathBuf::from("third_party/dtb/t8112-j473.dtb"));
+    }
+
+    #[test]
+    fn two_machines_are_never_guessed_between() {
+        // Booting the wrong Mac's device tree is not a recoverable mistake.
+        assert_eq!(pick_dtb(&paths(&["t8112-j473.dtb", "t6020-j414s.dtb"])), Err(2));
+    }
+
+    #[test]
+    fn an_empty_or_readme_only_directory_reports_none() {
+        assert_eq!(pick_dtb(&[]), Err(0));
+        assert_eq!(pick_dtb(&paths(&["README.md"])), Err(0));
+    }
 }
 
 fn run(cmd: &mut Command) -> Result<(), String> {

@@ -27,6 +27,11 @@ pub const OCF_DISCONNECT: u16 = 0x0006;
 pub const OCF_AUTH_REQUESTED: u16 = 0x0011;
 pub const OCF_PIN_CODE_REQUEST_REPLY: u16 = 0x000d;
 pub const OCF_PIN_CODE_REQUEST_NEGATIVE_REPLY: u16 = 0x000e;
+pub const OCF_IO_CAPABILITY_REQUEST_REPLY: u16 = 0x002b;
+pub const OCF_USER_CONFIRMATION_REQUEST_REPLY: u16 = 0x002c;
+pub const OCF_USER_CONFIRMATION_REQUEST_NEG_REPLY: u16 = 0x002d;
+pub const OCF_USER_PASSKEY_REQUEST_REPLY: u16 = 0x002e;
+pub const OCF_USER_PASSKEY_REQUEST_NEG_REPLY: u16 = 0x002f;
 pub const OCF_RESET: u16 = 0x0003;
 pub const OCF_WRITE_LOCAL_NAME: u16 = 0x0013;
 pub const OCF_READ_LOCAL_NAME: u16 = 0x0014;
@@ -48,6 +53,12 @@ pub const EVT_PIN_CODE_REQUEST: u8 = 0x16;
 pub const EVT_LINK_KEY_NOTIFICATION: u8 = 0x18;
 pub const EVT_INQUIRY_RESULT_WITH_RSSI: u8 = 0x22;
 pub const EVT_EXTENDED_INQUIRY_RESULT: u8 = 0x2f;
+pub const EVT_IO_CAPABILITY_REQUEST: u8 = 0x31;
+pub const EVT_IO_CAPABILITY_RESPONSE: u8 = 0x32;
+pub const EVT_USER_CONFIRMATION_REQUEST: u8 = 0x33;
+pub const EVT_USER_PASSKEY_REQUEST: u8 = 0x34;
+pub const EVT_REMOTE_OOB_DATA_REQUEST: u8 = 0x35;
+pub const EVT_SIMPLE_PAIRING_COMPLETE: u8 = 0x36;
 pub const EVT_NUMBER_OF_COMPLETED_PACKETS: u8 = 0x13;
 
 /// Pack OGF/OCF into a 16-bit HCI opcode.
@@ -166,6 +177,45 @@ pub fn cmd_pin_code_neg_reply_usb(bd_addr_le: &[u8; 6]) -> Vec<u8> {
         OCF_PIN_CODE_REQUEST_NEGATIVE_REPLY,
         bd_addr_le,
     )
+}
+
+/// SSP I/O capabilities.  DisplayYesNo lets the host explicitly confirm the
+/// six-digit numeric comparison rather than silently accepting a peer.
+pub const IO_CAP_DISPLAY_YES_NO: u8 = 0x01;
+/// No OOB data is available through the current UI.
+pub const OOB_DATA_NOT_PRESENT: u8 = 0x00;
+/// General bonding plus MITM protection.  A controller that cannot satisfy
+/// this reports pairing failure instead of silently falling back to a legacy
+/// unauthenticated link.
+pub const AUTH_REQ_GENERAL_BONDING_MITM: u8 = 0x05;
+
+pub fn cmd_io_capability_reply_usb(bd_addr_le: &[u8; 6], io_cap: u8, oob: u8, auth: u8) -> Vec<u8> {
+    let mut p = [0u8; 9];
+    p[..6].copy_from_slice(bd_addr_le);
+    p[6] = io_cap;
+    p[7] = oob;
+    p[8] = auth;
+    command_usb(OGF_LINK_CONTROL, OCF_IO_CAPABILITY_REQUEST_REPLY, &p)
+}
+
+pub fn cmd_user_confirmation_reply_usb(bd_addr_le: &[u8; 6]) -> Vec<u8> {
+    command_usb(OGF_LINK_CONTROL, OCF_USER_CONFIRMATION_REQUEST_REPLY, bd_addr_le)
+}
+
+pub fn cmd_user_confirmation_neg_reply_usb(bd_addr_le: &[u8; 6]) -> Vec<u8> {
+    command_usb(OGF_LINK_CONTROL, OCF_USER_CONFIRMATION_REQUEST_NEG_REPLY, bd_addr_le)
+}
+
+pub fn cmd_user_passkey_reply_usb(bd_addr_le: &[u8; 6], passkey: u32) -> Option<Vec<u8>> {
+    if passkey > 999_999 { return None; }
+    let mut p = [0u8; 10];
+    p[..6].copy_from_slice(bd_addr_le);
+    p[6..].copy_from_slice(&passkey.to_le_bytes());
+    Some(command_usb(OGF_LINK_CONTROL, OCF_USER_PASSKEY_REQUEST_REPLY, &p))
+}
+
+pub fn cmd_user_passkey_neg_reply_usb(bd_addr_le: &[u8; 6]) -> Vec<u8> {
+    command_usb(OGF_LINK_CONTROL, OCF_USER_PASSKEY_REQUEST_NEG_REPLY, bd_addr_le)
 }
 
 // ── events ───────────────────────────────────────────────────────────────
@@ -369,6 +419,27 @@ pub fn parse_pin_code_request(params: &[u8]) -> Option<[u8; 6]> {
     Some(bd)
 }
 
+/// SSP user-confirmation request: peer address followed by a six-digit value.
+pub fn parse_user_confirmation_request(params: &[u8]) -> Option<([u8; 6], u32)> {
+    if params.len() < 10 { return None; }
+    let mut bd = [0u8; 6];
+    bd.copy_from_slice(&params[..6]);
+    Some((bd, u32::from_le_bytes(params[6..10].try_into().ok()?)))
+}
+
+/// Events that only carry a peer address (I/O capability and passkey request).
+pub fn parse_bd_addr_event(params: &[u8]) -> Option<[u8; 6]> {
+    params.get(..6)?.try_into().ok()
+}
+
+/// Simple Pairing Complete: status then BD_ADDR.
+pub fn parse_simple_pairing_complete(params: &[u8]) -> Option<(u8, [u8; 6])> {
+    if params.len() < 7 { return None; }
+    let mut bd = [0u8; 6];
+    bd.copy_from_slice(&params[1..7]);
+    Some((params[0], bd))
+}
+
 /// ACL header for USB bulk: handle_flags LE (12-bit handle) + data_len LE.
 pub fn acl_header(handle: u16, pb_bc: u16, data_len: u16) -> [u8; 4] {
     let h = (handle & 0x0fff) | ((pb_bc & 0xf) << 12);
@@ -476,6 +547,31 @@ mod tests {
         assert_eq!(handle, 0x0b);
         assert_eq!(pb, 2);
         assert_eq!(len, 10);
+    }
+
+    #[test_case]
+    fn ssp_commands_and_events_keep_addresses_and_values_in_wire_order() {
+        let bd = [0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+        let io = cmd_io_capability_reply_usb(
+            &bd, IO_CAP_DISPLAY_YES_NO, OOB_DATA_NOT_PRESENT, AUTH_REQ_GENERAL_BONDING_MITM,
+        );
+        assert_eq!(&io[..3], &[0x2b, 0x04, 9], "IO capability reply opcode + length");
+        assert_eq!(&io[3..9], &bd);
+        assert_eq!(&io[9..], &[1, 0, 5]);
+
+        let passkey = cmd_user_passkey_reply_usb(&bd, 123_456).expect("six digits accepted");
+        assert_eq!(&passkey[..3], &[0x2e, 0x04, 10]);
+        assert_eq!(&passkey[3..9], &bd);
+        assert_eq!(u32::from_le_bytes(passkey[9..13].try_into().unwrap()), 123_456);
+        assert!(cmd_user_passkey_reply_usb(&bd, 1_000_000).is_none());
+
+        let mut confirm = alloc::vec![0u8; 10];
+        confirm[..6].copy_from_slice(&bd);
+        confirm[6..].copy_from_slice(&654_321u32.to_le_bytes());
+        assert_eq!(parse_user_confirmation_request(&confirm), Some((bd, 654_321)));
+        let mut complete = alloc::vec![0u8];
+        complete.extend_from_slice(&bd);
+        assert_eq!(parse_simple_pairing_complete(&complete), Some((0, bd)));
     }
 
     #[test_case]

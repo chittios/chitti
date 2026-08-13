@@ -349,8 +349,8 @@ pub fn scan() -> Result<alloc::vec::Vec<crate::drivers::wifi::proto::BssInfo>, &
         .map(|entry| crate::drivers::wifi::proto::BssInfo {
             ssid: entry.bss.ssid,
             bssid: entry.bss.bssid,
-            channel: entry.bss.channel,
-            rssi: entry.rssi.unwrap_or(-127),
+            channel: entry.bss.channel as u16,
+            rssi: entry.rssi.unwrap_or(-127) as i16,
             privacy: entry.bss.privacy,
         })
         .collect())

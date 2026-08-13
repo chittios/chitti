@@ -4,7 +4,7 @@
 //! neutral. Fail closed: every HCI failure is a string the shell prints.
 
 use super::{bond, hci, hidp, l2cap};
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
@@ -160,7 +160,12 @@ pub fn scan(length_slots: u8) -> Result<Vec<hci::InquiryEntry>, &'static str> {
     Ok(found)
 }
 
-/// Create ACL + PIN authenticate; store bond on success.
+/// Create ACL and pair, using Secure Simple Pairing when the peer supports it.
+///
+/// The PIN is retained strictly as a legacy fallback.  Modern keyboards and
+/// mice normally request SSP I/O capabilities followed by numeric comparison
+/// or passkey entry; treating those events as unknown is why they previously
+/// timed out after connecting.
 pub fn pair(addr_str: &str, pin: Option<&str>) -> Result<String, &'static str> {
     if !crate::arch::bt_hci_ready() {
         return Err("no HCI USB transport");
@@ -212,33 +217,102 @@ pub fn pair(addr_str: &str, pin: Option<&str>) -> Result<String, &'static str> {
     ACL_HANDLE.store(handle, Ordering::Relaxed);
     PAIRED_ADDR.store(pack_addr(&bd), Ordering::Relaxed);
 
-    // Request authentication if not already done.
+    // Request authentication if not already done.  From here controllers may
+    // choose legacy PIN pairing or SSP; handle both paths until completion.
     let _ = crate::arch::bt_hci_cmd(&hci::cmd_auth_requested_usb(handle), 2000);
     let start = crate::arch::now_ms();
+    let mut link_key = None;
+    let mut used_ssp = false;
+    let mut auth_complete = false;
     while crate::arch::now_ms().wrapping_sub(start) < 10_000 {
         crate::shell::upkeep();
         if let Some(n) = crate::arch::bt_take_event(&mut buf) {
             if let Some(ev) = hci::parse_event_usb(&buf[..n]) {
-                if ev.code == hci::EVT_PIN_CODE_REQUEST {
-                    if let Some(req_bd) = hci::parse_pin_code_request(ev.params) {
+                match ev.code {
+                    hci::EVT_PIN_CODE_REQUEST => {
+                        if let Some(req_bd) = hci::parse_pin_code_request(ev.params) {
+                            let _ = crate::arch::bt_hci_cmd(
+                                &hci::cmd_pin_code_reply_usb(&req_bd, pin.as_bytes()), 2000,
+                            );
+                        }
+                    }
+                    hci::EVT_IO_CAPABILITY_REQUEST => {
+                        let req_bd = hci::parse_bd_addr_event(ev.params).ok_or("malformed SSP I/O-capability request")?;
+                        used_ssp = true;
                         let _ = crate::arch::bt_hci_cmd(
-                            &hci::cmd_pin_code_reply_usb(&req_bd, pin.as_bytes()),
-                            2000,
+                            &hci::cmd_io_capability_reply_usb(
+                                &req_bd, hci::IO_CAP_DISPLAY_YES_NO,
+                                hci::OOB_DATA_NOT_PRESENT, hci::AUTH_REQ_GENERAL_BONDING_MITM,
+                            ), 2000,
                         );
                     }
-                }
-                if ev.code == hci::EVT_AUTH_COMPLETE {
-                    break;
+                    hci::EVT_USER_CONFIRMATION_REQUEST => {
+                        let (req_bd, value) = hci::parse_user_confirmation_request(ev.params)
+                            .ok_or("malformed SSP numeric-comparison request")?;
+                        used_ssp = true;
+                        let shown = crate::modal::input(
+                            "Bluetooth pairing confirmation",
+                            &alloc::format!("Does {} show {:06}? Type yes to approve", hci::format_bd_addr(&req_bd), value),
+                            false,
+                        );
+                        let reply = if shown.trim().eq_ignore_ascii_case("yes") {
+                            hci::cmd_user_confirmation_reply_usb(&req_bd)
+                        } else {
+                            hci::cmd_user_confirmation_neg_reply_usb(&req_bd)
+                        };
+                        let _ = crate::arch::bt_hci_cmd(&reply, 2000);
+                        if !shown.trim().eq_ignore_ascii_case("yes") {
+                            return Err("SSP numeric comparison declined");
+                        }
+                    }
+                    hci::EVT_USER_PASSKEY_REQUEST => {
+                        let req_bd = hci::parse_bd_addr_event(ev.params).ok_or("malformed SSP passkey request")?;
+                        used_ssp = true;
+                        let text = crate::modal::input(
+                            "Bluetooth passkey",
+                            &alloc::format!("Enter the six-digit passkey for {}", hci::format_bd_addr(&req_bd)), true,
+                        );
+                        let reply = text.parse::<u32>().ok().and_then(|v| hci::cmd_user_passkey_reply_usb(&req_bd, v))
+                            .unwrap_or_else(|| hci::cmd_user_passkey_neg_reply_usb(&req_bd));
+                        let _ = crate::arch::bt_hci_cmd(&reply, 2000);
+                        if text.parse::<u32>().ok().filter(|v| *v <= 999_999).is_none() {
+                            return Err("SSP passkey declined or invalid");
+                        }
+                    }
+                    hci::EVT_LINK_KEY_NOTIFICATION if ev.params.len() >= 22 => {
+                        if ev.params[..6] == bd {
+                            let mut hex = String::new();
+                            for b in &ev.params[6..22] { hex.push_str(&alloc::format!("{b:02x}")); }
+                            link_key = Some(hex);
+                        }
+                    }
+                    hci::EVT_SIMPLE_PAIRING_COMPLETE => {
+                        let (status, peer) = hci::parse_simple_pairing_complete(ev.params)
+                            .ok_or("malformed SSP completion event")?;
+                        if peer == bd {
+                            if status != 0 { return Err("Secure Simple Pairing failed"); }
+                            auth_complete = true;
+                            break;
+                        }
+                    }
+                    hci::EVT_AUTH_COMPLETE => {
+                        if ev.params.first().copied().unwrap_or(1) != 0 { return Err("authentication failed"); }
+                        auth_complete = true;
+                        if !used_ssp { break; }
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
+    if !auth_complete { return Err("pairing timed out"); }
+
     let name = addr_str;
-    let _ = bond::upsert(&hci::format_bd_addr(&bd), name, None);
+    let _ = bond::upsert(&hci::format_bd_addr(&bd), name, link_key.as_deref());
     Ok(alloc::format!(
-        "paired {} handle {handle:#x} (PIN used, bond saved)",
-        hci::format_bd_addr(&bd)
+        "paired {} handle {handle:#x} ({}; bond saved)",
+        hci::format_bd_addr(&bd), if used_ssp { "Secure Simple Pairing" } else { "legacy PIN" }
     ))
 }
 

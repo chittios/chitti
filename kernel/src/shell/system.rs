@@ -67,7 +67,7 @@ pub(super) fn run_power(arg: &str) {
     }
 }
 
-/// `/bluetooth` — HCI transport, scan, PIN pair, HID host.
+/// `/bluetooth` — HCI transport, SSP/PIN pair, HID host.
 pub(super) fn run_bluetooth(arg: &str) {
     let a = arg.trim();
     if a.is_empty() || a == "status" || a == "info" {
@@ -76,7 +76,7 @@ pub(super) fn run_bluetooth(arg: &str) {
             serial_println!("  {line}");
         }
         serial_println!(
-            "  cmds: status|reset|scan [n]|pair <AA:BB:…>|hid|bonds|disconnect"
+            "  cmds: status|reset|scan [n]|pair <AA:BB:…> [legacy-pin]|hid|bonds|disconnect"
         );
         return;
     }
@@ -119,8 +119,8 @@ pub(super) fn run_bluetooth(arg: &str) {
                 p.to_string()
             } else {
                 let p = crate::modal::input(
-                    "Bluetooth PIN",
-                    &alloc::format!("PIN for {addr} (default 0000 if empty)"),
+                    "Bluetooth legacy PIN",
+                    &alloc::format!("Only for pre-SSP devices; default 0000 if empty"),
                     true,
                 );
                 if p.is_empty() {
@@ -153,7 +153,7 @@ pub(super) fn run_bluetooth(arg: &str) {
             Err(e) => serial_println!("bluetooth> {e}"),
         },
         _ => serial_println!(
-            "bluetooth> usage: /bluetooth [status|reset|scan|pair <addr>|hid|bonds|disconnect]"
+            "bluetooth> usage: /bluetooth [status|reset|scan|pair <addr> [legacy-pin]|hid|bonds|disconnect]"
         ),
     }
 }

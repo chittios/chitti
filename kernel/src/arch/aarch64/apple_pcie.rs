@@ -1384,8 +1384,14 @@ fn probe_bar_candidates(
             core::hint::spin_loop();
         }
 
-        // HIT if BAR0 (regs) **or** BAR2 (TCM base) responds. Prefer a layout
-        // where BAR2 reads work — required for firmware download.
+        // BAR0 is mandatory.  The caller immediately reads chipcommon through
+        // BAR0 (and uses BAR0_WINDOW for all of the Apple TCM path), so a BAR2
+        // response alone cannot validate this candidate.  Accepting `r2` or
+        // `r2+ram` by themselves used to return a layout whose first direct
+        // chipcommon load external-aborted at the selected BAR0 address.
+        //
+        // BAR2 remains diagnostic only: on some Apple parts it accepts posted
+        // writes yet faults on reads, while the BAR0-window route is sound.
         let bar0_word = super::probe_read32(cpu0);
         let bar2_word = if cpu2 != 0 {
             super::probe_read32(cpu2)
@@ -1403,7 +1409,7 @@ fn probe_bar_candidates(
             "pcie: BAR try pci0={base0:#x} pci2={base2:#x} cpu0={cpu0:#x} cpu2={cpu2:#x} r0={bar0_word:?} r2={bar2_word:?} r2+ram={bar2_ram:?}"
         ));
 
-        if bar0_word.is_some() || bar2_word.is_some() || bar2_ram.is_some() {
+        if bar0_word.is_some() {
             crate::ktrace::log_fmt(format_args!(
                 "pcie: BAR window HIT pci0={base0:#x} pci2={base2:#x} cpu0={cpu0:#x} cpu2={cpu2:#x}"
             ));

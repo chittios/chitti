@@ -260,7 +260,9 @@ image:
 ##       tethered Apple Silicon Mac over the m1n1 USB proxy. Configure via env:
 ##       CHITTI_M1N1 (m1n1 checkout), CHITTI_DTB (machine dtb), optional
 ##       CHITTI_INITRD (model gguf), CHITTI_BOOTARGS, M1N1DEVICE (proxy tty).
-##       Use RELEASE=1 for hardware. Without CHITTI_M1N1/CHITTI_DTB it just
+##       CHITTI_M1N1/CHITTI_DTB default to the in-tree third_party/m1n1 and the
+##       single third_party/dtb/*.dtb, so a tethered boot usually needs only
+##       M1N1DEVICE. Use RELEASE=1 for hardware. With neither available it just
 ##       builds the Image and prints the manual linux.py command.
 ##       Best-effort: extract wifi-assets first so /wifi load embeds the dongle
 ##       image (no-op if already present; skips with a warning if macOS fw is
