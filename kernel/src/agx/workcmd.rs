@@ -6,35 +6,45 @@
 //! cmdqueue channel. For **G14G / M2 t8112, firmware V13.5** — so the version gates
 //! `V >= V13_0B4` and `V >= V13_3` are true and `G >= G14X` is false.
 //!
-//! **The reference is the vendored proxyclient**, `third_party/m1n1/proxyclient/
-//! m1n1/fw/agx/{cmdqueue,microsequence,channels}.py`, cross-checked field-for-field
-//! against the **captured `WorkCommandCP` hexdump in `cmdqueue.py`'s own
-//! docstring** — real bytes from a live macOS compute submission, which is the only
-//! ground truth available for a compute job and is what settles the offsets below.
-//! Decoding it (V < V13_0B4 layout, so 8 bytes earlier than ours) gives a
-//! meaningful value at every field: `encoder = 0x15_00078000`,
-//! `encoder_end = 0x15_00078024` (a 0x24-byte command stream — exactly what
-//! [`super::cdm`] emits), `pipeline_base = 0x11_00000000`, `unk_38 = 0x8c60`,
-//! `microsequence_ptr = 0xffffffa0_0c311cc0`, `stamp_addr = 0xffffffa0_000c8014`,
-//! `fw_stamp_addr = 0xffffffa0_0c378014`, `uuid = 0x120022b8`.
+//! **Two references, and they now agree.** `third_party/m1n1/proxyclient/m1n1/fw/
+//! agx/{cmdqueue,microsequence,channels}.py` (vendored) gives the wire layout, and
+//! **drm/asahi** — the Rust GPU driver in the Asahi Linux tree,
+//! `drivers/gpu/drm/asahi/{fw/compute.rs,fw/job.rs,fw/microseq.rs,queue/compute.rs}`
+//! — gives the *semantics*: which fields are pointers the firmware writes through,
+//! which are optional, and what a minimal compute submission actually sets.
+//! Everything below is one or the other, never recollection.
 //!
-//! Two things that dump settles, both of which were wrong here before:
+//! A third artefact settles the offsets independently: the **captured
+//! `WorkCommandCP` hexdump in `cmdqueue.py`'s own docstring** — real bytes from a
+//! live macOS compute submission. Decoding it (the `V < V13_0B4` layout, so 8 bytes
+//! earlier than ours) gives a meaningful value at every field:
+//! `cdm_ctrl_stream_base = 0x15_00078000`, `cdm_ctrl_stream_end = 0x15_00078024`
+//! (a 0x24-byte command stream — exactly what [`super::cdm`] emits),
+//! `usc_exec_base_cp = 0x11_00000000`, `unk_38 = 0x8c60`,
+//! `microsequence_ptr = 0xffffffa0_0c311cc0`, `stamp_addr = 0xffffffa0_000c8014`.
 //!
-//! 1. **`JobMeta` is 0x2c, not 0x24** — its `stamp_addr`/`fw_stamp_addr` are
-//!    **8-byte** pointers (m1n1 `WrappedPointer` = `Int64ul`), and the capture shows
-//!    two kernel VAs there. Read as `u32`s the second one decodes as `0xffffffa0`,
-//!    which is obviously not a stamp pointer. The old 0x24 form shifted every field
-//!    from `JobMeta` on by 8 *and* left both stamps null — and a stamp pointer is
-//!    where the firmware writes job completion, so null is not a benign default.
-//!    (This resolves the "KNOWN UNRESOLVED AMBIGUITY" this module used to document:
-//!    it was a conflict between drm/asahi's stale `unk_2d4` field *name* and its
-//!    `NonZeroU64` stamp *type*, and the bytes side with the type.)
-//! 2. **Every bookkeeping object is a kernel (TTBR1) VA, only the encoder is a
-//!    context (TTBR0) VA.** `microsequence_ptr`, both stamps and the timestamp
-//!    pointers are all `0xffffffa0…` while `encoder`/`deflake` are `0x15…`. See
-//!    `hw.rs`'s `kern_reserve` — placing the queue and microsequence in the
-//!    submitting context's TTBR0 makes them unreachable from the firmware's own
-//!    boot context, which is the same rule the RTKit crashlog buffer had to learn.
+//! Four things those references settle, each of which was wrong here before:
+//!
+//! 1. **`JobMeta` is 0x2c, not 0x24.** `stamp`/`fw_stamp` are **8-byte** pointers —
+//!    m1n1 types them `WrappedPointer` = `Int64ul`, drm/asahi types them
+//!    `GpuWeakPointer` = `NonZeroU64`, and the capture has two kernel VAs there
+//!    (read as `u32`s the second decodes as `0xffffffa0`, plainly not a pointer).
+//!    The 0x24 form shifted every field past `JobMeta` by 8 *and* left both stamps
+//!    null, where the type says null is not even legal. drm/asahi's `unk_2d4`-style
+//!    field *names* imply 0x24 and are simply stale — the types win.
+//! 2. **Every bookkeeping object is a kernel (TTBR1) VA; only the encoder, the
+//!    shader/USC and the preempt buffer are context (TTBR0) VAs.** The capture shows
+//!    the split directly, and drm/asahi allocates from `kalloc.*` vs `ualloc`
+//!    accordingly. See `hw.rs`'s `kern_reserve`.
+//! 3. **`preempt_buf1..5` are not optional.** What m1n1 names `iogpu_deflake_1..5`
+//!    are GPU preemption scratch, and drm/asahi passes all five for every
+//!    submission (plus `preempt_buf1` again in `JobParameters2`). They are pointers
+//!    the firmware writes through; null is a silent wedge, not a default.
+//! 4. **`helper_program`/`helper_arg`/`helper_cfg`/`iogpu_unk_40` are one group.**
+//!    drm/asahi's comments read `// 0x40 if internal program used` and
+//!    `iogpu_unk_40: 0, // 0x1c if internal program used`, so with no helper all
+//!    four are zero. Taking `0x1c` from the capture — whose job *did* use a helper —
+//!    told the firmware a helper was present and handed it a null one.
 //!
 //! Pure + arch-neutral, so the layouts are pinned by `cargo xtask test` on both
 //! arches rather than only by a hardware dispatch.
@@ -99,13 +109,17 @@ pub const CMD_TYPE_RUN_COMPUTE: u32 = 3;
 /// alignment the proxyclient allocates work commands at (`new(..., align=0x20)`).
 pub const RUN_COMPUTE_SIZE: usize = 0x320;
 
-/// `ComputeInfo.unk_38` — "always 0x8c60" per the proxyclient, and 0x8c60 in the
-/// captured dump. Left at 0 before, which is not a value the firmware ever sees
-/// from the real driver.
+/// `JobParameters1.unk_38` — "always 0x8c60" per the proxyclient, 0x8c60 in the
+/// captured dump, and a literal `U64(0x8c60)` in drm/asahi. Left at 0 before,
+/// which is not a value the firmware ever sees from the real driver.
 const COMPUTE_INFO_UNK_38: u64 = 0x8c60;
-/// `ComputeInfo.unk_58` / `iogpu_unk_40` — 1 / 0x1c in the capture.
+/// `JobParameters1.unk_58` — a literal 1 in drm/asahi.
 const COMPUTE_INFO_UNK_58: u32 = 1;
-const COMPUTE_INFO_IOGPU_UNK_40: u32 = 0x1c;
+/// Per-job GPU preemption scratch (`compute_preempt1_size` for **t8112** = 0x10000,
+/// plus four 8-byte slots for `preempt_buf2..5`). drm/asahi allocates this per
+/// submission out of the **user** VM and passes all five pointers unconditionally.
+pub const PREEMPT1_SIZE_T8112: u64 = 0x10000;
+pub const PREEMPT_BUF_SIZE: u64 = PREEMPT1_SIZE_T8112 + 4 * 8;
 /// `EncoderParams.iogpu_compute_unk44` — all-ones in the capture.
 const ENCODER_IOGPU_UNK44: u32 = 0xffff_ffff;
 /// `EventControl.unk_10` (proxyclient `GPURenderer`: `event_control.unk_10 = 0x50`).
@@ -123,12 +137,23 @@ pub struct ComputeCmd {
     /// `event_control_addr` — the `EventControl` (drm/asahi `Notifier`) the
     /// firmware posts completion through. **Kernel VA.**
     pub event_control: u64,
-    /// The CDM command stream GPU address (`ComputeInfo.encoder`). **Context VA.**
+    /// The CDM command stream GPU address (drm/asahi `cdm_ctrl_stream_base`, which
+    /// m1n1 calls `ComputeInfo.encoder`). **Context VA.**
     pub encoder: u64,
-    /// The context pipeline base (0x11_00000000) — `ComputeInfo.pipeline_base`.
+    /// `usc_exec_base_cp` — the base USC shader short-pointers are relative to
+    /// (0x11_00000000 here). m1n1 calls this slot `pipeline_base`; drm/asahi names
+    /// it, and takes it from userspace per queue.
     pub pipeline_base: u64,
-    /// End of the CDM stream (`ComputeInfo2.encoder_end`). **Context VA.**
+    /// End of the CDM stream (`cdm_ctrl_stream_end`). **Context VA.**
     pub encoder_end: u64,
+    /// Per-job preemption scratch, [`PREEMPT_BUF_SIZE`] bytes in the **context**
+    /// VM. drm/asahi passes `preempt_buf1` (this) plus four offset pointers into
+    /// the same buffer, unconditionally — a null here is a pointer the firmware
+    /// writes through, and the capture has a real context VA in the slot.
+    pub preempt_buf: u64,
+    /// A `JobTimestamps` (two `AtomicU64`s) in the **kernel** range. drm/asahi
+    /// always passes `Some(start)`/`Some(end)`; the firmware writes them.
+    pub timestamps: u64,
     pub encoder_id: u32,
     /// The microsequence GPU address + size. **Kernel VA.**
     pub microsequence: u64,
@@ -146,50 +171,64 @@ pub struct ComputeCmd {
     pub client_sequence: u8,
 }
 
-/// `ComputeInfo` (microsequence.py:708) — 0x150 bytes. The proxyclient's own note:
-/// "only the cmdlist and pipelinebase … are strictly needed to launch a basic
-/// compute shader", so the deflake/helper buffers stay null.
-fn compute_info(b: &mut Buf, c: &ComputeCmd) {
-    b.u64(0); // iogpu_deflake_1 (ComputeArgs)   +0x00
-    b.u64(c.encoder); // encoder (CommandList)   +0x08
-    b.u64(0); // iogpu_deflake_2                 +0x10
-    b.u64(0); // iogpu_deflake_3                 +0x18
-    b.u64(0); // iogpu_deflake_4                 +0x20
-    b.u64(0); // iogpu_deflake_5                 +0x28
-    b.u64(c.pipeline_base); // pipeline_base     +0x30
+/// `JobParameters1` (drm/asahi `fw::compute::raw::JobParameters1`; m1n1 calls the
+/// same bytes `ComputeInfo`) — 0x150.
+///
+/// **The five `preempt_buf` pointers are what the "deflake" names hide**, and
+/// drm/asahi passes every one of them for every submission. `helper_program`,
+/// `helper_arg`, `helper_cfg` and `iogpu_unk_40` are the *internal program* group:
+/// drm/asahi's own comments read `// 0x40 if internal program used` and
+/// `iogpu_unk_40: 0, // 0x1c if internal program used`, so with no helper they must
+/// **all** be zero. Setting `iogpu_unk_40 = 0x1c` (as the capture has it, because
+/// that job *did* use a helper) while `helper_program` is 0 tells the firmware a
+/// helper is present and hands it a null one.
+fn job_params1(b: &mut Buf, c: &ComputeCmd) {
+    let p = c.preempt_buf;
+    // buf2..5 are 8-byte slots that follow preempt1 inside the same buffer.
+    let off = |n: u64| if p == 0 { 0 } else { p + PREEMPT1_SIZE_T8112 + 8 * n };
+    b.u64(p); // preempt_buf1                    +0x00
+    b.u64(c.encoder); // cdm_ctrl_stream_base    +0x08
+    b.u64(off(0)); // preempt_buf2               +0x10
+    b.u64(off(1)); // preempt_buf3               +0x18
+    b.u64(off(2)); // preempt_buf4               +0x20
+    b.u64(off(3)); // preempt_buf5               +0x28
+    b.u64(c.pipeline_base); // usc_exec_base_cp  +0x30
     b.u64(COMPUTE_INFO_UNK_38); // unk_38        +0x38
-    b.u32(0); // helper_program (bit 0 = enable) +0x40
+    b.u32(0); // helper_program (0 = none)       +0x40
     b.u32(0); // unk_44                          +0x44
-    b.u64(0); // helper_arg (work layout)        +0x48
+    b.u64(0); // helper_arg                      +0x48
     b.u32(0); // helper_cfg                      +0x50
     b.u32(0); // unk_54                          +0x54
     b.u32(COMPUTE_INFO_UNK_58); // unk_58        +0x58
     b.u32(0); // unk_5c                          +0x5c
-    b.u32(COMPUTE_INFO_IOGPU_UNK_40); // iogpu_unk_40 +0x60
-    b.pad(0xec); // unk_pad                      +0x64 → 0x150
+    b.u32(0); // iogpu_unk_40 (0 with no helper) +0x60
+    b.pad(0xec); // __pad                        +0x64 → 0x150
 }
 
-/// `ComputeInfo2` (V >= V13_0B4) — 0x60 bytes; carries `encoder_end`.
-fn compute_info2(b: &mut Buf, c: &ComputeCmd) {
+/// `JobParameters2` (V >= V13_0B4) — 0x60; carries `cdm_ctrl_stream_end` and the
+/// same `preempt_buf1` pointer again.
+fn job_params2(b: &mut Buf, c: &ComputeCmd) {
     b.pad(4); // unk_0_0 (V >= V13_0B4)          +0x00
     b.pad(0x24); // unk_0                        +0x04
-    b.u64(0); // iogpu_deflake_1                 +0x28
-    b.u64(c.encoder_end); // encoder_end         +0x30
+    b.u64(c.preempt_buf); // preempt_buf1        +0x28
+    b.u64(c.encoder_end); // cdm_ctrl_stream_end +0x30
     b.pad(0x20); // unk_34                       +0x38
-    b.u32(0); // unk_g14x                        +0x58
+    b.u32(0); // unk_g14x (0 for G < G14X)       +0x58
     b.u32(0); // unk_58                          +0x5c → 0x60
 }
 
-/// `EncoderParams` (microsequence.py:672) — 0x28 bytes.
+/// `EncoderParams` (0x28). drm/asahi's `unk_mask` is `0xffffffff` — what m1n1
+/// calls `iogpu_compute_unk44` — and the sampler heap/count are 0 with no samplers.
 fn encoder_params(b: &mut Buf, c: &ComputeCmd) {
-    b.u32(0); // unk_0                           +0x00
-    b.u32(0); // unk_4                           +0x04
-    b.u32(0); // unk_8                           +0x08
+    b.u32(0); // unk_8                           +0x00
+    b.u32(0); // sync_grow                       +0x04
+    b.u32(0); // unk_10                          +0x08
     b.u32(c.encoder_id); // encoder_id           +0x0c
-    b.u32(0); // unk_10                          +0x10
-    b.u32(ENCODER_IOGPU_UNK44); // iogpu_compute_unk44 +0x14
-    b.u64(0); // seq_buffer                      +0x18
-    b.u64(0); // unk_1c                          +0x20 → 0x28
+    b.u32(0); // unk_18                          +0x10
+    b.u32(ENCODER_IOGPU_UNK44); // unk_mask      +0x14
+    b.u64(0); // sampler_array                   +0x18
+    b.u32(0); // sampler_count                   +0x20
+    b.u32(0); // sampler_max                     +0x24 → 0x28
 }
 
 /// `JobMeta` (microsequence.py:657) — **0x2c bytes**: `stamp_addr` and
@@ -207,10 +246,13 @@ fn job_meta(b: &mut Buf, c: &ComputeCmd) {
     b.u32(c.queue_cmd_count); // queue_cmd_count +0x28 → 0x2c
 }
 
-/// `TimeStampPointers` (0x10; both null → the firmware records no timestamps).
-fn timestamp_pointers(b: &mut Buf) {
-    b.u64(0); // start_addr
-    b.u64(0); // end_addr
+/// `TimestampPointers` (0x10). drm/asahi always passes `Some(start)`/`Some(end)`
+/// into a `JobTimestamps` (two `AtomicU64`s) that the firmware writes; `None`
+/// encodes as 0, so a null pair is a real difference from the reference and not
+/// merely "no timestamps requested".
+fn timestamp_pointers(b: &mut Buf, job_timestamps: u64) {
+    b.u64(job_timestamps); // start_addr (JobTimestamps.start)
+    b.u64(if job_timestamps == 0 { 0 } else { job_timestamps + 8 }); // end_addr
 }
 
 /// Build the full compute WorkCommand (m1n1 `WorkCommandCP`, G14G/V13.5),
@@ -225,26 +267,32 @@ pub fn run_compute(c: &ComputeCmd) -> Vec<u8> {
     b.u64(c.event_control); // event_control_addr           @0x014
     b.u32(0); // unk_2c                                     @0x01c
     b.pad(0x50); // unk_buf (G < G14X)                      @0x020
-    compute_info(&mut b, c); // compute_info                @0x070
+    job_params1(&mut b, c); // job_params1                  @0x070
     b.u64(0); // registers_addr (G14X only; null here)      @0x1c0
     b.u16(0); // register_count                             @0x1c8
     b.u16(0); // registers_length                           @0x1ca
     b.pad(0x24); // unk_pad                                 @0x1cc
     b.u64(c.microsequence); // microsequence_ptr            @0x1f0
     b.u32(c.microsequence_size); // microsequence_size      @0x1f8
-    compute_info2(&mut b, c); // compute_info2              @0x1fc
+    job_params2(&mut b, c); // job_params2                  @0x1fc
     encoder_params(&mut b, c); // encoder_params            @0x25c
     job_meta(&mut b, c); // job_meta                        @0x284
-    b.u64(0); // ts1 (command_time)                         @0x2b0
-    timestamp_pointers(&mut b); // ts_pointers              @0x2b8
-    timestamp_pointers(&mut b); // user_ts_pointers         @0x2c8
+    b.u64(0); // command_time                               @0x2b0
+    timestamp_pointers(&mut b, c.timestamps); // ts_ptrs    @0x2b8
+    timestamp_pointers(&mut b, 0); // user_ts_pointers      @0x2c8
     b.u8(c.client_sequence); // client_sequence             @0x2d8
-    b.u64(0); // unk_ts2 (V >= V13_0B4)                     @0x2d9
-    b.u64(0); // unk_ts (V >= V13_0B4)                      @0x2e1
-    b.pad(0x1c); // unk_2e1 (V >= V13_0B4)                  @0x2e9
+    b.pad(3); // pad_2d1                                    @0x2d9
+    b.u32(0); // unk_2d4                                    @0x2dc
+    b.u8(0); // unk_2d8                                     @0x2e0
+    b.u64(0); // context_store_req (V >= V13_0B4)           @0x2e1
+    b.u64(0); // context_store_compl (V >= V13_0B4)         @0x2e9
+    b.pad(0x14); // unk_2e9 (V >= V13_0B4)                  @0x2f1
     b.u32(0); // unk_flag (V >= V13_0B4)                    @0x305
-    b.pad(0x10); // unk_pad (V >= V13_0B4)                  @0x309
-    b.pad(0x7); // pad_2d9                                  @0x319 → 0x320
+    b.pad(0x10); // unk_pad (V >= V13_0B4)                  @0x309 → 0x319
+    // drm/asahi's fields end at 0x319; m1n1's trailing `pad_2d9` of 7 is the pad to
+    // the 0x20 boundary work commands are allocated at. Kept so the encoded length
+    // matches the proxyclient's.
+    b.pad(0x7); // pad to 0x20                              @0x319 → 0x320
     b.bytes
 }
 
@@ -301,19 +349,16 @@ const OP_FINALIZE_COMPUTE: u32 = 0x2a;
 /// `EndCmd` — `magic 0x18`, `flags 0x40` in byte 3 (m1n1 `EndCmd.__init__`), i.e.
 /// the little-endian word 0x4000_0018. This is drm/asahi's `RetireStamp` header.
 const OP_END: u32 = 0x4000_0018;
-/// `WaitForInterruptCmd` = `magic 0x01` + a pipe selector in bytes 1..3, i.e. the
-/// header is `0x01 | (pipe << 8)`. The proxyclient's own calls pin two thirds of
-/// the enum: `WaitForInterruptCmd(1,0,0)` for TA and `(0,1,0)` for 3D give
-/// `Vertex = 1 << 0` and `Fragment = 1 << 8`. Compute is `1 << 15` (drm/asahi's
-/// `Pipe`), so the header is `0x0080_0001` — **0x80 in byte 2**.
+/// `WaitForInterruptCmd` — `magic 0x01` plus a pipe selector, i.e. the header is
+/// `opcode | (pipe << 8)`. **Settled from drm/asahi** (`fw/microseq.rs`):
+/// `enum Pipe { Vertex = 1 << 0, Fragment = 1 << 8, Compute = 1 << 15 }` and
+/// `WaitForIdle::new(pipe) = OpHeader::with_args(OpCode::WaitForIdle, (pipe as u32) << 8)`
+/// where `with_args` is a plain OR — so compute is `0x01 | (0x8000 << 8)`, putting
+/// the 0x80 in **byte 2**. The proxyclient's own `WaitForInterruptCmd(1,0,0)` /
+/// `(0,1,0)` calls for TA/3D corroborate the other two enum values independently.
 ///
-/// The `1 << 15` is the one part of this taken from recollection of drm/asahi
-/// rather than from the vendored tree, so it is the first thing to flip if a
-/// dispatch is scheduled (queue ring read) but never completes: the plausible
-/// alternative puts the 0x80 in **byte 3** (`0x8000_0001`), which is what m1n1's
-/// "`TimestampCmd.unk_3` — sometimes 0x80" annotation would suggest if that field
-/// is the same selector. What is *certain* is that a bare `0x01` — which this
-/// emitted before — names no pipe at all and so waits on nothing.
+/// A bare `0x01` — which this emitted before — selects no pipe at all and so waits
+/// on nothing.
 pub const OP_WAIT_FOR_IDLE_COMPUTE: u32 = 0x0080_0001;
 /// `StartComputeCmd.unk_28` — 1 in the proxyclient's annotation.
 const START_COMPUTE_UNK_28: u32 = 1;
@@ -359,18 +404,11 @@ fn attachments(b: &mut Buf) {
     b.u32(0); // num_attachments
 }
 
-/// The alternative reading of the compute pipe selector — 0x80 in byte **3**
-/// rather than byte 2. Kept as a named constant so a hardware run can A/B the two
-/// in one boot (`/agx compute alt`) instead of one guess per rebuild: a
-/// `WaitForIdle` on a pipe that never raises hangs the microsequence *silently* —
-/// no fault, no event — which is exactly what the first successfully-scheduled
-/// dispatch showed on the M2.
-pub const OP_WAIT_FOR_IDLE_COMPUTE_ALT: u32 = 0x8000_0001;
-
-/// Build the compute microsequence (StartCompute → WaitForIdle → FinalizeCompute →
-/// End) for G14G/V13.5. `wait_header` is the `WaitForIdle` op word — pass
-/// [`OP_WAIT_FOR_IDLE_COMPUTE`] unless A/B-ing it against the `_ALT` reading.
-pub fn microseq_compute(r: &MicroSeqRefs, wait_header: u32) -> Vec<u8> {
+/// Build the compute microsequence for G14G/V13.5: StartCompute → WaitForIdle →
+/// FinalizeCompute → RetireStamp. drm/asahi's `queue/compute.rs` confirms this is
+/// the whole sequence for `G < G14X` — the `Timestamp` ops are gated on a userspace
+/// request and `WaitForIdle2` replaces `WaitForIdle` only on `G >= G14X`.
+pub fn microseq_compute(r: &MicroSeqRefs) -> Vec<u8> {
     let mut b = Buf::new();
     // --- StartComputeCmd (magic 0x29), 0x16c bytes ---
     let start = b.len();
@@ -395,7 +433,7 @@ pub fn microseq_compute(r: &MicroSeqRefs, wait_header: u32) -> Vec<u8> {
     b.u64(r.event_ctrl_buf); // event_ctrl_buf_addr         +0x164 → 0x16c
 
     // --- WaitForInterruptCmd (magic 0x01), compute pipe ---
-    b.u32(wait_header);
+    b.u32(OP_WAIT_FOR_IDLE_COMPUTE);
 
     // --- FinalizeComputeCmd (magic 0x2a), 0x7c bytes ---
     let finalize = b.len();
@@ -473,6 +511,18 @@ pub const QUEUE_INFO_SIZE: usize = 0xb8;
 /// `CommandQueueInfo.gpu_context_addr`'s offset — the field an 0x18-byte hole in
 /// the middle of this struct used to land 0x18 short of.
 pub const QI_GPU_CONTEXT_OFFSET: usize = 0xa4;
+
+/// Offsets of the `CommandQueueInfo` fields the **firmware** writes. Reading these
+/// back out of our own buffer is how the AP learns what the scheduler thinks of a
+/// submission: whether it is busy, how many commands it believes are in flight,
+/// and whether it recorded an error — none of which is visible from the ring
+/// cursors alone.
+pub const QI_GPU_RPTR1: u64 = 0x20;
+pub const QI_BUSY: u64 = 0x60;
+pub const QI_UNK_80: u64 = 0x80;
+pub const QI_HAS_COMMANDS: u64 = 0x84;
+pub const QI_ERROR_COUNT: u64 = 0x88;
+pub const QI_INFLIGHT_COMMANDS: u64 = 0x98;
 
 /// `CommandQueueInfo` (cmdqueue.py:505, V >= V13_2 && G < G14X) — 0xb8 bytes. The
 /// firmware reads this when a `RunCmdQueueMsg` names it: `pointers` holds the
@@ -621,6 +671,8 @@ mod tests {
             stamp_slot: 5,
             queue_cmd_count: 0,
             client_sequence: 0x15,
+            preempt_buf: 0x15_0008_8000,
+            timestamps: 0xffff_ffa0_0002_9030,
         }
     }
 
@@ -648,7 +700,10 @@ mod tests {
         assert_eq!(rd64(&w, 0x070 + 0x30), 0x11_0000_0000);
         assert_eq!(rd64(&w, 0x070 + 0x38), COMPUTE_INFO_UNK_38); // "always 0x8c60"
         assert_eq!(rd32(&w, 0x070 + 0x58), COMPUTE_INFO_UNK_58);
-        assert_eq!(rd32(&w, 0x070 + 0x60), COMPUTE_INFO_IOGPU_UNK_40);
+        // The internal-program group is all-zero together when there is no helper.
+        assert_eq!(rd32(&w, 0x070 + 0x40), 0); // helper_program
+        assert_eq!(rd32(&w, 0x070 + 0x50), 0); // helper_cfg
+        assert_eq!(rd32(&w, 0x070 + 0x60), 0); // iogpu_unk_40
         // microsequence @0x1f0 (dump 0x1e8) — i.e. ComputeInfo really is 0x150.
         assert_eq!(rd64(&w, 0x1f0), 0xffff_ffa0_0c31_1cc0);
         assert_eq!(rd32(&w, 0x1f8), 0x240);
@@ -668,23 +723,59 @@ mod tests {
         assert_eq!(w[0x2d8], 0x15);
     }
 
-    /// The stamps are `NonZeroU64` in drm/asahi, so a builder that leaves them
-    /// null has produced an illegal command — worth an explicit guard, because
-    /// the firmware's only complaint is a job that never completes.
+    /// Every pointer drm/asahi passes unconditionally must be non-null in a built
+    /// command. The firmware's only complaint about a null one is a job that never
+    /// completes — no fault, no event — so the guard has to be here.
     #[test_case]
-    fn a_stamp_pointer_is_never_null_in_a_built_command() {
+    fn no_unconditional_pointer_is_null_in_a_built_command() {
         let w = run_compute(&c());
-        assert_ne!(rd64(&w, 0x284 + 0x04), 0);
-        assert_ne!(rd64(&w, 0x284 + 0x0c), 0);
+        assert_ne!(rd64(&w, 0x284 + 0x04), 0, "JobMeta.stamp");
+        assert_ne!(rd64(&w, 0x284 + 0x0c), 0, "JobMeta.fw_stamp");
+        assert_ne!(rd64(&w, 0x014), 0, "notifier / event_control");
+        assert_ne!(rd64(&w, 0x070 + 0x00), 0, "JobParameters1.preempt_buf1");
+        for (i, off) in (0x10..=0x28).step_by(8).enumerate() {
+            assert_ne!(rd64(&w, 0x070 + off), 0, "preempt_buf{}", i + 2);
+        }
+        assert_ne!(rd64(&w, 0x1fc + 0x28), 0, "JobParameters2.preempt_buf1");
+        assert_ne!(rd64(&w, 0x2b8), 0, "timestamp_pointers.start");
+        assert_ne!(rd64(&w, 0x2b8 + 8), 0, "timestamp_pointers.end");
+    }
+
+    /// `preempt_buf2..5` are 8-byte slots *inside* the same buffer, past
+    /// `compute_preempt1_size` — not separate allocations.
+    #[test_case]
+    fn the_preempt_slots_follow_preempt1_in_one_buffer() {
+        let w = run_compute(&c());
+        let base = rd64(&w, 0x070);
+        for n in 0..4u64 {
+            assert_eq!(rd64(&w, 0x070 + 0x10 + 8 * n as usize), base + PREEMPT1_SIZE_T8112 + 8 * n);
+        }
+        // The last slot must still be inside the buffer we asked callers to reserve.
+        assert!(PREEMPT1_SIZE_T8112 + 8 * 3 + 8 <= PREEMPT_BUF_SIZE);
+    }
+
+    /// A null preempt buffer must not synthesise bogus non-null offset pointers —
+    /// `base + 0x10000` for `base == 0` is a plausible address and would be worse
+    /// than the null it came from.
+    #[test_case]
+    fn a_null_preempt_buffer_stays_null_in_every_slot() {
+        let w = run_compute(&ComputeCmd { preempt_buf: 0, ..c() });
+        for off in (0x00..=0x28).step_by(8) {
+            if off == 0x08 {
+                continue; // cdm_ctrl_stream_base
+            }
+            assert_eq!(rd64(&w, 0x070 + off), 0);
+        }
+        assert_eq!(rd64(&w, 0x1fc + 0x28), 0);
     }
 
     #[test_case]
     fn sub_struct_sizes() {
         let mut b = Buf::new();
-        compute_info(&mut b, &c());
+        job_params1(&mut b, &c());
         assert_eq!(b.len(), 0x150);
         let mut b = Buf::new();
-        compute_info2(&mut b, &c());
+        job_params2(&mut b, &c());
         assert_eq!(b.len(), 0x60);
         let mut b = Buf::new();
         encoder_params(&mut b, &c());
@@ -764,7 +855,7 @@ mod tests {
             uuid: 7,
             ..Default::default()
         };
-        let ms = microseq_compute(&refs, OP_WAIT_FOR_IDLE_COMPUTE);
+        let ms = microseq_compute(&refs);
         // StartCompute, then WaitForIdle, then FinalizeCompute, then End.
         assert_eq!(rd32(&ms, 0), OP_START_COMPUTE);
         assert_eq!(rd64(&ms, 0x004), 0x1000 + WC_UNK_BUF_OFFSET);
@@ -825,15 +916,18 @@ mod tests {
         assert_eq!(queue_cmd_count_for(base), base >> 8);
     }
 
-    /// The two candidate pipe encodings must differ in exactly which byte carries
-    /// the 0x80 — that is the whole point of being able to A/B them.
+    /// Pin the derivation from drm/asahi rather than the literal: `Pipe::Compute`
+    /// is `1 << 15` and the header ORs in `pipe << 8`.
     #[test_case]
-    fn the_two_pipe_readings_differ_only_in_the_selector_byte() {
-        let a = OP_WAIT_FOR_IDLE_COMPUTE.to_le_bytes();
-        let b = OP_WAIT_FOR_IDLE_COMPUTE_ALT.to_le_bytes();
-        assert_eq!((a[0], b[0]), (0x01, 0x01)); // same magic
-        assert_eq!((a[2], a[3]), (0x80, 0x00));
-        assert_eq!((b[2], b[3]), (0x00, 0x80));
+    fn the_compute_pipe_selector_is_derived_not_guessed() {
+        const PIPE_VERTEX: u32 = 1 << 0;
+        const PIPE_FRAGMENT: u32 = 1 << 8;
+        const PIPE_COMPUTE: u32 = 1 << 15;
+        let hdr = |pipe: u32| 0x01u32 | (pipe << 8);
+        // The proxyclient's TA/3D calls are (1,0,0) and (0,1,0) — bytes 1 and 2.
+        assert_eq!(hdr(PIPE_VERTEX).to_le_bytes(), [0x01, 0x01, 0x00, 0x00]);
+        assert_eq!(hdr(PIPE_FRAGMENT).to_le_bytes(), [0x01, 0x00, 0x01, 0x00]);
+        assert_eq!(hdr(PIPE_COMPUTE), OP_WAIT_FOR_IDLE_COMPUTE);
         let g = gpu_context_data();
         assert_eq!(g.len(), 0x40);
         assert_eq!((g[0], g[1], g[5], g[0x1e], g[0x23]), (0xff, 0xff, 1, 0xff, 2));

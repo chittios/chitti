@@ -81,15 +81,19 @@ fn status_str_advance(s: &str, cw: u64, ch: u64) -> u64 {
 }
 
 /// Live right-side status chips (same content the bar paints, in order).
-fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> {
+fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String, crate::icons::DeviceStatus)> {
+    use crate::icons::DeviceStatus;
     let mut out = alloc::vec::Vec::new();
     let last_k = crate::console::input_activity_ms();
     let k_active = last_k != 0 && crate::arch::now_ms().saturating_sub(last_k) < 1500;
-    out.push((StatusChip::Kbd, crate::icons::status_kbd(k_active)));
+    let k_st = crate::console::keyboard_status();
+    out.push((StatusChip::Kbd, crate::icons::status_kbd(k_st, k_active), k_st));
     let last_m = crate::mouse::activity_ms();
     let m_active = last_m != 0 && crate::arch::now_ms().saturating_sub(last_m) < 1500;
-    out.push((StatusChip::Mouse, crate::icons::status_mouse(m_active)));
-    out.push((StatusChip::Net, crate::icons::status_net(crate::net::is_up())));
+    let m_st = crate::mouse::pointer_status();
+    out.push((StatusChip::Mouse, crate::icons::status_mouse(m_st, m_active), m_st));
+    let n_st = crate::net::device_status();
+    out.push((StatusChip::Net, crate::icons::status_net(n_st), n_st));
     // mem / cpu / cores — match ui_config::resolve_var labels
     {
         let m = crate::mm::mem_stats();
@@ -105,7 +109,7 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> 
         } else {
             alloc::format!("mem {}/{}M", m.heap_used / mib, m.ram_total / mib)
         };
-        out.push((StatusChip::Mem, mem));
+        out.push((StatusChip::Mem, mem, DeviceStatus::Ready));
     }
     out.push((
         StatusChip::Cpu,
@@ -114,17 +118,20 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> 
             crate::shell::cpu_percent(),
             crate::arch::cpu_count()
         ),
+        DeviceStatus::Ready,
     ));
     if let Some(b) = crate::drivers::battery::cached() {
         let s = crate::drivers::battery::format(&b);
         if !s.is_empty() {
-            out.push((StatusChip::Battery, s));
+            out.push((StatusChip::Battery, s, DeviceStatus::Ready));
         }
     }
-    // Volume always shown (software gain applies even with no PCM device yet).
+    // Volume always shown — disabled (dim, x-mark) until a PCM device is up.
+    let v_st = crate::sound::device_status();
     out.push((
         StatusChip::Volume,
-        crate::icons::status_volume(crate::sound::muted(), crate::sound::volume()),
+        crate::icons::status_volume(v_st, crate::sound::muted(), crate::sound::volume()),
+        v_st,
     ));
     // Only shown when there is something unread — the Battery precedent above.
     // A machine with nothing to say has a byte-identical status bar, and
@@ -132,17 +139,26 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String)> 
     // drops the separator too.
     let unread = crate::notify::chip_text(crate::notify::unread_count());
     if !unread.is_empty() {
-        out.push((StatusChip::Notifications, unread));
+        out.push((StatusChip::Notifications, unread, DeviceStatus::Ready));
     }
     // Red ● + elapsed while a take is live; absent otherwise (same empty-chip
     // rule as notifications). Clicking it stops the recording.
     let rec = crate::shell::record::chip_text();
     if !rec.is_empty() {
-        out.push((StatusChip::Recording, rec));
+        out.push((StatusChip::Recording, rec, DeviceStatus::Ready));
     }
     // Compact macOS-style clock (no year / seconds / tz — dropdown has the rest).
-    out.push((StatusChip::Clock, crate::clock::format_datetime_short()));
+    out.push((StatusChip::Clock, crate::clock::format_datetime_short(), DeviceStatus::Ready));
     out
+}
+
+fn chip_ink(sc: &Screen, st: crate::icons::DeviceStatus) -> Rgb {
+    use crate::icons::DeviceStatus;
+    match st {
+        DeviceStatus::Ready => sc.theme.status_fg,
+        DeviceStatus::Pending => sc.mix(sc.theme.status_fg, sc.theme.status_bg, 0.40),
+        DeviceStatus::Disabled => sc.mix(sc.theme.status_fg, sc.theme.status_bg, 0.65),
+    }
 }
 
 /// Set the status-bar text (left = brand, right = datetime), then repaint just
@@ -299,11 +315,11 @@ impl Screen {
             self.draw_status_str(tx, top, line, fg, self.theme.status_bg, max_x);
             top += row;
         }
-        for (chip, text) in status_right_chips() {
+        for (chip, text, st) in status_right_chips() {
             if top + row > last {
                 break;
             }
-            self.draw_status_str(tx, top, &text, self.theme.status_fg, self.theme.status_bg, max_x);
+            self.draw_status_str(tx, top, &text, chip_ink(self, st), self.theme.status_bg, max_x);
             set_status_chip_rect(chip, (bx, top, bw, row));
             top += row;
         }
@@ -361,7 +377,7 @@ impl Screen {
         let gap1 = cw; // within a tight group
         let gap2 = 2 * cw; // between groups
         let mut total = 0u64;
-        for (i, (_, text)) in chips.iter().enumerate() {
+        for (i, (_, text, _)) in chips.iter().enumerate() {
             if i > 0 {
                 // kbd–mouse single space; otherwise group gap
                 total += if i == 1 { gap1 } else { gap2 };
@@ -375,7 +391,7 @@ impl Screen {
             .max(left_end)
             .min(self.width.saturating_sub(OUTER));
         let max_x = self.width.saturating_sub(OUTER / 2);
-        for (i, (chip, text)) in chips.iter().enumerate() {
+        for (i, (chip, text, st)) in chips.iter().enumerate() {
             if i > 0 {
                 x += if i == 1 { gap1 } else { gap2 };
             }
@@ -387,7 +403,7 @@ impl Screen {
                 x,
                 ty,
                 text,
-                self.theme.status_fg,
+                chip_ink(self, *st),
                 self.theme.status_bg,
                 max_x,
             );

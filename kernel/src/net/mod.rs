@@ -15,7 +15,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Loopback, Medium};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
@@ -305,12 +305,27 @@ pub fn is_up() -> bool {
     NET.with(|n| n.is_some())
 }
 
+/// Set once boot (or `/network`) has finished looking for a NIC.
+static DISCOVERY_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Record that NIC discovery has run, whether or not a device was found.
+pub fn mark_probed() {
+    DISCOVERY_DONE.store(true, Ordering::Relaxed);
+}
+
+/// Status-bar chip: Ready with a NIC, Pending until the first probe, Disabled
+/// after a probe that found nothing.
+pub fn device_status() -> crate::icons::DeviceStatus {
+    crate::icons::device_status(is_up(), DISCOVERY_DONE.load(Ordering::Relaxed))
+}
+
 /// Discover and bring up the first available NIC, then **auto-start DHCP** so the
 /// link comes up with an address on boot — the way a desktop OS does — without
 /// the user running `/network dhcp`. Tries virtio-net, then a PCI NIC, over each
 /// transport the platform exposes. No-op if none is found. Called once at boot.
 pub fn autodetect() {
     if is_up() {
+        mark_probed();
         return;
     }
     let mut brought_up = false;
@@ -346,6 +361,7 @@ pub fn autodetect() {
         let _ = dhcp_start();
         crate::ktrace::log("net", "autoconnect: DHCP started on eth0");
     }
+    mark_probed();
 }
 
 /// One-shot flag: best-effort SNTP after first IPv4 config (DHCP or static).

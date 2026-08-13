@@ -277,9 +277,34 @@ pub fn is_icon(ch: char) -> bool {
 /// full icon size and read as a giant blob next to the mouse/keyboard).
 const ACTIVE_MARK: char = '\u{00B7}'; // middle dot ·
 
-/// Status-bar keyboard indicator (active = icon + small body-size mark).
-pub fn status_kbd(active: bool) -> alloc::string::String {
-    if active {
+/// Whether a status-bar device chip is live, still coming up, or missing.
+///
+/// The painter dims Pending / Disabled; the glyph itself stays the device's
+/// own icon so the bar does not sprout a second "broken" mark next to every
+/// chip. Ready + recent input still gets the middle-dot activity pulse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeviceStatus {
+    Ready,
+    Pending,
+    Disabled,
+}
+
+/// Map "is the device up?" + "has discovery finished?" onto a chip state.
+///
+/// Pure: `Ready` wins, then `Pending` until the first probe, then `Disabled`.
+pub fn device_status(is_up: bool, discovery_done: bool) -> DeviceStatus {
+    if is_up {
+        DeviceStatus::Ready
+    } else if !discovery_done {
+        DeviceStatus::Pending
+    } else {
+        DeviceStatus::Disabled
+    }
+}
+
+/// Status-bar keyboard indicator.
+pub fn status_kbd(state: DeviceStatus, recent: bool) -> alloc::string::String {
+    if state == DeviceStatus::Ready && recent {
         alloc::format!("{}{}", fa::KEYBOARD, ACTIVE_MARK)
     } else {
         fa::KEYBOARD.to_string()
@@ -287,8 +312,8 @@ pub fn status_kbd(active: bool) -> alloc::string::String {
 }
 
 /// Status-bar mouse indicator.
-pub fn status_mouse(active: bool) -> alloc::string::String {
-    if active {
+pub fn status_mouse(state: DeviceStatus, recent: bool) -> alloc::string::String {
+    if state == DeviceStatus::Ready && recent {
         alloc::format!("{}{}", fa::MOUSE, ACTIVE_MARK)
     } else {
         fa::MOUSE.to_string()
@@ -296,26 +321,21 @@ pub fn status_mouse(active: bool) -> alloc::string::String {
 }
 
 /// Status-bar network indicator.
-pub fn status_net(up: bool) -> alloc::string::String {
-    if up {
-        fa::WIFI.to_string()
-    } else {
-        // network-wired when down still reads as "net", dimmer via theme fg.
-        fa::NETWORK.to_string()
+pub fn status_net(state: DeviceStatus) -> alloc::string::String {
+    match state {
+        DeviceStatus::Ready => fa::WIFI.to_string(),
+        // Same glyph as "no link" — the painter dims it when disabled.
+        DeviceStatus::Pending | DeviceStatus::Disabled => fa::NETWORK.to_string(),
     }
 }
 
-/// Status-bar **volume** chip: FA speaker glyph that reflects mute / level.
-/// Compact like macOS (icon only — percent lives in the dropdown).
-pub fn status_volume(muted: bool, pct: u32) -> alloc::string::String {
-    let icon = if muted {
-        fa::VOLUME_XMARK
-    } else if pct == 0 {
-        fa::VOLUME_OFF
-    } else if pct < 50 {
-        fa::VOLUME_LOW
-    } else {
-        fa::VOLUME_HIGH
+/// Status-bar **volume** chip: FA speaker glyph that reflects mute / level
+/// when a device is up, and a quiet speaker when it is not.
+pub fn status_volume(state: DeviceStatus, muted: bool, pct: u32) -> alloc::string::String {
+    let icon = match state {
+        DeviceStatus::Ready => volume_icon(muted, pct),
+        DeviceStatus::Pending => fa::VOLUME_OFF,
+        DeviceStatus::Disabled => fa::VOLUME_XMARK,
     };
     icon.to_string()
 }
@@ -490,16 +510,26 @@ mod tests {
     }
 
     #[test_case]
+    fn device_status_is_ready_then_pending_then_disabled() {
+        assert_eq!(device_status(true, false), DeviceStatus::Ready);
+        assert_eq!(device_status(true, true), DeviceStatus::Ready);
+        assert_eq!(device_status(false, false), DeviceStatus::Pending);
+        assert_eq!(device_status(false, true), DeviceStatus::Disabled);
+    }
+
+    #[test_case]
     fn status_helpers_compose_active_mark() {
-        let k = status_kbd(true);
+        let k = status_kbd(DeviceStatus::Ready, true);
         assert!(k.starts_with(fa::KEYBOARD));
         // Active mark is a body-size middle-dot, never a full FA circle.
         assert!(k.contains(ACTIVE_MARK));
         assert!(!k.contains(fa::CIRCLE));
-        assert_eq!(status_kbd(false), fa::KEYBOARD.to_string());
-        assert_eq!(status_mouse(true).chars().count(), 2);
-        assert_eq!(status_net(true), fa::WIFI.to_string());
-        assert_eq!(status_net(false), fa::NETWORK.to_string());
+        assert_eq!(status_kbd(DeviceStatus::Ready, false), fa::KEYBOARD.to_string());
+        assert_eq!(status_kbd(DeviceStatus::Disabled, true), fa::KEYBOARD.to_string());
+        assert_eq!(status_mouse(DeviceStatus::Ready, true).chars().count(), 2);
+        assert_eq!(status_net(DeviceStatus::Ready), fa::WIFI.to_string());
+        assert_eq!(status_net(DeviceStatus::Disabled), fa::NETWORK.to_string());
+        assert_eq!(status_net(DeviceStatus::Pending), fa::NETWORK.to_string());
     }
 
     #[test_case]
@@ -511,8 +541,22 @@ mod tests {
         assert_eq!(volume_icon(false, 100), fa::VOLUME_HIGH);
         assert!(is_icon(fa::VOLUME_HIGH));
         assert!(is_icon(fa::VOLUME_XMARK));
-        assert_eq!(status_volume(false, 100), fa::VOLUME_HIGH.to_string());
-        assert_eq!(status_volume(true, 100), fa::VOLUME_XMARK.to_string());
+        assert_eq!(
+            status_volume(DeviceStatus::Ready, false, 100),
+            fa::VOLUME_HIGH.to_string()
+        );
+        assert_eq!(
+            status_volume(DeviceStatus::Ready, true, 100),
+            fa::VOLUME_XMARK.to_string()
+        );
+        assert_eq!(
+            status_volume(DeviceStatus::Pending, false, 100),
+            fa::VOLUME_OFF.to_string()
+        );
+        assert_eq!(
+            status_volume(DeviceStatus::Disabled, false, 100),
+            fa::VOLUME_XMARK.to_string()
+        );
     }
 
     #[test_case]

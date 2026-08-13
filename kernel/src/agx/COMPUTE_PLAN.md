@@ -268,6 +268,94 @@ that never raises hangs exactly like this and produces no other signal.
 `/agx compute alt` runs the same submission with the byte-3 reading so one boot
 decides it.
 
+## drm/asahi is cloneable, and it settles the rest (2026-08)
+
+The whole "the dispatch ABI is undocumented, only Mesa has it" framing above is
+about the **USC/register encoding**, and it is still true of that. But the
+*submission* — every struct on this page — is in **drm/asahi**, the Rust GPU driver
+in the Asahi Linux tree, and it clones in a couple of minutes:
+
+```sh
+git clone --filter=blob:none --no-checkout --depth=1 -b asahi \
+    https://github.com/AsahiLinux/linux.git
+cd linux && git sparse-checkout init --cone \
+  && git sparse-checkout set drivers/gpu/drm/asahi && git checkout
+```
+
+Read `fw/compute.rs` (the `RunCompute` struct), `fw/job.rs` (`JobMeta`,
+`EncoderParams`, `TimestampPointers`), `fw/microseq.rs` (opcodes and `Pipe`) and
+`queue/compute.rs` (what a real submission sets). That should have been step one;
+reconstructing it from recollection is what produced every error in this file.
+
+What it settled:
+
+- **`Pipe::Compute = 1 << 15`**, and `WaitForIdle::new` ORs in `pipe << 8`, so the
+  header is `0x0080_0001` — the default was right and the `alt` reading was wrong.
+  `/agx compute alt` is **removed**; a knob for a disproven hypothesis is a trap.
+- **`RetireStamp::HEADER = with_args(0x18, 0x40000000)` = `0x40000018`** — identical
+  to m1n1's `EndCmd`, so our final op was already correct.
+- **The microsequence is exactly StartCompute → WaitForIdle → FinalizeCompute →
+  RetireStamp** for `G < G14X`. `WaitForIdle2` *replaces* `WaitForIdle` on G14X
+  rather than following it, and the `Timestamp` ops are gated on a userspace request.
+  So no op was missing.
+- **`JobMeta` = 0x2c confirmed a second way**: `GpuWeakPointer<T>(NonZeroU64, …)` is
+  8 bytes. Two independent references and the capture now agree.
+- **`preempt_buf1..5` are required** — what m1n1 calls `iogpu_deflake_1..5` is GPU
+  preemption scratch, `compute_preempt1_size` for **t8112 = 0x10000** plus four
+  8-byte slots, allocated per job from the **user** VM and passed unconditionally
+  (and `preempt_buf1` again in `JobParameters2` at +0x28). We were passing null.
+- **`timestamp_pointers` are always `Some`** — a `JobTimestamps` of two `AtomicU64`s
+  that the firmware writes. We were passing null.
+- **`iogpu_unk_40` must be 0, not 0x1c**, together with `helper_program`/`helper_arg`
+  /`helper_cfg`: they are one internal-program group. Copying `0x1c` from the capture
+  (whose job used a helper) while leaving `helper_program` null was self-inconsistent
+  — a fault I *introduced* in the pass above by trusting the capture over the source.
+- **The field at +0x30 is `usc_exec_base_cp`**, not a generic "pipeline base"; ours
+  is consistent with it, but the name matters for the USC short-pointer arithmetic.
+
+So the two remaining nulls the firmware writes through (`preempt_buf`, `timestamps`)
+are now real buffers, and `iogpu_unk_40` is consistent. Those are the best candidates
+for the hang: both are firmware stores through a null pointer, which is precisely a
+job that is dequeued and then produces no fault, no event and no completion.
+
+### The alt A/B was unreadable, and why (second run, same boot)
+
+`/agx compute alt` in the **same boot** reported `gpu_rptr=0x0` and
+`Stats 0x32->0x32` — "never took the ring entry", firmware idle. That is *not*
+evidence about the pipe constant: **the first dispatch's hung job wedges the
+firmware**, so every later submission in that boot reads as ignored no matter what
+changed. Only dispatch #1 of a boot is a clean experiment, and `/agx compute` now
+says which number it is.
+
+Two additions make the loop iterable instead of one-experiment-per-reboot, both
+read straight out of the replayed initdata (the capture recorded these regions):
+
+- **`/agx health`** — `InitData_FWStatus.{halted, halt_count, resume}` and
+  `AGXFaultInfo.{status, do_not_halt, did_not_halt, total_halts}`. The AP-side
+  cursors cannot say "I halted"; this can, and a halted coprocessor explains both
+  the silent job *and* why later dispatches are ignored.
+- **`/agx recover`** — the reference driver's `recover()`: zero `halted`, set
+  `resume`. Turns a wedging job into a retry rather than a reboot.
+
+Also now reported per dispatch: the `CommandQueueInfo` fields the **firmware**
+writes in our own buffer — `busy`, `has_commands`, `inflight_commands`,
+`error_count`. Those separate "the scheduler rejected this" (`error_count > 0`) from
+"it is in flight and stuck" (`inflight > 0`, no completion), which the ring cursors
+cannot.
+
+### `stats_ptr` was a null pointer handed to the firmware — now resolved
+
+`StartComputeCmd.stats_ptr` was 0. The reference always passes a real
+`GpuStatsComp` and the firmware **writes through it**, so 0 is a null dereference
+*inside the firmware* — which produces no GPU MMU fault and no event, i.e. exactly
+"dequeued, then never heard from again". It needed no capture after all:
+`InitData_RegionB` carries `stats_ta_addr`/`stats_3d_addr`/`stats_cp_addr` at +0x170
+/+0x178/+0x180 and RegionB is already replayed, so the pointer is **read at run
+time**. Two of the three neighbours have known values in the capture, so the offset
+arithmetic is **validated on hardware** before the pointer is used, and `stats_cp`
+is refused rather than guessed if they disagree — a plausible wrong pointer handed
+to the firmware is worse than none.
+
 Two things that run also corrected in the harness itself:
 
 - **`gpu_rptr`, not the channel read pointer, is the authority on whether the
@@ -292,9 +380,12 @@ queue ring (`gpu_rptr`), whether either stamp/`event_count` moved, the **decoded
 Event-channel messages (Flag = completed vs Fault/Timeout/ChannelError = rejected),
 and the firmware's own log text.
 
-Known-remaining gap in the submission itself: `StartComputeCmd.stats_ptr` is 0. The
-real driver points it at the `GpuStatsComp` region *inside* the initdata we replay,
-so resolving it means locating that offset in the captured blob.
+Known-remaining gaps in the submission itself, both null where the reference passes
+a real buffer: `ComputeInfo.iogpu_deflake_1` (a `ComputeArgs` block) and the helper
+program (`helper_program`/`helper_arg`/`helper_cfg` = 0x41 / a GEM buffer / 0x40 in
+the capture). The reference's own note says only the cmdlist and pipeline base are
+*strictly* needed, so these are the next things to fill in if the microsequence
+still hangs with the pipe constant and `stats_ptr` settled.
 
 ## Open questions to resolve during capture
 
