@@ -359,9 +359,18 @@ fn attachments(b: &mut Buf) {
     b.u32(0); // num_attachments
 }
 
+/// The alternative reading of the compute pipe selector — 0x80 in byte **3**
+/// rather than byte 2. Kept as a named constant so a hardware run can A/B the two
+/// in one boot (`/agx compute alt`) instead of one guess per rebuild: a
+/// `WaitForIdle` on a pipe that never raises hangs the microsequence *silently* —
+/// no fault, no event — which is exactly what the first successfully-scheduled
+/// dispatch showed on the M2.
+pub const OP_WAIT_FOR_IDLE_COMPUTE_ALT: u32 = 0x8000_0001;
+
 /// Build the compute microsequence (StartCompute → WaitForIdle → FinalizeCompute →
-/// End) for G14G/V13.5.
-pub fn microseq_compute(r: &MicroSeqRefs) -> Vec<u8> {
+/// End) for G14G/V13.5. `wait_header` is the `WaitForIdle` op word — pass
+/// [`OP_WAIT_FOR_IDLE_COMPUTE`] unless A/B-ing it against the `_ALT` reading.
+pub fn microseq_compute(r: &MicroSeqRefs, wait_header: u32) -> Vec<u8> {
     let mut b = Buf::new();
     // --- StartComputeCmd (magic 0x29), 0x16c bytes ---
     let start = b.len();
@@ -386,7 +395,7 @@ pub fn microseq_compute(r: &MicroSeqRefs) -> Vec<u8> {
     b.u64(r.event_ctrl_buf); // event_ctrl_buf_addr         +0x164 → 0x16c
 
     // --- WaitForInterruptCmd (magic 0x01), compute pipe ---
-    b.u32(OP_WAIT_FOR_IDLE_COMPUTE);
+    b.u32(wait_header);
 
     // --- FinalizeComputeCmd (magic 0x2a), 0x7c bytes ---
     let finalize = b.len();
@@ -527,10 +536,28 @@ pub fn event_count() -> Vec<u8> {
     alloc::vec![0u8; 4]
 }
 
-/// A `StampCounter` (u32) pre-set to `value`, as the proxyclient initialises both
-/// of a queue's stamps to the job's stamp value before the first submission.
+/// A `StampCounter` (u32) pre-set to `value`.
+///
+/// The proxyclient seeds both of a queue's stamps with the **base** value and
+/// gives each submission `base + 0x100 * n` ([`stamp_value_for`]), so a completed
+/// job leaves the counter *different* from its seed. Seeding a counter with the
+/// value the job completes with makes completion unobservable — which is how a
+/// hardware run reported both stamps holding the expected value while
+/// `gpu_doneptr` said the job had not finished.
 pub fn stamp_counter(value: u32) -> Vec<u8> {
     value.to_le_bytes().to_vec()
+}
+
+/// The stamp value submission `n` (1-based) of a queue completes with, given the
+/// queue's base — the proxyclient's `stamp_value += 0x100` per job.
+pub const fn stamp_value_for(base: u32, n: u32) -> u32 {
+    base + 0x100 * n
+}
+
+/// `JobMeta.queue_cmd_count` — the proxyclient derives it from the *previous*
+/// stamp value (`prev_stamp_value >> 8`), not from a plain submission count.
+pub const fn queue_cmd_count_for(prev_stamp_value: u32) -> u32 {
+    prev_stamp_value >> 8
 }
 
 /// Encoded size of [`event_control`]; its trailing `unk_buf` is at 0xa8.
@@ -737,7 +764,7 @@ mod tests {
             uuid: 7,
             ..Default::default()
         };
-        let ms = microseq_compute(&refs);
+        let ms = microseq_compute(&refs, OP_WAIT_FOR_IDLE_COMPUTE);
         // StartCompute, then WaitForIdle, then FinalizeCompute, then End.
         assert_eq!(rd32(&ms, 0), OP_START_COMPUTE);
         assert_eq!(rd64(&ms, 0x004), 0x1000 + WC_UNK_BUF_OFFSET);
@@ -785,6 +812,28 @@ mod tests {
         assert_eq!(&ec[EC_UNK_BUF_OFFSET as usize..], &[0xff; 8]);
         assert_eq!(event_count().len(), 4);
         assert_eq!(stamp_counter(0x3b00), 0x3b00u32.to_le_bytes());
+    }
+
+    /// A job must not complete with the value its stamp was seeded with, or
+    /// "finished" and "never started" read identically.
+    #[test_case]
+    fn a_jobs_stamp_value_differs_from_its_seed() {
+        let base = 0xc500_0000u32;
+        assert_ne!(stamp_value_for(base, 1), base);
+        assert_eq!(stamp_value_for(base, 1), base + 0x100);
+        assert_eq!(stamp_value_for(base, 2), base + 0x200);
+        assert_eq!(queue_cmd_count_for(base), base >> 8);
+    }
+
+    /// The two candidate pipe encodings must differ in exactly which byte carries
+    /// the 0x80 — that is the whole point of being able to A/B them.
+    #[test_case]
+    fn the_two_pipe_readings_differ_only_in_the_selector_byte() {
+        let a = OP_WAIT_FOR_IDLE_COMPUTE.to_le_bytes();
+        let b = OP_WAIT_FOR_IDLE_COMPUTE_ALT.to_le_bytes();
+        assert_eq!((a[0], b[0]), (0x01, 0x01)); // same magic
+        assert_eq!((a[2], a[3]), (0x80, 0x00));
+        assert_eq!((b[2], b[3]), (0x00, 0x80));
         let g = gpu_context_data();
         assert_eq!(g.len(), 0x40);
         assert_eq!((g[0], g[1], g[5], g[0x1e], g[0x23]), (0xff, 0xff, 1, 0xff, 2));

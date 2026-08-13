@@ -713,9 +713,23 @@ fn wait_link(port: u64, timeout_ms: u64, tag: &str) -> (bool, u32, u32) {
 }
 
 /// Full PERST cycle + LTSSM start (Linux `apple_pcie_setup_port`).
-/// Drives **both** the pinctrl GPIO (ACTIVE_LOW) and `PORT_PERST`.
+/// Exact port of Asahi `apple_pcie_setup_link` + `apple_pcie_setup_refclk`
+/// (`t8103_hw`, which `"apple,pcie"` matches on t8112). Drives **both** the
+/// pinctrl GPIO (ACTIVE_LOW) and `PORT_PERST`.
+///
+/// **The load-bearing ordering:** module power (`gP0d`/pwren) is asserted **while
+/// PERST# is held**, then the endpoint refclk, then a **100 ms settle**, then
+/// PERST# de-assert, then a **second 100 ms settle**. This is the only sequence
+/// under which the dongle's own PMU starts its main clock domain and powers
+/// SYS_MEM/CA7 — it samples PERST#/straps at de-assert with power already
+/// settled. Applying power out of step (or after the link is already up) leaves
+/// the RAM domain gated, which is the BAR2/TCM read-abort blocker.
 fn port_perst_cycle_and_ltssm(port: u64, port_phy: u64, pinctrl: u64) {
-    // 1) Assert PERST# (GPIO first, then port reg) — device held in reset.
+    // 0) APPCLK on.
+    let app = r32(port + PORT_APPCLK as u64);
+    w32(port + PORT_APPCLK as u64, app | PORT_APPCLK_EN);
+
+    // 1) Assert PERST# (GPIO then port reg) — device held in reset.
     perst_gpio_assert(pinctrl);
     let perst = r32(port + PORT_PERST as u64);
     w32(port + PORT_PERST as u64, perst & !PORT_PERST_OFF);
@@ -724,13 +738,19 @@ fn port_perst_cycle_and_ltssm(port: u64, port_phy: u64, pinctrl: u64) {
         r32(port + PORT_STATUS as u64),
         r32(port + PORT_LINKSTS as u64)
     ));
-    mdelay(10);
+    mdelay(1);
 
-    // 2) Refclk while held in reset (Linux: assert GPIO, then setup_refclk).
+    // 2) Power the module (gP0d/pwren) WHILE PERST# is asserted — THE fix. The
+    //    dongle boot ROM samples this and starts its PMU on PERST# de-assert.
+    super::apple_smc::wifi_power_on();
+
+    // 3) Enable the endpoint refclk (req/ack/en + PORT_REFCLK_EN) held in reset.
     port_clocks_on(port, port_phy);
-    mdelay(1); // Tperst-clk ≥ 100 µs
 
-    // 3) Deassert PORT_PERST then GPIO (Linux order).
+    // 4) Settle 100 ms (pwren present — Asahi's power case, not the 100 µs one).
+    mdelay(100);
+
+    // 5) De-assert PERST# (port reg then GPIO).
     let perst = r32(port + PORT_PERST as u64);
     w32(port + PORT_PERST as u64, perst | PORT_PERST_OFF);
     perst_gpio_deassert(pinctrl);
@@ -738,9 +758,11 @@ fn port_perst_cycle_and_ltssm(port: u64, port_phy: u64, pinctrl: u64) {
         "pcie: {port:#x} PERST deassert PERST={:#x}",
         r32(port + PORT_PERST as u64)
     ));
-    mdelay(100); // PCIe r5.0 §6.6.1
 
-    // 4) Wait READY
+    // 6) Second mandatory settle 100 ms.
+    mdelay(100);
+
+    // 7) Wait READY (100 µs poll, 250 ms timeout).
     let deadline = crate::arch::now_ms() + 250;
     while crate::arch::now_ms() < deadline {
         if r32(port + PORT_STATUS as u64) & PORT_STATUS_READY != 0 {
@@ -749,11 +771,16 @@ fn port_perst_cycle_and_ltssm(port: u64, port_phy: u64, pinctrl: u64) {
         core::hint::spin_loop();
     }
 
-    // 5) Kick LTSSM (clear then START so a sticky bit re-arms).
+    // 8) Clear clock-gating disables (setup_port tail).
+    let refc = r32(port + PORT_REFCLK as u64);
+    w32(port + PORT_REFCLK as u64, refc & !PORT_REFCLK_CGDIS);
+    let app = r32(port + PORT_APPCLK as u64);
+    w32(port + PORT_APPCLK as u64, app & !PORT_APPCLK_CGDIS);
+
+    // 9) Kick LTSSM (clear then START so a sticky bit re-arms).
     w32(port + PORT_LTSSMCTL as u64, 0);
     mdelay(1);
     w32(port + PORT_LTSSMCTL as u64, PORT_LTSSMCTL_START);
-    // PORT_PREFMEM (0x994) is RAZ/WI on t8112; host MEM uses the non-pref path.
     crate::ktrace::log_fmt(format_args!(
         "pcie: {port:#x} LTSSMCTL={:#x} STATUS={:#x} LINKSTS={:#x}",
         r32(port + PORT_LTSSMCTL as u64),
@@ -1006,17 +1033,17 @@ pub fn hard_reset_wifi_port() -> bool {
     }
     crate::ktrace::log(
         "pcie",
-        "HARD reset of WiFi endpoint: SMC power-cycle + PERST# (cold-boot so PMU re-powers RAM)",
+        "HARD reset: power OFF, then PERST# cycle with power re-applied DURING reset (Asahi order)",
     );
 
-    // Full SMC power-cycle FIRST — PERST# alone leaves the dongle PMU's resource
-    // state intact (RAM stays gated); a rail off→on cold-boots the chip so the
-    // PMU reloads its defaults with the SYS_MEM/RAM domain powered.
-    super::apple_smc::wifi_power_cycle();
-
-    // Then the full PERST cycle to bring the freshly-powered chip's link back up.
-    let app = r32(port0 + PORT_APPCLK as u64);
-    w32(port0 + PORT_APPCLK as u64, app | PORT_APPCLK_EN);
+    // Power the module fully OFF first so the dongle resets, THEN
+    // port_perst_cycle_and_ltssm re-applies power ON *while PERST# is asserted*
+    // and enables refclk with the two 100 ms settles — the only ordering under
+    // which the dongle's PMU starts and powers the SYS_MEM/CA7 RAM domain. A
+    // power-cycle that finishes before PERST (the old code) samples straps at
+    // the wrong instant and leaves RAM gated.
+    super::apple_smc::wifi_power_off();
+    mdelay(200);
     port_perst_cycle_and_ltssm(port0, port_phy, pinctrl);
     // A PERST retrain clears the axi2af/RC/config tunables m1n1 applied — without
     // re-applying them MEM outbound stays dead even though config works.

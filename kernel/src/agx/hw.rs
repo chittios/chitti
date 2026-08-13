@@ -1495,7 +1495,14 @@ impl Obj {
 /// even when the shader itself never ran.
 const COMPUTE_CTX_ID: u16 = 3;
 const COMPUTE_UUID: u32 = 0x00c5_0000;
-const COMPUTE_STAMP_VALUE: u32 = 0xc500_0000;
+/// The queue's stamp **base**: both stamp counters are seeded with this and the
+/// job completes with `base + 0x100` ([`workcmd::stamp_value_for`]), so the
+/// counters *changing* is what proves the firmware finished the job.
+const COMPUTE_STAMP_BASE: u32 = 0xc500_0000;
+/// How long to wait for a dispatch before diagnosing. Deliberately past the
+/// firmware's own job-timeout, so a hung microsequence produces a `TIMEOUT` event
+/// rather than silence.
+const COMPUTE_WAIT_MS: u64 = 8000;
 
 /// **A compute dispatch** — build the full submission (a GPU context holding the
 /// shader + USC + CDM stream, and the kernel-side queue + microsequence +
@@ -1514,9 +1521,10 @@ const COMPUTE_STAMP_VALUE: u32 = 0xc500_0000;
 /// the Event channel, what its own log says, and whether either stamp landed. Those
 /// distinguish "never scanned the channel" from "scheduled and faulted" from "ran
 /// and the shader is wrong", which are three different next steps.
-fn dispatch_hello_compute() {
+fn dispatch_hello_compute(wait_header: u32) {
     use super::{cdm, shaders, workcmd};
     use workcmd::{ComputeCmd, MicroSeqRefs, QueueRefs};
+    let stamp_value = workcmd::stamp_value_for(COMPUTE_STAMP_BASE, 1);
     if !uat_init() {
         crate::ktrace::log("agx", "compute: uat not ready — run /agx up first");
         return;
@@ -1617,11 +1625,11 @@ fn dispatch_hello_compute() {
         vm_slot: ctx.ctx_id as u32,
         uuid: COMPUTE_UUID,
         fw_stamp: o_fw_stamp.va,
-        stamp_value: COMPUTE_STAMP_VALUE,
+        stamp_value,
         unk_flag: o_wc.va + workcmd::WC_UNK_FLAG_OFFSET,
         event_ctrl_buf: o_ec.va + workcmd::EC_UNK_BUF_OFFSET,
         ..Default::default()
-    });
+    }, wait_header);
     let wc = workcmd::run_compute(&ComputeCmd {
         counter: 1,
         vm_slot: ctx.ctx_id as u32,
@@ -1635,9 +1643,9 @@ fn dispatch_hello_compute() {
         uuid: COMPUTE_UUID,
         stamp: o_stamp.va,
         fw_stamp: o_fw_stamp.va,
-        stamp_value: COMPUTE_STAMP_VALUE,
+        stamp_value,
         stamp_slot: 0,
-        queue_cmd_count: 1,
+        queue_cmd_count: workcmd::queue_cmd_count_for(COMPUTE_STAMP_BASE),
         client_sequence: 1,
     });
     // The ring holds u64 work-command pointers; entry 0 is this job and cpu_wptr
@@ -1664,11 +1672,12 @@ fn dispatch_hello_compute() {
     o_gctx.fill(&workcmd::gpu_context_data());
     o_ec.fill(&workcmd::event_control(o_evcount.va));
     o_evcount.fill(&workcmd::event_count());
-    // Both stamps start at the value the job will complete with, as the reference
-    // driver does — so a *change* is what proves the firmware wrote them, and the
-    // pre-seeded value can't be mistaken for completion.
-    o_stamp.fill(&workcmd::stamp_counter(COMPUTE_STAMP_VALUE));
-    o_fw_stamp.fill(&workcmd::stamp_counter(COMPUTE_STAMP_VALUE));
+    // Both stamps start at the queue's BASE, and the job completes with
+    // base + 0x100 — so a stamp reading `stamp_value` is proof the firmware
+    // finished the job. (Seeding them with the completion value, as this first
+    // did, makes "finished" and "never started" read identically.)
+    o_stamp.fill(&workcmd::stamp_counter(COMPUTE_STAMP_BASE));
+    o_fw_stamp.fill(&workcmd::stamp_counter(COMPUTE_STAMP_BASE));
 
     crate::ktrace::log_fmt(format_args!(
         "agx: compute: ctx {} — context: shader@{va_shader:#x} usc@{va_usc:#x} cdm@{va_cdm:#x} out@{va_out:#x}",
@@ -1680,10 +1689,10 @@ fn dispatch_hello_compute() {
     ));
     // Record the one encoding in the submission that is recalled rather than
     // derived from the vendored reference, so a hardware log says which value was
-    // tried (see `workcmd::OP_WAIT_FOR_IDLE_COMPUTE`).
+    // tried (`/agx compute alt` picks the other reading).
     crate::ktrace::log_fmt(format_args!(
-        "agx: compute: WaitForIdle header={:#010x} (compute pipe; alternative reading is 0x80000001)",
-        workcmd::OP_WAIT_FOR_IDLE_COMPUTE
+        "agx: compute: WaitForIdle header={wait_header:#010x} ({}), stamp seed={COMPUTE_STAMP_BASE:#x} -> completes at {stamp_value:#x}",
+        if wait_header == workcmd::OP_WAIT_FOR_IDLE_COMPUTE { "pipe byte 2, default" } else { "pipe byte 3, alt" }
     ));
 
     // Snapshot every firmware→AP channel so movement is attributable, plus the CL
@@ -1696,13 +1705,16 @@ fn dispatch_hello_compute() {
 
     // --- submit RunCmdQueueMsg on the CP channel (CL_0, id 2) + doorbell ---
     let msg = workcmd::run_cmd_queue_msg(workcmd::QUEUE_COMPUTE, o_qi.va, 1, 1, true);
-    let wptr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
+    // Wrap like every other channel writer: repeated dispatches keep bumping the
+    // write pointer, and past 0x100 an unwrapped index writes off the end of the
+    // ring into whatever the allocator put next.
+    let wptr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0) % CL_RING_ITEMS;
     let slot = CL_RING_VA + CL_ITEM * (wptr as u64);
     if gpu_write(slot, &msg) != msg.len() {
         crate::ktrace::log("agx", "compute: CL ring slot unmapped");
         return;
     }
-    gpu_write_u32(CL_STATE_VA + STATE_WRITE_PTR, wptr + 1);
+    gpu_write_u32(CL_STATE_VA + STATE_WRITE_PTR, (wptr + 1) % CL_RING_ITEMS);
     crate::ktrace::log_fmt(format_args!(
         "agx: compute: submitted on CL_0 — read={cl_rd_before} write {}->{}, doorbell {CL_CHANNEL:#x}",
         wptr,
@@ -1719,8 +1731,12 @@ fn dispatch_hello_compute() {
     // A general kick (0x10) nudges the firmware to pump its channels.
     let _ = send(&asc, proto::msg_doorbell(0x10), proto::EP_DOORBELL);
 
-    // --- poll the output buffer for the magic + watch for a GPU fault ---
-    let deadline = crate::arch::now_ms() + 3000;
+    // --- wait for the shader's output, a completion stamp, or a firmware event ---
+    // Long enough for the firmware's own job **timeout** to fire: a TimeoutMsg on
+    // the Event channel is a far more specific diagnosis than "nothing happened",
+    // and a hung microsequence produces nothing else at all. Ctrl+C still cuts it
+    // short, and `pump()` keeps the clock/mouse/net alive throughout.
+    let deadline = crate::arch::now_ms() + COMPUTE_WAIT_MS;
     let mut got = 0u32;
     while crate::arch::now_ms() < deadline {
         pump();
@@ -1728,6 +1744,14 @@ fn dispatch_hello_compute() {
         // SAFETY: out_phys is our identity-mapped page.
         got = unsafe { core::ptr::read_volatile(out_phys as *const u32) };
         if got == shaders::HELLO_COMPUTE_MAGIC {
+            break;
+        }
+        // A stamp firing or an Event posting means the firmware has finished with
+        // the job — there is nothing more to wait for, so stop and report.
+        if o_fw_stamp.read_u32(0) == stamp_value
+            || o_stamp.read_u32(0) == stamp_value
+            || gpu_read_u32(EVENT_STATE_VA + STATE_WRITE_PTR).unwrap_or(event_before) != event_before
+        {
             break;
         }
         if ABORT.load(core::sync::atomic::Ordering::Relaxed) {
@@ -1753,6 +1777,8 @@ fn dispatch_hello_compute() {
         fw_stamp: o_fw_stamp,
         ec: o_ec,
         evcount: o_evcount,
+        stamp_seed: COMPUTE_STAMP_BASE,
+        stamp_expect: stamp_value,
     });
 }
 
@@ -1768,6 +1794,10 @@ struct DispatchProbe {
     fw_stamp: Obj,
     ec: Obj,
     evcount: Obj,
+    /// What the stamp counters were seeded with, and the value a completed job
+    /// writes — reported together so a reader does not have to know the rule.
+    stamp_seed: u32,
+    stamp_expect: u32,
 }
 
 /// Report which stage of the submission the firmware reached. Each line answers a
@@ -1778,12 +1808,23 @@ fn diagnose_dispatch(p: &DispatchProbe) {
     use super::workcmd;
     sgx_fault_check();
 
-    // 1. Did the firmware take our message off the channel at all?
+    // 1. Did the firmware SCHEDULE the job — i.e. follow the channel message to
+    // the queue and take our ring entry? `gpu_rptr` is the authority here, not the
+    // channel's own read pointer: an M2 run showed `gpu_rptr` advance to 1 while
+    // CL_0's READ_PTR stayed 0, so the firmware does not publish that cursor back
+    // to shared memory and "read != write" is NOT evidence it ignored us.
+    let doneptr = p.rs.read_u32(workcmd::RS_GPU_DONEPTR);
+    let gpu_rptr = p.rs.read_u32(workcmd::RS_GPU_RPTR);
+    let cpu_wptr = p.rs.read_u32(workcmd::RS_CPU_WPTR);
     let cl_rd = gpu_read_u32(CL_STATE_VA).unwrap_or(0);
     let cl_wr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
     crate::ktrace::log_fmt(format_args!(
-        "agx: compute: CL_0 read={cl_rd:#x} write={cl_wr:#x} ⇒ firmware {}",
-        if cl_rd == cl_wr { "CONSUMED the channel message" } else { "never drained the CP channel" }
+        "agx: compute: queue gpu_rptr={gpu_rptr:#x} gpu_doneptr={doneptr:#x} cpu_wptr={cpu_wptr:#x} (CL_0 read={cl_rd:#x} write={cl_wr:#x}) ⇒ {}",
+        match (gpu_rptr > 0, doneptr >= cpu_wptr) {
+            (true, true) => "firmware SCHEDULED and COMPLETED the job (⇒ the shader or its output binding is wrong)",
+            (true, false) => "firmware SCHEDULED the job and it is still in flight (⇒ stuck in the microsequence)",
+            (false, _) => "firmware never took the ring entry (⇒ the queue or the channel message is wrong)",
+        }
     ));
 
     // 2. Is it alive at all? (Stats advanced during the DevCtrl kick, so a frozen
@@ -1795,21 +1836,21 @@ fn diagnose_dispatch(p: &DispatchProbe) {
         if stats_after != p.stats_before { "alive during the dispatch" } else { "idle or stuck" }
     ));
 
-    // 3. Did it schedule the job — i.e. read the queue's ring?
-    let doneptr = p.rs.read_u32(workcmd::RS_GPU_DONEPTR);
-    let gpu_rptr = p.rs.read_u32(workcmd::RS_GPU_RPTR);
-    let cpu_wptr = p.rs.read_u32(workcmd::RS_CPU_WPTR);
+    // 3. Did it write the stamps? Both were seeded with the queue's base, so a
+    // stamp holding `expect` is the firmware's own record that the job finished.
+    let (stamp, fw_stamp) = (p.stamp.read_u32(0), p.fw_stamp.read_u32(0));
     crate::ktrace::log_fmt(format_args!(
-        "agx: compute: queue cursors gpu_doneptr={doneptr:#x} gpu_rptr={gpu_rptr:#x} cpu_wptr={cpu_wptr:#x} ⇒ {}",
-        if gpu_rptr > 0 { "firmware READ the queue ring" } else { "queue ring never read" }
+        "agx: compute: stamp={stamp:#x} fw_stamp={fw_stamp:#x} (seed {:#x}, completes at {:#x}) ⇒ {}",
+        p.stamp_seed,
+        p.stamp_expect,
+        if stamp == p.stamp_expect || fw_stamp == p.stamp_expect {
+            "a stamp FIRED — the microsequence reached FinalizeCompute"
+        } else {
+            "neither stamp fired"
+        }
     ));
-
-    // 4. Did it complete the job? The stamps are what a finished job writes, and
-    // they were pre-seeded with the completion value, so report them raw.
     crate::ktrace::log_fmt(format_args!(
-        "agx: compute: stamp={:#x} fw_stamp={:#x} event_count={:#x} ec.cur_count={:#x} ec.submission_id={:#x}",
-        p.stamp.read_u32(0),
-        p.fw_stamp.read_u32(0),
+        "agx: compute: event_count={:#x} ec.cur_count={:#x} ec.submission_id={:#x}",
         p.evcount.read_u32(0),
         p.ec.read_u32(0x0c),
         p.ec.read_u32(0x08)
@@ -2053,9 +2094,16 @@ pub fn command(arg: &str) {
         "status" | "info" => status(),
         "sgx" | "dump" => sgx_dump(),
         "ctx" => context_selftest(),
-        "compute" => dispatch_hello_compute(),
+        "compute" => dispatch_hello_compute(super::workcmd::OP_WAIT_FOR_IDLE_COMPUTE),
+        // The one submission field taken from recollection rather than from the
+        // vendored reference is the microsequence's compute-pipe selector, and
+        // getting it wrong hangs the job silently. `alt` runs the same dispatch
+        // with the other reading, so one boot decides it.
+        "compute alt" => dispatch_hello_compute(super::workcmd::OP_WAIT_FOR_IDLE_COMPUTE_ALT),
         other => {
-            crate::serial_println!("agx> unknown subcommand '{other}' (try: up | status | sgx | ctx | compute)");
+            crate::serial_println!(
+                "agx> unknown subcommand '{other}' (try: up | status | sgx | ctx | compute | compute alt)"
+            );
         }
     }
 }

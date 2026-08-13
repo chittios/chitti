@@ -180,6 +180,10 @@ shader. Falls back to Path A for compute regardless.
 
 ## Immediate next actions
 
+**Superseded — steps 2 and 3 are done and the job is now scheduled on hardware; see
+the encoding audit below for the live next step (A/B the `WaitForIdle` pipe with
+`/agx compute alt`). Step 1 is still the fallback if that does not resolve it.**
+
 1. Boot the M2 into **m1n1 proxy** mode (not ChittiOS) and run
    `tools/agx-extract/capture_render.py` to produce the render replay blob.
 2. Implement Layer 1 (GPU context) + the CP/3D cmdqueue channel `send`/Event poll
@@ -245,7 +249,42 @@ the capture), `unk_58 = 1`, `iogpu_unk_40 = 0x1c`,
 seeded with the context id), the `gpu_buf` is sized to its documented 0x2c18, and
 `StartComputeCmd.unk_buf_addr` / `unk_28 = 1` are populated.
 
-**None of this is hardware-verified** — it is source- and capture-verified, pinned by
+### Hardware result of that pass (real M2): the job is now SCHEDULED
+
+`/agx compute` on the Mac mini went from "nothing consumed" to:
+
+```text
+queue cursors gpu_doneptr=0x0 gpu_rptr=0x1 cpu_wptr=0x1  ⇒ firmware READ the queue ring
+SGX FAULT_INFO=0x0 faulted=0                              ⇒ no GPU MMU fault
+Stats 0x2a->0x32                                          ⇒ firmware alive throughout
+Event 0x0 unchanged                                       ⇒ no completion, fault or timeout
+```
+
+So the firmware **followed the channel message to the queue and dequeued the work
+command** (`gpu_rptr` 0→1) and the job is *in flight* (`gpu_doneptr` still 0) with no
+fault and no event. That is the signature of a **hung microsequence**, which puts the
+guessed `Pipe::Compute` (item 5) at the top of the list: a `WaitForIdle` on a pipe
+that never raises hangs exactly like this and produces no other signal.
+`/agx compute alt` runs the same submission with the byte-3 reading so one boot
+decides it.
+
+Two things that run also corrected in the harness itself:
+
+- **`gpu_rptr`, not the channel read pointer, is the authority on whether the
+  firmware processed a submission.** CL_0's `READ_PTR` stayed 0 while `gpu_rptr`
+  advanced, so the firmware evidently does not publish that cursor back to shared
+  memory — and the diagnostic that read "never drained the CP channel" was reporting
+  a *success* as a failure.
+- **Both stamps were seeded with the value a completed job writes**, which made
+  completion unobservable (they read `0xc5000000` either way). The reference seeds the
+  **base** and gives submission *n* `base + 0x100 * n`, so the seed and the completion
+  value now differ and a fired stamp is visible.
+
+The wait is also long enough for the firmware's own job timeout to fire, since a
+`TIMEOUT` event names the hang where silence does not.
+
+**Nothing below the scheduler is hardware-verified yet** — the encodings are source-
+and capture-verified, pinned by
 `cargo xtask test` on both arches. What a dispatch now reports, in firmware order, so
 one boot separates the remaining causes instead of one bit: whether the channel
 message was consumed, whether the firmware is alive (Stats), whether it read the
