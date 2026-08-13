@@ -1042,8 +1042,9 @@ pub fn hard_reset_wifi_port() -> bool {
     // which the dongle's PMU starts and powers the SYS_MEM/CA7 RAM domain. A
     // power-cycle that finishes before PERST (the old code) samples straps at
     // the wrong instant and leaves RAM gated.
-    super::apple_smc::wifi_power_off();
-    mdelay(200);
+    // 500 ms hold so the die's rails actually drain (Broadcom parts retain state
+    // for a while); the readback in the log proves the rail dropped.
+    super::apple_smc::wifi_power_off_hold(500);
     port_perst_cycle_and_ltssm(port0, port_phy, pinctrl);
     // A PERST retrain clears the axi2af/RC/config tunables m1n1 applied — without
     // re-applying them MEM outbound stays dead even though config works.

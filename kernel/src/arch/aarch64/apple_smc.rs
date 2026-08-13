@@ -553,12 +553,25 @@ pub fn wifi_power_on() -> bool {
     true
 }
 
+/// Power the WiFi/BT module **off** (GPIO 13 / `gP0d` output-low), then hold for
+/// `hold_ms` so the die's rails actually drain before power is re-applied. Reads
+/// `gP0d` back to prove the write landed — if the rail can't be dropped, a
+/// "power-cycle" is a no-op and the dongle PMU never re-sequences.
+pub fn wifi_power_off_hold(hold_ms: u64) -> bool {
+    let ok = write_u32(KEY_GP0D, GPIO_OFF);
+    // Also drop the companion enable.
+    let _ = write_u32(KEY_GP1A, 0);
+    let back = read_u32(KEY_GP0D);
+    crate::ktrace::log_fmt(format_args!(
+        "smc: WiFi power OFF gP0d=0x800000 write_ok={ok} readback={back:?} hold={hold_ms}ms"
+    ));
+    mdelay(hold_ms);
+    ok
+}
+
 /// Power the WiFi/BT module **off** (GPIO 13 / `gP0d` output-low).
 pub fn wifi_power_off() -> bool {
-    crate::ktrace::log("smc", "de-asserting WiFi power gP0d=0x800000");
-    let ok = write_u32(KEY_GP0D, GPIO_OFF);
-    mdelay(50);
-    ok
+    wifi_power_off_hold(50)
 }
 
 /// **Full power-cycle** of the WiFi/BT module: rail off, settle, rail on. Unlike
