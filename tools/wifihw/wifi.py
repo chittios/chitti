@@ -161,8 +161,30 @@ def _st(tag):
         tag, pr(PORT0 + P_PERST), pr(PORT0 + P_STATUS), pr(PORT0 + P_LINKSTS),
         pr(PORT0 + P_APPCLK), pr(PORT0 + P_REFCLK), pr(PHY0 + PHY_CFG), gp0d_read()))
 
+# ── ADT PCIe tunables (m1n1 proxy mode doesn't run pcie_init, so PHY/RC config
+#    the link needs is unset). Apply via m1n1's OWN tunable applier — same data
+#    ChittiOS hardcodes (reapply_host_tunables), applied by m1n1 itself (safe).
+RC_BASE = 0x680000000
+AXI2AF_BASE = 0x68C000000
+APCIE = "/arm-io/apcie"
+BRIDGE = "/arm-io/apcie/pci-bridge0"
+
+def apply_tunables():
+    for path, prop, base in [
+        (APCIE, "apcie-axi2af-tunables", AXI2AF_BASE),
+        (APCIE, "apcie-common-tunables", RC_BASE),
+        (BRIDGE, "apcie-config-tunables", PORT0),
+        (BRIDGE, "pcie-rc-tunables", ECAM),
+    ]:
+        try:
+            p.tunables_apply_local_addr(path, prop, base)
+            print("  tunable %-26s @ %#x ok" % (prop, base))
+        except Exception as e:
+            print("  tunable %-26s ERR %s %s" % (prop, type(e).__name__, e))
+
 def bringup(power_during_perst=True, off_first=True, off_hold=0.5, settle=0.1, verbose=True):
     """Full port bring-up. Returns (link_up, status, linksts)."""
+    apply_tunables()
     configure_root_port()
     if off_first:
         power_off(); time.sleep(off_hold)
