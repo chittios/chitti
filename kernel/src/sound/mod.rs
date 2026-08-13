@@ -245,6 +245,63 @@ pub fn is_up() -> bool {
     SND.with(|s| s.is_some())
 }
 
+/// Set once [`autodetect`] has run to completion (success or not).
+static DISCOVERY_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Status-bar chip state: Ready once a PCM device is up, Pending until the
+/// first probe, Disabled if that probe found nothing (or the built-in amp
+/// refused).
+pub fn device_status() -> crate::icons::DeviceStatus {
+    crate::icons::device_status(
+        is_up(),
+        DISCOVERY_DONE.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Milliseconds between re-probes when no device is up. A human plugging
+/// something in cannot notice this delay; what it stops is a caller in a loop
+/// re-walking PCI (and re-selecting a USB alternate setting) on a machine that
+/// genuinely has no audio. The best-effort paths — the notification chime, a
+/// wasm app's `play` — deliberately stay on [`is_up`] and never probe at all.
+const REPROBE_MS: u64 = 1500;
+
+/// When the last re-probe ran, so [`should_reprobe`] can rate-limit it.
+static LAST_PROBE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether a play attempt at `now_ms` should re-run discovery.
+///
+/// Pure so the rate limit is testable (nothing else in this decision is worth a
+/// test; the *timing* is the part that would silently regress into either a
+/// per-chime PCI scan or a device that is never found).
+pub fn should_reprobe(is_up: bool, last_ms: u64, now_ms: u64) -> bool {
+    !is_up && (last_ms == 0 || now_ms.saturating_sub(last_ms) >= REPROBE_MS)
+}
+
+/// Ensure a sound device is up, re-running discovery if one has appeared since
+/// boot. Returns whether there is one now.
+///
+/// **Discovery used to happen only at boot**, and every play path then asked
+/// `is_up()` — so a USB DAC plugged in after boot, or enumerated after
+/// `autodetect()` ran, reported "no sound device" for the rest of the session
+/// even though a re-probe would have adopted it immediately. That is the whole
+/// difference between "this machine has no audio" and "this machine has audio"
+/// on hardware whose only output is a USB device, which is exactly the position
+/// an Apple Silicon Mac is in here (see [`autodetect`]).
+///
+/// Cheap when a device is already up (one atomic load and a `Locked` peek), so
+/// the play paths can call it unconditionally in place of `is_up()`.
+pub fn ensure_up() -> bool {
+    if is_up() {
+        return true;
+    }
+    let now = crate::arch::now_ms();
+    if should_reprobe(false, LAST_PROBE_MS.load(core::sync::atomic::Ordering::Relaxed), now) {
+        LAST_PROBE_MS.store(now.max(1), core::sync::atomic::Ordering::Relaxed);
+        autodetect();
+    }
+    is_up()
+}
+
 /// Re-establish the sound device after a suspend.
 ///
 /// Every backend here is **polled and stateful in the controller** — HDA's
@@ -273,27 +330,108 @@ pub fn resume() {
     ));
 }
 
+/// A sound backend, and — the part that matters here — **what probing it
+/// touches**.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backend {
+    /// virtio-snd over the `virt` machine's fixed virtio-mmio window.
+    VirtioMmio,
+    /// virtio-snd as a PCI function.
+    VirtioPci,
+    /// Intel HDA (PCI).
+    Hda,
+    /// AC'97 (PCI, x86).
+    Ac97,
+    /// Sound Blaster 16 (ISA ports, x86).
+    Sb16,
+    /// USB audio class, over a controller this kernel brought up itself.
+    Usb,
+}
+
+impl Backend {
+    /// Whether probing this backend reads a **PC-shaped address that was never
+    /// discovered** — QEMU `virt`'s virtio-mmio window at a compiled-in
+    /// `0x0a00_0000`, PCI configuration space, an ISA port.
+    ///
+    /// On a PC or a VM those reads are harmless: an absent device answers
+    /// all-ones. **On Apple Silicon they are fatal.** There is no PCI to
+    /// enumerate unless `chitti.wifi` brought APCIE up, and the low GiB the
+    /// virtio window lives in is Device-typed with nothing behind it, so the
+    /// access takes an external abort — which is not a failed probe, it is the
+    /// machine going down. The boot path has always known this (`main.rs` runs
+    /// the whole `net`/`sound`/`clipboard` block only in its non-Apple arm);
+    /// what it could not do is stop a *later* caller from reaching the same
+    /// probes, which is exactly what `ensure_up` then did.
+    pub fn probes_undiscovered_hardware(self) -> bool {
+        !matches!(self, Backend::Usb)
+    }
+}
+
+/// The backends [`autodetect`] may probe, in order, on this machine.
+///
+/// Pure and tested, because the rule it encodes is one a future backend can
+/// silently break: adding a probe to `autodetect` without classifying it here is
+/// a machine-killer on one platform and invisible on every other.
+pub fn probe_order(apple: bool) -> &'static [Backend] {
+    use Backend::*;
+    if apple {
+        // USB first (a DAC on the dwc3 we already brought up). Built-in
+        // speaker follow-up is `try_apple_builtin`, gated on the tree, not a
+        // Backend probe — it must not appear here or the "no undiscovered
+        // hardware" test would have to special-case it.
+        &[Usb]
+    } else {
+        &[VirtioMmio, VirtioPci, Hda, Ac97, Sb16, Usb]
+    }
+}
+
 /// Discover and bring up the first available sound device: virtio-snd over
 /// mmio (aarch64 QEMU `-kernel`), virtio-snd over PCI (QEMU), then **Intel
 /// HDA** — VirtualBox (x86 + ARM) and real machines. No-op if none is present.
+///
+/// The probe list comes from [`probe_order`] rather than being written out
+/// inline; see [`Backend::probes_undiscovered_hardware`] for why that is a
+/// safety property and not tidiness.
 pub fn autodetect() {
     if is_up() {
+        DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    let apple = crate::arch::aarch64::is_apple();
+    #[cfg(not(target_arch = "aarch64"))]
+    let apple = false;
+    let order = probe_order(apple);
 
     #[cfg(target_arch = "aarch64")]
-    {
+    if order.contains(&Backend::VirtioMmio) {
         if let Some(dev) = crate::arch::aarch64::virtio_snd::VirtioSndMmio::probe() {
             init(Box::new(dev));
+            DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
             return;
         }
     }
+    if !order.contains(&Backend::VirtioPci) {
+        // Apple: skip straight to the portable backends. Written as an early
+        // exit rather than wrapping each probe, so a probe added below without a
+        // guard cannot be reached here at all.
+        if let Some(dev) = usb::UsbAudio::probe() {
+            init(dev);
+            DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        try_apple_builtin();
+        DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     if let Some(dev) = virtio_snd_pci::VirtioSndPci::probe() {
         init(dev);
+        DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
         return;
     }
     if let Some(dev) = hda::Hda::probe() {
         init(dev);
+        DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
         return;
     }
     // Legacy x86 audio: AC'97 (VirtualBox/ICH), then Sound Blaster 16 (ISA).
@@ -301,10 +439,12 @@ pub fn autodetect() {
     {
         if let Some(dev) = crate::arch::x86_64::ac97::Ac97::probe() {
             init(dev);
+            DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
             return;
         }
         if let Some(dev) = crate::arch::x86_64::sb16::Sb16::probe() {
             init(dev);
+            DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
             return;
         }
     }
@@ -325,15 +465,123 @@ pub fn autodetect() {
     // preferring the headset becomes the right default.
     if let Some(dev) = usb::UsbAudio::probe() {
         init(dev);
+        DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
         return;
     }
-    // Nothing matched: dump the multimedia-class PCI devices so an unsupported
-    // controller (or a PCI-discovery gap) is diagnosable from the boot log.
+    // Nothing matched. Everywhere the list above ran, audio is a PCI function,
+    // so an unsupported controller (or a PCI-discovery gap) is diagnosable from
+    // the class-4 list. (Apple Silicon returned above, before any of it.)
+    DISCOVERY_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
     crate::ktrace::log("sound", "no audio device matched — multimedia (class 0x04) PCI devices:");
     #[cfg(target_arch = "aarch64")]
     crate::pci::log_class(0x04);
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::pci::log_class(0x04);
+}
+
+/// What an Apple Silicon Mac has instead of an audio controller, read off its
+/// own device tree — and which piece of it is unimplemented here.
+///
+/// **Apple Silicon has no PCI audio function at all**, so the class-4 dump that
+/// diagnoses every other machine prints an empty list and reads as "the OS
+/// cannot see your sound card". Nothing is missing: built-in audio on these
+/// machines is an I2S controller (`apple,mca`) fed by a DMA engine, clocked by
+/// `apple,nco`, driving an amplifier over I2C — five separate drivers, none of
+/// which exists here. Which DMA engine it is differs by generation and is the
+/// part that decides how much work this is: the M1 uses **ADMAC**, a plain MMIO
+/// engine (m1n1's `proxyclient/experiments/speaker_amp.py` drives the whole
+/// stack in 148 lines), while the M2 routes audio through **SIO**, an RTKit
+/// coprocessor that has to be given firmware parameters and a mailbox before it
+/// will move a byte (`third_party/m1n1/src/sio.c`).
+///
+/// So this is a report, not a probe: it only ever *reads* the device tree, and
+/// touches no register of any of it. A USB audio device works today through the
+/// same dwc3/xHCI path the keyboard and mouse use.
+#[cfg(target_arch = "aarch64")]
+fn report_apple_audio() {
+    // Once per boot: `ensure_up` re-probes on every play attempt, and a machine
+    // with no audio would otherwise repeat the whole census into the log each
+    // time somebody opened a file.
+    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let dtb = crate::arch::aarch64::boot::boot_x0();
+    crate::ktrace::log("sound", "no audio device: this is an Apple Silicon Mac, which has no PCI audio function");
+    // `(compatible, what it is, what using it would need)`. Reported in the
+    // order the signal flows, so the list reads as the stack that is missing.
+    const BLOCKS: &[(&[u8], &str)] = &[
+        (b"apple,nco", "audio clock generator (NCO)"),
+        (b"apple,mca", "I2S controller (MCA)"),
+        (b"apple,admac", "audio DMA engine (ADMAC — plain MMIO)"),
+        (b"apple,sio", "the SIO coprocessor (RTKit; DMA for other peripherals)"),
+        (b"ti,tas2764", "built-in speaker amplifier, over I2C"),
+        (b"cirrus,cs42l84", "headphone jack codec, over I2C"),
+        (b"apple,dpaudio", "HDMI/DisplayPort audio (needs the DCP display coprocessor)"),
+        (b"apple,aop-audio", "microphone, via the always-on processor"),
+    ];
+    for (compat, what) in BLOCKS {
+        // SAFETY: `boot_x0` is the FDT pointer (or not an FDT, rejected by magic).
+        if let Some((base, _)) = unsafe { crate::fdt::reg_of_compatible(dtb, compat) } {
+            crate::ktrace::log_fmt(format_args!(
+                "sound:   {base:#x} {what} — no driver",
+            ));
+        }
+    }
+    // **Which DMA engine feeds the I2S is a property of the machine, not of its
+    // generation.** Both an ADMAC and a SIO are present here, and guessing from
+    // the SoC ("the M2 moved audio to SIO") got it backwards — the M2 mini's MCA
+    // is wired to ADMAC exactly as the M1's is, which is the difference between
+    // porting m1n1's 148-line `speaker_amp.py` recipe and bringing up an RTKit
+    // coprocessor with firmware. The tree answers it directly: `dmas`' first cell
+    // is the engine's phandle. Ask, do not infer.
+    let mut dmas = [0u32; 2];
+    // SAFETY: as above.
+    let n = unsafe { crate::fdt::prop_cells_of_compatible(dtb, b"apple,mca", b"dmas", &mut dmas) };
+    if n > 0 {
+        // SAFETY: as above.
+        match unsafe { crate::fdt::reg_by_phandle(dtb, dmas[0]) } {
+            Some((base, _)) => crate::ktrace::log_fmt(format_args!(
+                "sound:   the I2S controller's DMA is the engine at {base:#x} (its `dmas` phandle {:#x})",
+                dmas[0]
+            )),
+            None => crate::ktrace::log_fmt(format_args!(
+                "sound:   the I2S controller names DMA phandle {:#x}, which resolves to no node",
+                dmas[0]
+            )),
+        }
+    }
+    crate::ktrace::log(
+        "sound",
+        "no built-in speaker amp in the tree; a USB audio device works through the same \
+         dwc3/xHCI path as the keyboard (chitti.usb)",
+    );
+}
+
+/// Bring up the Mac's own speaker if the tree names it. Tried **once**: the
+/// first write is an amplifier leaving shutdown, and a loop of that is how a
+/// failed boot would keep clicking the speaker. USB already ran; this is the
+/// fallback, not a re-probe of undiscovered hardware.
+fn try_apple_builtin() {
+    if is_up() {
+        return;
+    }
+    if !apple::builtin_present() {
+        #[cfg(target_arch = "aarch64")]
+        report_apple_audio();
+        return;
+    }
+    static TRIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if TRIED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        match apple::up() {
+            Ok(()) => crate::ktrace::log("sound", "built-in speaker up"),
+            Err(e) => crate::ktrace::log_fmt(format_args!("sound: built-in speaker bring-up failed: {e}")),
+        }
+    }
 }
 
 /// Queue `pcm` (S16 mono at `hz`) for playback. Applies the global software
@@ -426,6 +674,8 @@ fn libm_sqrt(x: f64) -> f64 {
 }
 
 pub mod g2p;
+/// Built-in audio on Apple Silicon (NCO -> MCA -> ADMAC -> TAS2764).
+pub mod apple;
 pub mod hda;
 pub mod mel;
 pub mod model_store;
@@ -550,5 +800,49 @@ mod tests {
     fn test_tone_length_matches_duration() {
         // A 200 ms tone at 16 kHz is 3200 samples.
         assert_eq!(test_tone(440, 200, 16_000).len(), 3200);
+    }
+
+    #[test_case]
+    fn apple_probes_nothing_it_has_not_discovered() {
+        // The rule this pins: on Apple Silicon no probe may read a compiled-in
+        // PC address. Those reads are harmless everywhere else — an absent PCI
+        // function answers all-ones — and on that machine they take an external
+        // abort, which is not a failed probe but the machine going down. It is
+        // how `/open <audio>` came to reset a Mac mini.
+        for b in probe_order(true) {
+            assert!(
+                !b.probes_undiscovered_hardware(),
+                "{b:?} may not be probed on Apple Silicon"
+            );
+        }
+        assert!(probe_order(true).contains(&Backend::Usb), "USB audio is the one that works there");
+        // Everywhere else the full list still runs, in the documented order,
+        // with USB last so a headset never displaces a full-duplex codec.
+        let pc = probe_order(false);
+        assert_eq!(pc.first(), Some(&Backend::VirtioMmio));
+        assert_eq!(pc.last(), Some(&Backend::Usb));
+        assert!(pc.iter().filter(|b| b.probes_undiscovered_hardware()).count() >= 4);
+    }
+
+    #[test_case]
+    fn a_device_that_is_up_is_never_re_probed() {
+        // The whole point of the rate limit is that the common case costs
+        // nothing: with a device up, no elapsed time makes a probe due.
+        assert!(!should_reprobe(true, 0, 0));
+        assert!(!should_reprobe(true, 1, 10_000_000));
+    }
+
+    #[test_case]
+    fn the_first_play_probes_and_the_next_ones_wait() {
+        // Never probed (0 is the "never" sentinel, and a machine really can be
+        // at now_ms 0): probe. Then hold off until the interval has passed, so
+        // a caller in a loop does not re-walk the bus per call.
+        assert!(should_reprobe(false, 0, 0));
+        assert!(!should_reprobe(false, 1_000, 1_000));
+        assert!(!should_reprobe(false, 1_000, 1_000 + REPROBE_MS - 1));
+        assert!(should_reprobe(false, 1_000, 1_000 + REPROBE_MS));
+        // A clock that went backwards (a resume re-anchor) must not lock
+        // discovery out forever — saturating, so it simply waits.
+        assert!(!should_reprobe(false, 10_000, 5));
     }
 }

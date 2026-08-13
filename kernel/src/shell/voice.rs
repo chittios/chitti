@@ -279,7 +279,9 @@ pub(super) fn speak_text(text: &str) -> usize {
 /// one runs on the SMP fleet, so speech starts in ~a second instead of after
 /// the whole utterance. Ctrl+C stops between chunks and drains the queue.
 pub(super) fn voice_say(text: &str) {
-    if !crate::sound::is_up() {
+    // `ensure_up`, not `is_up`: a USB audio device plugged in after boot was
+    // otherwise never adopted (discovery ran once, at boot).
+    if !crate::sound::ensure_up() {
         serial_println!("voice> no sound device");
         return;
     }
@@ -584,7 +586,7 @@ pub(super) fn voice_test() {
             serial_println!("voice>   {line}");
         }
     }
-    if !crate::sound::is_up() {
+    if !crate::sound::ensure_up() {
         serial_println!("voice> no sound device found");
         return;
     }
@@ -644,7 +646,7 @@ pub(super) fn voice_talk(
     remote_cfg: &Option<remote::RemoteConfig>,
     remote_chat: &mut Option<remote::RemoteChat>,
 ) {
-    if !crate::sound::is_up() {
+    if !crate::sound::ensure_up() {
         serial_println!("voice> no sound device found");
         return;
     }

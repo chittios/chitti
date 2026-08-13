@@ -235,6 +235,7 @@ fn shell_commands() -> Vec<ToolDef> {
         ToolDef::shell("network", "Show the network status (ip/gw/dns), or configure it. args: empty=status, 'dhcp', 'static <ip/prefix> [gw]', 'dns <ip>'.", false),
         ToolDef::shell("ping", "ICMP-ping a host to check connectivity. args: a hostname or IPv4 address, e.g. 'www.google.com'.", false),
         ToolDef::shell("wifi", "Wi-Fi: real Broadcom on Apple (chitti.wifi); facade on QEMU. args: info|scan|connect <ssid>|load.", false),
+        ToolDef::shell("audio", "Built-in audio on Apple Silicon (NCO/MCA/ADMAC/amp). args: probe|up|dump|gain|status.", false),
         ToolDef::shell(
             "display",
             "Screen size. args: empty=status, 'list', 'scale <1-4>|auto' (text size — USE THIS for \"too small\"), 'set <WxH>|native' (logical desktop, letterboxes), 'boot <WxH>|auto' (panel mode, next boot).",
