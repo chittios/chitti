@@ -17,7 +17,7 @@ pub mod space;
 pub mod walk;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A mutual-exclusion cell around `T`. Since Phase 7's SMP bring-up there can
 /// be more than one core, so this is a real **spinlock** (a test-and-test-and-
@@ -41,6 +41,32 @@ pub struct Locked<T> {
 // (cross-core mutual exclusion) with interrupts disabled (same-core exclusion)
 // for the entire duration -- so there is only ever one live `&mut T`.
 unsafe impl<T> Sync for Locked<T> {}
+
+/// How many [`Locked`]s are held right now, across all cores.
+///
+/// Read by [`crate::fault_recovery`], which may not unwind past a frame that
+/// owes a release: the abandoned frame never runs its `store(false)` and the next
+/// taker spins forever with interrupts disabled — a machine that stops with no
+/// output at all, which is worse than the halt recovery was avoiding.
+///
+/// **Interrupts-enabled is the usual way to ask this question and does not work
+/// here.** That inference (the one `sched::block_on`'s lock-discipline assert
+/// makes) holds only where interrupts are ever on: an Apple Silicon boot has no
+/// usable CPU interrupt interface, so `initial_daif` masks them for every task
+/// and "interrupts are off" says nothing at all. That is also the machine where
+/// surviving a fault matters most.
+///
+/// Deliberately **global rather than per-core**: the count is only ever compared
+/// against zero, and a fault on one core while another holds a lock then refuses
+/// recovery — conservative, which is the correct direction, and it costs no
+/// per-CPU plumbing. Two relaxed RMWs per acquisition, on a line that is already
+/// being written by the lock word next to it.
+static LOCKS_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// How many [`Locked`]s are held right now. See [`LOCKS_HELD`].
+pub fn locks_held() -> usize {
+    LOCKS_HELD.load(Ordering::Relaxed)
+}
 
 impl<T> Locked<T> {
     pub const fn new(value: T) -> Self {
@@ -68,7 +94,9 @@ impl<T> Locked<T> {
             // SAFETY: the lock is held and interrupts are disabled, so this is
             // the only live access to `inner` on any core.
             let inner = unsafe { &mut *self.inner.get() };
+            LOCKS_HELD.fetch_add(1, Ordering::Relaxed);
             let result = f(inner);
+            LOCKS_HELD.fetch_sub(1, Ordering::Relaxed);
             self.locked.store(false, Ordering::Release);
             Some(result)
         })
@@ -90,7 +118,12 @@ impl<T> Locked<T> {
             // SAFETY: the lock is held and interrupts are disabled, so this is
             // the only live access to `inner` on any core.
             let inner = unsafe { &mut *self.inner.get() };
+            // Counted around `f`, not around the lock word: what a fault handler
+            // needs to know is whether abandoning this frame would strand a
+            // release, and the frames that can fault are the ones inside `f`.
+            LOCKS_HELD.fetch_add(1, Ordering::Relaxed);
             let result = f(inner);
+            LOCKS_HELD.fetch_sub(1, Ordering::Relaxed);
             self.locked.store(false, Ordering::Release);
             result
         })
@@ -384,9 +417,21 @@ unsafe extern "C" {
 ///   exact counterpart of the `MEMMAP_USABLE` entries x86 builds from.
 /// * **QEMU `-kernel`** (DTB or fw_cfg, no firmware resident) — the whole
 ///   machine is ours, so the DRAM extents minus what the kernel itself placed.
-/// * **anything else** — declined. Two real cases: a stub older than the free
-///   list (its DRAM extents cannot be distinguished from free memory), and
-///   Apple/m1n1, where m1n1 stays resident in RAM it does not describe.
+/// * **Apple/m1n1** — the DTB's `/memory`, which on that path is not "the DRAM
+///   the machine has" but *the window m1n1 says the kernel may use*. m1n1 shrinks
+///   `mem_size` as it allocates (`top_of_memory_alloc`) and writes `/memory`
+///   **last**, deliberately, so the framebuffer, the ISP and GPU carveouts and
+///   its own log buffer are already outside it; what remains inside is named by
+///   the FDT reservation block (m1n1's image, the device tree, each secondary
+///   CPU's stack, the initrd) and by `/reserved-memory` (the AGX `uat-*`
+///   carveouts). Both are subtracted below. This used to be declined on the
+///   grounds that m1n1 "stays resident in RAM it does not describe" — it is
+///   resident, but it *does* describe it, and the cost of that reading was that
+///   **no ring-3 tenant could exist on real Apple hardware**: no address space
+///   means `LoadError::NoAddressSpace`, so the `/open` image sandbox and every
+///   package-UI app failed on the one machine they most needed to work on.
+/// * **anything else** — declined. One real case: a stub older than the free
+///   list, whose DRAM extents cannot be distinguished from free memory.
 ///
 /// Whatever the pool, [`ramlayout::carve_free`] then subtracts everything the
 /// kernel put in it. Getting that list wrong is silent corruption, so the result
@@ -401,6 +446,19 @@ fn aarch64_frames(heap_base: usize, heap_size: usize) {
 
     let decline = |why: &str| crate::ktrace::log("mm", why);
 
+    // **The kill switch, and why it exists.** This allocator's pool comes from
+    // what the boot loader *says* is free, and on a machine that can only be
+    // rebooted, "the new memory pool handed out something live" and "something
+    // else is wrong" produce the same symptom: a crash some time later, in
+    // whatever got overwritten. `chitti.noframes` turns it off, restoring
+    // exactly the previous behaviour (no frame allocator, so no ring-3 tenants
+    // and no heap growth), which makes that one question answerable in one boot
+    // instead of by argument — the `/wifi diag` rule.
+    // SAFETY: `boot_x0` is the DTB pointer (or not an FDT, rejected by magic).
+    if unsafe { crate::fdt::bootarg_present(boot::boot_x0(), b"chitti.noframes") } {
+        return decline("chitti.noframes on the kernel command line -- no frame allocator (ring 3 and heap growth are off)");
+    }
+
     let mut pool = [(0u64, 0u64); 16];
     let mut n_pool = mmu::free_regions(&mut pool);
     if n_pool == 0 {
@@ -410,14 +468,11 @@ fn aarch64_frames(heap_base: usize, heap_size: usize) {
                  include firmware-owned memory, so there is no safe frame pool -- no frame allocator",
             );
         }
-        if crate::arch::aarch64::is_apple() {
-            return decline(
-                "Apple/m1n1 boot: m1n1 stays resident in RAM the device tree does not describe, \
-                 so no extent is known-free -- no frame allocator",
-            );
-        }
         // Firmware-less `-kernel`: the DTB's `/memory` (or fw_cfg's ramsize) is
-        // the whole machine, and it is all ours.
+        // the whole machine, and it is all ours. Under m1n1 the same node means
+        // something narrower but no less positive — the window m1n1 kept nothing
+        // in — and the exceptions inside it arrive as FDT reservations, which the
+        // reserved list below subtracts.
         n_pool = mmu::ram_regions(&mut pool);
         if n_pool == 0 {
             return decline("no RAM extents discovered at boot -- no frame allocator");
@@ -426,12 +481,25 @@ fn aarch64_frames(heap_base: usize, heap_size: usize) {
     let pool = &pool[..n_pool];
 
     // Everything the kernel or its loader placed inside that pool.
-    let mut reserved = [(0u64, 0u64); 8];
+    //
+    // **Overflow is not an option here.** A reservation that does not fit is a
+    // range the allocator would hand out, and the verification below cannot
+    // catch it — both sides read the same list, so a dropped entry is simply
+    // absent from both. m1n1 contributes an unbounded-in-principle number of
+    // these (one stack per secondary CPU, one node per carveout), so the
+    // condition is recorded and declines the allocator rather than being capped.
+    let mut reserved = [(0u64, 0u64); 48];
     let mut k = 0usize;
+    let mut overflow = false;
     let mut reserve = |base: u64, len: u64| {
-        if len > 0 && k < reserved.len() {
+        if len == 0 {
+            return;
+        }
+        if k < reserved.len() {
             reserved[k] = (base, len);
             k += 1;
+        } else {
+            overflow = true;
         }
     };
     // 1. The kernel image, including the stack this code is on.
@@ -477,6 +545,50 @@ fn aarch64_frames(heap_base: usize, heap_size: usize) {
     //    case this is a no-op), but on some platforms it is plain RAM.
     if let Some((b, s)) = mmu::framebuffer_region() {
         reserve(b, s);
+    }
+    //    On the DTB path the framebuffer is not in boot-info at all — it is the
+    //    `simple-framebuffer` node the console is *currently drawing into*. m1n1
+    //    allocates it off the top of memory, so this is normally outside the
+    //    pool; it costs one FDT walk to not be guessing, and the failure it
+    //    guards is the display of the machine reporting the bug.
+    // SAFETY: `boot_x0` is the DTB pointer (or not an FDT, rejected by magic).
+    if let Some(fb) = unsafe { crate::fdt::find_framebuffer(boot::boot_x0()) } {
+        reserve(fb.base, fb.size.max((fb.stride as u64).saturating_mul(fb.height as u64)));
+    }
+    // 7. What the *boot loader* kept, in the tree's own words. Empty under QEMU
+    //    (which reserves nothing and publishes no `/reserved-memory`); on
+    //    Apple/m1n1 this is m1n1's image, the device tree, every secondary CPU
+    //    stack, the initrd, and the AGX `uat-*` carveouts the GPU firmware reads
+    //    while we run. Truncation is treated exactly as overflow — see `reserve`.
+    //    **Each one is logged.** They are the only entries here that come from
+    //    outside this kernel, they are the difference between a pool and a
+    //    landmine, and if memory does get corrupted the first question is
+    //    whether the range that was overwritten is in this list or missing from
+    //    it — which is not answerable after the fact from a count.
+    let dtb = boot::boot_x0();
+    let mut fdt_rsv = [(0u64, 0u64); 32];
+    let mut truncated = false;
+    // SAFETY: as above; both readers are bounded by the blob's declared size.
+    for (what, read) in [
+        ("memreserve", crate::fdt::mem_reservations as unsafe fn(u64, &mut [(u64, u64)]) -> usize),
+        ("reserved-memory", crate::fdt::reserved_memory),
+    ] {
+        let n = unsafe { read(dtb, &mut fdt_rsv) };
+        truncated |= n > fdt_rsv.len();
+        for &(b, s) in &fdt_rsv[..n.min(fdt_rsv.len())] {
+            let inside = pool.iter().any(|&(pb, ps)| b < pb.saturating_add(ps) && b.saturating_add(s) > pb);
+            crate::ktrace::log_fmt(format_args!(
+                "mm: fdt {what} {b:#x}+{s:#x} ({})",
+                if inside { "inside the pool -- carved out" } else { "outside the pool" }
+            ));
+            reserve(b, s);
+        }
+    }
+    if overflow || truncated {
+        return decline(
+            "more boot-loader reservations than the reserved list holds: some range would be \
+             handed out as free memory -- no frame allocator (raise the arrays in aarch64_frames)",
+        );
     }
     let reserved = &reserved[..k];
 

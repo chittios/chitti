@@ -212,6 +212,88 @@ pub const fn split_child(level: u32, desc: u64, i: usize) -> u64 {
     descriptor(child, pa, descriptor_attrs(desc) & !CONTIGUOUS)
 }
 
+/// The **link address** of the aarch64 kernel image (`kernel/linker-aarch64.ld`).
+/// A PIE kernel runs wherever the loader put it — m1n1 places it at Apple's
+/// ~32 GiB RAM base — so a raw `ELR_EL1` matches nothing in `nm` output. Subtract
+/// the runtime image base and add this back, and the result is the address the
+/// symbol table uses. See [`fault_pc_in_image`].
+pub const AARCH64_LINK_BASE: u64 = 0x4008_0000;
+
+/// A faulting PC, translated from where the kernel is *running* to where it was
+/// *linked*, so it can be looked up directly:
+/// `nm -C target/aarch64-chitti/release/chitti-kernel | sort | grep -i <addr>`.
+///
+/// Doing this by hand is the step that costs a debugging cycle every time — the
+/// note in CLAUDE.md about resolving a faulting PC against the symbol table is
+/// exactly this arithmetic, and a kernel that already knows its own load address
+/// should not make a human redo it from two hex numbers on a serial console.
+/// `None` when the PC is outside the image (a tenant, or a wild jump), which is
+/// itself the answer to a different question.
+pub fn fault_pc_in_image(pc: u64, image_base: u64, image_end: u64) -> Option<u64> {
+    if image_base == 0 || pc < image_base || pc >= image_end {
+        return None;
+    }
+    Some(AARCH64_LINK_BASE + (pc - image_base))
+}
+
+/// The ESR_EL1 exception class (bits 31:26) in words, and whether it is a data
+/// or instruction abort whose `FAR_EL1` is meaningful.
+///
+/// Only the classes this kernel can actually take are named. An unknown class
+/// returns `"unknown exception class"` rather than a guess — the number is
+/// printed beside it, and a wrong English label is worse than none.
+pub fn esr_class(esr: u64) -> &'static str {
+    match (esr >> 26) & 0x3f {
+        0b000000 => "unknown reason (often a bad instruction encoding)",
+        0b000001 => "trapped WFI/WFE",
+        0b000111 => "SIMD/FP access trapped (CPACR)",
+        0b001110 => "illegal execution state",
+        0b010101 => "SVC from AArch64",
+        0b011000 => "trapped MSR/MRS (system register)",
+        0b100000 => "instruction abort from a lower EL",
+        0b100001 => "instruction abort at this EL",
+        0b100010 => "PC alignment fault",
+        0b100100 => "data abort from a lower EL",
+        0b100101 => "data abort at this EL",
+        0b100110 => "SP alignment fault",
+        0b101100 => "floating-point exception",
+        0b101111 => "SError",
+        0b111100 => "BRK (breakpoint instruction)",
+        _ => "unknown exception class",
+    }
+}
+
+/// The data/instruction fault status code (ESR bits 5:0) in words, for the abort
+/// classes. This is the field that distinguishes the two failures that look
+/// identical from a serial log: **translation fault** (nothing is mapped there —
+/// a wild pointer, or memory the map never covered) from **alignment fault** (the
+/// mapping is Device-typed and something issued an unaligned or vector access,
+/// the trap `+strict-align` and the VirtualBox mixed-GiB block both produce).
+pub fn esr_fault_status(esr: u64) -> &'static str {
+    match esr & 0x3f {
+        0b000000..=0b000011 => "address size fault",
+        0b000100 => "translation fault, level 0 (nothing mapped)",
+        0b000101 => "translation fault, level 1 (nothing mapped)",
+        0b000110 => "translation fault, level 2 (nothing mapped)",
+        0b000111 => "translation fault, level 3 (nothing mapped)",
+        0b001001..=0b001011 => "access flag fault",
+        0b001101 => "permission fault, level 1",
+        0b001110 => "permission fault, level 2",
+        0b001111 => "permission fault, level 3",
+        0b010000 => "synchronous external abort (the address decoded to nothing)",
+        0b100001 => "alignment fault (unaligned access to Device memory)",
+        0b110000 => "TLB conflict",
+        _ => "other fault status",
+    }
+}
+
+/// Whether `FAR_EL1` names a real address for this syndrome. For anything but an
+/// abort it holds a stale value, and reporting it as "the faulting address"
+/// sends the reader after a number that means nothing.
+pub fn esr_far_is_valid(esr: u64) -> bool {
+    matches!((esr >> 26) & 0x3f, 0b100000 | 0b100001 | 0b100100 | 0b100101)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,4 +460,38 @@ mod tests {
         assert_eq!(descriptor_attrs(d), attrs);
         assert_eq!(descriptor(3, descriptor_addr(d), descriptor_attrs(d)), d);
     }
+    #[test_case]
+    fn a_faulting_pc_translates_into_the_symbol_table() {
+        // m1n1 loads the PIE kernel at Apple's RAM base; a fault 0x1234 into the
+        // image must read back as link_base + 0x1234, which is what `nm` prints.
+        let base = 0x10_0000_0000u64;
+        let end = base + 0x0200_0000;
+        assert_eq!(fault_pc_in_image(base + 0x1234, base, end), Some(AARCH64_LINK_BASE + 0x1234));
+        assert_eq!(fault_pc_in_image(base, base, end), Some(AARCH64_LINK_BASE));
+        // Outside the image is not a symbol: a tenant's PC, a wild jump, or a
+        // boot before the base was known.
+        assert_eq!(fault_pc_in_image(base - 1, base, end), None);
+        assert_eq!(fault_pc_in_image(end, base, end), None);
+        assert_eq!(fault_pc_in_image(0x1234, 0, 0), None);
+    }
+
+    #[test_case]
+    fn the_two_syndromes_that_look_alike_read_differently() {
+        // These are the two real aborts this kernel takes, and the whole value
+        // of decoding ESR is that they stop looking the same on a serial log:
+        // ESR 0x96000044 is a data abort with a level-0 translation fault (the
+        // >512 GiB BAR that was never mapped); 0x96000021 is an alignment fault
+        // (a NEON load against Device-typed memory).
+        assert_eq!(esr_class(0x9600_0044), "data abort at this EL");
+        assert_eq!(esr_fault_status(0x9600_0044), "translation fault, level 0 (nothing mapped)");
+        assert_eq!(esr_fault_status(0x9600_0021), "alignment fault (unaligned access to Device memory)");
+        assert_eq!(esr_fault_status(0x9600_0050), "synchronous external abort (the address decoded to nothing)");
+        // FAR is meaningful for aborts and stale for everything else.
+        assert!(esr_far_is_valid(0x9600_0044));
+        assert!(esr_far_is_valid(0x8600_0007), "instruction abort");
+        assert!(!esr_far_is_valid(0x5600_0000), "SVC carries no faulting address");
+        // An unnamed class says so rather than guessing.
+        assert_eq!(esr_class(0xfc00_0000), "unknown exception class");
+    }
+
 }

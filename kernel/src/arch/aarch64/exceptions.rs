@@ -91,10 +91,56 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
             super::hlt();
         }
     }
+    // **The syndrome goes out on raw serial first, before anything that can
+    // fault.** `ktrace::log_fmt` reads the clock, takes the framebuffer lock and
+    // paints — all reasonable, none of it safe when the reason we are here is a
+    // corrupt heap or a wild write, and a fault *inside* the fault handler
+    // re-enters this vector forever. From the outside that is a machine that
+    // reboots (a watchdog) or hangs, with nothing on screen either way: the
+    // failure that most needs a message produces none. Three hex numbers written
+    // straight to the UART cost nothing and cannot fail.
+    raw_syndrome("sync", esr, elr, far);
+    if !enter_fault() {
+        crate::serial::write_str_raw(
+            "aarch64 FATAL: fault while handling a fault -- halting before it loops\n",
+        );
+        loop {
+            super::hlt();
+        }
+    }
     crate::ktrace::log_fmt(format_args!(
         "aarch64 sync exception: ESR_EL1={:#x} ELR_EL1={:#x} FAR_EL1={:#x}",
         esr, elr, far
     ));
+    // The same three numbers in words, plus the PC translated back to the
+    // address the symbol table uses. Reading them by hand is the step that costs
+    // a debugging cycle each time: a translation fault and an alignment fault
+    // are one nibble apart and mean completely different things, and a PIE
+    // kernel's `ELR` matches nothing in `nm` until the load base is subtracted.
+    {
+        use crate::mm::armv8;
+        crate::ktrace::log_fmt(format_args!(
+            "aarch64   {} / {}{}",
+            armv8::esr_class(esr),
+            armv8::esr_fault_status(esr),
+            if armv8::esr_far_is_valid(esr) { "" } else { " (FAR is stale for this class)" },
+        ));
+        unsafe extern "C" {
+            static _image_start: u8;
+            static __stack_top: u8;
+        }
+        // Addresses of linker-provided symbols; never dereferenced.
+        let (img, img_end) = ((&raw const _image_start) as u64, (&raw const __stack_top) as u64);
+        match armv8::fault_pc_in_image(elr, img, img_end) {
+            Some(pc) => crate::ktrace::log_fmt(format_args!(
+                "aarch64   faulting PC {pc:#x} as linked (loaded at {img:#x}) -- \
+                 `llvm-addr2line -e <kernel elf> {pc:#x}`, or find the nearest lower `nm -C` symbol"
+            )),
+            None => crate::ktrace::log_fmt(format_args!(
+                "aarch64   faulting PC {elr:#x} is outside the kernel image ({img:#x}..{img_end:#x})"
+            )),
+        }
+    }
     // Contain it to the faulting task if there is one, exactly as x86's #PF/#GP
     // handlers do — the dual-arch rule: if a capability exists on one arch it
     // exists on the other. This handler runs on the faulting task's own stack, so
@@ -102,10 +148,77 @@ extern "C" fn aarch64_sync_dispatch(frame: *mut u64) {
     // `eret` from it. Returns only when isolation is impossible (no scheduler, or
     // the bootstrap task, where a fault is a kernel bug rather than a tenant's).
     crate::sched::fault_current_task("aarch64 synchronous exception");
+    // Not isolatable: the fault is in the shell's own task (or before there was
+    // a scheduler). Before halting, try the shell's recovery landmark — the
+    // machine keeps its framebuffer, its console and its loaded model, and the
+    // syndrome above is on screen instead of being the last thing it ever said.
+    // Refuses, loudly, when unwinding would strand a lock or when the faults are
+    // coming faster than the prompt can be reached.
+    let armed = crate::fault_recovery::is_armed();
+    let held = crate::mm::locks_held();
+    let n = crate::fault_recovery::consecutive();
+    if crate::fault_recovery::should_recover(armed, held, n) {
+        // SAFETY: this handler runs on the faulting task's own stack, so the
+        // frames being abandoned (including this one) are above the landmark's
+        // and nothing will `eret` from this trap frame. The gate above has
+        // established that no `Locked` is held.
+        unsafe { crate::fault_recovery::recover("synchronous exception") };
+    }
+    if let Some(why) = crate::fault_recovery::refusal(armed, held, n) {
+        crate::ktrace::log_fmt(format_args!("aarch64: cannot return to the prompt -- {why}"));
+    }
     crate::ktrace::log("aarch64", "sync exception not isolatable -- halting");
     loop {
         super::hlt();
     }
+}
+
+/// Depth guard for the fault handlers. Anything this handler does beyond writing
+/// bytes to the UART can itself fault — logging paints, `fault_current_task`
+/// walks the scheduler — and re-entering the vector on every attempt is an
+/// unbounded loop that, from outside the machine, looks exactly like a watchdog
+/// reset with no output. Entering twice is a bug that must be *reported* rather
+/// than retried.
+static IN_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Claim the fault path; `false` if it was already claimed (a nested fault).
+/// Never released: reaching the end of a fault means halting or unwinding to the
+/// shell, and the shell re-arms it (see [`clear_fault_depth`]).
+fn enter_fault() -> bool {
+    !IN_FAULT.swap(true, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Release the fault path. Called from the shell once it has come back to the
+/// prompt: at that point the previous fault is over, and a *new* one must be
+/// allowed to report and recover rather than being mistaken for a nested fault.
+pub fn clear_fault_depth() {
+    IN_FAULT.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Write a syndrome to the UART with no locks, no allocation, no clock and no
+/// framebuffer — the only reporting path that is still trustworthy when the
+/// reason for the fault is that memory is not what the kernel thinks it is.
+fn raw_syndrome(kind: &str, esr: u64, elr: u64, far: u64) {
+    fn hex(v: u64) {
+        const D: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; 18];
+        buf[0] = b'0';
+        buf[1] = b'x';
+        for i in 0..16 {
+            buf[2 + i] = D[((v >> (60 - 4 * i)) & 0xf) as usize];
+        }
+        // SAFETY: every byte written above is ASCII.
+        crate::serial::write_str_raw(unsafe { core::str::from_utf8_unchecked(&buf) });
+    }
+    crate::serial::write_str_raw("\naarch64 ");
+    crate::serial::write_str_raw(kind);
+    crate::serial::write_str_raw(" exception: ESR=");
+    hex(esr);
+    crate::serial::write_str_raw(" ELR=");
+    hex(elr);
+    crate::serial::write_str_raw(" FAR=");
+    hex(far);
+    crate::serial::write_str_raw("\n");
 }
 
 /// True when `addr` lies in the reserved region just below the boot stack
@@ -131,7 +244,37 @@ fn in_stack_guard(addr: u64) -> bool {
 /// silently looping in a vector.
 #[no_mangle]
 extern "C" fn aarch64_fatal_exception(esr: u64, elr: u64, kind: u64) -> ! {
-    crate::ktrace::log_fmt(format_args!("aarch64 FATAL exception: kind={} ESR_EL1={:#x} ELR_EL1={:#x}", kind, esr, elr));
+    // Raw serial first, for the same reason the sync path does it: this is
+    // reached when something has already gone badly wrong, and a reporting path
+    // that can itself fault produces a silent reset instead of a message.
+    raw_syndrome("FATAL/vector", esr, elr, kind);
+    if enter_fault() {
+        crate::ktrace::log_fmt(format_args!(
+            "aarch64 FATAL exception: kind={} ESR_EL1={:#x} ELR_EL1={:#x} -- {}",
+            kind,
+            esr,
+            elr,
+            crate::mm::armv8::esr_class(esr)
+        ));
+        // **An SError is not automatically a dead machine.** On Apple Silicon it
+        // is the ordinary result of touching a device that is powered down or
+        // unclocked — which is most of what hardware bring-up consists of — and
+        // it arrives *asynchronously*, so the instruction stream is not
+        // necessarily corrupt. That makes it a better recovery candidate than a
+        // synchronous abort, not a worse one. Same three gates, same refusal
+        // messages; this vector used to halt with no attempt at all.
+        let armed = crate::fault_recovery::is_armed();
+        let held = crate::mm::locks_held();
+        let n = crate::fault_recovery::consecutive();
+        if crate::fault_recovery::should_recover(armed, held, n) {
+            // SAFETY: taken on the current task's stack, exactly as the
+            // synchronous vector is; the gate has established no lock is held.
+            unsafe { crate::fault_recovery::recover("SError / unexpected vector") };
+        }
+        if let Some(why) = crate::fault_recovery::refusal(armed, held, n) {
+            crate::ktrace::log_fmt(format_args!("aarch64: cannot return to the prompt -- {why}"));
+        }
+    }
     loop {
         super::hlt();
     }

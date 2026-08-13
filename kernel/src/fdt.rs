@@ -223,6 +223,256 @@ unsafe fn header(dtb_pa: u64) -> Option<(*const u8, Header)> {
     Some((base, Header { total, off_struct, off_strings }))
 }
 
+/// The `reg` of the node whose `compatible` contains `want` **and** whose
+/// `label` property equals `label`.
+///
+/// Apple's power domains are all one `compatible` — a t8112 has ~90
+/// `apple,pmgr-pwrstate` children of the PMGR — and the only thing telling
+/// `audio_p` from `sio_adma` from `gfx` is that string. Indexing them by
+/// position instead would depend on the order a device tree happens to list
+/// them in, which is the same class of mistake as picking display output 0.
+///
+/// The returned `reg` is an **offset within the parent**, not an absolute
+/// address, for these particular nodes — that is how the binding defines them,
+/// and the caller adds the PMGR's own base.
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn reg_of_labeled_node(dtb_pa: u64, want: &[u8], label: &[u8]) -> Option<(u64, u64)> {
+    let (base, h) = unsafe { header(dtb_pa)? };
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut scells = [2u32; MAX_DEPTH];
+    let mut matched = [false; MAX_DEPTH];
+    let mut labelled = [false; MAX_DEPTH];
+    let mut reg_off = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    loop {
+        let tok = unsafe { be32(base, off, h.total)? };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return None;
+                }
+                acells[depth] = 2;
+                scells[depth] = 2;
+                matched[depth] = false;
+                labelled[depth] = false;
+                reg_off[depth] = 0;
+                let len = unsafe { cstr_len(base, off, h.total)? };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                if matched[depth] && labelled[depth] && reg_off[depth] != 0 {
+                    let (pa, ps) = (acells[depth - 1], scells[depth - 1]);
+                    let b = unsafe { read_cells(base, reg_off[depth], pa, h.total)? };
+                    let s = unsafe { read_cells(base, reg_off[depth] + pa as usize * 4, ps, h.total)? };
+                    return Some((b, s));
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let len = unsafe { be32(base, off, h.total)? } as usize;
+                let name_off = unsafe { be32(base, off + 4, h.total)? } as usize;
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"#address-cells", h.total) } {
+                        acells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"#size-cells", h.total) } {
+                        scells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"label", h.total) } {
+                        // The value is a NUL-terminated string; compare the whole
+                        // thing, so `mca0` never matches `mca0x`.
+                        let want_len = label.len();
+                        if len == want_len + 1 {
+                            let mut same = true;
+                            for (i, &c) in label.iter().enumerate() {
+                                // SAFETY: `data_off + i` is inside the property value,
+                                // whose declared length was bounds-checked by `be32`.
+                                if data_off + i >= h.total || unsafe { *base.add(data_off + i) } != c {
+                                    same = false;
+                                    break;
+                                }
+                            }
+                            labelled[depth] = same;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
+                        reg_off[depth] = data_off;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return None,
+            _ => return None,
+        }
+    }
+}
+
+/// The `reg` of the **parent** of the node whose `compatible` contains `want`.
+///
+/// A device on a bus is described by its position in the tree, not by a search:
+/// the amplifier is `ti,tas2764` *under* `i2c@235014000`, and this machine has
+/// five `apple,i2c` controllers. Taking the first one that matches a compatible
+/// talks to the wrong bus — where, on a machine with something else at the same
+/// address, every transaction is acknowledged and nothing happens. That is a
+/// failure with no error in it at all.
+///
+/// The same mistake in two other places cost a fault and a silent driver: the
+/// DMA engine's IOMMU (twenty-one `apple,t8110-dart` nodes, the first one
+/// powered down) and the DMA engine itself. **When the tree states a
+/// relationship — a phandle, a parent — resolve it; never search by compatible
+/// and hope the first hit is the one the relationship names.**
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn parent_reg_of_compatible(dtb_pa: u64, want: &[u8]) -> Option<(u64, u64)> {
+    let (base, h) = unsafe { header(dtb_pa)? };
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut scells = [2u32; MAX_DEPTH];
+    let mut matched = [false; MAX_DEPTH];
+    let mut reg_off = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    loop {
+        let tok = unsafe { be32(base, off, h.total)? };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return None;
+                }
+                acells[depth] = 2;
+                scells[depth] = 2;
+                matched[depth] = false;
+                reg_off[depth] = 0;
+                let len = unsafe { cstr_len(base, off, h.total)? };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return None;
+                }
+                if matched[depth] && depth >= 2 && reg_off[depth - 1] != 0 {
+                    // The parent's own `reg` decodes against the *grandparent's*
+                    // cell widths.
+                    let (pa, ps) = (acells[depth - 2], scells[depth - 2]);
+                    let o = reg_off[depth - 1];
+                    let b = unsafe { read_cells(base, o, pa, h.total)? };
+                    let s = unsafe { read_cells(base, o + pa as usize * 4, ps, h.total)? };
+                    return Some((b, s));
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let len = unsafe { be32(base, off, h.total)? } as usize;
+                let name_off = unsafe { be32(base, off + 4, h.total)? } as usize;
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"#address-cells", h.total) } {
+                        acells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"#size-cells", h.total) } {
+                        scells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) } {
+                        reg_off[depth] = data_off;
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return None,
+            _ => return None,
+        }
+    }
+}
+
+/// Read `prop` (as u32 cells) off the **parent** of the node whose `compatible`
+/// contains `want`. The companion to [`parent_reg_of_compatible`], for a bus's
+/// `power-domains`: the controller a device hangs off has to be powered, and it
+/// is not necessarily the first controller of its kind.
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn parent_prop_cells_of_compatible(
+    dtb_pa: u64,
+    want: &[u8],
+    prop: &[u8],
+    out: &mut [u32],
+) -> usize {
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return 0 };
+    let mut matched = [false; MAX_DEPTH];
+    let mut buf = [[0u32; 8]; MAX_DEPTH];
+    let mut buf_n = [0usize; MAX_DEPTH];
+    let mut depth: usize = 0;
+    let mut off = h.off_struct;
+    loop {
+        let Some(tok) = (unsafe { be32(base, off, h.total) }) else { return 0 };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return 0;
+                }
+                matched[depth] = false;
+                buf_n[depth] = 0;
+                let Some(len) = (unsafe { cstr_len(base, off, h.total) }) else { return 0 };
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return 0;
+                }
+                if matched[depth] && depth >= 1 {
+                    let n = buf_n[depth - 1].min(out.len());
+                    out[..n].copy_from_slice(&buf[depth - 1][..n]);
+                    return n;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let Some(len) = (unsafe { be32(base, off, h.total) }).map(|v| v as usize) else { return 0 };
+                let Some(name_off) = (unsafe { be32(base, off + 4, h.total) }).map(|v| v as usize) else {
+                    return 0;
+                };
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"compatible", h.total) } {
+                        if unsafe { compat_has(base, data_off, len, want, h.total) } {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, prop, h.total) } {
+                        let cells = (len / 4).min(8);
+                        for i in 0..cells {
+                            let Some(v) = (unsafe { be32(base, data_off + i * 4, h.total) }) else { return 0 };
+                            buf[depth][i] = v;
+                            buf_n[depth] = i + 1;
+                        }
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return 0,
+            _ => return 0,
+        }
+    }
+}
+
 /// True if `dtb_pa` points at a structurally valid FDT (magic + readable
 /// header). Callers gating platform behavior on FDT *contents* must first know
 /// whether an FDT exists at all: QEMU/VBox `-kernel` and the UEFI-stub boots
@@ -249,6 +499,196 @@ pub unsafe fn present(dtb_pa: u64) -> bool {
 pub unsafe fn total_size(dtb_pa: u64) -> Option<u64> {
     // SAFETY: delegated to `header` (magic-checked, bounded reads).
     unsafe { header(dtb_pa) }.map(|(_, h)| h.total as u64)
+}
+
+/// True if `needle` appears in `/chosen`'s `bootargs` — the kernel command line
+/// m1n1 passes with `-b` (and QEMU with `-append`).
+///
+/// This is how a hardware path that cannot be probed for is opted into or out of
+/// on a machine you can only reboot: `chitti.usb`, `chitti.agx`, `chitti.wifi`.
+/// A substring match, deliberately — the arguments here are flags, and a
+/// tokenizing version would differ from the two open-coded copies in
+/// `arch::aarch64::{apple_usb, apple_pcie}` that predate this one.
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn bootarg_present(dtb_pa: u64, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    // SAFETY: delegated to `chosen`, which is magic-checked and bounded.
+    let Some(c) = (unsafe { chosen(dtb_pa) }) else { return false };
+    if c.bootargs_ptr.is_null() || c.bootargs_len < needle.len() {
+        return false;
+    }
+    // SAFETY: `[bootargs_ptr, +bootargs_len)` is a view into the still-mapped FDT.
+    let s = unsafe { core::slice::from_raw_parts(c.bootargs_ptr, c.bootargs_len) };
+    s.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The FDT **memory reservation block**: `(address, size)` ranges inside the
+/// `/memory` window that the boot loader is still using and the kernel must not
+/// allocate from.
+///
+/// This is the half of "which memory is free" that a device tree states *outside*
+/// the tree itself — a list of big-endian `(u64, u64)` pairs at the header's
+/// `off_mem_rsvmap`, terminated by an all-zero pair. It is normally empty under
+/// QEMU and is load-bearing under **m1n1**, which puts four kinds of thing in it:
+/// its own image, the device tree it just built, each secondary CPU's stack, and
+/// the initrd. Ignoring it is not a subtle loss — it is the frame allocator
+/// handing out the device tree the boot path re-parses.
+///
+/// Returns the number of entries **found**, which may exceed `out.len()`; only
+/// the first `out.len()` are written. A caller must treat `n > out.len()` as
+/// truncation rather than as the whole list, because a reservation silently
+/// dropped is memory silently handed out.
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn mem_reservations(dtb_pa: u64, out: &mut [(u64, u64)]) -> usize {
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return 0 };
+    // off_mem_rsvmap@16. A blob whose reservation block starts past its own
+    // declared size is malformed; report no reservations rather than read on.
+    let Some(mut off) = (unsafe { be32(base, 16, h.total) }).map(|v| v as usize) else { return 0 };
+    let mut n = 0usize;
+    while off + 16 <= h.total {
+        // SAFETY: the 16 bytes at `off` are inside the blob (checked above).
+        let addr = unsafe { read_cells(base, off, 2, h.total) };
+        let size = unsafe { read_cells(base, off + 8, 2, h.total) };
+        let (Some(addr), Some(size)) = (addr, size) else { return n };
+        // The terminator is the pair (0, 0) — not "size 0", which a malformed
+        // blob could carry mid-list without ending it.
+        if addr == 0 && size == 0 {
+            return n;
+        }
+        if size != 0 {
+            if let Some(slot) = out.get_mut(n) {
+                *slot = (addr, size);
+            }
+            n += 1;
+        }
+        off += 16;
+    }
+    n
+}
+
+/// Every `reg` range of every child of `/reserved-memory`.
+///
+/// The tree's own statement of memory that is inside the `/memory` window and
+/// nevertheless spoken for. On Apple/m1n1 these are live firmware structures, not
+/// bookkeeping: the AGX `uat-handoff` / `uat-pagetables` / `uat-ttbs` carveouts
+/// (which `agx::hw` itself resolves by phandle and the GPU firmware reads), the
+/// DCP/ISP heaps, and m1n1's ADT + console-log `phram` nodes. They are `<0 0>` in
+/// a static `.dtb` and filled in by m1n1 on the live machine, so a parser tested
+/// only against a checked-in tree sees nothing at all.
+///
+/// `no-map` is deliberately **not** consulted: it distinguishes "must not be in
+/// the kernel's linear map" from "must not be allocated", and every node here is
+/// the second regardless.
+///
+/// Address/size cell widths come from the `/reserved-memory` node itself (the
+/// children's parent), per the specification. Returns the number of ranges found,
+/// with the same truncation contract as [`mem_reservations`].
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn reserved_memory(dtb_pa: u64, out: &mut [(u64, u64)]) -> usize {
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return 0 };
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut scells = [2u32; MAX_DEPTH];
+    let mut depth: usize = 0;
+    // Depth of the `/reserved-memory` node while inside it, else 0 (the root is
+    // depth 1, so 0 is never a real node depth).
+    let mut rm: usize = 0;
+    let mut n = 0usize;
+    let mut off = h.off_struct;
+    loop {
+        let Some(tok) = (unsafe { be32(base, off, h.total) }) else { return n };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return n;
+                }
+                acells[depth] = 2;
+                scells[depth] = 2;
+                let name_off = off;
+                let Some(len) = (unsafe { cstr_len(base, name_off, h.total) }) else { return n };
+                // `/reserved-memory` is a direct child of the root and carries no
+                // unit address, so this is an exact name match, not a prefix one.
+                if rm == 0 && depth == 2 && len == 15 {
+                    let want = b"reserved-memory";
+                    let mut matches = true;
+                    for (i, &b) in want.iter().enumerate() {
+                        // SAFETY: `name_off + i` is inside the name `cstr_len` just bounded.
+                        if unsafe { *base.add(name_off + i) } != b {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        rm = depth;
+                    }
+                }
+                off += (len + 1 + 3) & !3;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return n;
+                }
+                if rm == depth {
+                    // Left `/reserved-memory`; the rest of the tree is not ours.
+                    return n;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let Some(len) = (unsafe { be32(base, off, h.total) }).map(|v| v as usize) else { return n };
+                let Some(name_off) = (unsafe { be32(base, off + 4, h.total) }).map(|v| v as usize) else {
+                    return n;
+                };
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"#address-cells", h.total) } {
+                        acells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, b"#size-cells", h.total) } {
+                        scells[depth] = unsafe { be32(base, data_off, h.total) }.unwrap_or(2);
+                    } else if rm != 0
+                        && depth == rm + 1
+                        && unsafe { prop_name_is(base, h.off_strings, name_off, b"reg", h.total) }
+                    {
+                        // A child's `reg` decodes against its parent's cells, and
+                        // may carry several ranges.
+                        let (pa, ps) = (acells[rm], scells[rm]);
+                        let stride = (pa as usize + ps as usize) * 4;
+                        if stride > 0 {
+                            let mut o = data_off;
+                            while o + stride <= data_off + len {
+                                let b = unsafe { read_cells(base, o, pa, h.total) };
+                                let s = unsafe { read_cells(base, o + pa as usize * 4, ps, h.total) };
+                                let (Some(b), Some(s)) = (b, s) else { return n };
+                                // A size of 0 is an *unfilled* placeholder (a
+                                // static dtb's `uat-*` nodes read `<0 0 0 0>`),
+                                // not a zero-length reservation.
+                                if s != 0 {
+                                    if let Some(slot) = out.get_mut(n) {
+                                        *slot = (b, s);
+                                    }
+                                    n += 1;
+                                }
+                                o += stride;
+                            }
+                        }
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return n,
+            _ => return n,
+        }
+    }
 }
 
 /// True if the `compatible` property value at `[data_off, data_off+len)` — a
@@ -851,6 +1291,82 @@ pub unsafe fn for_each_prop_of_compatible(dtb_pa: u64, want: &[u8], f: &mut dyn 
 ///
 /// # Safety
 /// `dtb_pa`, if a valid FDT, must point at a readable blob.
+/// Read `prop` (as u32 cells) off the node carrying `phandle`.
+///
+/// The companion to [`reg_by_phandle`] for the properties that are plain
+/// numbers rather than addresses — a referenced `fixed-clock`'s
+/// `clock-frequency`, say. Returns how many cells were written.
+///
+/// # Safety
+/// As [`present`].
+pub unsafe fn prop_cells_by_phandle(dtb_pa: u64, phandle: u32, prop: &[u8], out: &mut [u32]) -> usize {
+    let Some((base, h)) = (unsafe { header(dtb_pa) }) else { return 0 };
+    let mut depth: usize = 0;
+    let mut matched = [false; MAX_DEPTH];
+    let mut off = h.off_struct;
+    // Two passes are not needed: `phandle` and the wanted property are both
+    // properties of the same node, but either may come first, so the value is
+    // buffered until the node ends.
+    let mut buf = [0u32; 8];
+    let mut buf_n = 0usize;
+    loop {
+        let Some(tok) = (unsafe { be32(base, off, h.total) }) else { return 0 };
+        off += 4;
+        match tok {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                if depth >= MAX_DEPTH {
+                    return 0;
+                }
+                matched[depth] = false;
+                if depth == 1 {
+                    buf_n = 0;
+                }
+                let Some(len) = (unsafe { cstr_len(base, off, h.total) }) else { return 0 };
+                off += (len + 1 + 3) & !3;
+                buf_n = 0;
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    return 0;
+                }
+                if matched[depth] && buf_n > 0 {
+                    let n = buf_n.min(out.len());
+                    out[..n].copy_from_slice(&buf[..n]);
+                    return n;
+                }
+                depth -= 1;
+            }
+            FDT_PROP => {
+                let Some(len) = (unsafe { be32(base, off, h.total) }).map(|v| v as usize) else { return 0 };
+                let Some(name_off) = (unsafe { be32(base, off + 4, h.total) }).map(|v| v as usize) else {
+                    return 0;
+                };
+                let data_off = off + 8;
+                if depth < MAX_DEPTH {
+                    if unsafe { prop_name_is(base, h.off_strings, name_off, b"phandle", h.total) } {
+                        if unsafe { be32(base, data_off, h.total) } == Some(phandle) {
+                            matched[depth] = true;
+                        }
+                    } else if unsafe { prop_name_is(base, h.off_strings, name_off, prop, h.total) } {
+                        buf_n = 0;
+                        let cells = (len / 4).min(buf.len());
+                        for i in 0..cells {
+                            let Some(v) = (unsafe { be32(base, data_off + i * 4, h.total) }) else { return 0 };
+                            buf[i] = v;
+                            buf_n = i + 1;
+                        }
+                    }
+                }
+                off += 8 + ((len + 3) & !3);
+            }
+            FDT_NOP => {}
+            FDT_END => return 0,
+            _ => return 0,
+        }
+    }
+}
+
 pub unsafe fn reg_by_phandle(dtb_pa: u64, phandle: u32) -> Option<(u64, u64)> {
     // SAFETY: delegated to `header`.
     let (base, h) = unsafe { header(dtb_pa)? };
@@ -1191,10 +1707,14 @@ mod tests {
     struct FdtBuild {
         st: Vec<u8>,   // struct block
         strs: Vec<u8>, // strings block
+        rsv: Vec<(u64, u64)>, // memory reservation block (m1n1 fills this)
     }
     impl FdtBuild {
         fn new() -> Self {
-            FdtBuild { st: Vec::new(), strs: Vec::new() }
+            FdtBuild { st: Vec::new(), strs: Vec::new(), rsv: Vec::new() }
+        }
+        fn reserve(&mut self, addr: u64, size: u64) {
+            self.rsv.push((addr, size));
         }
         fn tok(&mut self, t: u32) {
             self.st.extend_from_slice(&t.to_be_bytes());
@@ -1243,7 +1763,7 @@ mod tests {
         }
         fn build(mut self) -> Vec<u8> {
             self.tok(FDT_END);
-            let rsvmap = 16usize; // one terminating (0,0) reserve entry
+            let rsvmap = 16 * (self.rsv.len() + 1); // entries + the (0,0) terminator
             let off_struct = 40 + rsvmap;
             let off_strings = off_struct + self.st.len();
             let total = off_strings + self.strs.len();
@@ -1261,6 +1781,10 @@ mod tests {
             h[9] = self.st.len() as u32;
             for w in h {
                 out.extend_from_slice(&w.to_be_bytes());
+            }
+            for (a, s) in &self.rsv {
+                out.extend_from_slice(&a.to_be_bytes());
+                out.extend_from_slice(&s.to_be_bytes());
             }
             out.extend_from_slice(&[0u8; 16]); // reserve map terminator
             out.extend_from_slice(&self.st);
@@ -1508,5 +2032,197 @@ mod tests {
         assert_eq!(format_shifts(b"x2r10g10b10"), (22, 12, 2, 4));
         // Unknown → 32bpp XRGB fallback.
         assert_eq!(format_shifts(b"weird"), (16, 8, 0, 4));
+    }
+
+    // --- boot-loader reservations -----------------------------------------
+    //
+    // What the frame allocator must subtract from `/memory` before handing any
+    // of it out. Under QEMU both lists are empty; under m1n1 they carry its own
+    // image, the device tree, each secondary CPU's stack, the initrd, and the
+    // GPU/ISP carveouts — so these are the tests standing between a tenant
+    // address space on Apple hardware and the allocator overwriting the tree the
+    // boot path re-parses.
+
+    /// An m1n1-shaped tree: a reservation block, plus a `/reserved-memory` node
+    /// carrying both a filled AGX carveout and the `<0 0 0 0>` placeholder a
+    /// static `.dtb` ships (which m1n1 fills in on the live machine).
+    fn m1n1_sample() -> Vec<u8> {
+        let mut f = FdtBuild::new();
+        f.reserve(0x8_0800_0000, 0x0008_0000); // m1n1's own image
+        f.reserve(0x8_0900_0000, 0x0001_0000); // the device tree it just built
+        f.reserve(0x8_0A00_0000, 0x0000_4000); // a secondary CPU's stack
+        f.begin("");
+        f.prop_u32("#address-cells", 2);
+        f.prop_u32("#size-cells", 2);
+
+        f.begin("memory@800000000");
+        f.prop_str("device_type", "memory");
+        f.prop_pair64("reg", 0x8_0000_0000, 0x1_E000_0000);
+        f.end();
+
+        f.begin("reserved-memory");
+        f.prop_u32("#address-cells", 2);
+        f.prop_u32("#size-cells", 2);
+        f.begin("uat-ttbs");
+        f.prop_pair64("reg", 0x9_F000_0000, 0x0000_8000);
+        f.end();
+        f.begin("uat-pagetables");
+        f.prop_pair64("reg", 0, 0); // unfilled placeholder
+        f.end();
+        f.begin("fw-carveouts");
+        // One node, two ranges — legal, and a parser that reads only the first
+        // hands out the second.
+        let mut v = Vec::new();
+        for (a, s) in [(0x9_F100_0000u64, 0x0010_0000u64), (0x9_F300_0000, 0x0020_0000)] {
+            v.extend_from_slice(&a.to_be_bytes());
+            v.extend_from_slice(&s.to_be_bytes());
+        }
+        f.prop("reg", &v);
+        f.end();
+        f.end(); // reserved-memory
+
+        f.end(); // root
+        f.build()
+    }
+
+    #[test_case]
+    fn mem_reservations_reads_the_block_and_stops_at_the_terminator() {
+        let blob = m1n1_sample();
+        let mut out = [(0u64, 0u64); 8];
+        let n = unsafe { mem_reservations(blob.as_ptr() as u64, &mut out) };
+        assert_eq!(n, 3);
+        assert_eq!(out[0], (0x8_0800_0000, 0x0008_0000));
+        assert_eq!(out[1], (0x8_0900_0000, 0x0001_0000));
+        assert_eq!(out[2], (0x8_0A00_0000, 0x0000_4000));
+        // Past the terminator is the struct block, not a fourth reservation.
+        assert_eq!(out[3], (0, 0));
+    }
+
+    #[test_case]
+    fn a_tree_that_reserves_nothing_reserves_nothing() {
+        // `sample()` builds a terminator-only block, which is what QEMU hands us.
+        let blob = sample();
+        let mut out = [(0u64, 0u64); 4];
+        assert_eq!(unsafe { mem_reservations(blob.as_ptr() as u64, &mut out) }, 0);
+        assert_eq!(unsafe { reserved_memory(blob.as_ptr() as u64, &mut out) }, 0);
+    }
+
+    #[test_case]
+    fn reservation_readers_report_what_did_not_fit() {
+        // The caller must be able to tell "that was all" from "that was as much
+        // as you asked for": a dropped reservation is memory handed out.
+        let blob = m1n1_sample();
+        let mut one = [(0u64, 0u64); 1];
+        assert_eq!(unsafe { mem_reservations(blob.as_ptr() as u64, &mut one) }, 3);
+        assert_eq!(one[0], (0x8_0800_0000, 0x0008_0000));
+        assert_eq!(unsafe { reserved_memory(blob.as_ptr() as u64, &mut one) }, 3);
+    }
+
+    #[test_case]
+    fn reserved_memory_reads_every_child_and_every_range() {
+        let blob = m1n1_sample();
+        let mut out = [(0u64, 0u64); 8];
+        let n = unsafe { reserved_memory(blob.as_ptr() as u64, &mut out) };
+        // The `<0 0>` placeholder is not a reservation; both ranges of the
+        // two-range node are.
+        assert_eq!(n, 3);
+        assert_eq!(out[0], (0x9_F000_0000, 0x0000_8000));
+        assert_eq!(out[1], (0x9_F100_0000, 0x0010_0000));
+        assert_eq!(out[2], (0x9_F300_0000, 0x0020_0000));
+    }
+
+    #[test_case]
+    fn reserved_memory_decodes_against_its_own_cells() {
+        // The children's `reg` uses the *parent's* cell widths, so a node that
+        // declares 1/1 must not be read as 2/2 — which would fold two ranges
+        // into one address and leave live memory looking free.
+        let mut f = FdtBuild::new();
+        f.begin("");
+        f.prop_u32("#address-cells", 2);
+        f.prop_u32("#size-cells", 2);
+        f.begin("reserved-memory");
+        f.prop_u32("#address-cells", 1);
+        f.prop_u32("#size-cells", 1);
+        f.begin("logbuf");
+        let mut v = Vec::new();
+        v.extend_from_slice(&0x4020_0000u32.to_be_bytes());
+        v.extend_from_slice(&0x0000_4000u32.to_be_bytes());
+        f.prop("reg", &v);
+        f.end();
+        f.end();
+        f.end();
+        let blob = f.build();
+        let mut out = [(0u64, 0u64); 4];
+        let n = unsafe { reserved_memory(blob.as_ptr() as u64, &mut out) };
+        assert_eq!(n, 1);
+        assert_eq!(out[0], (0x4020_0000, 0x0000_4000));
+    }
+
+    #[test_case]
+    fn a_device_resolves_to_the_bus_it_is_actually_on() {
+        // Two identical controllers, the device on the *second*. Searching by
+        // compatible finds the first and talks to the wrong bus — where nothing
+        // answers, or worse, something else does.
+        let mut f = FdtBuild::new();
+        f.begin("");
+        f.prop_u32("#address-cells", 2);
+        f.prop_u32("#size-cells", 2);
+        f.begin("i2c@1000");
+        f.prop_str("compatible", "apple,i2c");
+        f.prop_pair64("reg", 0x1000, 0x100);
+        f.prop_u32("#address-cells", 1);
+        f.prop_u32("#size-cells", 0);
+        f.end();
+        f.begin("i2c@2000");
+        f.prop_str("compatible", "apple,i2c");
+        f.prop_pair64("reg", 0x2000, 0x100);
+        f.prop_u32("#address-cells", 1);
+        f.prop_u32("#size-cells", 0);
+        f.begin("codec@38");
+        f.prop_str("compatible", "ti,tas2764");
+        f.prop("reg", &0x38u32.to_be_bytes());
+        f.end();
+        f.end();
+        f.end();
+        let blob = f.build();
+        let p = blob.as_ptr() as u64;
+        assert_eq!(
+            unsafe { reg_of_compatible(p, b"apple,i2c") },
+            Some((0x1000, 0x100)),
+            "a compatible search finds the first controller"
+        );
+        assert_eq!(
+            unsafe { parent_reg_of_compatible(p, b"ti,tas2764") },
+            Some((0x2000, 0x100)),
+            "the device's own bus is the second one"
+        );
+        // A node with no parent reg, and an absent device, both decline.
+        assert_eq!(unsafe { parent_reg_of_compatible(p, b"nothing,here") }, None);
+    }
+
+    #[test_case]
+    fn bootarg_present_matches_a_flag_among_others() {
+        // `sample()`'s bootargs are "chitti.epoch=1700000000".
+        let blob = sample();
+        let p = blob.as_ptr() as u64;
+        assert!(unsafe { bootarg_present(p, b"chitti.epoch=") });
+        assert!(!unsafe { bootarg_present(p, b"chitti.noframes") });
+        // No bootargs at all, not an FDT at all, and the empty needle (which
+        // would otherwise match everything, including a machine that passed no
+        // arguments — an accidental "always on" for every flag).
+        let junk = [0u8; 64];
+        assert!(!unsafe { bootarg_present(junk.as_ptr() as u64, b"chitti.usb") });
+        assert!(!unsafe { bootarg_present(0, b"chitti.usb") });
+        assert!(!unsafe { bootarg_present(p, b"") });
+    }
+
+    #[test_case]
+    fn reservation_readers_reject_non_fdt() {
+        let junk = [0u8; 64];
+        let mut out = [(0u64, 0u64); 4];
+        assert_eq!(unsafe { mem_reservations(0, &mut out) }, 0);
+        assert_eq!(unsafe { reserved_memory(0, &mut out) }, 0);
+        assert_eq!(unsafe { mem_reservations(junk.as_ptr() as u64, &mut out) }, 0);
+        assert_eq!(unsafe { reserved_memory(junk.as_ptr() as u64, &mut out) }, 0);
     }
 }
