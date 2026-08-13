@@ -1612,21 +1612,9 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
     // ── 2.5. PCIE2 BAR1/TCM window fixup (brcmf_pcie_attach) ───────────────
     pcie2_bar_window_fixup(bar0, &pci, cores.pcie2_base);
 
-    // ── 3. BOOT-ROM experiment: RELEASE the CA7 (out of reset, NO CPUHALT) ──
-    // The CA7 is in reset on a bare boot, so its boot ROM — which sets up the
-    // PMU/RAM before firmware — never ran. A platform PERST would have released
-    // it. Bring it out of reset, let the ROM run, and check if SYS_MEM powers.
-    if cores.arm_wrap != 0 {
-        ai_core_reset(bar0, &pci, cores.arm_wrap, 0, 0, 0);
-    }
-    mdelay(150);
-    let ci_ca7 = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
-    let up_ca7 = ai_iscoreup(bar0, &pci, cores.arm_wrap);
-    out.push(format!(
-        "after CA7 RELEASE: SYS_MEM coreinfo={ci_ca7:?} ca7_up={up_ca7:?} (boot ROM should power RAM)"
-    ));
-
-    // ── 3b. brcmfmac path: halt CA7 (set_passive) then reset SYS_MEM ────────
+    // ── 3. Bring-up: halt CA7 (set_passive) then reset SYS_MEM ──────────────
+    // (Releasing the CA7 to run its boot ROM was tried and only aborts the
+    // backplane — the CPU disrupts bus access rather than powering RAM.)
     if cores.arm_wrap != 0 {
         arm_halt(bar0, &pci, cores.arm_wrap);
     }
@@ -1636,8 +1624,7 @@ fn diag_inner(dev: &mut BrcmDevice) -> Vec<String> {
     mdelay(3);
     let ci_after = bp_read32_probe(bar0, &pci, cores.sysmem_base + SYSMEM_COREINFO);
     let up_after = ai_iscoreup(bar0, &pci, cores.sysmem_wrap);
-    // "Powered" if RAM decoded a real value at either point.
-    let sysmem_powered = !dead(&ci_after) || !dead(&ci_ca7);
+    let sysmem_powered = !dead(&ci_after);
     out.push(format!(
         "SYS_MEM coreinfo after bring-up={ci_after:?} up={up_after:?} powered={sysmem_powered}"
     ));

@@ -90,8 +90,12 @@ grid dims are bound. Findings:
   the firmware/kernel level.
 - m1n1 has **no compute example** and does not annotate the compute registers
   (`RegisterDefinition {number,data}`; USC_EXEC_BASE 0x10069 etc. appear only in
-  the *render* path, uncommented). So there are **no capturable reference bytes**
-  and no doc for the compute USC.
+  the *render* path, uncommented). So there is no doc for the compute USC.
+  **Correction (2026-08): reference bytes for the compute *submission* do exist**
+  — a full `WorkCommandCP` hexdump sits in `fw/agx/cmdqueue.py`'s own docstring
+  (see the encoding audit below), which settles Layer 2 field-for-field. It does
+  **not** contain the USC/register array, so 3b below still stands for the
+  dispatch descriptors.
 - The ONLY complete public reference is **Mesa source** (`src/asahi/lib` +
   the compute launch: USC packing, `ComputeInfo`/register-array construction,
   `libagx`). Reverse-engineering the dispatch = reading that code.
@@ -182,6 +186,76 @@ shader. Falls back to Path A for compute regardless.
    in `hw.rs`, reusing `uat.rs` and the `gpu_read/gpu_write` helpers.
 3. Port the `WorkCommand`/microsequence encoders (pure, tested) from
    `cmdqueue.py`/`microsequence.py`.
+
+## Submission-encoding audit (2026-08) — the reference was in the tree all along
+
+The first dispatch attempt bound the context, placed every object and rang the
+doorbell, and the firmware **never drained the CP channel** (`CL_0` read pointer
+stayed 0). Re-deriving the whole submission from the **vendored** proxyclient —
+`third_party/m1n1/proxyclient/m1n1/{agx,fw/agx}/*.py` — instead of from
+recollection of drm/asahi found five encoding faults. Four are settled by source
+or by real bytes; one is still a two-way guess and is logged as such at run time.
+
+The decisive artefact is the **captured `WorkCommandCP` hexdump in `cmdqueue.py`'s
+own docstring** — real bytes from a live macOS compute submission, i.e. exactly the
+"no capturable reference bytes exist for compute" gap this doc claimed above. Every
+field decodes to something meaningful: `encoder = 0x15_00078000`,
+`encoder_end = 0x15_00078024` (**a 0x24-byte command list — the same length
+`cdm.rs` emits**), `pipeline_base = 0x11_00000000`, `unk_38 = 0x8c60`,
+`microsequence_ptr = 0xffffffa0_0c311cc0`, `stamp_addr = 0xffffffa0_000c8014`.
+
+1. **The bookkeeping objects were in the wrong address space.** The queue, its ring
+   and cursors, the microsequence, the work command, the EventControl and the stamps
+   all lived in the submitting context's TTBR0 (`0x15…`). The capture shows every one
+   of those as a **kernel `0xffffffa0…` TTBR1** VA, and the proxyclient allocates
+   them from `kobj`/`kshared`/`cmdbuf` (all kernel) while only the encoder, shader
+   and USC come from the context (`gobj`/`pobj`). TTBR0 is per-context and **not
+   active in the firmware's own boot context**, so the firmware could not read the
+   queue it was being pointed at. This is the same rule the RTKit crashlog buffer had
+   to learn, and it is the most likely reason nothing was consumed.
+2. **`JobMeta` is 0x2c, not 0x24, and both stamps were null.** m1n1 types
+   `stamp_addr`/`fw_stamp_addr` as `WrappedPointer` = `Int64ul`, and the capture has
+   two kernel VAs there (read as `u32`s, the second decodes as `0xffffffa0` — plainly
+   not a pointer). The 0x24 form shifted every field past `JobMeta` by 8 *and* left
+   the stamps at zero, where drm/asahi types them `NonZeroU64`. This **resolves the
+   "KNOWN UNRESOLVED AMBIGUITY"** `workcmd.rs` used to carry: it was a conflict
+   between drm/asahi's stale `unk_2d4` field *name* and its stamp *type*, and the
+   bytes side with the type. Corroboration: the corrected total is 0x320, and the
+   reference driver allocates work commands with `align = 0x20`.
+3. **`CommandQueueInfo` was 0x18 bytes short in the middle.** `unk_34`, `unk_38`,
+   `unk_40`, `unk_44` and `prio5` were missing, so `uuid` sat at 0x38 instead of 0x50
+   and **`gpu_context_addr` — the scheduler block — at 0x8c instead of 0xa4**, with a
+   total of 0xa0 instead of 0xb8. Also: `event_id`/`unk_4c`/`unk_54` default to **-1**
+   in the reference, and 0 is a legal event id, so zero was the wrong "unset".
+4. **`WaitForIdle` named no pipe.** The header is `0x01 | (pipe << 8)`; the
+   proxyclient's own `WaitForInterruptCmd(1,0,0)` / `(0,1,0)` calls pin
+   `Vertex = 1<<0` and `Fragment = 1<<8`. A bare `0x01` waits on nothing.
+5. **Still a guess: `Pipe::Compute`.** Encoded as `1 << 15` (giving header
+   `0x0080_0001`) from recollection of drm/asahi; the plausible alternative puts the
+   0x80 in byte 3 (`0x8000_0001`), which is what m1n1's "`TimestampCmd.unk_3` —
+   sometimes 0x80" annotation would suggest. `/agx compute` logs the header word it
+   used, and this is the **first thing to flip** if the queue ring is read but the job
+   never completes.
+
+Smaller fixes from the same pass: `ComputeInfo.unk_38 = 0x8c60` ("always", and so in
+the capture), `unk_58 = 1`, `iogpu_unk_40 = 0x1c`,
+`EncoderParams.iogpu_compute_unk44 = 0xffffffff`, `ring_state` is 0x60 not 0x70 with
+`rb_size` 0x500 (the reference default) rather than an invented 0x80,
+`EventControl.submission_id` is a submission counter and starts at **0** (it was
+seeded with the context id), the `gpu_buf` is sized to its documented 0x2c18, and
+`StartComputeCmd.unk_buf_addr` / `unk_28 = 1` are populated.
+
+**None of this is hardware-verified** — it is source- and capture-verified, pinned by
+`cargo xtask test` on both arches. What a dispatch now reports, in firmware order, so
+one boot separates the remaining causes instead of one bit: whether the channel
+message was consumed, whether the firmware is alive (Stats), whether it read the
+queue ring (`gpu_rptr`), whether either stamp/`event_count` moved, the **decoded**
+Event-channel messages (Flag = completed vs Fault/Timeout/ChannelError = rejected),
+and the firmware's own log text.
+
+Known-remaining gap in the submission itself: `StartComputeCmd.stats_ptr` is 0. The
+real driver points it at the `GpuStatsComp` region *inside* the initdata we replay,
+so resolving it means locating that offset in the captured blob.
 
 ## Open questions to resolve during capture
 
