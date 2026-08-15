@@ -21,9 +21,11 @@ M1N1DEVICE=/dev/cu.usbmodemW945XQL26D1 \
 
 Commands:
 - `state` — read current port/PERST/link + gP0d + WiFi config (read-only).
-- `up` — full port bring-up (power gP0d during PERST, refclk, LTSSM), map BARs,
-  read chipcommon chipid + EROM + **SYS_MEM coreinfo** + TCM. A real coreinfo
-  (not `0xffffffff`/`0xabad1dea`) means the RAM domain is POWERED.
+- `up` — `apple_pcie_setup_link` order: CLKREQ pinmux (pins 162/163/164
+  → periph1), APPCLK, assert PERST#, optional rail-off **while held**, pwren,
+  refclk, 100 ms, deassert, 100 ms, LTSSM. Then map BARs and read chipcommon
+  + **SYS_MEM coreinfo** + TCM. A real coreinfo (not `0xffffffff`/`0xabad1dea`)
+  means the RAM domain is POWERED. Never drop the rail with PERST# deasserted.
 
 `p.read32/write32` recover from external aborts (return `0xabad1dea`), so pokes
 can't crash m1n1 — safe to experiment with power/PERST/refclk orderings until

@@ -112,7 +112,7 @@ def gpio_out(pin, level_high):
         v |= G_DATA
     pw(a, v)
 
-# ── Port bring-up (Asahi apple_pcie_setup_link order) ───────────────────────
+# ── Port bring-up (apple_pcie_setup_link order) ───────────────────────
 def perst_assert():
     gpio_out(PERST_PIN, False)          # ACTIVE_LOW: assert = drive 0
     rmw_clr(PORT0 + P_PERST, PERST_OFF)
@@ -182,15 +182,28 @@ def apply_tunables():
         except Exception as e:
             print("  tunable %-26s ERR %s %s" % (prop, type(e).__name__, e))
 
+# t8112 pcie_pins: CLKREQ on pinctrl_ap 162/163/164 → periph1.
+# PERIPH = GENMASK(6,5), INPUT_ENABLE = BIT(9). See pinctrl-apple-gpio.c.
+CLKREQ_PINS = (162, 163, 164)
+PIN_PERIPH, PIN_INPUT_EN = 0x3 << 5, 1 << 9
+
+def pinmux_clkreq():
+    for pin in CLKREQ_PINS:
+        a = PINCTRL_AP + 4 * pin
+        cur = pr(a)
+        pw(a, (cur & ~PIN_PERIPH) | (1 << 5) | PIN_INPUT_EN)
+
 def bringup(power_during_perst=True, off_first=True, off_hold=0.5, settle=0.1, verbose=True):
-    """Full port bring-up. Returns (link_up, status, linksts)."""
+    """Full port bring-up (apple_pcie_setup_link order). Returns (link_up, status, linksts)."""
     apply_tunables()
     configure_root_port()
-    if off_first:
-        power_off(); time.sleep(off_hold)
+    pinmux_clkreq()
     if verbose: _st("start")
     rmw_set(PORT0 + P_APPCLK, APPCLK_EN)
     perst_assert(); time.sleep(0.001)
+    # Rail off ONLY while PERST# is held — never with PERST deasserted.
+    if off_first:
+        power_off(); time.sleep(off_hold)
     if power_during_perst:
         power_on()
     if verbose: _st("perst+pwr")

@@ -538,6 +538,13 @@ const CTX_PIPELINE_BASE: u64 = 0x1100000000;
 const CTX_GEM_BASE: u64 = 0x1500000000;
 #[allow(dead_code)]
 const CTX_USERSPACE_BASE: u64 = 0x1600000000;
+/// Per-context scratch m1n1 maps in every `GPUContext.bind` (`context.py`:
+/// `self.thing = self.buf_at(0x6fffff8000, 0, 0x4000, "thing")`). The tracer
+/// dumps this page after every compute job. An unmapped page here is a
+/// firmware UAT walk during *job intake* — which is exactly retire-only's
+/// symptom (rptr advanced, busy=1, RetireStamp never ran, no GPU fault).
+const CTX_THING_BASE: u64 = 0x6fff_ff80_00;
+const CTX_THING_SIZE: u64 = 0x4000;
 
 /// A live GPU context: its numeric id (ASID) + the phys of its TTBR0 L1 table.
 #[derive(Clone, Copy)]
@@ -574,7 +581,17 @@ fn create_context(ctx_id: u16) -> Option<GpuContext> {
     crate::ktrace::log_fmt(format_args!(
         "agx: ctx {ctx_id} bound TTBR0={ttbr0:#018x} (L1 {l1:#x}) TTBR1={ttbr1:#018x}"
     ));
-    Some(GpuContext { ctx_id, l1 })
+    let ctx = GpuContext { ctx_id, l1 };
+    // Same page m1n1 installs at bind — must exist before the firmware is
+    // pointed at this context_id, not only before StartCompute.
+    if ctx_alloc_at(&ctx, CTX_THING_BASE, CTX_THING_SIZE, false).is_none() {
+        crate::ktrace::log("agx", "ctx: could not map the 0x6fffff8000 scratch page");
+        return None;
+    }
+    crate::ktrace::log_fmt(format_args!(
+        "agx: ctx {ctx_id} thing @{CTX_THING_BASE:#x}/{CTX_THING_SIZE:#x}"
+    ));
+    Some(ctx)
 }
 
 /// Map one 16 KiB context object page into `ctx`'s TTBR0 (low-half VA; `pipeline`
@@ -1524,6 +1541,49 @@ fn recover_firmware() {
     dump_firmware_health();
 }
 
+/// Invalidate one GPU context through the FWCtl channel. The captured initdata
+/// is from a live session that may already have walked this ASID; we overwrite
+/// its TTBRs and then the firmware keeps the stale walk until FWCtl. m1n1
+/// `GPUFWCtlChannel.send_inval`: 0x14-byte `FWCtlMsg` into the ring named by
+/// `InitData_FWStatus.fwctl_channel`, WRITE_PTR at +0x10 (not +0x20), then
+/// mailbox type 0x84 on EP 0x21.
+fn fwctl_invalidate(asc: &Asc, ctx_id: u32) {
+    let mut info = [0u8; 16];
+    if gpu_read(FW_STATUS_VA, &mut info) != 16 {
+        crate::ktrace::log("agx", "fwctl: InitData_FWStatus.fwctl_channel unmapped");
+        return;
+    }
+    let mut state_b = [0u8; 8];
+    let mut ring_b = [0u8; 8];
+    state_b.copy_from_slice(&info[0..8]);
+    ring_b.copy_from_slice(&info[8..16]);
+    let state = u64::from_le_bytes(state_b);
+    let ring = u64::from_le_bytes(ring_b);
+    const WRITE_PTR: u64 = 0x10;
+    const ITEM: u64 = 0x14;
+    const ITEMS: u32 = 0x100;
+    let Some(wptr) = gpu_read_u32(state + WRITE_PTR) else {
+        crate::ktrace::log_fmt(format_args!("agx: fwctl: state @{state:#x} unmapped"));
+        return;
+    };
+    let wptr = wptr % ITEMS;
+    let mut msg = [0u8; ITEM as usize];
+    msg[12..16].copy_from_slice(&ctx_id.to_le_bytes());
+    msg[16..18].copy_from_slice(&1u16.to_le_bytes());
+    msg[18..20].copy_from_slice(&2u16.to_le_bytes());
+    let slot = ring + ITEM * wptr as u64;
+    if gpu_write(slot, &msg) != msg.len() {
+        crate::ktrace::log_fmt(format_args!("agx: fwctl: ring slot @{slot:#x} unmapped"));
+        return;
+    }
+    gpu_write_u32(state + WRITE_PTR, (wptr + 1) % ITEMS);
+    let ok = send(asc, proto::msg_fwctl(), proto::EP_DOORBELL);
+    crate::ktrace::log_fmt(format_args!(
+        "agx: fwctl: inval ctx {ctx_id} state={state:#x} ring={ring:#x} slot={wptr} doorbell {}",
+        if ok { "ok" } else { "FAILED" }
+    ));
+}
+
 /// How many dispatches this boot has made. Only the **first** is a clean
 /// experiment: a job that wedges the firmware makes every later submission read as
 /// "never took the ring entry" regardless of what changed, so an A/B across two
@@ -1614,6 +1674,12 @@ impl Obj {
         // SAFETY: within our own identity-mapped allocation.
         unsafe { core::ptr::read_volatile((self.phys + off) as *const u32) }
     }
+
+    fn read_u64(&self, off: u64) -> u64 {
+        dcache_invalidate(self.phys + off, 8);
+        // SAFETY: within our own identity-mapped allocation.
+        unsafe { core::ptr::read_volatile((self.phys + off) as *const u64) }
+    }
 }
 
 /// The GPU context id `/agx compute` submits from, and the uuid/stamp identity it
@@ -1624,14 +1690,32 @@ impl Obj {
 /// even when the shader itself never ran.
 const COMPUTE_CTX_ID: u16 = 3;
 const COMPUTE_UUID: u32 = 0x00c5_0000;
-/// The queue's stamp **base**: both stamp counters are seeded with this and the
-/// job completes with `base + 0x100` ([`workcmd::stamp_value_for`]), so the
-/// counters *changing* is what proves the firmware finished the job.
-const COMPUTE_STAMP_BASE: u32 = 0xc500_0000;
+/// Stamp base for [`workcmd::FIRST_EVENT_SLOT`]. drm/asahi EventManager
+/// seeds `stamps[slot] = slot << 24` — not a pipe-shaped constant.
+const COMPUTE_STAMP_BASE: u32 = super::workcmd::stamp_base_for_slot(super::workcmd::FIRST_EVENT_SLOT);
 /// How long to wait for a dispatch before diagnosing. Deliberately past the
 /// firmware's own job-timeout, so a hung microsequence produces a `TIMEOUT` event
 /// rather than silence.
 const COMPUTE_WAIT_MS: u64 = 8000;
+
+/// Which experiment `/agx compute` runs. Only the first of a boot is clean.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComputeKind {
+    /// StartCompute → WaitForIdle → Finalize → RetireStamp + the hello shader.
+    Full,
+    /// Same WorkCommand, microsequence is only RetireStamp.
+    Retire,
+    /// RetireStamp, but `context_id = 0` (the firmware's already-live boot
+    /// context). Isolates "intake switches to ctx 3 and walks it" from
+    /// "intake is broken even on the kernel context".
+    RetireCtx0,
+}
+
+impl ComputeKind {
+    fn retire_only(self) -> bool {
+        !matches!(self, ComputeKind::Full)
+    }
+}
 
 /// **A compute dispatch** — build the full submission (a GPU context holding the
 /// shader + USC + CDM stream, and the kernel-side queue + microsequence +
@@ -1650,7 +1734,8 @@ const COMPUTE_WAIT_MS: u64 = 8000;
 /// the Event channel, what its own log says, and whether either stamp landed. Those
 /// distinguish "never scanned the channel" from "scheduled and faulted" from "ran
 /// and the shader is wrong", which are three different next steps.
-fn dispatch_hello_compute() {
+fn dispatch_hello_compute(kind: ComputeKind) {
+    let retire_only = kind.retire_only();
     use super::{cdm, shaders, workcmd};
     use workcmd::{ComputeCmd, MicroSeqRefs, QueueRefs};
     let stamp_value = workcmd::stamp_value_for(COMPUTE_STAMP_BASE, 1);
@@ -1676,6 +1761,12 @@ fn dispatch_hello_compute() {
     let Some(ctx) = create_context(COMPUTE_CTX_ID) else {
         crate::ktrace::log("agx", "compute: create_context failed");
         return;
+    };
+    // RetireCtx0 keeps the objects in ctx 3 (so placement is unchanged) but
+    // tells the firmware the job belongs to the boot context it already has.
+    let vm_slot = match kind {
+        ComputeKind::RetireCtx0 => 0,
+        _ => ctx.ctx_id as u32,
     };
 
     // ---- context (TTBR0) VAs: what the GPU dereferences running our shader ----
@@ -1761,23 +1852,33 @@ fn dispatch_hello_compute() {
     dcache_clean(out_phys, 4);
 
     // ---- build the kernel-side objects ----
-    let ms = workcmd::microseq_compute(&MicroSeqRefs {
+    // `retire` keeps the same WorkCommand and queue and only swaps the
+    // microsequence for a lone RetireStamp, so a completion isolates
+    // StartCompute/WaitForIdle from "the firmware cannot run any op".
+    let ms_refs = MicroSeqRefs {
         work_cmd_unk_buf: o_wc.va + workcmd::WC_UNK_BUF_OFFSET,
         compute_info: o_wc.va + workcmd::WC_COMPUTE_INFO_OFFSET,
         compute_info2: o_wc.va + workcmd::WC_COMPUTE_INFO2_OFFSET,
         work_queue: o_qi.va,
         stats, // GpuStatsComp, read out of the replayed initdata's RegionB
-        vm_slot: ctx.ctx_id as u32,
+        vm_slot,
+        event_generation: workcmd::FIRST_EVENT_GENERATION,
+        event_seq: workcmd::FIRST_EVENT_SEQ as u64,
         uuid: COMPUTE_UUID,
         fw_stamp: o_fw_stamp.va,
         stamp_value,
         unk_flag: o_wc.va + workcmd::WC_UNK_FLAG_OFFSET,
         event_ctrl_buf: o_ec.va + workcmd::EC_UNK_BUF_OFFSET,
         ..Default::default()
-    });
+    };
+    let ms = if retire_only {
+        workcmd::microseq_retire_only()
+    } else {
+        workcmd::microseq_compute(&ms_refs)
+    };
     let wc = workcmd::run_compute(&ComputeCmd {
         counter: 1,
-        vm_slot: ctx.ctx_id as u32,
+        vm_slot,
         event_control: o_ec.va,
         encoder: va_cdm,
         pipeline_base: CTX_PIPELINE_BASE,
@@ -1789,8 +1890,8 @@ fn dispatch_hello_compute() {
         stamp: o_stamp.va,
         fw_stamp: o_fw_stamp.va,
         stamp_value,
-        stamp_slot: 0,
-        queue_cmd_count: workcmd::queue_cmd_count_for(COMPUTE_STAMP_BASE),
+        stamp_slot: workcmd::FIRST_EVENT_SLOT,
+        event_seq: workcmd::FIRST_EVENT_SEQ,
         client_sequence: 1,
         preempt_buf: va_preempt,
         timestamps: o_ts.va,
@@ -1817,8 +1918,10 @@ fn dispatch_hello_compute() {
     o_qi.fill(&qi);
     o_jl.fill(&workcmd::job_list(o_jl.va));
     o_gctx.fill(&workcmd::gpu_context_data());
-    o_ec.fill(&workcmd::event_control(o_evcount.va));
-    o_evcount.fill(&workcmd::event_count());
+    o_ec.fill(&workcmd::event_control(o_evcount.va, vm_slot));
+    // Armed: m1n1 bumps event_count before submit. Zero + a colliding slot 0
+    // is how a replayed event table looks "empty" and then never completes.
+    o_evcount.fill(&1u32.to_le_bytes());
     // Both stamps start at the queue's BASE, and the job completes with
     // base + 0x100 — so a stamp reading `stamp_value` is proof the firmware
     // finished the job. (Seeding them with the completion value, as this first
@@ -1827,7 +1930,7 @@ fn dispatch_hello_compute() {
     o_fw_stamp.fill(&workcmd::stamp_counter(COMPUTE_STAMP_BASE));
 
     crate::ktrace::log_fmt(format_args!(
-        "agx: compute: ctx {} — context: shader@{va_shader:#x} usc@{va_usc:#x} cdm@{va_cdm:#x} out@{va_out:#x} preempt@{va_preempt:#x}/{:#x}",
+        "agx: compute: ctx {} (job context_id={vm_slot}) — context: shader@{va_shader:#x} usc@{va_usc:#x} cdm@{va_cdm:#x} out@{va_out:#x} preempt@{va_preempt:#x}/{:#x}",
         ctx.ctx_id, workcmd::PREEMPT_BUF_SIZE
     ));
     crate::ktrace::log_fmt(format_args!(
@@ -1837,9 +1940,19 @@ fn dispatch_hello_compute() {
     // The pipe selector and the stats pointer are both worth having in the log:
     // the first was the last recalled value in the submission (now settled from
     // drm/asahi), the second was a null the firmware writes through.
+    let (prio, _, prio_mask, prio_unk40, _, prio5) = workcmd::PRIORITY[0];
     crate::ktrace::log_fmt(format_args!(
-        "agx: compute: WaitForIdle header={:#010x}, stats_ptr={stats:#x}, stamp seed={COMPUTE_STAMP_BASE:#x} -> completes at {stamp_value:#x}",
-        workcmd::OP_WAIT_FOR_IDLE_COMPUTE
+        "agx: compute: {} ms={:#x}B, WaitForIdle header={:#010x}, stats_ptr={stats:#x}, stamp seed={COMPUTE_STAMP_BASE:#x} -> completes at {stamp_value:#x}, event gen={} seq={} slot={}, queue prio={prio} unk_38={prio_mask:#x} unk_40={prio_unk40} prio5={prio5}",
+        match kind {
+            ComputeKind::Full => "full StartCompute→WaitForIdle→Finalize",
+            ComputeKind::Retire => "RETIRE-ONLY (no StartCompute)",
+            ComputeKind::RetireCtx0 => "RETIRE-ONLY context_id=0 (boot ctx)",
+        },
+        ms.len(),
+        workcmd::OP_WAIT_FOR_IDLE_COMPUTE,
+        workcmd::FIRST_EVENT_GENERATION,
+        workcmd::FIRST_EVENT_SEQ,
+        workcmd::FIRST_EVENT_SLOT,
     ));
 
     // Snapshot every firmware→AP channel so movement is attributable, plus the CL
@@ -1850,8 +1963,24 @@ fn dispatch_hello_compute() {
     let event_before = gpu_read_u32(EVENT_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
     let cl_rd_before = gpu_read_u32(CL_STATE_VA).unwrap_or(0);
 
+    let Some(base) = discover_asc_base() else {
+        crate::ktrace::log("agx", "compute: ASC not available");
+        return;
+    };
+    // SAFETY: `base` is the discovered ASC MMIO base (mapped during `up`).
+    let asc = unsafe { Asc::new(base as usize) };
+    // Drop any walk of this ASID left over from the captured session, *before*
+    // the firmware is asked to take the work command.
+    fwctl_invalidate(&asc, ctx.ctx_id as u32);
+
     // --- submit RunCmdQueueMsg on the CP channel (CL_0, id 2) + doorbell ---
-    let msg = workcmd::run_cmd_queue_msg(workcmd::QUEUE_COMPUTE, o_qi.va, 1, 1, true);
+    let msg = workcmd::run_cmd_queue_msg(
+        workcmd::QUEUE_COMPUTE,
+        o_qi.va,
+        1,
+        workcmd::FIRST_EVENT_SLOT,
+        true,
+    );
     // Wrap like every other channel writer: repeated dispatches keep bumping the
     // write pointer, and past 0x100 an unwrapped index writes off the end of the
     // ring into whatever the allocator put next.
@@ -1868,12 +1997,6 @@ fn dispatch_hello_compute() {
         wptr + 1
     ));
 
-    let Some(base) = discover_asc_base() else {
-        crate::ktrace::log("agx", "compute: ASC not available");
-        return;
-    };
-    // SAFETY: `base` is the discovered ASC MMIO base (mapped during `up`).
-    let asc = unsafe { Asc::new(base as usize) };
     let _ = send(&asc, proto::msg_doorbell(CL_CHANNEL), proto::EP_DOORBELL);
     // A general kick (0x10) nudges the firmware to pump its channels.
     let _ = send(&asc, proto::msg_doorbell(0x10), proto::EP_DOORBELL);
@@ -1890,14 +2013,15 @@ fn dispatch_hello_compute() {
         dcache_invalidate(out_phys, 4);
         // SAFETY: out_phys is our identity-mapped page.
         got = unsafe { core::ptr::read_volatile(out_phys as *const u32) };
-        if got == shaders::HELLO_COMPUTE_MAGIC {
+        if !retire_only && got == shaders::HELLO_COMPUTE_MAGIC {
             break;
         }
-        // A stamp firing or an Event posting means the firmware has finished with
-        // the job — there is nothing more to wait for, so stop and report.
+        // A stamp firing, an Event posting, or (retire-only) doneptr catching
+        // wptr means the firmware has finished with the job.
         if o_fw_stamp.read_u32(0) == stamp_value
             || o_stamp.read_u32(0) == stamp_value
             || gpu_read_u32(EVENT_STATE_VA + STATE_WRITE_PTR).unwrap_or(event_before) != event_before
+            || (retire_only && o_rs.read_u32(workcmd::RS_GPU_DONEPTR) >= 1)
         {
             break;
         }
@@ -1905,16 +2029,30 @@ fn dispatch_hello_compute() {
             break;
         }
     }
-    if got == shaders::HELLO_COMPUTE_MAGIC {
+    if !retire_only && got == shaders::HELLO_COMPUTE_MAGIC {
         crate::ktrace::log_fmt(format_args!(
             "agx: compute: *** GPU DISPATCH SUCCEEDED *** out[0]={got:#x} (== HELLO_COMPUTE_MAGIC)"
         ));
         return;
     }
-    crate::ktrace::log_fmt(format_args!(
-        "agx: compute: no result — out[0]={got:#x} (want {:#x}). Diagnosing:",
-        shaders::HELLO_COMPUTE_MAGIC
-    ));
+    if retire_only
+        && (o_fw_stamp.read_u32(0) == stamp_value
+            || o_stamp.read_u32(0) == stamp_value
+            || o_rs.read_u32(workcmd::RS_GPU_DONEPTR) >= 1)
+    {
+        crate::ktrace::log_fmt(format_args!(
+            "agx: compute: *** RETIRE-ONLY COMPLETED *** doneptr={:#x} stamp={:#x} fw_stamp={:#x} — firmware can run a microsequence; StartCompute is the remaining hang",
+            o_rs.read_u32(workcmd::RS_GPU_DONEPTR),
+            o_stamp.read_u32(0),
+            o_fw_stamp.read_u32(0)
+        ));
+        // Still dump the rest so a stamp-vs-doneptr split is visible.
+    } else {
+        crate::ktrace::log_fmt(format_args!(
+            "agx: compute: no result — out[0]={got:#x} (want {:#x}). Diagnosing:",
+            shaders::HELLO_COMPUTE_MAGIC
+        ));
+    }
     diagnose_dispatch(&DispatchProbe {
         baseline,
         stats_before,
@@ -1923,10 +2061,14 @@ fn dispatch_hello_compute() {
         qi: o_qi,
         stamp: o_stamp,
         fw_stamp: o_fw_stamp,
+        ts: o_ts,
+        wc: o_wc,
         ec: o_ec,
         evcount: o_evcount,
+        gctx: o_gctx,
         stamp_seed: COMPUTE_STAMP_BASE,
         stamp_expect: stamp_value,
+        retire_only,
     });
 }
 
@@ -1941,12 +2083,16 @@ struct DispatchProbe {
     qi: Obj,
     stamp: Obj,
     fw_stamp: Obj,
+    ts: Obj,
+    wc: Obj,
     ec: Obj,
     evcount: Obj,
+    gctx: Obj,
     /// What the stamp counters were seeded with, and the value a completed job
     /// writes — reported together so a reader does not have to know the rule.
     stamp_seed: u32,
     stamp_expect: u32,
+    retire_only: bool,
 }
 
 /// Report which stage of the submission the firmware reached. Each line answers a
@@ -1969,10 +2115,12 @@ fn diagnose_dispatch(p: &DispatchProbe) {
     let cl_wr = gpu_read_u32(CL_STATE_VA + STATE_WRITE_PTR).unwrap_or(0);
     crate::ktrace::log_fmt(format_args!(
         "agx: compute: queue gpu_rptr={gpu_rptr:#x} gpu_doneptr={doneptr:#x} cpu_wptr={cpu_wptr:#x} (CL_0 read={cl_rd:#x} write={cl_wr:#x}) ⇒ {}",
-        match (gpu_rptr > 0, doneptr >= cpu_wptr) {
-            (true, true) => "firmware SCHEDULED and COMPLETED the job (⇒ the shader or its output binding is wrong)",
-            (true, false) => "firmware SCHEDULED the job and it is still in flight (⇒ stuck in the microsequence)",
-            (false, _) => "firmware never took the ring entry (⇒ the queue or the channel message is wrong)",
+        match (gpu_rptr > 0, doneptr >= cpu_wptr, p.retire_only) {
+            (true, true, true) => "firmware RAN the retire-only microsequence to completion (⇒ StartCompute is the hang)",
+            (true, true, false) => "firmware SCHEDULED and COMPLETED the job (⇒ the shader or its output binding is wrong)",
+            (true, false, true) => "firmware took the entry but RetireStamp never finished (⇒ stuck before any microseq op)",
+            (true, false, false) => "firmware SCHEDULED the job and it is still in flight (⇒ stuck in the microsequence)",
+            (false, _, _) => "firmware never took the ring entry (⇒ the queue or the channel message is wrong)",
         }
     ));
 
@@ -1982,13 +2130,22 @@ fn diagnose_dispatch(p: &DispatchProbe) {
     // recorded an error. `error_count > 0` is a rejection; `inflight > 0` with no
     // completion is a hang.
     crate::ktrace::log_fmt(format_args!(
-        "agx: compute: queue state busy={:#x} has_commands={:#x} inflight={:#x} error_count={:#x} unk_80={:#x} gpu_rptr1={:#x}",
+        "agx: compute: queue state busy={:#x} has_commands={:#x} inflight={:#x} pending={:#x} error_count={:#x} unk_80={:#x} gpu_rptr1={:#x} event_id={}",
         p.qi.read_u32(workcmd::QI_BUSY),
         p.qi.read_u32(workcmd::QI_HAS_COMMANDS),
         p.qi.read_u32(workcmd::QI_INFLIGHT_COMMANDS),
+        p.qi.read_u32(workcmd::QI_PENDING),
         p.qi.read_u32(workcmd::QI_ERROR_COUNT),
         p.qi.read_u32(workcmd::QI_UNK_80),
-        p.qi.read_u32(workcmd::QI_GPU_RPTR1)
+        p.qi.read_u32(workcmd::QI_GPU_RPTR1),
+        p.qi.read_u32(workcmd::QI_EVENT_ID) as i32
+    ));
+    // Firmware assigns these over 0xff during queue init. Still 0xff after a
+    // busy=1 hang means it never finished *creating* the queue.
+    crate::ktrace::log_fmt(format_args!(
+        "agx: compute: gpu_context queue_table={:#x} pid_table={:#x} (0xff = firmware has not assigned a slot)",
+        p.gctx.read_u32(0) as u8,
+        p.gctx.read_u32(0) >> 8 & 0xff
     ));
 
     // 2. Is it alive at all? (Stats advanced during the DevCtrl kick, so a frozen
@@ -2012,6 +2169,22 @@ fn diagnose_dispatch(p: &DispatchProbe) {
         } else {
             "neither stamp fired"
         }
+    ));
+    // JobTimestamps.start is written when StartCompute (or a Timestamp op)
+    // actually runs. Zero after a busy=1 hang means StartCompute never kicked
+    // the GPU; non-zero means it did and WaitForIdle is what's stuck.
+    let (ts_start, ts_end) = (p.ts.read_u64(0), p.ts.read_u64(8));
+    crate::ktrace::log_fmt(format_args!(
+        "agx: compute: timestamps.start={ts_start:#x} end={ts_end:#x} ⇒ {}",
+        if ts_start != 0 {
+            "StartCompute RAN (GPU was kicked; WaitForIdle is the hang)"
+        } else {
+            "StartCompute never wrote a start time (did not run, or timestamps need a Timestamp op)"
+        }
+    ));
+    let unk_flag = p.wc.read_u32(workcmd::WC_UNK_FLAG_OFFSET);
+    crate::ktrace::log_fmt(format_args!(
+        "agx: compute: workcmd.unk_flag={unk_flag:#x} (StartCompute/Finalize write this)"
     ));
     crate::ktrace::log_fmt(format_args!(
         "agx: compute: event_count={:#x} ec.cur_count={:#x} ec.submission_id={:#x}",
@@ -2260,13 +2433,15 @@ pub fn command(arg: &str) {
         "status" | "info" => status(),
         "sgx" | "dump" => sgx_dump(),
         "ctx" => context_selftest(),
-        "compute" => dispatch_hello_compute(),
+        "compute" => dispatch_hello_compute(ComputeKind::Full),
+        "compute retire" => dispatch_hello_compute(ComputeKind::Retire),
+        "compute retire0" => dispatch_hello_compute(ComputeKind::RetireCtx0),
         // Clear a firmware halt so a wedging job costs a retry instead of a reboot.
         "recover" => recover_firmware(),
         "health" => dump_firmware_health(),
         other => {
             crate::serial_println!(
-                "agx> unknown subcommand '{other}' (try: up | status | sgx | ctx | health | recover | compute)"
+                "agx> unknown subcommand '{other}' (try: up | status | sgx | ctx | health | recover | compute | compute retire | compute retire0)"
             );
         }
     }

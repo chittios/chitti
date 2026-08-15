@@ -6,7 +6,7 @@
 //! On a bare m1n1 boot of a Mac mini M2 (`chitti.wifi` bootarg):
 //! 1. [`crate::arch::aarch64::apple_pcie`] maps the APCIE ECAM + DART.
 //! 2. `brcm` probes `pci14e4,4434` (BCM4387/4388), reads chip id + FDT MAC.
-//! 3. `/wifi load` downloads the Asahi `.bin` into dongle TCM (BAR2) and waits
+//! 3. `/wifi load` downloads the brcmfmac `.bin` into dongle TCM (BAR2) and waits
 //!    for the shared-RAM handshake. Scan/connect still need the common-ring
 //!    ioctl path (next). Until then `/wifi info` shows BAR + firmware state.
 //!
@@ -48,7 +48,11 @@ pub fn init_apple() -> bool {
     }
 }
 
-/// Re-run SMC power + link wait + probe (e.g. `/wifi power`).
+/// Bring the radio up if needed (e.g. `/wifi power`).
+///
+/// If BARs are already mapped, this is a no-op — PERST is `/wifi reset`,
+/// because a rail cycle drops endpoint config and is not required once
+/// the host has enumerated the function.
 pub fn power_on() -> Result<(), &'static str> {
     // An Intel radio needs no board-level power sequencing — it is an ordinary PCIe
     // function — so `up` on such a machine means bring-up, which `/wifi up` routes to
@@ -62,13 +66,15 @@ pub fn power_on() -> Result<(), &'static str> {
         if !crate::arch::aarch64::apple_pcie::ready() && !crate::arch::aarch64::apple_pcie::init() {
             return Err("PCIe init failed");
         }
+        if radio_ready() {
+            return Ok(());
+        }
         if !crate::arch::aarch64::apple_pcie::retry_wifi_power() {
-            return Err("link still down after SMC gP0d power");
+            return Err("link still down after module power");
         }
         if brcm::probe() {
             Ok(())
         } else {
-            // Still publish FDT/link state so `/wifi info` is useful.
             let _ = brcm::ensure_stub("probe incomplete (BAR/MMIO)");
             Err("link up but BAR MMIO not reachable — see ktrace (BAR window miss/HIT)")
         }
@@ -198,7 +204,15 @@ pub fn info_lines() -> Vec<String> {
                         "  status: radio enumerated (BAR MEM OK); firmware not loaded".into(),
                     );
                     lines.push(format!(
-                        "  next: host `make wifi-assets` then rebuild (embeds {}.bin), or place it in /brcm/",
+                        "  next: /wifi diag (TCM at rambase {:#x}), then /wifi load",
+                        if d.rambase != 0 {
+                            d.rambase
+                        } else {
+                            proto::rambase_for_chip(d.chip_id).unwrap_or(0x20_0000)
+                        }
+                    ));
+                    lines.push(format!(
+                        "  then: host `make wifi-assets` then rebuild (embeds {}.bin), or place it in /brcm/",
                         d.firmware_stem
                     ));
                     lines.push(

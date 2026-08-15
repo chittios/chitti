@@ -1,7 +1,7 @@
 //! Minimal **Apple SMC** client (RTKit over ASC) for GPIO power keys.
 //!
 //! Used to assert WiFi/BT module power: key `gP0d` (GPIO 13) ← `0x800001`
-//! (m1n1 `pcie_enable_devices.py` / Asahi `pwren-gpios = <&smc_gpio 13>`).
+//! (m1n1 `pcie_enable_devices.py` / `pwren-gpios = <&smc_gpio 13>`).
 //!
 //! Boot order matches **proxyclient `mgmt.py` / our AGX path**, not the generic
 //! m1n1 `rtkit.c` wait-IOP-then-AP sequence. SMC (like AGX) stalls after
@@ -180,7 +180,7 @@ fn handle_system_ep(asc: &Asc, ep: u8, msg0: u64) {
                 "smc: oslog ty={ty:#x} low={ty_hi:#x} msg0={msg0:#018x}"
             ));
             if ty == 0x10 || (msg0 & 0xff) == 0x10 {
-                // MSG_OSLOG_INIT → ACK with 0x30 (Linux/asahi)
+                // MSG_OSLOG_INIT → ACK with 0x30 (Linux)
                 let _ = send(asc, 0x30, ep);
             }
         }

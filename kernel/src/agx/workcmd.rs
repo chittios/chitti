@@ -23,7 +23,7 @@
 //! `usc_exec_base_cp = 0x11_00000000`, `unk_38 = 0x8c60`,
 //! `microsequence_ptr = 0xffffffa0_0c311cc0`, `stamp_addr = 0xffffffa0_000c8014`.
 //!
-//! Four things those references settle, each of which was wrong here before:
+//! Five things those references settle, each of which was wrong here before:
 //!
 //! 1. **`JobMeta` is 0x2c, not 0x24.** `stamp`/`fw_stamp` are **8-byte** pointers —
 //!    m1n1 types them `WrappedPointer` = `Int64ul`, drm/asahi types them
@@ -45,6 +45,13 @@
 //!    `iogpu_unk_40: 0, // 0x1c if internal program used`, so with no helper all
 //!    four are zero. Taking `0x1c` from the capture — whose job *did* use a helper —
 //!    told the firmware a helper was present and handed it a null one.
+//! 5. **`CommandQueueInfo` +0x30 is a 6-field priority descriptor, not
+//!    `priority = 0` and five zeros.** m1n1 `set_prio(0)` and drm/asahi
+//!    `PRIORITY[0]` are `(0, 0, 0xffffffffffff0000, 1, 0, 1)`. The all-zero
+//!    row is not in the table; the firmware dequeues then polls a timestamp
+//!    window that never opens — rptr advances, `busy` stays 0, Stats freeze.
+//!    `JobMeta`'s last word and `StartCompute` +0x2c/+0x30 are asahi's
+//!    `event_seq` (a small notifier sequence), not `stamp >> 8`.
 //!
 //! Pure + arch-neutral, so the layouts are pinned by `cargo xtask test` on both
 //! arches rather than only by a hardware dispatch.
@@ -166,8 +173,12 @@ pub struct ComputeCmd {
     pub fw_stamp: u64,
     pub stamp_value: u32,
     pub stamp_slot: u32,
-    /// `JobMeta.queue_cmd_count` — how many commands this queue has submitted.
-    pub queue_cmd_count: u32,
+    /// `JobMeta` last word: drm/asahi types this `event_seq` (the allocated
+    /// notifier sequence); m1n1 names it `queue_cmd_count`. It is a small
+    /// incrementing sequence — **not** `stamp_value >> 8`. A stamp-derived
+    /// value like `0xc50000` is a plausible OOB index into the firmware's
+    /// 128-slot event table.
+    pub event_seq: u32,
     pub client_sequence: u8,
 }
 
@@ -243,7 +254,7 @@ fn job_meta(b: &mut Buf, c: &ComputeCmd) {
     b.u32(0); // evctl_index                     +0x1c
     b.u32(0); // unk_20                          +0x20
     b.u32(c.uuid); // uuid                       +0x24
-    b.u32(c.queue_cmd_count); // queue_cmd_count +0x28 → 0x2c
+    b.u32(c.event_seq); // event_seq (asahi) / queue_cmd_count (m1n1) +0x28 → 0x2c
 }
 
 /// `TimestampPointers` (0x10). drm/asahi always passes `Some(start)`/`Some(end)`
@@ -348,7 +359,8 @@ const OP_START_COMPUTE: u32 = 0x29;
 const OP_FINALIZE_COMPUTE: u32 = 0x2a;
 /// `EndCmd` — `magic 0x18`, `flags 0x40` in byte 3 (m1n1 `EndCmd.__init__`), i.e.
 /// the little-endian word 0x4000_0018. This is drm/asahi's `RetireStamp` header.
-const OP_END: u32 = 0x4000_0018;
+pub const OP_RETIRE_STAMP: u32 = 0x4000_0018;
+const OP_END: u32 = OP_RETIRE_STAMP;
 /// `WaitForInterruptCmd` — `magic 0x01` plus a pipe selector, i.e. the header is
 /// `opcode | (pipe << 8)`. **Settled from drm/asahi** (`fw/microseq.rs`):
 /// `enum Pipe { Vertex = 1 << 0, Fragment = 1 << 8, Compute = 1 << 15 }` and
@@ -383,8 +395,13 @@ pub struct MicroSeqRefs {
     /// records no per-pipe stats for this job.
     pub stats: u64,
     pub vm_slot: u32,
-    pub counter1: u32,
-    pub counter2: u32,
+    /// asahi `event_generation` (m1n1 `counter1` at +0x2c) — the queue's id.
+    /// Zero is not a generation the firmware has ever been given by the
+    /// reference driver.
+    pub event_generation: u32,
+    /// asahi `event_seq` (m1n1 `counter2` + `unk_34` at +0x30) — a U64. Same
+    /// small sequence as [`ComputeCmd::event_seq`], not a stamp-derived count.
+    pub event_seq: u64,
     pub uuid: u32,
     /// `FinalizeComputeCmd.stamp` — the fw stamp (same as `JobMeta.fw_stamp_addr`).
     pub fw_stamp: u64,
@@ -419,9 +436,8 @@ pub fn microseq_compute(r: &MicroSeqRefs) -> Vec<u8> {
     b.u64(r.work_queue); // cmdqueue_ptr                    +0x01c
     b.u32(r.vm_slot); // context_id                         +0x024
     b.u32(START_COMPUTE_UNK_28); // unk_28                  +0x028
-    b.u32(r.counter1); // counter1                          +0x02c
-    b.u32(r.counter2); // counter2                          +0x030
-    b.u32(0); // unk_34                                     +0x034
+    b.u32(r.event_generation); // event_generation (m1n1 counter1) +0x02c
+    b.u64(r.event_seq); // event_seq (m1n1 counter2+unk_34) +0x030
     b.u32(0); // unk_38                                     +0x038
     b.u64(r.compute_info2); // computeinfo2_addr            +0x03c
     b.u32(0); // unk_44                                     +0x044
@@ -456,6 +472,16 @@ pub fn microseq_compute(r: &MicroSeqRefs) -> Vec<u8> {
 
     // --- EndCmd ---
     b.u32(OP_END);
+    b.bytes
+}
+
+/// A microsequence that is **only** `RetireStamp`. Used to ask: can the firmware
+/// execute *any* microsequence on this queue, or is it stuck before the first
+/// op? A full StartCompute hang and a retire-only completion are opposite
+/// next steps (StartCompute/event vs. the queue/message).
+pub fn microseq_retire_only() -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u32(OP_RETIRE_STAMP);
     b.bytes
 }
 
@@ -503,6 +529,8 @@ pub struct QueueRefs {
     /// `event_id` — **-1 until the firmware assigns one** (the proxyclient's
     /// default). Zero is a valid event id, so it is the wrong "unset".
     pub event_id: i32,
+    /// 0..=3 — indexes [`PRIORITY`]. Out of range is clamped to 0 (the compute
+    /// doorbell we ring is priority 0's CL_0).
     pub priority: u32,
 }
 
@@ -523,11 +551,41 @@ pub const QI_UNK_80: u64 = 0x80;
 pub const QI_HAS_COMMANDS: u64 = 0x84;
 pub const QI_ERROR_COUNT: u64 = 0x88;
 pub const QI_INFLIGHT_COMMANDS: u64 = 0x98;
+/// asahi `pending` sits here if the V13.2/G14G extra word is present; dumped
+/// alongside `inflight` so a zero at 0x98 is not mistaken for "nothing pending".
+pub const QI_PENDING: u64 = 0x9c;
+
+/// `CommandQueueInfo` priority descriptor — the six fields at +0x30.
+///
+/// **Zero is not a legal row.** m1n1 `CommandQueueInfo.set_prio` and drm/asahi
+/// `fw/workqueue.rs` `PRIORITY` agree on four tuples; `unk_38` is a timestamp
+/// compare-mask, and the all-zero row matches none of them. A prio-0 queue
+/// with `unk_38 = 0` is the scheduler sitting in a poll after dequeue: rptr
+/// advances, `busy` stays 0, Stats freeze, no GPU kick. Byte-identical to
+/// asahi's `PRIORITY` array.
+pub const PRIORITY: [(u32, u32, u64, u32, u32, u32); 4] = [
+    (0, 0, 0xffff_ffff_ffff_0000, 1, 0, 1),
+    (1, 1, 0xffff_ffff_0000_0000, 0, 0, 0),
+    (2, 2, 0xffff_0000_0000_0000, 0, 0, 2),
+    (3, 3, 0x0000_0000_0000_0000, 0, 0, 3),
+];
+
+/// Offsets of the priority descriptor inside [`queue_info`].
+pub const QI_PRIORITY: usize = 0x30;
+pub const QI_UNK_34: usize = 0x34;
+pub const QI_UNK_38: usize = 0x38;
+pub const QI_UNK_40: usize = 0x40;
+pub const QI_PRIO5: usize = 0x48;
+
+fn priority_row(p: u32) -> (u32, u32, u64, u32, u32, u32) {
+    PRIORITY.get(p as usize).copied().unwrap_or(PRIORITY[0])
+}
 
 /// `CommandQueueInfo` (cmdqueue.py:505, V >= V13_2 && G < G14X) — 0xb8 bytes. The
 /// firmware reads this when a `RunCmdQueueMsg` names it: `pointers` holds the
 /// cursors, `rb` the WorkCommand pointers, `gpu_context` the scheduler block.
 pub fn queue_info(q: &QueueRefs) -> Vec<u8> {
+    let (priority, unk_34, unk_38, unk_40, unk_44, prio5) = priority_row(q.priority);
     let mut b = Buf::new();
     b.u64(q.state); // pointers_addr        @0x00
     b.u64(q.ring); // rb_addr               @0x08
@@ -537,12 +595,12 @@ pub fn queue_info(q: &QueueRefs) -> Vec<u8> {
     b.u32(0); // gpu_rptr2                  @0x24
     b.u32(0); // gpu_rptr3                  @0x28
     b.i32(q.event_id); // event_id          @0x2c
-    b.u32(q.priority); // priority          @0x30
-    b.u32(0); // unk_34                     @0x34
-    b.u64(0); // unk_38                     @0x38
-    b.u32(0); // unk_40                     @0x40
-    b.u32(0); // unk_44                     @0x44
-    b.u32(0); // prio5                      @0x48
+    b.u32(priority); // priority            @0x30
+    b.u32(unk_34); // unk_34                @0x34
+    b.u64(unk_38); // unk_38                @0x38
+    b.u32(unk_40); // unk_40                @0x40
+    b.u32(unk_44); // unk_44                @0x44
+    b.u32(prio5); // prio5                  @0x48
     b.i32(-1); // unk_4c                    @0x4c
     b.u32(q.uuid); // uuid                  @0x50
     b.i32(-1); // unk_54                    @0x54
@@ -604,8 +662,30 @@ pub const fn stamp_value_for(base: u32, n: u32) -> u32 {
     base + 0x100 * n
 }
 
-/// `JobMeta.queue_cmd_count` — the proxyclient derives it from the *previous*
-/// stamp value (`prev_stamp_value >> 8`), not from a plain submission count.
+/// drm/asahi `event.rs` EventManager: every slot's stamp is seeded
+/// `slot << 24`, then incremented by 0x100 per job. Firmware intake that
+/// checks `stamp_value >> 24 == stamp_slot` hangs if we send a CP-shaped
+/// `0xc5000000` (top byte 0xc5) against slot 0 or 64.
+pub const fn stamp_base_for_slot(slot: u32) -> u32 {
+    slot << 24
+}
+
+/// First-job event sequence / stamp slot. drm/asahi fills `JobMeta.event_seq`
+/// and `StartCompute.event_seq` from the allocated notifier (`ev_comp.event_seq`),
+/// and `RunCmdQueueMsg.event_number` from the slot (0..127).
+///
+/// Slot **0 is not safe on a replayed initdata**: the captured session already
+/// allocated low event ids, and firmware intake that re-arms a live slot
+/// spins — rptr advances, `busy=1`, RetireStamp never runs. 64 is in the
+/// 128-slot table and far above anything a short capture uses.
+pub const FIRST_EVENT_SLOT: u32 = 64;
+pub const FIRST_EVENT_SEQ: u32 = 1;
+/// asahi `event_generation` for the first queue we create this boot.
+pub const FIRST_EVENT_GENERATION: u32 = 1;
+
+/// m1n1's `prev_stamp_value >> 8` derivation. Kept so the stamp arithmetic is
+/// pinned; do **not** put this in `JobMeta` — drm/asahi types that word
+/// `event_seq`, and a stamp-base of `0xc5000000` makes this `0xc50000`.
 pub const fn queue_cmd_count_for(prev_stamp_value: u32) -> u32 {
     prev_stamp_value >> 8
 }
@@ -613,6 +693,10 @@ pub const fn queue_cmd_count_for(prev_stamp_value: u32) -> u32 {
 /// Encoded size of [`event_control`]; its trailing `unk_buf` is at 0xa8.
 pub const EVENT_CONTROL_SIZE: usize = 0xb0;
 pub const EC_UNK_BUF_OFFSET: u64 = 0xa8;
+/// `EventControl.vm_slot` — m1n1 `cmdqueue.py` EventControl, after `unk_20`.
+pub const EC_VM_SLOT: usize = 0x24;
+/// `CommandQueueInfo.event_id` — firmware writes the assigned id over our `-1`.
+pub const QI_EVENT_ID: u64 = 0x2c;
 
 /// `EventControl` (cmdqueue.py:91, V >= V13_0B4 → 0xb0). Everything past
 /// `unk_10` is firmware-managed state and starts zero, except the trailing
@@ -621,13 +705,21 @@ pub const EC_UNK_BUF_OFFSET: u64 = 0xa8;
 /// `submission_id` is **0** for a fresh queue (proxyclient
 /// `event_control.submission_id = 0`) — it is a submission counter, not an
 /// identity, so seeding it with the context id was wrong.
-pub fn event_control(event_count_va: u64) -> Vec<u8> {
+///
+/// `vm_slot` is the GPU context this notifier is bound to. The default pad
+/// left it 0 while the work command named ctx 3; firmware intake that
+/// matches the two can wait forever.
+pub fn event_control(event_count_va: u64, vm_slot: u32) -> Vec<u8> {
     let mut b = Buf::new();
     b.u64(event_count_va); // event_count_addr  @0x00
     b.u32(0); // submission_id                  @0x08
     b.u32(0); // cur_count                      @0x0c
     b.u32(EVENT_CONTROL_UNK_10); // unk_10      @0x10
-    b.pad(EVENT_CONTROL_SIZE - 0x14 - 8); // firmware-managed state @0x14
+    b.u32(0); // unk_14                         @0x14
+    b.u64(0); // unk_18                         @0x18
+    b.u32(0); // unk_20                         @0x20
+    b.u32(vm_slot); // vm_slot                  @0x24
+    b.pad(EVENT_CONTROL_SIZE - 0x28 - 8); // rest of firmware state @0x28
     b.pad(8); // unk_buf                        @0xa8
     let n = b.bytes.len();
     for x in &mut b.bytes[n - 8..] {
@@ -669,7 +761,7 @@ mod tests {
             fw_stamp: 0xffff_ffa0_0c37_8014,
             stamp_value: 0x3b00,
             stamp_slot: 5,
-            queue_cmd_count: 0,
+            event_seq: 0,
             client_sequence: 0x15,
             preempt_buf: 0x15_0008_8000,
             timestamps: 0xffff_ffa0_0002_9030,
@@ -718,6 +810,7 @@ mod tests {
         assert_eq!(rd64(&w, 0x284 + 0x0c), 0xffff_ffa0_0c37_8014);
         assert_eq!(rd32(&w, 0x284 + 0x14), 0x3b00); // stamp_value
         assert_eq!(rd32(&w, 0x284 + 0x18), 5); // stamp_slot
+        assert_eq!(rd32(&w, 0x284 + 0x28), 0); // event_seq (fixture)
         assert_eq!(rd32(&w, 0x284 + 0x24), 0x1200_22b8); // uuid
         // client_sequence @0x2d8 (dump 0x2d0) — only right if JobMeta is 0x2c.
         assert_eq!(w[0x2d8], 0x15);
@@ -841,6 +934,40 @@ mod tests {
         assert_eq!(rd32(&qi, 0x4c) as i32, -1); // unk_4c
         assert_eq!(rd32(&qi, 0x54) as i32, -1); // unk_54
         assert_eq!(rd64(&qi, QI_GPU_CONTEXT_OFFSET), 0xe000);
+        // Prio 0 is the compute doorbell's row — not the all-zero tuple.
+        assert_eq!(rd32(&qi, QI_PRIORITY), 0);
+        assert_eq!(rd32(&qi, QI_UNK_34), 0);
+        assert_eq!(rd64(&qi, QI_UNK_38), 0xffff_ffff_ffff_0000);
+        assert_eq!(rd32(&qi, QI_UNK_40), 1);
+        assert_eq!(rd32(&qi, QI_PRIO5), 1);
+    }
+
+    /// Every priority the reference driver names, byte-for-byte. The all-zero
+    /// encoding this used to emit for prio 0 is not in the table.
+    #[test_case]
+    fn queue_info_priority_matches_asahi_and_m1n1() {
+        for (i, &(p, u34, u38, u40, u44, p5)) in PRIORITY.iter().enumerate() {
+            let qi = queue_info(&QueueRefs { priority: i as u32, ..Default::default() });
+            assert_eq!(rd32(&qi, QI_PRIORITY), p);
+            assert_eq!(rd32(&qi, QI_UNK_34), u34);
+            assert_eq!(rd64(&qi, QI_UNK_38), u38);
+            assert_eq!(rd32(&qi, QI_UNK_40), u40);
+            assert_eq!(rd32(&qi, 0x44), u44);
+            assert_eq!(rd32(&qi, QI_PRIO5), p5);
+        }
+        // An out-of-range request must not invent a fifth row.
+        let qi = queue_info(&QueueRefs { priority: 99, ..Default::default() });
+        assert_eq!(rd32(&qi, QI_PRIORITY), 0);
+        assert_eq!(rd64(&qi, QI_UNK_38), 0xffff_ffff_ffff_0000);
+        // The all-zero descriptor is not a legal row at any priority.
+        for i in 0..4u32 {
+            let qi = queue_info(&QueueRefs { priority: i, ..Default::default() });
+            let zero = rd32(&qi, QI_PRIORITY) == 0
+                && rd64(&qi, QI_UNK_38) == 0
+                && rd32(&qi, QI_UNK_40) == 0
+                && rd32(&qi, QI_PRIO5) == 0;
+            assert!(!zero, "priority {i} encoded as the illegal all-zero row");
+        }
     }
 
     #[test_case]
@@ -862,6 +989,9 @@ mod tests {
         assert_eq!(rd64(&ms, 0x00c), 0x1000 + WC_COMPUTE_INFO_OFFSET);
         assert_eq!(rd64(&ms, 0x01c), 0x2000); // cmdqueue_ptr
         assert_eq!(rd32(&ms, 0x028), START_COMPUTE_UNK_28);
+        // Default leaves event_generation/event_seq at 0; a real submit fills them.
+        assert_eq!(rd32(&ms, 0x02c), 0);
+        assert_eq!(rd64(&ms, 0x030), 0);
         assert_eq!(rd64(&ms, 0x03c), 0x1000 + WC_COMPUTE_INFO2_OFFSET);
         assert_eq!(rd32(&ms, START_COMPUTE_SIZE), OP_WAIT_FOR_IDLE_COMPUTE);
         let fin = START_COMPUTE_SIZE + 4;
@@ -872,6 +1002,16 @@ mod tests {
         assert_eq!(rd32(&ms, fin + 0x58) as i32, -(fin as i32));
         assert_eq!(ms.len(), START_COMPUTE_SIZE + 4 + FINALIZE_COMPUTE_SIZE + 4);
         assert_eq!(rd32(&ms, ms.len() - 4), OP_END);
+    }
+
+    /// Retire-only is one word and that word is RetireStamp — a longer sequence
+    /// here would no longer isolate StartCompute.
+    #[test_case]
+    fn retire_only_is_just_retire_stamp() {
+        let ms = microseq_retire_only();
+        assert_eq!(ms.len(), 4);
+        assert_eq!(rd32(&ms, 0), OP_RETIRE_STAMP);
+        assert_eq!(OP_RETIRE_STAMP, 0x4000_0018);
     }
 
     /// The compute wait must name *a* pipe. The proxyclient's TA/3D calls
@@ -895,11 +1035,12 @@ mod tests {
         assert_eq!(jl.len(), 0x18);
         assert_eq!(rd64(&jl, 0), 0); // first_job
         assert_eq!(rd64(&jl, 8), 0x1000); // last_head = self
-        let ec = event_control(0x2000);
+        let ec = event_control(0x2000, 3);
         assert_eq!(ec.len(), EVENT_CONTROL_SIZE);
         assert_eq!(rd64(&ec, 0), 0x2000); // event_count_addr
         assert_eq!(rd32(&ec, 0x08), 0); // submission_id starts at 0
         assert_eq!(rd32(&ec, 0x10), EVENT_CONTROL_UNK_10);
+        assert_eq!(rd32(&ec, EC_VM_SLOT), 3);
         assert_eq!(&ec[EC_UNK_BUF_OFFSET as usize..], &[0xff; 8]);
         assert_eq!(event_count().len(), 4);
         assert_eq!(stamp_counter(0x3b00), 0x3b00u32.to_le_bytes());
@@ -909,11 +1050,35 @@ mod tests {
     /// "finished" and "never started" read identically.
     #[test_case]
     fn a_jobs_stamp_value_differs_from_its_seed() {
-        let base = 0xc500_0000u32;
+        let base = stamp_base_for_slot(FIRST_EVENT_SLOT);
+        assert_eq!(base, FIRST_EVENT_SLOT << 24);
+        assert_eq!(base >> 24, FIRST_EVENT_SLOT);
         assert_ne!(stamp_value_for(base, 1), base);
         assert_eq!(stamp_value_for(base, 1), base + 0x100);
         assert_eq!(stamp_value_for(base, 2), base + 0x200);
-        assert_eq!(queue_cmd_count_for(base), base >> 8);
+        assert_eq!(stamp_value_for(base, 1) >> 24, FIRST_EVENT_SLOT);
+        assert_eq!(queue_cmd_count_for(0xc500_0000), 0xc500_0000 >> 8);
+        // The JobMeta word is event_seq, not that derivation.
+        assert_ne!(FIRST_EVENT_SEQ, queue_cmd_count_for(0xc500_0000));
+        let w = run_compute(&ComputeCmd { event_seq: FIRST_EVENT_SEQ, ..c() });
+        assert_eq!(rd32(&w, 0x284 + 0x28), FIRST_EVENT_SEQ);
+    }
+
+    /// StartCompute's event_generation + event_seq occupy 12 bytes at +0x2c
+    /// (u32 + U64) and must not shift `computeinfo2_addr` off +0x3c.
+    #[test_case]
+    fn start_compute_event_seq_is_a_u64_and_does_not_shift_the_rest() {
+        let refs = MicroSeqRefs {
+            event_generation: 1,
+            event_seq: 1,
+            compute_info2: 0x1111_2222_3333_4444,
+            ..Default::default()
+        };
+        let ms = microseq_compute(&refs);
+        assert_eq!(rd32(&ms, 0x02c), 1);
+        assert_eq!(rd64(&ms, 0x030), 1);
+        assert_eq!(rd32(&ms, 0x038), 0); // unk_38 still immediately after the U64
+        assert_eq!(rd64(&ms, 0x03c), 0x1111_2222_3333_4444);
     }
 
     /// Pin the derivation from drm/asahi rather than the literal: `Pipe::Compute`

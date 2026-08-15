@@ -1735,7 +1735,9 @@ fn wifi_cmd(arg: &str) {
         }
         "power" | "up" => match crate::drivers::wifi::power_on() {
             Ok(()) => {
-                serial_println!("wifi> power OK — link up, radio enumerated");
+                serial_println!(
+                    "wifi> power OK — link up, radio enumerated"
+                );
                 for line in crate::drivers::wifi::info_lines() {
                     serial_println!("wifi> {line}");
                 }
