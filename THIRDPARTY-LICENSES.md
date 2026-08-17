@@ -531,7 +531,7 @@ files and should honour those licences; `SAMPLES=` builds an image without them.
 
 ## omarchy themes (MIT)
 
-`assets/themes/omarchy-*.json` are colour palettes converted from
+Most of `assets/themes/*.json` are colour palettes converted from
 [omarchy](https://github.com/basecamp/omarchy) (Copyright (c) David Heinemeier
 Hansson, MIT licence) by `tools/import_omarchy_themes.py`.
 
@@ -542,5 +542,7 @@ renders a gradient derived from its own palette instead. Its per-application
 configuration (neovim, vscode, icon and keyboard themes) is also not included,
 being for software this OS does not run.
 
-Names are prefixed `omarchy-` so they cannot collide with this project's own
-themes — both ship a `nord`, and the palettes differ.
+Themes keep their own names. Both projects ship a `nord` and the palettes are
+not identical, so the import replaced this project's earlier hand-tuned one.
+The six themes that did not come from omarchy are `dark`, `light`,
+`solarized-dark`, `dracula` and `ubuntu` (and `nord`, now omarchy's).

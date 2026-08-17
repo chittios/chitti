@@ -19,9 +19,9 @@ Two things are deliberately NOT imported:
 * **The per-app configs** (`neovim.lua`, `vscode.json`, `icons.theme`,
   `keyboard.rgb`). They configure software this OS does not run.
 
-Names are prefixed `omarchy-` so an import cannot silently overwrite a
-hand-tuned theme of ours -- both projects ship a `nord`, and they are not the
-same file.
+Themes keep their own names. Both projects ship a `nord` and the palettes are
+not identical (omarchy's accent is the blue hue, ours was cyan), so an import
+**replaces** ours -- deliberate, and recoverable from git history.
 """
 
 import argparse
@@ -100,7 +100,7 @@ def convert(name, src):
     bg = pick(src, ("background",))
     deep = pick(src, ("darker_background", "dark_background", "background"))
     return {
-        "name": f"omarchy-{name}",
+        "name": name,
         # Left as our default face and automatic scale: a theme should recolour
         # the desktop, not silently resize every glyph on it.
         "font": "Geist Mono",
@@ -137,7 +137,7 @@ def main():
         if theme is None:
             skipped.append((d.name, "no background/foreground"))
             continue
-        dest = args.out / f"omarchy-{d.name}.json"
+        dest = args.out / f"{d.name}.json"
         dest.write_text(json.dumps(theme, indent=2) + "\n", encoding="utf-8")
         written.append((dest.name, len(theme["palette"]), len(theme["syntax"])))
 
