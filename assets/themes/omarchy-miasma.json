@@ -1,0 +1,44 @@
+{
+  "name": "omarchy-miasma",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#222222,#121212",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#222222",
+    "outline": "#c2c2b0"
+  },
+  "palette": {
+    "accent": "#78824b",
+    "logo": "#78824b",
+    "logo_node": "#c2c2b0",
+    "screen_bg": "#222222",
+    "chat_bg": "#2c2c2c",
+    "logs_bg": "#121212",
+    "chat_fg": "#c2c2b0",
+    "logs_fg": "#8a8a7e",
+    "border_dim": "#666666",
+    "title_active": "#78824b",
+    "title_dim": "#555555",
+    "sep_dim": "#2c2c2c",
+    "status_bg": "#2c2c2c",
+    "status_fg": "#c2c2b0",
+    "editor_bg": "#222222",
+    "editor_fg": "#c2c2b0",
+    "editor_lineno": "#666666",
+    "editor_sel": "#383838",
+    "composer_bg": "#2c2c2c",
+    "composer_border": "#666666",
+    "composer_hint": "#555555"
+  },
+  "syntax": {
+    "text": "#c2c2b0",
+    "keyword": "#78824b",
+    "string": "#5f875f",
+    "number": "#bb7744",
+    "comment": "#555555",
+    "punct": "#c9a554",
+    "heading": "#c9a554",
+    "code": "#5f875f"
+  }
+}

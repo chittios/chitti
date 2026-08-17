@@ -27,6 +27,34 @@ pub static BUNDLED_THEMES: &[(&str, &str)] = &[
     ("nord", include_str!("../../assets/themes/nord.json")),
     ("dracula", include_str!("../../assets/themes/dracula.json")),
     ("ubuntu", include_str!("../../assets/themes/ubuntu.json")),
+    // Imported from omarchy (https://github.com/basecamp/omarchy, MIT) by
+    // `tools/import_omarchy_themes.py`. Prefixed because both projects ship a
+    // `nord` and they are not the same palette -- an unprefixed import would
+    // silently replace ours. Palettes only: their wallpapers are 108 MB with
+    // their own provenance, so each of these renders a gradient derived from
+    // the colours instead. Regenerate rather than hand-editing.
+    ("omarchy-catppuccin", include_str!("../../assets/themes/omarchy-catppuccin.json")),
+    ("omarchy-catppuccin-latte", include_str!("../../assets/themes/omarchy-catppuccin-latte.json")),
+    ("omarchy-ethereal", include_str!("../../assets/themes/omarchy-ethereal.json")),
+    ("omarchy-everforest", include_str!("../../assets/themes/omarchy-everforest.json")),
+    ("omarchy-flexoki-light", include_str!("../../assets/themes/omarchy-flexoki-light.json")),
+    ("omarchy-gruvbox", include_str!("../../assets/themes/omarchy-gruvbox.json")),
+    ("omarchy-hackerman", include_str!("../../assets/themes/omarchy-hackerman.json")),
+    ("omarchy-kanagawa", include_str!("../../assets/themes/omarchy-kanagawa.json")),
+    ("omarchy-last-horizon", include_str!("../../assets/themes/omarchy-last-horizon.json")),
+    ("omarchy-lumon", include_str!("../../assets/themes/omarchy-lumon.json")),
+    ("omarchy-lupine", include_str!("../../assets/themes/omarchy-lupine.json")),
+    ("omarchy-matte-black", include_str!("../../assets/themes/omarchy-matte-black.json")),
+    ("omarchy-miasma", include_str!("../../assets/themes/omarchy-miasma.json")),
+    ("omarchy-nord", include_str!("../../assets/themes/omarchy-nord.json")),
+    ("omarchy-osaka-jade", include_str!("../../assets/themes/omarchy-osaka-jade.json")),
+    ("omarchy-retro-82", include_str!("../../assets/themes/omarchy-retro-82.json")),
+    ("omarchy-ristretto", include_str!("../../assets/themes/omarchy-ristretto.json")),
+    ("omarchy-rose-pine", include_str!("../../assets/themes/omarchy-rose-pine.json")),
+    ("omarchy-solitude", include_str!("../../assets/themes/omarchy-solitude.json")),
+    ("omarchy-tokyo-night", include_str!("../../assets/themes/omarchy-tokyo-night.json")),
+    ("omarchy-vantablack", include_str!("../../assets/themes/omarchy-vantablack.json")),
+    ("omarchy-white", include_str!("../../assets/themes/omarchy-white.json")),
 ];
 
 /// All available theme names: bundled + installed (in the store), de-duplicated.

@@ -1,0 +1,44 @@
+{
+  "name": "omarchy-vantablack",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#000000,#070707",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#000000",
+    "outline": "#ffffff"
+  },
+  "palette": {
+    "accent": "#8d8d8d",
+    "logo": "#8d8d8d",
+    "logo_node": "#ffffff",
+    "screen_bg": "#000000",
+    "chat_bg": "#1a1a1a",
+    "logs_bg": "#070707",
+    "chat_fg": "#ffffff",
+    "logs_fg": "#ececec",
+    "border_dim": "#7a7a7a",
+    "title_active": "#8d8d8d",
+    "title_dim": "#505050",
+    "sep_dim": "#1a1a1a",
+    "status_bg": "#1a1a1a",
+    "status_fg": "#ffffff",
+    "editor_bg": "#000000",
+    "editor_fg": "#ffffff",
+    "editor_lineno": "#7a7a7a",
+    "editor_sel": "#1a1a1a",
+    "composer_bg": "#1a1a1a",
+    "composer_border": "#7a7a7a",
+    "composer_hint": "#505050"
+  },
+  "syntax": {
+    "text": "#ffffff",
+    "keyword": "#8d8d8d",
+    "string": "#b6b6b6",
+    "number": "#9b9b9b",
+    "comment": "#505050",
+    "punct": "#b0b0b0",
+    "heading": "#b0b0b0",
+    "code": "#b6b6b6"
+  }
+}

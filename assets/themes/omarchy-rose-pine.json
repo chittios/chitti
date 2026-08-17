@@ -1,0 +1,44 @@
+{
+  "name": "omarchy-rose-pine",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#faf4ed,#e1dbd5",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#faf4ed",
+    "outline": "#575279"
+  },
+  "palette": {
+    "accent": "#56949f",
+    "logo": "#56949f",
+    "logo_node": "#575279",
+    "screen_bg": "#faf4ed",
+    "chat_bg": "#f2e9e1",
+    "logs_bg": "#e1dbd5",
+    "chat_fg": "#575279",
+    "logs_fg": "#6e6a86",
+    "border_dim": "#cecacd",
+    "title_active": "#56949f",
+    "title_dim": "#9893a5",
+    "sep_dim": "#f2e9e1",
+    "status_bg": "#f2e9e1",
+    "status_fg": "#575279",
+    "editor_bg": "#faf4ed",
+    "editor_fg": "#575279",
+    "editor_lineno": "#cecacd",
+    "editor_sel": "#dfdad9",
+    "composer_bg": "#f2e9e1",
+    "composer_border": "#cecacd",
+    "composer_hint": "#9893a5"
+  },
+  "syntax": {
+    "text": "#575279",
+    "keyword": "#56949f",
+    "string": "#286983",
+    "number": "#907aa9",
+    "comment": "#9893a5",
+    "punct": "#d7827e",
+    "heading": "#d7827e",
+    "code": "#286983"
+  }
+}
