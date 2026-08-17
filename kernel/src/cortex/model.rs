@@ -954,6 +954,29 @@ impl<'a> Model<'a> {
     /// `attn_core`/`delta_core`. Only the last position needs logits.
     #[cfg(target_arch = "aarch64")]
     fn prefill_batched(&self, prompt: &[usize], pos0: usize, cache: &mut Cache, s: &mut State) {
+        self.prefill_batched_inner(prompt, pos0, cache, s, None)
+    }
+
+    /// The batched prefill, optionally emitting logits for **every** position.
+    ///
+    /// Speculative decoding needs exactly this: the expensive part — all layers
+    /// over all `m` positions — is already batched here, and the only thing done
+    /// once is the final `vocab x dim` projection. Verifying a window of drafts
+    /// is therefore one batched pass plus `m` projections, not `m` full forwards,
+    /// which is where the entire speedup comes from.
+    ///
+    /// `all_logits` is filled with one vector per position when supplied. The
+    /// last position is still written to `s.logits` either way, so every existing
+    /// caller is bit-identical.
+    #[cfg(target_arch = "aarch64")]
+    fn prefill_batched_inner(
+        &self,
+        prompt: &[usize],
+        pos0: usize,
+        cache: &mut Cache,
+        s: &mut State,
+        mut all_logits: Option<&mut alloc::vec::Vec<alloc::vec::Vec<f32>>>,
+    ) {
         let c = &self.config;
         let dim = c.embedding_length;
         let ffn = c.feed_forward_length;
@@ -1209,10 +1232,24 @@ impl<'a> Model<'a> {
             t = phase_mark(&PHASE_ELEM, t);
         }
 
+        let out_w = self.output.unwrap_or(self.token_embd);
+
+        // Speculative verification wants a distribution at every position, not
+        // just the last. Done before the last-position projection below so the
+        // existing path is untouched when nobody asked.
+        if let Some(sink) = all_logits.as_deref_mut() {
+            sink.clear();
+            for mi in 0..m {
+                tensor::rmsnorm(&hidden[mi * dim..(mi + 1) * dim], self.output_norm, c.rms_eps, &mut s.norm);
+                matvec_qw(out_w, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
+                self.logit_tail(c, s);
+                sink.push(s.logits.clone());
+            }
+        }
+
         // Only the final position's logits are needed to pick the first token.
         let last = m - 1;
         tensor::rmsnorm(&hidden[last * dim..(last + 1) * dim], self.output_norm, c.rms_eps, &mut s.norm);
-        let out_w = self.output.unwrap_or(self.token_embd);
         matvec_qw(out_w, &s.norm, &mut s.logits, &mut s.xq, &mut s.xs, self.vocab, dim);
         // Gemma final-logit softcap + suppressed-token bias — the same tail
         // `forward` applies. Omitting it here would make the first sampled token
@@ -1230,6 +1267,70 @@ impl<'a> Model<'a> {
             }
         }
         cache.positions = cache.positions.max(pos0 + m);
+    }
+
+    /// **Speculative verification.** Run `tokens` through the model starting at
+    /// `pos0` and return the next-token logits at **every** position.
+    ///
+    /// `tokens` is the accepted prefix's last token followed by the γ drafted
+    /// ones, so the returned `tokens.len()` distributions line up as: index `i`
+    /// is the target's opinion of what should follow `tokens[i]`. That makes
+    /// index 0 the check on the first draft and the final index the free bonus
+    /// position.
+    ///
+    /// **The cache is advanced by the whole window**, including positions whose
+    /// drafts are about to be rejected. The caller must snapshot the cache
+    /// before calling and restore it on a partial accept — see
+    /// [`Cache::clone`]. That is not an optimisation detail: a DeltaNet layer's
+    /// recurrent state is *stepped*, not appended, so it cannot be rewound by
+    /// truncating anything. Skipping the snapshot leaves the model conditioned
+    /// on tokens it never emitted, and the output stays fluent while silently
+    /// diverging from what unassisted decode would have produced.
+    ///
+    /// On aarch64 this is one batched pass plus `m` output projections. On x86
+    /// there is no batched matmul kernel, so it degrades to `m` sequential
+    /// forwards and speculation is a **net loss** — `spec::Stats::speedup_estimate`
+    /// will report below 1.0, and the caller should leave it off there.
+    pub fn verify_window(
+        &self,
+        tokens: &[usize],
+        pos0: usize,
+        cache: &mut Cache,
+        s: &mut State,
+    ) -> alloc::vec::Vec<alloc::vec::Vec<f32>> {
+        let mut out = alloc::vec::Vec::with_capacity(tokens.len());
+        if tokens.is_empty() {
+            return out;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if tokens.len() >= 2 && self.batched {
+            self.prefill_batched_inner(tokens, pos0, cache, s, Some(&mut out));
+            return out;
+        }
+        // Portable fallback: correct, but one pass per position.
+        for (i, &tok) in tokens.iter().enumerate() {
+            self.forward(tok, pos0 + i, cache, s, true);
+            out.push(s.logits.clone());
+        }
+        out
+    }
+
+    /// Gemma final-logit softcap + suppressed-token bias, applied to
+    /// `s.logits`. Shared so a per-position projection cannot drift from the
+    /// last-position one.
+    #[cfg(target_arch = "aarch64")]
+    fn logit_tail(&self, c: &Config, s: &mut State) {
+        if let Some(swa) = c.swa {
+            if swa.logit_softcap != 0.0 {
+                let cap = swa.logit_softcap;
+                s.logits.iter_mut().for_each(|x| *x = cap * tensor::tanhf(*x / cap));
+            }
+        }
+        for &id in &self.gguf.suppress_tokens {
+            if let Some(lg) = s.logits.get_mut(id as usize) {
+                *lg = f32::NEG_INFINITY;
+            }
+        }
     }
 
     /// Weight-stationary batched projection: quantize each of the `m` input
