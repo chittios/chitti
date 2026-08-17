@@ -31,6 +31,7 @@ pub mod bench;
 pub mod executor;
 pub mod fs;
 pub mod grammar;
+pub mod journal;
 pub mod policy;
 pub mod registry;
 pub mod ui;
