@@ -108,11 +108,20 @@ static DEFER_PRESENT: core::sync::atomic::AtomicBool =
 static DIRTY: Locked<alloc::vec::Vec<u32>> = Locked::new(alloc::vec::Vec::new());
 
 /// Run `f` without compositor presents; one present per dirtied surface at the end.
+///
+/// **Nests.** The previous value is restored rather than cleared, and an inner
+/// call does not flush — otherwise an inner deferral ending would re-enable
+/// presents for the rest of an outer one, and the outer batch would pay a full
+/// pane-scale present per remaining op. That is reachable now that a chunked
+/// `ui_draw` defers around its pieces while app init already defers around the
+/// whole start-up sequence.
 pub fn with_deferred_present(f: impl FnOnce()) {
-    DEFER_PRESENT.store(true, Ordering::SeqCst);
+    let outer = DEFER_PRESENT.swap(true, Ordering::SeqCst);
     f();
-    DEFER_PRESENT.store(false, Ordering::SeqCst);
-    flush_deferred();
+    if !outer {
+        DEFER_PRESENT.store(false, Ordering::SeqCst);
+        flush_deferred();
+    }
 }
 
 fn mark_dirty(id: u32) {
