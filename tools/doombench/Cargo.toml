@@ -1,0 +1,30 @@
+# Host-side harness for the Doom port: `third_party/doomgeneric` built **natively**
+# and **to wasm and run under wasmi** (the interpreter the kernel uses), so the
+# interpreter's tax on a real game loop is measurable in seconds without a kernel
+# build — the `pngbench`/`pdfbench`/`h264diff` pattern.
+#
+# This is the **decision gate** for the whole port. The app model can host a game
+# two ways: a wasm package (ordinary, signed, capability-gated) or a ring-3 tenant
+# (native speed, but it means writing the first chunked stateful tenant). Which one
+# is right is a question about a number, and CLAUDE.md's own figures bracket it far
+# too widely to guess from — wasmi measured 47-67x native on PNG decode, and 3-30x
+# on the PDF rasterizer once it was on wasmi 1.1 with `simd128`. Doom at 320x200 has
+# enormous headroom over the 486 it shipped for, so 30x may well still be playable;
+# "may well" is exactly what this harness exists to replace.
+[package]
+name = "chitti-doombench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Stand-alone: not part of the root workspace.
+[workspace]
+
+[dependencies]
+# **Match the kernel exactly** (`kernel/Cargo.toml`): same version, same `simd`
+# feature. A harness on a different interpreter measures a different program — the
+# whole value of these numbers is that they transfer to the kernel.
+wasmi = { version = "1.1", default-features = false, features = ["simd", "std"] }
+
+[profile.release]
+opt-level = 3
