@@ -302,6 +302,39 @@ pub fn run() -> ! {
     update_composer_hint(remote_on, remote_cfg.as_ref());
 
     loop {
+        // **The kernel's recovery point.** A CPU fault in a task is contained by
+        // `sched::fault_current_task`, but it refuses for task 0 — this one —
+        // where the choice used to be halting the machine. A fault below here
+        // now unwinds to this exact spot instead, so a bad command costs a line
+        // of output rather than the session: the framebuffer, the USB console
+        // and a model that took a minute to load all survive it. The state a
+        // fault left behind is *not* known-good, which is why this says so
+        // rather than resuming silently. See [`crate::fault_recovery`] for the
+        // three cases where it still refuses and halts.
+        match crate::fault_recovery::arm() {
+            crate::fault_recovery::Arrival::Armed => {
+                // Reaching the top of the loop normally means the previous
+                // command finished without faulting, which is what ends a
+                // fault-storm streak.
+                crate::fault_recovery::disarm_reset();
+            }
+            crate::fault_recovery::Arrival::Recovered(why) => {
+                line.clear();
+                // Reaching the prompt ends the previous fault, so the handlers'
+                // nested-fault guard must be released — otherwise the *next*
+                // fault is mistaken for a fault-inside-a-fault and halts the
+                // machine that just proved it could recover.
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::aarch64::exceptions::clear_fault_depth();
+                serial_println!(
+                    "shell> recovered from a kernel fault ({}) — the syndrome is above, in /ktrace. \
+                     Kernel state may be inconsistent after this; prefer /reboot once you have what \
+                     you need. ({} fault(s) recovered this boot)",
+                    why,
+                    crate::fault_recovery::total()
+                );
+            }
+        }
         // External channel inbox → agent turn → reply. Must run whenever
         // messages are queued — including right after a channel-wake from
         // idle read_line (otherwise Telegram DMs sit unprocessed forever).
@@ -805,6 +838,7 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "network" | "net" => net_cmd(arg),
         "ping" => net_ping(arg),
         "wifi" => wifi_cmd(arg),
+        "audio" => audio_cmd(arg),
         "tls" => tls_cmd(arg),
         "decoder" => decoder_cmd(arg),
         "heap" => heap_cmd(arg),
@@ -1632,6 +1666,21 @@ fn js_run_source(source: &str, force_print: bool, argv: &[String]) {
     }
 }
 
+/// `/audio` — built-in audio on Apple Silicon (NCO -> MCA -> ADMAC -> the
+/// speaker amplifier over I2C). Boot calls this via `sound::autodetect` when
+/// the tree names the amp; `/audio up` retries, `/audio probe` is read-only.
+fn audio_cmd(arg: &str) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::sound::apple::command(arg);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = arg;
+        serial_println!("audio> built-in audio bring-up is Apple Silicon only");
+    }
+}
+
 /// `/wifi [info|scan|connect <ssid>|load]` — real Broadcom FullMAC on Apple
 /// (`chitti.wifi` bootarg); on QEMU/VBox a facade over the wired NIC.
 fn wifi_cmd(arg: &str) {
@@ -1639,7 +1688,11 @@ fn wifi_cmd(arg: &str) {
         Some((s, r)) => (s, r.trim()),
         None => (arg.trim(), ""),
     };
-    let real = crate::drivers::wifi::hardware_present();
+    // `hardware_present` reports the Apple FullMAC path. Intel is a regular
+    // PCIe endpoint and is discovered independently, so include it here or a
+    // successful Intel RF scan is mislabeled as the QEMU wired facade.
+    let intel = crate::drivers::wifi::iwl::probe().is_some();
+    let real = crate::drivers::wifi::hardware_present() || intel;
     let radio = crate::drivers::wifi::radio_ready();
     match sub {
         "" | "info" => {
@@ -1686,7 +1739,9 @@ fn wifi_cmd(arg: &str) {
         }
         "power" | "up" => match crate::drivers::wifi::power_on() {
             Ok(()) => {
-                serial_println!("wifi> power OK — link up, radio enumerated");
+                serial_println!(
+                    "wifi> power OK — link up, radio enumerated"
+                );
                 for line in crate::drivers::wifi::info_lines() {
                     serial_println!("wifi> {line}");
                 }
@@ -1780,7 +1835,7 @@ fn wifi_cmd(arg: &str) {
                     }
                     if !real {
                         serial_println!("wifi>   (wired-facade SSID — not an RF scan)");
-                    } else if !radio {
+                    } else if !radio && !intel {
                         serial_println!(
                             "wifi>   note: real RF scan needs BAR MMIO + firmware (/wifi power, /wifi load)"
                         );

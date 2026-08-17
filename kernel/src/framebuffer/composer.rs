@@ -469,18 +469,12 @@ impl Screen {
         };
         let radius = (4 * self.scale).max(4);
         self.rounded_outline(bx, by, bw, bh, radius, border);
-        // Focus glow: when the composer owns focus, the hint gap below the box
-        // gets an accent-tinged band (fading to the border colour) — reads as a
-        // soft under-glow, so the input box visibly "lifts" off the pane.
-        if self.composer_active && !self.action_focused() {
-            let gap = hy.saturating_sub(by + bh);
-            if gap > 0 {
-                let g1 = self.mix(self.theme.composer_bg, self.theme.accent, 0.22);
-                let g2 = self.mix(self.theme.composer_bg, self.theme.accent, 0.10);
-                self.fill_rect(bx + 2, by + bh, bw.saturating_sub(4), 1, g1);
-                self.fill_rect(bx + 2, by + bh + 1, bw.saturating_sub(4), gap.saturating_sub(1), g2);
-            }
-        }
+        // No under-glow. The gap between the box and the hint line used to carry
+        // an accent-tinged band meant to read as the composer "lifting" off the
+        // pane; a 1px band the width of the box, one pixel below the box's own
+        // bottom border, is a second line rather than a shadow — and the box
+        // already turns `accent` when it owns focus, which is the same
+        // information said once. The gap is left as background.
         // Prompt glyph + input text.
         let prompt: &str = if self.composer_prompt.is_empty() {
             "> "

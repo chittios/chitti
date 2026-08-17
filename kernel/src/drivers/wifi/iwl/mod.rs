@@ -65,17 +65,17 @@
 //! `-kernel`, where ECAM comes from the stub's ACPI) simply finds nothing: `pci::for_each`
 //! returns immediately when no ECAM base was published.
 
+pub mod assoc;
 pub mod context;
 pub mod csr;
+pub mod ctxt;
 pub mod device;
 pub mod fw;
-pub mod assoc;
-pub mod ctxt;
+pub mod proto;
 pub mod rx;
 pub mod scan;
 pub mod sta;
 pub mod tx;
-pub mod proto;
 
 use alloc::string::String;
 
@@ -83,10 +83,10 @@ use alloc::string::String;
 // One cfg pair here and nothing below it is arch-gated — an Intel WiFi card in an ARM
 // machine's PCIe slot is an ordinary endpoint, and gating the whole driver on x86 would
 // make it invisible there for no reason but the import.
-#[cfg(target_arch = "aarch64")]
-use crate::pci;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::pci;
+#[cfg(target_arch = "aarch64")]
+use crate::pci;
 
 /// What was found on the bus, for `/wifi` to report.
 #[derive(Debug, Clone)]
@@ -245,7 +245,12 @@ pub fn bring_up() -> Result<String, String> {
     match dev.read_mac() {
         Some(m) => report.push_str(&alloc::format!(
             "; mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            m[0], m[1], m[2], m[3], m[4], m[5]
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
         )),
         None => report.push_str("; no MAC address in the strap or OTP registers"),
     }
@@ -257,14 +262,18 @@ pub fn bring_up() -> Result<String, String> {
         Ok(n) => {
             report.push_str(&alloc::format!(
                 "; NVM v{:#x} board {:#x}, {} hw address(es)",
-                n.nvm_version, n.board_type, n.n_hw_addrs
+                n.nvm_version,
+                n.board_type,
+                n.n_hw_addrs
             ));
             if let Some((tx, rx)) = n.chains {
                 report.push_str(&alloc::format!(" chains tx {tx:#x} rx {rx:#x}"));
             }
             report.push_str(" -- the command round-trip works");
         }
-        Err(e) => report.push_str(&alloc::format!("; the first command got no usable reply ({e})")),
+        Err(e) => report.push_str(&alloc::format!(
+            "; the first command got no usable reply ({e})"
+        )),
     }
     // How many commands this firmware declares versions for. Not cosmetic: it is the table
     // any future configuration command has to consult, and its presence is what would make
@@ -276,8 +285,75 @@ pub fn bring_up() -> Result<String, String> {
         )),
         None => report.push_str(". Firmware declares no command-version table"),
     }
-    report.push_str("; scan and associate need its configuration commands, which are not implemented.");
+    report.push_str(
+        "; scan and associate need its configuration commands, which are not implemented.",
+    );
     Ok(report)
+}
+
+/// Perform one bounded RF scan with an Intel radio.
+///
+/// This intentionally opens a fresh firmware session for the scan rather than
+/// retaining a global mutable device object.  That keeps the command and DMA
+/// rings owned by this operation while it pumps the UI, avoiding a lock held
+/// across `shell::upkeep` (which would deadlock on the first re-entrant shell
+/// action).  Association will need a long-lived link/data-path owner; scan does
+/// not.
+pub fn scan() -> Result<alloc::vec::Vec<crate::drivers::wifi::proto::BssInfo>, &'static str> {
+    let found = probe().ok_or("no recognised Intel WiFi device")?;
+    let mut target = None;
+    pci::for_each(&mut |d| {
+        if d.vendor == fw::VENDOR_INTEL && d.device == found.device_id {
+            target = Some(d);
+            return false;
+        }
+        true
+    });
+    let d = target.ok_or("the Intel WiFi device disappeared between probe and scan")?;
+
+    let (name, bytes) = find_firmware(found.family)
+        .ok_or("Intel WiFi firmware is missing; run cargo xtask iwlwifi-assets")?;
+    let image = fw::parse_image(&bytes).ok_or("Intel WiFi firmware is not a valid TLV image")?;
+    if !image.has_runtime_section() {
+        return Err("Intel WiFi firmware has no runtime section");
+    }
+    // Do this check before touching the radio.  A command-version table that
+    // does not name v17 is an incompatible wire format, not a cue to guess.
+    scan_supported(&image, &bytes).map_err(|e| match e {
+        ScanUnsupported::Version(_) => "Intel firmware uses an unsupported SCAN_REQ_UMAC layout",
+        ScanUnsupported::Unstated => "Intel firmware does not state a SCAN_REQ_UMAC layout",
+    })?;
+
+    let mut dev =
+        device::IwlDevice::open(d, found.family).ok_or("could not open Intel WiFi BAR")?;
+    dev.load_firmware(&image, &bytes)?;
+    dev.wait_for_alive()?;
+    let mac = dev
+        .read_mac()
+        .ok_or("Intel WiFi firmware is alive but the adapter MAC is unavailable")?;
+    let channels = scan::default_channels();
+    dev.start_scan(&image, &bytes, &mac, &channels, false)?;
+
+    let mut results = crate::drivers::wifi::scan::Scan::new();
+    // A 22-channel active scan normally completes in well below this bound;
+    // the bound also covers quiet environments without making the shell wait
+    // forever for a beacon that may never arrive.
+    dev.collect_scan(&mut results, 6_000);
+    crate::ktrace::log_fmt(format_args!(
+        "iwlwifi: scan completed with {} network(s) using {name}",
+        results.len()
+    ));
+    Ok(results
+        .results()
+        .into_iter()
+        .map(|entry| crate::drivers::wifi::proto::BssInfo {
+            ssid: entry.bss.ssid,
+            bssid: entry.bss.bssid,
+            channel: entry.bss.channel as u16,
+            rssi: entry.rssi.unwrap_or(-127) as i16,
+            privacy: entry.bss.privacy,
+        })
+        .collect())
 }
 
 /// Whether this firmware's `SCAN_REQ_UMAC` layout is one this driver implements.
@@ -348,8 +424,15 @@ mod scan_gate_tests {
         let e = ScanUnsupported::Unstated;
         assert!(e.message().contains("not version 0"));
         let v = ScanUnsupported::Version(17);
-        assert!(v.message().contains("v17"), "the version must be named: {}", v.message());
-        assert!(v.message().contains("fw/api/scan.h"), "and where to get the layout");
+        assert!(
+            v.message().contains("v17"),
+            "the version must be named: {}",
+            v.message()
+        );
+        assert!(
+            v.message().contains("fw/api/scan.h"),
+            "and where to get the layout"
+        );
     }
 
     /// The gate is driven by the firmware's own table, so a version that *is*
@@ -362,7 +445,12 @@ mod scan_gate_tests {
     #[test_case]
     fn every_listed_version_has_an_implemented_layout() {
         for &v in proto::SCAN_REQ_UMAC_VERSIONS {
-            assert_eq!(v, scan::VERSION, "v{v} is listed but only v{} is built", scan::VERSION);
+            assert_eq!(
+                v,
+                scan::VERSION,
+                "v{v} is listed but only v{} is built",
+                scan::VERSION
+            );
         }
         assert!(
             proto::SCAN_REQ_UMAC_VERSIONS.contains(&scan::VERSION),

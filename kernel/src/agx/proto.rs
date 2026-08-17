@@ -54,6 +54,8 @@ pub const EP_DOORBELL: u8 = 0x21;
 const GPUMSG_TYPE: (u32, u32) = (63, 48);
 const GPUMSG_INIT: u64 = 0x81;
 const GPUMSG_DOORBELL: u64 = 0x83;
+/// FWCtl doorbell — type 0x84, no channel field. m1n1 `DoorbellEP.fwctl_doorbell`.
+const GPUMSG_FWCTL: u64 = 0x84;
 const INITDATA_FIELD: (u32, u32) = (43, 0);
 const DOORBELL_CHANNEL: (u32, u32) = (15, 0);
 /// DevCtrl channel id / doorbell number. The proxyclient allocates the device-
@@ -69,6 +71,12 @@ pub fn msg_fw_init(initdata_va: u64) -> u64 {
 /// A doorbell kicking `channel`, sent on `EP_DOORBELL`.
 pub fn msg_doorbell(channel: u16) -> u64 {
     field_prep(GPUMSG_DOORBELL, GPUMSG_TYPE.0, GPUMSG_TYPE.1) | field_prep(channel as u64, DOORBELL_CHANNEL.0, DOORBELL_CHANNEL.1)
+}
+
+/// Kick the FWCtl channel. Unlike a regular doorbell this is type 0x84 with no
+/// channel index — the ring address lives in `InitData_FWStatus.fwctl_channel`.
+pub fn msg_fwctl() -> u64 {
+    field_prep(GPUMSG_FWCTL, GPUMSG_TYPE.0, GPUMSG_TYPE.1)
 }
 
 // --- RTKit power states (rtkit.c:75-81) ----------------------------------
@@ -515,6 +523,10 @@ mod tests {
         let d = msg_doorbell(DOORBELL_DEVCTRL);
         assert_eq!(field_get(d, 63, 48), 0x83);
         assert_eq!(field_get(d, 15, 0), DOORBELL_DEVCTRL as u64);
+        // FWCtl is type 0x84 with an empty payload — not doorbell 0x83.
+        let f = msg_fwctl();
+        assert_eq!(field_get(f, 63, 48), 0x84);
+        assert_eq!(field_get(f, 47, 0), 0);
     }
 
     #[test_case]

@@ -99,7 +99,14 @@ pub struct Ids {
 
 impl Default for Ids {
     fn default() -> Self {
-        Ids { phy_id: 0, phy_color: 0, mac_id: 0, mac_color: 0, binding_id: 0, binding_color: 0 }
+        Ids {
+            phy_id: 0,
+            phy_color: 0,
+            mac_id: 0,
+            mac_color: 0,
+            binding_id: 0,
+            binding_color: 0,
+        }
     }
 }
 
@@ -114,7 +121,12 @@ pub struct Sequence {
 
 impl Sequence {
     pub fn new(target: Target, ids: Ids, tfd_queue_msk: u32) -> Sequence {
-        Sequence { stage: Stage::Idle, target, ids, tfd_queue_msk }
+        Sequence {
+            stage: Stage::Idle,
+            target,
+            ids,
+            tfd_queue_msk,
+        }
     }
 
     pub fn stage(&self) -> Stage {
@@ -138,7 +150,11 @@ impl Sequence {
     /// Advancing is [`Self::advance`]'s job, not this one's: a caller that fails
     /// to send must be able to ask again and get the same command rather than
     /// skipping it.
-    pub fn next_command(&self, keys: Option<(&[u8; 16], u64)>, gtk: Option<(u8, &[u8])>) -> Option<Command> {
+    pub fn next_command(
+        &self,
+        keys: Option<(&[u8; 16], u64)>,
+        gtk: Option<(u8, &[u8])>,
+    ) -> Option<Command> {
         use super::{ctxt, sta};
         match self.stage {
             Stage::Idle | Stage::PhyContext => Some((
@@ -199,7 +215,11 @@ impl Sequence {
                     &self.target.our_mac,
                     &self.target.bssid,
                     ctxt::ACTION_MODIFY,
-                    Some((self.target.aid, self.target.beacon_interval, self.target.dtim_period)),
+                    Some((
+                        self.target.aid,
+                        self.target.beacon_interval,
+                        self.target.dtim_period,
+                    )),
                 ),
             )),
             Stage::InstallKeys => {
@@ -254,8 +274,8 @@ impl Sequence {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{ctxt, sta};
+    use super::*;
 
     fn target() -> Target {
         Target {
@@ -325,7 +345,11 @@ mod tests {
         // Only *after* the station does the 802.11 exchange run.
         s.advance();
         assert_eq!(s.stage(), Stage::AuthAssoc);
-        assert_eq!(s.next_command(None, None), None, "this stage waits on frames");
+        assert_eq!(
+            s.next_command(None, None),
+            None,
+            "this stage waits on frames"
+        );
     }
 
     /// **The MAC context is sent twice**, and the second carries the AID and the
@@ -338,7 +362,11 @@ mod tests {
         s.advance(); // past phy
         let (_, _, first) = s.next_command(None, None).unwrap();
         let u = ctxt::MAC_UNION_OFF;
-        assert_eq!(u32::from_le_bytes(first[u..u + 4].try_into().unwrap()), 0, "not associated");
+        assert_eq!(
+            u32::from_le_bytes(first[u..u + 4].try_into().unwrap()),
+            0,
+            "not associated"
+        );
         let a1 = u32::from_le_bytes(first[4..8].try_into().unwrap());
         assert_eq!(a1, ctxt::ACTION_ADD);
 
@@ -351,10 +379,18 @@ mod tests {
         assert_eq!(s.stage(), Stage::MacContextAssoc);
         let (_, id, second) = s.next_command(None, None).unwrap();
         assert_eq!(id, ctxt::MAC_CONTEXT_CMD, "the same command, a second time");
-        assert_eq!(u32::from_le_bytes(second[u..u + 4].try_into().unwrap()), 1, "associated");
+        assert_eq!(
+            u32::from_le_bytes(second[u..u + 4].try_into().unwrap()),
+            1,
+            "associated"
+        );
         let a2 = u32::from_le_bytes(second[4..8].try_into().unwrap());
         assert_eq!(a2, ctxt::ACTION_MODIFY, "modify, not add");
-        assert_eq!(u32::from_le_bytes(second[u + 36..u + 40].try_into().unwrap()), 9, "the AID");
+        assert_eq!(
+            u32::from_le_bytes(second[u + 36..u + 40].try_into().unwrap()),
+            9,
+            "the AID"
+        );
     }
 
     /// **Keys come last**, after the handshake — they do not exist until it

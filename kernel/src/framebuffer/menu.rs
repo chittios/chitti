@@ -284,10 +284,10 @@ fn draw_volume_menu_body(
     y += bar_h + ch / 2;
 
     // Device line.
-    let dev = if crate::sound::is_up() {
-        "Device  PCM ready"
-    } else {
-        "Device  none (software gain still applies)"
+    let dev = match crate::sound::device_status() {
+        crate::icons::DeviceStatus::Ready => "Device  PCM ready",
+        crate::icons::DeviceStatus::Pending => "Device  bringing up…",
+        crate::icons::DeviceStatus::Disabled => "Device  none (disabled)",
     };
     sc.draw_str(ix, y, dev, sc.theme.title_dim, bg);
     y += ch + 4;
@@ -346,14 +346,13 @@ fn draw_volume_menu_body(
 }
 
 fn draw_net_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb) -> u64 {
-    let up = crate::net::is_up();
-    sc.draw_str(
-        ix,
-        y,
-        if up { "Status   Connected" } else { "Status   Offline" },
-        if up { sc.theme.accent } else { sc.theme.title_dim },
-        bg,
-    );
+    let st = crate::net::device_status();
+    let (line, ink) = match st {
+        crate::icons::DeviceStatus::Ready => ("Status   Connected", sc.theme.accent),
+        crate::icons::DeviceStatus::Pending => ("Status   Bringing up…", sc.theme.title_dim),
+        crate::icons::DeviceStatus::Disabled => ("Status   Disabled", sc.theme.title_dim),
+    };
+    sc.draw_str(ix, y, line, ink, bg);
     y += ch;
     if let Some(info) = crate::net::info() {
         sc.draw_str(ix, y, &alloc::format!("Interface  {}", info.ifname), sc.theme.chat_fg, bg);
@@ -527,25 +526,25 @@ fn draw_input_menu_body(sc: &Screen, ix: u64, mut y: u64, ch: u64, bg: Rgb, kbd:
     if kbd {
         let last = crate::console::input_activity_ms();
         let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
-        sc.draw_str(
-            ix,
-            y,
-            if active { "Keyboard  Active" } else { "Keyboard  Idle" },
-            if active { sc.theme.accent } else { sc.theme.chat_fg },
-            bg,
-        );
+        let st = crate::console::keyboard_status();
+        let (line, ink) = match (st, active) {
+            (crate::icons::DeviceStatus::Disabled, _) => ("Keyboard  Disabled", sc.theme.title_dim),
+            (_, true) => ("Keyboard  Active", sc.theme.accent),
+            _ => ("Keyboard  Idle", sc.theme.chat_fg),
+        };
+        sc.draw_str(ix, y, line, ink, bg);
         y += ch;
         sc.draw_str(ix, y, "USB HID / virtio / PS-2", sc.theme.title_dim, bg);
     } else {
         let last = crate::mouse::activity_ms();
         let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
-        sc.draw_str(
-            ix,
-            y,
-            if active { "Mouse  Active" } else { "Mouse  Idle" },
-            if active { sc.theme.accent } else { sc.theme.chat_fg },
-            bg,
-        );
+        let st = crate::mouse::pointer_status();
+        let (line, ink) = match (st, active) {
+            (crate::icons::DeviceStatus::Disabled, _) => ("Mouse  Disabled", sc.theme.title_dim),
+            (_, true) => ("Mouse  Active", sc.theme.accent),
+            _ => ("Mouse  Idle", sc.theme.chat_fg),
+        };
+        sc.draw_str(ix, y, line, ink, bg);
         y += ch;
         sc.draw_str(ix, y, "Pointer + wheel scroll", sc.theme.title_dim, bg);
     }

@@ -82,7 +82,7 @@ VBOX_MEM  ?= 8192
 # SAMPLES: bundle the `/samples/` corpus (images, videos, audios, misc) into the
 # image, so a freshly booted machine can `/open /samples/images/fruits.jpg` with
 # no network and no disk. **On by default for `run` / `run-remote` / `run-uefi` /
-# `image` / `vbox`.** First use downloads ~10 MiB into the gitignored
+# `image` / `vbox` / `m1n1`.** First use downloads ~10 MiB into the gitignored
 # `assets/samples/` (`cargo xtask sample-files`, cached afterwards) and embeds it
 # in the kernel; a failed download is a warning, never a failed build. Set
 # `SAMPLES=` (or 0/off) for an image without them.
@@ -260,15 +260,21 @@ image:
 ##       tethered Apple Silicon Mac over the m1n1 USB proxy. Configure via env:
 ##       CHITTI_M1N1 (m1n1 checkout), CHITTI_DTB (machine dtb), optional
 ##       CHITTI_INITRD (model gguf), CHITTI_BOOTARGS, M1N1DEVICE (proxy tty).
-##       Use RELEASE=1 for hardware. Without CHITTI_M1N1/CHITTI_DTB it just
+##       CHITTI_M1N1/CHITTI_DTB default to the in-tree third_party/m1n1 and the
+##       single third_party/dtb/*.dtb, so a tethered boot usually needs only
+##       M1N1DEVICE. Use RELEASE=1 for hardware. With neither available it just
 ##       builds the Image and prints the manual linux.py command.
 ##       Best-effort: extract wifi-assets first so /wifi load embeds the dongle
 ##       image (no-op if already present; skips with a warning if macOS fw is
 ##       missing so CI/non-Apple hosts still build the Image).
+##       Honours SAMPLES like every other image path (this was the one target
+##       that did not, so `make m1n1 SAMPLES=1` silently did nothing and only a
+##       raw `CHITTI_SAMPLE_FILES=1` in the environment worked). The corpus adds
+##       ~13 MiB to the payload pushed over the USB proxy — `SAMPLES=` opts out.
 .PHONY: m1n1
 m1n1:
 	-$(XTASK) wifi-assets
-	$(XTASK) m1n1 $(REL)
+	CHITTI_SAMPLE_FILES='$(SAMPLES)' $(XTASK) m1n1 $(REL)
 
 ## vbox: rebuild the aarch64 image and (re)load it into VirtualBox VM VBOX_VM
 ##       uses the local bundled GGUF (MODEL); no remote seed (see vbox-remote)

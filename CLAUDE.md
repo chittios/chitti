@@ -482,6 +482,27 @@ specific emulator/hypervisor. Discover hardware the way real firmware does
 mode tables) and degrade gracefully when a facility is absent. A feature that only
 works under QEMU is not done.
 
+**On Apple Silicon a probe of undiscovered hardware is not a failed probe, it is
+the machine going down** — and a guard at the *call site* does not survive a new
+caller. Reading a compiled-in address costs nothing on a PC or a VM (an absent PCI
+function answers all-ones), so probe-and-see is the normal shape and looks
+harmless. There is no PCI to enumerate on a bare m1n1 boot unless `chitti.wifi`
+brought APCIE up, and QEMU `virt`'s virtio-mmio window at `0x0a00_0000` is inside a
+Device-typed GiB with nothing behind it: the read takes an external abort, and what
+the human sees is a **reboot** — the SoC watchdog resets a few seconds later — with
+no syndrome, because nothing survived to print one. `main.rs` has always known
+this, running the whole `net`/`sound`/`clipboard` bring-up block only in its
+non-Apple arm. What that could not do is stop *another* caller from reaching the
+same probes, which is exactly what adding a runtime re-probe to `sound::ensure_up`
+then did: `/open <audio>` reset a Mac mini, and dropping `chitti.wifi` changed
+nothing because the radio was never involved. The guard now lives **inside**
+`sound::autodetect`, as data — `sound::probe_order(apple)` returns the backends
+that machine may probe and `Backend::probes_undiscovered_hardware` classifies each
+one, so a backend added without being classified fails a test rather than a
+laptop. The generalisable rule: **when a path is unsafe on a platform, the
+refusal belongs in the function that does the unsafe thing**, not in the one
+caller that happened to know.
+
 **The display mode comes from the display, via EDID — never a constant, never
 "the biggest mode advertised".** The kernel itself holds **no resolution at all**:
 `width`/`height`/`pitch`/pixel-format arrive from the firmware (Limine's
@@ -766,6 +787,32 @@ spanned lowest-to-highest non-MMIO descriptor, which on QEMU `virt` starts near 
 while RAM starts at 1 GiB, so a 2 GiB machine reported 3 GiB; it sums DRAM
 descriptors now, with the same filter `ram_regions` uses so the total and the
 extents describe the same memory.
+
+**On m1n1, `/memory` is not "the RAM this machine has" — it is the window m1n1
+says the kernel may use, and refusing to believe it cost real Apple hardware
+every ring-3 tenant.** `mm::aarch64_frames` declined to build a frame allocator on
+Apple, reasoning that "m1n1 stays resident in RAM the device tree does not
+describe". It is resident, and it *does* describe it: `top_of_memory_alloc`
+**shrinks `cur_boot_args.mem_size`** as m1n1 allocates, and `dt_set_memory` writes
+`/memory` **last**, deliberately (its own comment says so), so the boot
+framebuffer, the ISP heap, the GPU initdata and m1n1's log buffer are already
+*outside* the node by the time we read it. What is still inside is named in two
+places, and Linux honours both: the FDT **memory reservation block** (m1n1's own
+image, the device tree, one stack per secondary CPU, and the **initrd — which on
+this path is the GGUF**, since `cortex::model_module` reads the model from
+`/chosen`), and **`/reserved-memory`**, whose `uat-handoff` / `uat-pagetables` /
+`uat-ttbs` nodes `agx::hw` itself resolves by phandle and the GPU firmware reads
+*while we run*. `fdt::mem_reservations` and `fdt::reserved_memory` parse them
+(pure, unit-tested on both arches) and `aarch64_frames` subtracts them. Three
+things to keep: a reservation that does not fit the list is **declined, not
+capped** — the post-carve verification cannot catch a dropped entry, since both
+sides read the same list; the `uat-*` nodes are `<0 0 0 0>` in the checked-in
+`.dtb` and filled in only on the live machine, so a parser tested against the
+tree in this repo sees nothing at all and must treat a zero size as *unfilled*
+rather than as a zero-length reservation; and the symptom of not having an
+allocator was `LoadError::NoAddressSpace` on a path that mentions neither
+memory nor m1n1 — `/open` reporting "the decode sandbox could not be started"
+and every package-UI app failing `ui_surface_request`.
 
 **A machine can have more than one display, so the stub enumerates every graphics
 output** (`locate_handle_buffer`, not `get_handle_for_protocol`) and picks one via
@@ -2161,6 +2208,74 @@ FDT claims a GICv3 but carries no readable `reg`.
   Validated by KATs (`rsa_testvec.rs`, `gen_rsa_testvec.sh`) + a real embedded
   chain (`ca_testvec.rs`, `gen_ca_testvec.sh`: verifies, and tampered/expired/
   wrong-host fail closed) + live `/http https://…` to real providers.
+- **Built-in audio on Apple Silicon works** (`sound/apple/`, `/audio`) — the Mac
+  mini's own speaker plays. Five blocks in series, each silent when wrong:
+  **PMGR** power domains → **NCO** (900 MHz reference → 3.072 MHz master clock) →
+  **MCA** (I2S serialiser) → **ADMAC** (DMA through a T8110 DART in bypass) →
+  **TAS2764/SN012776** over the Apple/PASemi **I2C** master. Started on the first
+  play (`sound::try_apple_builtin`, gated on the tree naming the amplifier, tried
+  once); `/audio probe` is read-only, `/audio up` retries, `/audio dump` reads
+  every layer back, `/audio gain <n>` sets the analog level, `/audio amp [reg]`
+  round-trips one register. Ported from m1n1's
+  `proxyclient/experiments/speaker_amp.py` plus `hw/{nco,mca,admac,i2c}.py` and
+  `hw/codecs/`'s `SN012776Regs` — but **the working configuration is Linux's, not
+  the script's**, which is the single most expensive thing in this whole
+  bring-up: the script drives a one-clock TDM pulse at 12.288 MHz, and this
+  machine's amplifier wants `SND_SOC_DAIFMT_I2S | IB_IF` — **64 bit-clocks per
+  frame** (two 32-bit slots), a **square** FSYNC, one-bit data delay, `BCLK_POL`
+  clear, `MCLK_CONF` divider 1, and `TDM_CFG1 = 0x03` on the amp. Given the wrong
+  one it accepts the clock, latches `tdm_clock_error` and shuts itself down.
+
+  **What made this take a dozen boots is that every failure is silence, and the
+  layer that can see the problem is the last one.** The lessons, in the order
+  they cost time:
+
+  - **Resolve what the tree states; never search by compatible and take the first
+    hit.** Made three times in one driver: the wrong IOMMU (21 `apple,t8110-dart`
+    nodes — the first is powered down, so reading its lock register took a
+    **synchronous external abort**), the wrong DMA engine (2 `apple,admac`), and
+    the wrong **I2C bus** (5 `apple,i2c`), where every register write was
+    acknowledged by *something else* and discarded while reads returned that
+    bus's world. `fdt::{reg_by_phandle, parent_reg_of_compatible,
+    parent_prop_cells_of_compatible}` exist for this, and a block's **power
+    domain must be resolved the same way its registers are** — a gated block does
+    not read as all-ones, it does not decode at all.
+  - **A register field is not a register.** `PORT_CLK_SEL`'s selector is bits
+    11:8, so `1` leaves `SEL = 0` and routes **no clock to the port's pins**. The
+    serialiser still runs, the DMA still drains at real time, every controller
+    register still reads back correct — only the amplifier can tell, and it says
+    so by refusing to leave shutdown while latching *no* fault (an absent clock is
+    not a clock error). `mca::port_clk_sel` is a tested function for that reason;
+    `PORT_DATA_SEL` next to it genuinely *is* a raw bitmask, which is why the
+    distinction is written down.
+  - **Writing a register is a request; read it back.** `power_up` returns
+    `PWR_CTRL` as it reads *after* the write, `configure` verifies one register,
+    and `/audio gain` reports what stuck — "we powered the amplifier" and "we
+    asked and it declined" are indistinguishable otherwise and produce identical
+    silence. `CHNL_0` and `DVC` are only writable in shutdown, so `set_gain`
+    brackets its write; the part's `INT_LTCH0` (0x49) latches the *reason*.
+  - **The part is booked and paged.** macOS configures this amplifier minutes
+    before m1n1 boots and m1n1 leaves it alone, so it can be on any book — where
+    writes are acknowledged and land elsewhere. `select_and_reset` does
+    page 0 → book 0 → `SW_RESET` → select again, after an SDZ pulse with delays.
+  - **A `SndDevice::play` must never call `upkeep()`.** It runs inside
+    `sound::play_ch`, which holds the `SND` lock, and `upkeep` pumps the media
+    player straight back into it: a non-reentrant `Locked` taken twice on one
+    core, i.e. a machine that stops with no output and no Ctrl+C. Blocking waits
+    spin on their own hardware and are **bounded** (`STALL_MS`), and the
+    descriptor ring is sized so a whole 200 ms pump chunk fits without waiting.
+  - **Diagnosis has to be built, not reasoned.** `/audio dump` reading all four
+    layers back — and printing what each *should* be — is what found the clock
+    selector, after three rounds of plausible hypotheses. The pure parts (the
+    NCO's LFSR divider table, MCA field packing, ADMAC descriptor encoding, I2C
+    FIFO words, the gain field) are unit-tested on both arches; everything else
+    needed the machine.
+
+  The amplifier's analog gain starts at its **minimum** and nothing raises it
+  implicitly — loudness is `sound::apply_output_gain`, where a mistake is quiet
+  rather than destructive. Unimplemented and refused rather than guessed: capture
+  (the mic is behind the always-on processor), the CS42L84 headphone jack, stereo,
+  and the SIO DMA path.
 - **Sound & voice** (`sound/`, `onnx/`) — virtio-snd PCM in/out (S16 mono,
   poll-driven, descriptor chains) over virtio-mmio (aarch64) and virtio-PCI
   (x86 QEMU), **Intel HDA** for VirtualBox (x86+ARM) and real hardware, plus **AC'97** and **Sound Blaster 16** (x86 legacy; via `mm::alloc_dma_bounded`, which asks the frame allocator for the 8237's real constraints — under 16 MiB and inside one 128 KiB block — instead of allocating normally and hoping, which never held and made the driver unreachable code); `/voice` (waveform modal, level-gated utterances) and `/voice test`
@@ -3029,6 +3144,56 @@ the next command still runs) and a unit test on the pure poll logic
 stay *responsive* there — they clear the typed field and repaint, so the key is
 never dead — but neither returns from the loop. Do not "fix" it.
 
+**A kernel fault returns to the prompt instead of halting the machine**
+(`fault_recovery.rs`). `sched::fault_current_task` already contains a fault in any
+task *except* task 0 — the shell — where the choice used to be a halt. The REPL now
+arms a `setjmp`-style landmark at the top of its loop and the aarch64 sync
+dispatcher, x86's `#PF`/`#GP` handlers **and the Rust `panic_handler`** jump back to
+it. The point is the hardware loop: on a tethered Apple boot a halt costs the
+framebuffer, the USB console, a model that took a minute to load and the state that
+produced the bug, so a one-line bug used to cost a cold boot; and a halted AP is
+also what a watchdog reset looks like from the outside. Six things this pins down:
+
+- **It never hides anything.** The syndrome prints first, the recovery is counted,
+  and the shell says it happened and suggests a reboot. A fault is still a bug.
+- **It refuses in three cases, and says which** (`should_recover` / `refusal`, both
+  pure and tested): nothing armed (a fault during boot), **a `Locked` is held** — the
+  abandoned frame never releases it and the next taker spins forever with
+  interrupts off, which is worse than halting — or too many in a row.
+- **"Are interrupts enabled" cannot answer the lock question here**, which is why
+  `mm::locks_held` exists (two relaxed RMWs inside `Locked::with`). That inference
+  — the one `sched::block_on`'s assert makes — needs interrupts to ever be *on*,
+  and `initial_daif` masks them for every task on Apple Silicon, the machine this
+  feature is for.
+- **Restore the landmark's own IRQ mask, do not "enable interrupts".** Unmasking on
+  Apple would let an interrupt reach a vector that dispatches into an absent GIC,
+  turning one fault into a fault loop. `LANDMARK_IRQ_ON` records it at arm time.
+- **The `longjmp` must load everything before it moves SP.** The buffer sits on the
+  *faulting* stack, below the landmark's SP; once SP is restored, an interrupt frame
+  lands on top of it. Loading `d8-d15` (or the x86 resume address) after the switch
+  mirrors the save and is a race that surfaces as corrupt FP state much later.
+- **Anything written between the save and the jump must live in memory**, not in a
+  local — the oldest `setjmp` trap, and it applies to the test that proves the asm
+  works as much as to `arm_here` itself.
+
+Not covered, and stated rather than discovered: a fault *inside an interrupt
+handler* is abandoned without its EOI, so that source can stop delivering (a dead
+timer — impossible on the cooperative Apple path); and everything the abandoned
+frames owned is leaked.
+
+The syndrome itself is now decoded rather than printed as three hex numbers
+(`mm::armv8::esr_class` / `esr_fault_status` / `esr_far_is_valid` /
+`fault_pc_in_image`, pure and tested on **both** arches because `arch/aarch64/` is
+`cfg`'d out of the x86 test build). Two of those matter specifically: a
+**translation fault** and an **alignment fault** are one nibble apart in `ESR` and
+mean completely different things (nothing mapped vs. a vector access to
+Device-typed memory — the `+strict-align` and VirtualBox-mixed-GiB traps), and a
+**PIE kernel's `ELR` matches nothing in `nm`** until the load base is subtracted, so
+the handler prints the PC translated back to the link address plus the
+`llvm-addr2line` command. That arithmetic-by-hand is the step CLAUDE.md already
+records as the fastest tool here; the kernel knows its own load address and should
+not make a human redo it.
+
 ## STANDING RULE — human-only commands are absent from `dispatch_system`, not guarded inside it
 
 `/passwd` and `/lock` (`kernel/src/shell/auth.rs`, [`crate::auth`]) are matched in
@@ -3200,7 +3365,7 @@ embedded in the image and seeded into the store at boot — `/samples/images/`,
 Five rules it follows, each of which is a way this could have gone wrong:
 
 - **Opt-in, and default-on only for the dev flows.** `CHITTI_SAMPLE_FILES` gates
-  it; `make run|run-remote|run-uefi|image|vbox|e2e` set it (the `SAMPLES` knob),
+  it; `make run|run-remote|run-uefi|image|vbox|m1n1|e2e` set it (the `SAMPLES` knob),
   and a plain `cargo xtask build` / CI / `cargo xtask test` embeds nothing, so
   those kernels are byte-identical to before. **Empty reads as unset** — `make`
   passes the variable through unconditionally, the same trap `CHITTI_RESOLUTION`

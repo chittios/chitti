@@ -28,9 +28,23 @@ fn cfg_addr(bus: u8, dev: u8, func: u8, off: u16) -> u64 {
 }
 
 pub fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
+    let addr = cfg_addr(bus, dev, func, off);
+    // Apple's APCIE ECAM **external-aborts** a config read to an unlinked
+    // secondary bus instead of returning all-ones (standard PCI behaviour). A
+    // raw read there is a fatal data abort (ESR 0x96000010, FAR = ecam +
+    // bus<<20), which a plain bus scan (`for_each` over 0..=bus_end) will hit as
+    // soon as any bus beyond the linked ones is walked. Route through the
+    // recoverable probe so an absent/unlinked bus reads as `0xffffffff` (absent).
+    #[cfg(all(target_arch = "aarch64", not(test)))]
+    {
+        return crate::arch::aarch64::probe_read32(addr).unwrap_or(0xffff_ffff);
+    }
     // SAFETY: ECAM is identity-mapped Device memory (mapped by mmu::init);
     // config space is 4 KiB per function.
-    unsafe { core::ptr::read_volatile(cfg_addr(bus, dev, func, off) as *const u32) }
+    #[cfg(not(all(target_arch = "aarch64", not(test))))]
+    unsafe {
+        core::ptr::read_volatile(addr as *const u32)
+    }
 }
 pub fn write32(bus: u8, dev: u8, func: u8, off: u16, v: u32) {
     unsafe { core::ptr::write_volatile(cfg_addr(bus, dev, func, off) as *mut u32, v) };

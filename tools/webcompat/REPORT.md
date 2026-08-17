@@ -110,24 +110,24 @@ chromestatus csspopularity ∩ css.rs::apply_one (auto-derived; 'supported' = ar
 > **Render resolution:** the browser lays out and paints at the action pane's **native pixel size** (1:1 present), not a fixed 640×400 buffer upscaled to the pane — the previous source of pixelated/soft text.
 
 ### Top missing popular properties
-- `alias-webkit-user-select` (~64.5% page loads)
-- `alias-webkit-appearance` (~63.6% page loads)
-- `alias-webkit-transform` (~57.9% page loads)
-- `alias-webkit-text-size-adjust` (~57.3% page loads)
-- `alias-word-wrap` (~56.8% page loads)
-- `alias-webkit-transition` (~55.2% page loads)
-- `alias-webkit-box-sizing` (~42.0% page loads)
-- `alias-webkit-animation` (~36.3% page loads)
-- `alias-webkit-box-shadow` (~36.2% page loads)
-- `alias-webkit-justify-content` (~34.1% page loads)
-- `alias-webkit-mask-image` (~28.4% page loads)
-- `alias-webkit-align-items` (~25.2% page loads)
-- `alias-webkit-flex-direction` (~22.8% page loads)
-- `alias-webkit-transform-origin` (~22.1% page loads)
-- `alias-webkit-border-radius` (~22.0% page loads)
+- `alias-webkit-user-select` (~64.1% page loads)
+- `alias-webkit-appearance` (~62.6% page loads)
+- `alias-word-wrap` (~59.1% page loads)
+- `alias-webkit-text-size-adjust` (~58.6% page loads)
+- `alias-webkit-transform` (~57.8% page loads)
+- `alias-webkit-transition` (~55.3% page loads)
+- `alias-webkit-box-sizing` (~44.3% page loads)
+- `alias-webkit-animation` (~37.1% page loads)
+- `alias-webkit-box-shadow` (~37.0% page loads)
+- `alias-webkit-justify-content` (~35.0% page loads)
+- `alias-webkit-mask-image` (~30.4% page loads)
+- `alias-webkit-align-items` (~25.8% page loads)
+- `scrollbar-color` (~23.8% page loads)
+- `alias-webkit-flex-direction` (~22.9% page loads)
+- `alias-webkit-transform-origin` (~22.7% page loads)
+- `alias-webkit-border-radius` (~22.3% page loads)
+- `inset-inline-end` (~20.7% page loads)
 - `alias-webkit-filter` (~20.7% page loads)
-- `scrollbar-color` (~20.3% page loads)
-- `margin-inline` (~19.1% page loads)
 
 ## WebAssembly/testsuite
 
@@ -142,90 +142,6 @@ chromestatus csspopularity ∩ css.rs::apply_one (auto-derived; 'supported' = ar
 - **Legacy tier — `js_bc` bytecode VM**: the arithmetic/console fast path, kept as a fallback for trivial scripts.
 - **DOM binding** (`browser::js_just`): document/window/location/style/classList/canvas/fetch/postMessage/storage wired through the just PluginResolver; page JS is sandboxed (no Synapse/fs/net).
 - **Native Cranelift JIT** from just is **not** in-kernel (no_std, dual-arch, no RWX).
-
-### Language gaps a real React/shadcn bundle found
-
-Each of these parsed and ran without an error — they produced a *wrong value*,
-which is why a 144 KiB bundle failed with a message that pointed nowhere:
-
-- **Relational comparison of two strings** went through ToNumber, making both
-  sides NaN and every string comparison `false`. React guards every DOM access
-  with `typeof document < "u"`, so it decided the page had no document.
-- **Destructured / defaulted / rest parameters** were never bound — only plain
-  identifiers were — so `function Check({ label, ok })`, an ordinary component,
-  threw `label is not defined` on a correct call.
-- **`break label` out of a labelled *block*** broke only the innermost loop: a
-  loop claims every pending label at entry, so the label had to stop being
-  pending on a non-loop statement. ReactDOM's `commitPlacement` is exactly
-  `e: { for (…) { break e; } throw … }`.
-- **A computed object key that is a bare identifier** (`{ [node]: v }`) was
-  stored under the literal name `"node"`, because `computed` was inferred from
-  the key expression's shape instead of from the source. Radix builds every one
-  of its primitives that way, so `Primitive.div` was `undefined`.
-- **`for (const x of …)`** reused one binding and threw `'x' is set and
-  immutable` on the second element; a lexical loop head needs a fresh binding
-  per iteration.
-- **`String(obj)`** did not run the object's own `toString`, so
-  `String(new Error("x"))` was `"[object Object]"` while `"" + e` was correct.
-- **`WeakMap`/`WeakSet`** did not exist (implemented as their strong
-  counterparts — with no GC there is nothing weak to model).
-- **`console.log(obj)`** printed `[object Object]` for everything, including
-  errors, which is what page-level error reporting turns into.
-
-### DOM surface a component library actually calls
-
-Added to `browser::js_just` for the same reason — each took out a whole family
-of components with a bare `X is not a function`:
-
-- `node.constructor` (with a `prototype`) — ReactDOM reads
-  `Object.getOwnPropertyDescriptor(node.constructor.prototype, "value")` for
-  every `<input>`/`<textarea>` it commits.
-- `node.hasOwnProperty(...)` — a host object does not inherit `Object.prototype`.
-- `closest` / `matches` — Radix finds a control's owning form with them.
-- `document.createElementNS` — React creates every SVG node through it
-  (namespace argument **first**).
-- `getComputedStyle` — component libraries read a node's style before animating
-  or measuring it; an undefined global is a hard ReferenceError.
-- `window.HTMLIFrameElement` and the other interface constructors — ReactDOM's
-  selection save is `while (node instanceof window.HTMLIFrameElement)`, and an
-  undefined right-hand side is a TypeError, not a `false`.
-- **Element wrappers are interned**, so a node has identity across lookups and
-  keeps the expandos React stores on it (each fiber lives on its own node).
-
-### A page's scripts are bounded, and say so
-
-The interpreter is a tree-walker with no yield points, so `browser_js_tick`
-(installed by `shell::browser`) pumps the UI and answers Ctrl+C from the
-engine's hot loops. That was not enough: `/browse https://ui.shadcn.com` is
-**50 scripts over 2 MB** of Next.js chunks, and the *parse* alone outran any
-patience — the clock kept ticking and the machine had to be rebooted.
-
-- `js_just::SCRIPT_BUDGET_MS` (60 s) bounds the whole script phase, armed per
-  JS entry point (`page_boot`, `page_dispatch`, `run_scripts_via_just`) and
-  disarmed on the way out, so a page that spends its whole budget at load still
-  answers the next click.
-- The **parse** phase pumps and checks between scripts, since the interpreter's
-  tick only fires from evaluation loops. Granularity is one script; a single
-  very large chunk is still parsed without a yield.
-- An interrupt is reported in the page's own words — `script stopped (Ctrl+C)`
-  or `script parsing stopped after 60s — the page is rendered without its
-  scripts (49 of 50 script(s) parsed)` — and never as `Uncaught`, which would
-  be a lie about a page that is merely too heavy.
-- The document survives: `ui.shadcn.com` renders its static page (812 text
-  runs, 5 controls) and `/browse` returns normally.
-
-Covered by `a_runaway_page_script_is_stopped_and_says_why`,
-`a_script_budget_is_armed_per_entry_and_disarmed_after`, and the
-`browse_runaway` e2e scenario (Ctrl+C stops it in ~0.1 s; the shell and the
-rendered page both survive).
-
-### Live-DOM commit
-
-`js::commit_full` materialises script-created elements one level of depth per
-pass (React builds bottom-up, so a child's index is lower than its parent's).
-The bound was a flat 4 passes, which silently truncated any deeper tree: a
-component gallery drew every section frame with nothing inside it, while the DOM
-itself was correct. It now runs until a pass places nothing.
 
 ## Forms / video / canvas
 

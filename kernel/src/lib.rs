@@ -137,6 +137,8 @@ pub mod editor;
 pub mod editor_motion;
 pub mod editor_undo;
 pub mod editor_wrap;
+/// Returning to the prompt after a kernel fault instead of halting the machine.
+pub mod fault_recovery;
 // The Geist Mono glyph atlas the framebuffer console renders with (data-only).
 // (`synapse::ui`'s `text` draw op uses the runtime `font_ttf` rasterizer, not
 // this fixed-cell atlas — sizes below the cell smear when downscaled.)

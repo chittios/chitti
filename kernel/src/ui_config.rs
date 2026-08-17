@@ -649,16 +649,16 @@ fn resolve_var(var: &str) -> String {
         // Status-bar icons: Font Awesome Free Solid (see `icons::fa`). The FA
         // face is first in the TTF fallback chain so these PUA scalars paint as
         // real glyphs. Active input appends a solid circle.
-        "net" => crate::icons::status_net(crate::net::is_up()),
+        "net" => crate::icons::status_net(crate::net::device_status()),
         "kbd" => {
             let last = crate::console::input_activity_ms();
             let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
-            crate::icons::status_kbd(active)
+            crate::icons::status_kbd(crate::console::keyboard_status(), active)
         }
         "mouse" => {
             let last = crate::mouse::activity_ms();
             let active = last != 0 && crate::arch::now_ms().saturating_sub(last) < 1500;
-            crate::icons::status_mouse(active)
+            crate::icons::status_mouse(crate::mouse::pointer_status(), active)
         }
         // Empty at zero, so `expand` swallows the following separator too and a
         // machine with nothing unread has a byte-identical bar. Must stay in

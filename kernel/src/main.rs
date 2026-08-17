@@ -274,6 +274,16 @@ pub extern "C" fn aarch64_start() -> ! {
     chitti_kernel::arch::aarch64::init_uart_apple();
     chitti_kernel::serial::init();
     serial_println!("{} -- NATIVE aarch64 on Apple Silicon (QEMU + HVF)", BOOT_MSG);
+    // **Before anything that can fault**, and before the first long operation:
+    // switch the SoC watchdog off. A machine that resets a few seconds after the
+    // kernel stops turns every failure into "it rebooted" — the syndrome scrolls
+    // away with the reset, and "halted with a diagnosis" becomes impossible to
+    // tell from "hung with no output". m1n1 already disables it; this covers the
+    // boots where that did not happen and cannot be checked from in here.
+    match chitti_kernel::arch::aarch64::wdt::disable() {
+        Some(base) => serial_println!("Chitti: SoC watchdog disabled ({base:#x}) -- a halt will stay halted"),
+        None => serial_println!("Chitti: no apple,wdt node (nothing to disable)"),
+    }
     chitti_kernel::init();
     // Bring up the framebuffer TUI. Preferred source: the **boot-info page** the
     // UEFI stub publishes at 0x47F00000 (magic "CHITTIBI") carrying the GOP
@@ -443,6 +453,13 @@ pub extern "C" fn aarch64_start() -> ! {
         if chitti_kernel::drivers::wifi::init_apple() {
             serial_println!("Chitti: Wi-Fi radio probed (see /wifi info)");
         }
+        // No virtio/PCI NIC on this path; still close the status-bar "pending"
+        // state so a machine with no radio does not sit on a spinning net chip.
+        chitti_kernel::net::mark_probed();
+        // Built-in speaker (TAS2764/SN012776) or a USB DAC — same autodetect
+        // the other arches run. Used to be `/audio up` only, which left the
+        // volume chip disabled until a human typed it.
+        chitti_kernel::sound::autodetect();
     } else {
         chitti_kernel::net::autodetect();
         // Bring up audio (virtio-snd) for the /voice pipeline. No-op if absent.
@@ -742,9 +759,45 @@ fn fmt_u32(mut n: u32, buf: &mut [u8; 12]) -> &str {
     core::str::from_utf8(&buf[..buf.len() - i]).unwrap()
 }
 
+/// A Rust panic is the *likeliest* way this kernel stops, and far more likely
+/// than a CPU fault: an index out of range, an `unwrap` on a `None`, an assert
+/// in a driver bring-up. It used to halt the machine outright, which on a
+/// tethered hardware boot costs the whole session — so it takes the same
+/// recovery landmark [`chitti_kernel::fault_recovery`] gives the fault handlers,
+/// and returns to the prompt with the message printed.
+///
+/// **Panicking is still a bug and still says so.** The message is printed first,
+/// unconditionally, and the shell reports the recovery when it lands. Recovery
+/// is refused — and the machine halts as before — where unwinding would strand a
+/// held lock, where nothing has armed a landmark yet (any panic during boot), or
+/// where panics are arriving faster than the prompt can be reached.
+///
+/// A panic is in one way *safer* to unwind than a CPU fault: it is a deliberate
+/// abort at a known point, not memory the hardware refused to translate. It is
+/// in another way worse — it can happen inside a critical section — which is
+/// exactly what the lock gate is for.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // A marker on the raw UART **before** anything that takes a lock. The line
+    // below goes through `Serial`, which mirrors into the framebuffer console —
+    // and a panic raised from inside either of those locks would spin there
+    // forever, with no output at all, which is indistinguishable from the
+    // machine simply stopping. One unconditional byte sequence answers "did it
+    // panic, or did it vanish?" even when nothing else can be trusted.
+    chitti_kernel::serial::write_str_raw("\nKERNEL PANIC\n");
     serial_println!("KERNEL PANIC: {}", info);
+    let armed = chitti_kernel::fault_recovery::is_armed();
+    let held = chitti_kernel::mm::locks_held();
+    let n = chitti_kernel::fault_recovery::consecutive();
+    if chitti_kernel::fault_recovery::should_recover(armed, held, n) {
+        // SAFETY: a panic runs on the panicking task's own stack, so the frames
+        // between here and the landmark are abandoned with nothing left to
+        // return into them; the gate has established that no `Locked` is held.
+        unsafe { chitti_kernel::fault_recovery::recover("kernel panic") };
+    }
+    if let Some(why) = chitti_kernel::fault_recovery::refusal(armed, held, n) {
+        serial_println!("KERNEL PANIC: cannot return to the prompt -- {}", why);
+    }
     loop {
         chitti_kernel::arch::hlt();
     }

@@ -243,10 +243,14 @@ pub fn aes128_decrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
             let mut m = [0u8; 16];
             for c in 0..4 {
                 let col = &t[c * 4..c * 4 + 4];
-                m[c * 4] = xtime(col[0], 14) ^ xtime(col[1], 11) ^ xtime(col[2], 13) ^ xtime(col[3], 9);
-                m[c * 4 + 1] = xtime(col[0], 9) ^ xtime(col[1], 14) ^ xtime(col[2], 11) ^ xtime(col[3], 13);
-                m[c * 4 + 2] = xtime(col[0], 13) ^ xtime(col[1], 9) ^ xtime(col[2], 14) ^ xtime(col[3], 11);
-                m[c * 4 + 3] = xtime(col[0], 11) ^ xtime(col[1], 13) ^ xtime(col[2], 9) ^ xtime(col[3], 14);
+                m[c * 4] =
+                    xtime(col[0], 14) ^ xtime(col[1], 11) ^ xtime(col[2], 13) ^ xtime(col[3], 9);
+                m[c * 4 + 1] =
+                    xtime(col[0], 9) ^ xtime(col[1], 14) ^ xtime(col[2], 11) ^ xtime(col[3], 13);
+                m[c * 4 + 2] =
+                    xtime(col[0], 13) ^ xtime(col[1], 9) ^ xtime(col[2], 14) ^ xtime(col[3], 11);
+                m[c * 4 + 3] =
+                    xtime(col[0], 11) ^ xtime(col[1], 13) ^ xtime(col[2], 9) ^ xtime(col[3], 14);
             }
             *block = m;
         } else {
@@ -645,7 +649,10 @@ impl Handshake {
     /// is an attack or a retransmission.
     pub fn on_frame(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
         let key = EapolKey::parse(frame).ok_or("malformed EAPOL-Key frame")?;
-        match key.message().ok_or("EAPOL-Key frame is not a handshake message")? {
+        match key
+            .message()
+            .ok_or("EAPOL-Key frame is not a handshake message")?
+        {
             HandshakeMessage::One => self.on_msg1(&key).map(Some),
             HandshakeMessage::Three => self.on_msg3(&key).map(Some),
             // The AP does not send these; receiving one means something is impersonating a
@@ -850,7 +857,10 @@ mod tests {
             k
         };
         assert_eq!(frame.len(), 94);
-        assert_eq!(hex(&eapol_mic(&kck, &frame)), "3bd7333f98ba70268a0a983084ef93f9");
+        assert_eq!(
+            hex(&eapol_mic(&kck, &frame)),
+            "3bd7333f98ba70268a0a983084ef93f9"
+        );
     }
 
     #[test_case]
@@ -916,7 +926,10 @@ mod tests {
 
         let mut bad = good.clone();
         bad[5] ^= 1;
-        assert!(aes_key_unwrap(&kek, &bad).is_none(), "tampered wrap accepted");
+        assert!(
+            aes_key_unwrap(&kek, &bad).is_none(),
+            "tampered wrap accepted"
+        );
 
         let mut wrong_kek = kek;
         wrong_kek[0] ^= 1;
@@ -948,9 +961,9 @@ mod tests {
     /// `the_pmk_comes_from_the_passphrase_and_ssid` already pins. Kept equal to it by
     /// `the_literal_pmk_is_the_one_the_vector_produces`, so the shortcut cannot drift.
     const TEST_PMK: [u8; 32] = [
-        0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a,
-        0x5f, 0x90, 0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e,
-        0x97, 0x10, 0xa1, 0x2e,
+        0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f,
+        0x90, 0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10,
+        0xa1, 0x2e,
     ];
 
     fn test_pmk() -> [u8; 32] {
@@ -987,7 +1000,16 @@ mod tests {
 
     /// Message 3: MIC, Install, Secure, and the group key wrapped under the KEK.
     fn ap_msg3(ptk: &Ptk, anonce: [u8; 32], replay: u64, gtk: &[u8]) -> Vec<u8> {
-        let mut kde = alloc::vec![0xdd, (4 + 2 + gtk.len()) as u8, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00];
+        let mut kde = alloc::vec![
+            0xdd,
+            (4 + 2 + gtk.len()) as u8,
+            0x00,
+            0x0f,
+            0xac,
+            0x01,
+            0x01,
+            0x00
+        ];
         kde.extend_from_slice(gtk);
         while kde.len() % 8 != 0 {
             kde.push(0xdd); // the RFC 3394 input must be a multiple of 8
@@ -1028,7 +1050,10 @@ mod tests {
         let parsed = EapolKey::parse(&msg2).expect("our own frame must parse");
         assert_eq!(parsed.message(), Some(HandshakeMessage::Two));
         assert_eq!(parsed.nonce, snonce);
-        assert_eq!(parsed.replay_counter, 1, "message 2 echoes the AP's counter");
+        assert_eq!(
+            parsed.replay_counter, 1,
+            "message 2 echoes the AP's counter"
+        );
         assert_eq!(
             parsed.key_data, rsn,
             "message 2 must carry our RSN element verbatim, id and length included"
@@ -1037,7 +1062,10 @@ mod tests {
         // The AP derives the same PTK from its side and can check that MIC.
         let ptk = derive_ptk(&test_pmk(), &AP, &ME, &anonce, &snonce);
         assert_eq!(hs.ptk(), Some(&ptk));
-        assert!(parsed.mic_valid(&ptk.kck), "the AP would reject our message 2");
+        assert!(
+            parsed.mic_valid(&ptk.kck),
+            "the AP would reject our message 2"
+        );
 
         // Message 3 in, message 4 out, group key installed.
         let gtk = [0x5au8; 16];
@@ -1100,7 +1128,10 @@ mod tests {
         let mut wrong = TEST_PMK;
         wrong[31] ^= 1;
         let mut hs = Handshake::new(wrong, ME, AP, nonce(0x44), Vec::new());
-        assert!(hs.on_frame(&ap_msg1(anonce, 1)).is_ok(), "message 1 always succeeds");
+        assert!(
+            hs.on_frame(&ap_msg1(anonce, 1)).is_ok(),
+            "message 1 always succeeds"
+        );
 
         let real_ptk = derive_ptk(&test_pmk(), &AP, &ME, &anonce, &nonce(0x44));
         let err = hs
@@ -1108,7 +1139,10 @@ mod tests {
             .expect_err("a MIC computed under a different PMK must be rejected");
         assert!(err.contains("passphrase"), "unhelpful error: {err}");
         assert!(!hs.done);
-        assert!(hs.gtk.is_none(), "no key may be installed after a MIC failure");
+        assert!(
+            hs.gtk.is_none(),
+            "no key may be installed after a MIC failure"
+        );
     }
 
     #[test_case]
@@ -1118,8 +1152,14 @@ mod tests {
         // encrypted with.
         let mut hs = Handshake::new(test_pmk(), ME, AP, nonce(0x55), Vec::new());
         assert!(hs.on_frame(&ap_msg1(nonce(0x11), 5)).is_ok());
-        assert!(hs.on_frame(&ap_msg1(nonce(0x11), 5)).is_err(), "same counter accepted");
-        assert!(hs.on_frame(&ap_msg1(nonce(0x11), 4)).is_err(), "older counter accepted");
+        assert!(
+            hs.on_frame(&ap_msg1(nonce(0x11), 5)).is_err(),
+            "same counter accepted"
+        );
+        assert!(
+            hs.on_frame(&ap_msg1(nonce(0x11), 4)).is_err(),
+            "older counter accepted"
+        );
         // A genuinely newer one is a legitimate restart.
         assert!(hs.on_frame(&ap_msg1(nonce(0x66), 6)).is_ok());
     }
@@ -1149,7 +1189,10 @@ mod tests {
             key_data: Vec::new(),
         }
         .to_bytes();
-        assert!(hs.on_frame(&msg2).is_err(), "a message 2 was accepted from the AP");
+        assert!(
+            hs.on_frame(&msg2).is_err(),
+            "a message 2 was accepted from the AP"
+        );
 
         // A group rekey is not part of the four-way handshake (no Pairwise bit).
         let rekey = EapolKey {
@@ -1197,7 +1240,10 @@ mod tests {
         let mut lying = good.clone();
         lying[4 + 93] = 0xff;
         lying[4 + 94] = 0xff;
-        assert!(EapolKey::parse(&lying).is_none(), "a lying key-data length was accepted");
+        assert!(
+            EapolKey::parse(&lying).is_none(),
+            "a lying key-data length was accepted"
+        );
 
         // A body length shorter than the fixed fields, and a non-Key packet type.
         let mut short = good.clone();
@@ -1231,7 +1277,9 @@ mod tests {
         msg3[data_at + 9] ^= 1;
         let mut k = EapolKey::parse(&msg3).unwrap();
         k.mic = eapol_mic(&ptk.kck, &k.to_bytes_for_mic());
-        let err = hs.on_frame(&k.to_bytes()).expect_err("a tampered group key was installed");
+        let err = hs
+            .on_frame(&k.to_bytes())
+            .expect_err("a tampered group key was installed");
         assert!(err.contains("integrity"), "misdiagnosed: {err}");
         assert!(hs.gtk.is_none());
     }

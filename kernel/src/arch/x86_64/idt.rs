@@ -146,6 +146,20 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
     // it. Returns only when isolation is impossible — no scheduler yet, or the
     // bootstrap task, where a fault is a kernel bug.
     crate::sched::fault_current_task("page fault");
+    // Not isolatable (the shell's own task, or no scheduler yet): try the
+    // shell's recovery landmark before halting. Same reasoning as the aarch64
+    // dispatcher — this handler is on the faulting task's own stack (only #DF
+    // uses an IST), so nothing will ever `iretq` from this frame.
+    let armed = crate::fault_recovery::is_armed();
+    let held = crate::mm::locks_held();
+    let n = crate::fault_recovery::consecutive();
+    if crate::fault_recovery::should_recover(armed, held, n) {
+        // SAFETY: as above; the gate has established no `Locked` is held.
+        unsafe { crate::fault_recovery::recover("page fault") };
+    }
+    if let Some(why) = crate::fault_recovery::refusal(armed, held, n) {
+        crate::ktrace::log_fmt(format_args!("idt: cannot return to the prompt -- {why}"));
+    }
     crate::ktrace::log("idt", "page fault not isolatable -- halting");
     loop {
         super::hlt();
@@ -162,6 +176,20 @@ extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStack
         unsafe { super::fastcall::abort_tenant(error_code, frame.instruction_pointer) };
     }
     crate::sched::fault_current_task("general protection fault");
+    // Not isolatable (the shell's own task, or no scheduler yet): try the
+    // shell's recovery landmark before halting. Same reasoning as the aarch64
+    // dispatcher — this handler is on the faulting task's own stack (only #DF
+    // uses an IST), so nothing will ever `iretq` from this frame.
+    let armed = crate::fault_recovery::is_armed();
+    let held = crate::mm::locks_held();
+    let n = crate::fault_recovery::consecutive();
+    if crate::fault_recovery::should_recover(armed, held, n) {
+        // SAFETY: as above; the gate has established no `Locked` is held.
+        unsafe { crate::fault_recovery::recover("general protection fault") };
+    }
+    if let Some(why) = crate::fault_recovery::refusal(armed, held, n) {
+        crate::ktrace::log_fmt(format_args!("idt: cannot return to the prompt -- {why}"));
+    }
     crate::ktrace::log("idt", "GP fault not isolatable -- halting");
     loop {
         super::hlt();

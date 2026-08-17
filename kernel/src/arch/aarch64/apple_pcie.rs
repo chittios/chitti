@@ -7,19 +7,33 @@
 //! module (SMC), re-train the port link, assign bridge bus numbers, enable the
 //! DART for DMA, and leave config-space access to [`crate::pci`].
 //!
-//! ## What Asahi / Linux actually do (j473 / t8112)
+//! ## What the Linux Apple PCIe host does (j473 / t8112)
 //!
 //! From `t8112-j473.dts` + `pcie-apple.c` + `pinctrl-apple-gpio.c`:
 //!
-//! 1. **pwren** = SMC GPIO 13 (`gP0d` = `0x800001`) — we already do this.
-//! 2. **PERST#** is **two** things, both required:
+//! 1. **CLKREQ pinmux** first. `pinctrl-0 = <&pcie_pins>` muxes pinctrl_ap
+//!    162/163/164 to `periph1` (`APPLE_PINMUX(n, 1)`). Linux's pinctrl
+//!    driver does this *before* `pcie-apple` probes. Without it the
+//!    endpoint cannot assert CLKREQ# and the dongle PMU never starts the
+//!    SYS_MEM/RAM domain — chipcommon still answers (ALP osc) so the
+//!    failure looks like "radio enumerated, TCM aborts".
+//! 2. **pwren** = SMC GPIO 13 (`pwren-gpios = <&smc_gpio 13>`, key `gP0d`
+//!    = `0x800001`).
+//! 3. **PERST#** is **two** things, both required:
 //!    - APCIE `PORT_PERST` (0x814) bit `PERST_OFF`
 //!    - **pinctrl_ap GPIO 166**, `GPIO_ACTIVE_LOW` (`reset-gpios` on `port00`)
-//! 3. Sequence (Linux `apple_pcie_setup_port`): APPCLK → assert GPIO PERST →
-//!    refclk → deassert PORT_PERST + GPIO → 100 ms → LTSSM start.
-//! 4. **Bus numbers** are forced by DT (`bus-range = <1 1>` on port00). Without
+//! 4. Sequence (`apple_pcie_setup_link`): APPCLK → assert GPIO PERST →
+//!    pwren=1 → refclk → 100 ms (Tpvperl) → deassert PORT_PERST then GPIO
+//!    → 100 ms → wait READY. `setup_port` then clears CGDIS and starts
+//!    LTSSM. **Never** drop the rail while PERST# is deasserted.
+//! 5. **Bus numbers** are forced by DT (`bus-range = <1 1>` on port00). Without
 //!    programming the type-1 bridge's primary/secondary/subordinate (config
 //!    0x18), ECAM bus 1 never routes — we saw `sec=0` on all root ports.
+//!
+//! Linux *skips* `setup_link` when `LINKSTS.UP` is already set, because
+//! its bootloader did the sequence above. m1n1 `pcie_init` does **not**
+//! (no GPIO PERST, no pwren-during-reset, no CLKREQ pinmux), so a
+//! "link already up — skip PERST" path on this OS leaves SYS_MEM gated.
 //!
 //! ## Critical abort rule
 //!
@@ -31,6 +45,7 @@
 
 use core::ptr::{read_volatile, write_volatile};
 use super::dart::Dart;
+use crate::drivers::wifi::brcm::proto;
 
 /// FDT compatible for the M2 (t8112) and generic Apple PCIe host.
 const PCIE_COMPAT: &[&[u8]] = &[b"apple,t8112-pcie", b"apple,pcie"];
@@ -66,11 +81,6 @@ const PINCTRL_COMPAT: &[&[u8]] = &[b"apple,t8112-pinctrl", b"apple,pinctrl"];
 /// Well-known AP pinctrl base on t8112 (FDT `pinctrl@23c100000`).
 const PINCTRL_AP_T8112: u64 = 0x2_3c10_0000;
 const PERST_GPIO_PORT0: u32 = 166; // pinctrl_ap pin, ACTIVE_LOW
-const REG_GPIO_DATA: u32 = 1 << 0;
-const REG_GPIO_MODE: u32 = 0x7 << 1; // GENMASK(3,1)
-const REG_GPIO_MODE_OUT: u32 = 1 << 1; // FIELD_PREP(MODE, OUT=1)
-const REG_GPIO_PERIPH: u32 = 0x3 << 5; // GENMASK(6,5) — clear for GPIO
-
 // PCI config
 const PCI_COMMAND: u16 = 0x04;
 const PCI_COMMAND_IO: u32 = 1 << 0;
@@ -236,7 +246,7 @@ fn discover_pcie() -> Option<(u64, u64, u64, u64, u64, u64, u32, u8)> {
         // 2) Scan every reg for a 0x681/2/3_000000-class window.
         // 3) Derive from DART: t8112 pcie0 DART is port0 + 0x8000.
         // 4) Derive from RC: Linux CORE layout port0 = not fixed; use
-        //    Asahi/ADT port0 = 0x681000000 when ecam is the t8112 ECAM.
+        //    ADT port0 = 0x681000000 when ecam is the t8112 ECAM.
         let mut port0 = 0u64;
         let mut port0_phy = 0u64;
         let mut how = "none";
@@ -270,7 +280,7 @@ fn discover_pcie() -> Option<(u64, u64, u64, u64, u64, u64, u32, u8)> {
                 if !is_plausible_mmio(b) {
                     continue;
                 }
-                // Port control windows are 0x8000 (Asahi) and live at
+                // Port control windows are 0x8000 and live at
                 // 0x681/682/683_000000. Skip ECAM (0x690…) and RC (0x6800…).
                 let is_port_aperture = (0x6810_0000_0u64..0x6840_0000_0).contains(&b);
                 if is_port_aperture && (sz == 0 || sz >= 0x800) {
@@ -302,7 +312,7 @@ fn discover_pcie() -> Option<(u64, u64, u64, u64, u64, u64, u32, u8)> {
         }
 
         if port0 == 0 && ecam == 0x6900_0000_0 {
-            // Last-resort t8112 identity map from Asahi ADT (same SoC as this
+            // Last-resort t8112 identity map from the ADT (same SoC as this
             // machine's ECAM). Prefer discovery; this only fires when FDT is
             // Linux-trimmed to config+rc.
             port0 = 0x6810_0000_0;
@@ -399,7 +409,7 @@ fn discover_pinctrl_ap() -> u64 {
             }
         }
     }
-    // t8112 well-known AP pinctrl (Asahi `pinctrl@23c100000`).
+    // t8112 well-known AP pinctrl (`pinctrl@23c100000`).
     crate::ktrace::log_fmt(format_args!(
         "pcie: pinctrl_ap fallback @{PINCTRL_AP_T8112:#x}"
     ));
@@ -408,19 +418,32 @@ fn discover_pinctrl_ap() -> u64 {
 
 /// Configure pinctrl pin as GPIO output and drive `level` (1 = high, 0 = low).
 /// For ACTIVE_LOW PERST: assert = low (0), deassert = high (1).
+/// Encoding is [`proto::pinctrl_gpio_out_word`] (`apple_gpio_direction_output`).
 fn pinctrl_gpio_out(pinctrl: u64, pin: u32, level_high: bool) {
     if pinctrl == 0 || pin > 512 {
         return;
     }
     let addr = pinctrl + 4 * pin as u64;
-    // MODE=OUT, PERIPH=0 (GPIO), DATA=level. Matches apple_gpio_direction_output.
-    let mut v = r32(addr);
-    v &= !(REG_GPIO_MODE | REG_GPIO_PERIPH | REG_GPIO_DATA);
-    v |= REG_GPIO_MODE_OUT;
-    if level_high {
-        v |= REG_GPIO_DATA;
+    w32(addr, proto::pinctrl_gpio_out_word(r32(addr), level_high));
+}
+
+/// Mux CLKREQ pins to `periph1` (`pcie_pins` / `apple_gpio_pinmux_set`).
+/// Must run before the PERST/pwren/refclk sequence — without CLKREQ# the
+/// endpoint never requests the 100 MHz refclk the dongle PMU needs for RAM.
+fn pinctrl_pinmux_clkreq(pinctrl: u64) {
+    if pinctrl == 0 {
+        return;
     }
-    w32(addr, v);
+    for &pin in proto::PCIE_CLKREQ_PINS {
+        let addr = pinctrl + 4 * pin as u64;
+        let cur = r32(addr);
+        let next = proto::pinctrl_pinmux_word(cur, proto::PCIE_CLKREQ_FUNC);
+        w32(addr, next);
+        crate::ktrace::log_fmt(format_args!(
+            "pcie: CLKREQ pin {pin} pinmux periph{} {cur:#x}→{next:#x}",
+            proto::PCIE_CLKREQ_FUNC
+        ));
+    }
 }
 
 fn perst_gpio_assert(pinctrl: u64) {
@@ -462,7 +485,7 @@ fn configure_wifi_root_only() {
 ///
 /// # Bare m1n1 / t8112 finding (j473, 2026-07)
 ///
-/// Programming **prefetchable upper** `0x28/0x2c = 6` (the Asahi DTS 64-bit
+/// Programming **prefetchable upper** `0x28/0x2c = 6` (the DTS 64-bit
 /// pref hole at `0x6_a000_0000`) makes host MEM to that aperture **L2C-abort**
 /// (poison). The path that works on bare m1n1:
 ///
@@ -712,54 +735,94 @@ fn wait_link(port: u64, timeout_ms: u64, tag: &str) -> (bool, u32, u32) {
     }
 }
 
-/// Full PERST cycle + LTSSM start (Linux `apple_pcie_setup_port`).
-/// Drives **both** the pinctrl GPIO (ACTIVE_LOW) and `PORT_PERST`.
-fn port_perst_cycle_and_ltssm(port: u64, port_phy: u64, pinctrl: u64) {
-    // 1) Assert PERST# (GPIO first, then port reg) — device held in reset.
-    perst_gpio_assert(pinctrl);
-    let perst = r32(port + PORT_PERST as u64);
-    w32(port + PORT_PERST as u64, perst & !PORT_PERST_OFF);
-    crate::ktrace::log_fmt(format_args!(
-        "pcie: {port:#x} PERST assert STATUS={:#x} LINKSTS={:#x}",
-        r32(port + PORT_STATUS as u64),
-        r32(port + PORT_LINKSTS as u64)
-    ));
-    mdelay(10);
-
-    // 2) Refclk while held in reset (Linux: assert GPIO, then setup_refclk).
-    port_clocks_on(port, port_phy);
-    mdelay(1); // Tperst-clk ≥ 100 µs
-
-    // 3) Deassert PORT_PERST then GPIO (Linux order).
-    let perst = r32(port + PORT_PERST as u64);
-    w32(port + PORT_PERST as u64, perst | PORT_PERST_OFF);
-    perst_gpio_deassert(pinctrl);
-    crate::ktrace::log_fmt(format_args!(
-        "pcie: {port:#x} PERST deassert PERST={:#x}",
-        r32(port + PORT_PERST as u64)
-    ));
-    mdelay(100); // PCIe r5.0 §6.6.1
-
-    // 4) Wait READY
-    let deadline = crate::arch::now_ms() + 250;
-    while crate::arch::now_ms() < deadline {
-        if r32(port + PORT_STATUS as u64) & PORT_STATUS_READY != 0 {
-            break;
+/// Full PERST cycle + LTSSM start. Walks [`proto::apple_port_bringup_steps`]:
+/// CLKREQ pinmux → APPCLK → assert PERST# → (optional rail-off while held) →
+/// pwren → refclk → 100 ms → deassert PORT_PERST then GPIO → 100 ms → READY →
+/// clear CGDIS → LTSSM. That is Linux `apple_pcie_setup_link` + the
+/// `setup_port` tail, plus the pinctrl applied before the PCIe driver
+/// runs. `cycle_power` is the `/wifi power` / `/wifi reset` path: the rail
+/// must drop **after** PERST# is asserted, never before.
+fn port_perst_cycle_and_ltssm(port: u64, port_phy: u64, pinctrl: u64, cycle_power: bool) {
+    for &step in proto::apple_port_bringup_steps(cycle_power) {
+        match step {
+            proto::PortBringupStep::PinmuxClkreq => {
+                pinctrl_pinmux_clkreq(pinctrl);
+            }
+            proto::PortBringupStep::AppclkOn => {
+                let app = r32(port + PORT_APPCLK as u64);
+                w32(port + PORT_APPCLK as u64, app | PORT_APPCLK_EN);
+            }
+            proto::PortBringupStep::PerstAssert => {
+                // GPIO first (physical PERST# to the module), then the
+                // controller bit.
+                perst_gpio_assert(pinctrl);
+                let perst = r32(port + PORT_PERST as u64);
+                w32(port + PORT_PERST as u64, perst & !PORT_PERST_OFF);
+                crate::ktrace::log_fmt(format_args!(
+                    "pcie: {port:#x} PERST assert STATUS={:#x} LINKSTS={:#x}",
+                    r32(port + PORT_STATUS as u64),
+                    r32(port + PORT_LINKSTS as u64)
+                ));
+                mdelay(1);
+            }
+            proto::PortBringupStep::PowerOffWhilePerst => {
+                // 500 ms so the die's rails actually drain. Doing this
+                // *before* PERST# used to sample straps with the rail down
+                // and PERST deasserted — RAM stayed gated.
+                super::apple_smc::wifi_power_off_hold(500);
+            }
+            proto::PortBringupStep::PowerOnWhilePerst => {
+                super::apple_smc::wifi_power_on();
+            }
+            proto::PortBringupStep::RefclkOn => {
+                port_clocks_on(port, port_phy);
+            }
+            proto::PortBringupStep::SettlePwrenMs => {
+                // Tpvperl = 100 ms when pwren is present (not the 100 µs
+                // Tperst-clk path).
+                mdelay(100);
+            }
+            proto::PortBringupStep::PerstDeassert => {
+                // PORT_PERST_OFF first, then GPIO.
+                let perst = r32(port + PORT_PERST as u64);
+                w32(port + PORT_PERST as u64, perst | PORT_PERST_OFF);
+                perst_gpio_deassert(pinctrl);
+                crate::ktrace::log_fmt(format_args!(
+                    "pcie: {port:#x} PERST deassert PERST={:#x}",
+                    r32(port + PORT_PERST as u64)
+                ));
+            }
+            proto::PortBringupStep::SettlePerstMs => {
+                mdelay(100);
+            }
+            proto::PortBringupStep::WaitReady => {
+                let deadline = crate::arch::now_ms() + 250;
+                while crate::arch::now_ms() < deadline {
+                    if r32(port + PORT_STATUS as u64) & PORT_STATUS_READY != 0 {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+            proto::PortBringupStep::ClearCgdis => {
+                let refc = r32(port + PORT_REFCLK as u64);
+                w32(port + PORT_REFCLK as u64, refc & !PORT_REFCLK_CGDIS);
+                let app = r32(port + PORT_APPCLK as u64);
+                w32(port + PORT_APPCLK as u64, app & !PORT_APPCLK_CGDIS);
+            }
+            proto::PortBringupStep::LtssmStart => {
+                w32(port + PORT_LTSSMCTL as u64, 0);
+                mdelay(1);
+                w32(port + PORT_LTSSMCTL as u64, PORT_LTSSMCTL_START);
+                crate::ktrace::log_fmt(format_args!(
+                    "pcie: {port:#x} LTSSMCTL={:#x} STATUS={:#x} LINKSTS={:#x}",
+                    r32(port + PORT_LTSSMCTL as u64),
+                    r32(port + PORT_STATUS as u64),
+                    r32(port + PORT_LINKSTS as u64),
+                ));
+            }
         }
-        core::hint::spin_loop();
     }
-
-    // 5) Kick LTSSM (clear then START so a sticky bit re-arms).
-    w32(port + PORT_LTSSMCTL as u64, 0);
-    mdelay(1);
-    w32(port + PORT_LTSSMCTL as u64, PORT_LTSSMCTL_START);
-    // PORT_PREFMEM (0x994) is RAZ/WI on t8112; host MEM uses the non-pref path.
-    crate::ktrace::log_fmt(format_args!(
-        "pcie: {port:#x} LTSSMCTL={:#x} STATUS={:#x} LINKSTS={:#x}",
-        r32(port + PORT_LTSSMCTL as u64),
-        r32(port + PORT_STATUS as u64),
-        r32(port + PORT_LINKSTS as u64),
-    ));
 }
 
 /// Dump root-port config space (bus 0) for diagnostics — never touches bus ≥ 1.
@@ -803,10 +866,11 @@ fn dump_root_ports() {
 
 /// Assert SMC WiFi power and bring the WiFi port's link up.
 ///
-/// Bare m1n1 already ran `pcie_init` (axi2af + port APPCLK/PERST deassert).
-/// A full GPIO+reg PERST retrain can leave **config** working while **MEM**
-/// outbound stays dead — so we prefer a light path when the link is already
-/// live, and only fall back to the full Asahi PERST cycle when it is not.
+/// Always runs the full host sequence (CLKREQ pinmux + PERST-held pwren +
+/// two 100 ms settles). m1n1 `pcie_init` can leave `LINKSTS.UP` set without
+/// ever powering SYS_MEM — the old "light path if already up" is exactly
+/// why `/wifi power` then `/wifi diag` reported `coreinfo=0xffffffff`.
+/// Tunables are re-applied after PERST so the MEM outbound window survives.
 pub fn power_wifi_and_wait_link(fdt_bus_end: u8) -> bool {
     let port0 = REPORT.with(|r| r.port0);
     let port_phy = REPORT.with(|r| r.port0_phy);
@@ -816,7 +880,7 @@ pub fn power_wifi_and_wait_link(fdt_bus_end: u8) -> bool {
         return false;
     }
 
-    crate::ktrace::log("pcie", "link train v6 (bare m1n1: light path if already up)");
+    crate::ktrace::log("pcie", "link train v7 (setup_link, never skip PERST)");
 
     if !is_plausible_mmio(port0) {
         crate::ktrace::log_fmt(format_args!(
@@ -839,61 +903,33 @@ pub fn power_wifi_and_wait_link(fdt_bus_end: u8) -> bool {
     // Port0 only for windows; sibling roots cleared (all-roots np re-poisoned MEM).
     configure_wifi_root_only();
 
-    // SMC power always (airplane-mode rail).
-    let smc_ok = super::apple_smc::wifi_power_on();
-    if !smc_ok {
-        crate::ktrace::log("pcie", "SMC wifi power failed — will still try link wait");
-    }
-    mdelay(100);
-
-    // Light path: m1n1 left APPCLK + PERST deasserted. Ensure clocks, kick
-    // LTSSM if needed, do **not** re-assert PERST unless the link is down.
     let (already, st0, ls0) = link_seems_up(port0);
     crate::ktrace::log_fmt(format_args!(
-        "pcie: pre-train STATUS={st0:#x} LINKSTS={ls0:#x} already_up={already}"
+        "pcie: pre-train STATUS={st0:#x} LINKSTS={ls0:#x} already_up={already} (ignored — full PERST cycle)"
     ));
 
-    let mut link_up = already;
-    if already {
-        crate::ktrace::log("pcie", "link already up — skip full PERST cycle (preserve MEM path)");
-        // Mild poke: APPCLK + LTSSM start without touching PERST.
-        let app = r32(port0 + PORT_APPCLK as u64);
-        w32(port0 + PORT_APPCLK as u64, (app | PORT_APPCLK_EN) & !PORT_APPCLK_CGDIS);
-        w32(port0 + PORT_LTSSMCTL as u64, PORT_LTSSMCTL_START);
-        mdelay(50);
-        let (up, st, ls) = link_seems_up(port0);
-        link_up = up;
+    // cycle_power when the link is already up: m1n1 left PERST deasserted
+    // with the rail on, so we must drop the rail *while held in reset* or
+    // the dongle PMU never re-samples. Cold start (link down) just applies
+    // pwren during PERST.
+    port_perst_cycle_and_ltssm(port0, port_phy, pinctrl, already);
+    reapply_host_tunables();
+    let (mut link_up, st, ls) = wait_link(port0, LINK_WAIT_MS, "port0");
+    if link_up {
         crate::ktrace::log_fmt(format_args!(
-            "pcie: light path STATUS={st:#x} LINKSTS={ls:#x} up={up}"
+            "pcie: LINK UP port0 STATUS={st:#x} LINKSTS={ls:#x}"
         ));
     } else {
-        crate::ktrace::log("pcie", "link down — full GPIO PERST + LTSSM (Asahi order)");
-        let app = r32(port0 + PORT_APPCLK as u64);
-        w32(port0 + PORT_APPCLK as u64, app | PORT_APPCLK_EN);
-        perst_gpio_assert(pinctrl);
-        {
-            let perst = r32(port0 + PORT_PERST as u64);
-            w32(port0 + PORT_PERST as u64, perst & !PORT_PERST_OFF);
-        }
-        mdelay(10);
-        port_perst_cycle_and_ltssm(port0, port_phy, pinctrl);
-        // PERST can clear axi2af / RC state that m1n1 applied at pcie_init.
-        reapply_host_tunables();
-        let (up, st, ls) = wait_link(port0, LINK_WAIT_MS, "port0");
-        link_up = up;
-        if link_up {
-            crate::ktrace::log_fmt(format_args!(
-                "pcie: LINK UP port0 STATUS={st:#x} LINKSTS={ls:#x}"
-            ));
-        } else {
-            crate::ktrace::log_fmt(format_args!(
-                "pcie: port0 still DOWN STATUS={st:#x} LINKSTS={ls:#x} smc_ok={smc_ok}"
-            ));
-        }
+        crate::ktrace::log_fmt(format_args!(
+            "pcie: port0 still DOWN STATUS={st:#x} LINKSTS={ls:#x}"
+        ));
     }
 
     // Bus numbers + MEM windows again after any train / tunable re-apply.
     configure_wifi_root_only();
+    if link_up {
+        mdelay(100);
+    }
 
     // Re-probe bus1 after bus numbers exist — link may already be up with
     // sec=0 so earlier probes couldn't see the endpoint.
@@ -1006,33 +1042,29 @@ pub fn hard_reset_wifi_port() -> bool {
     }
     crate::ktrace::log(
         "pcie",
-        "HARD reset of WiFi endpoint: SMC power-cycle + PERST# (cold-boot so PMU re-powers RAM)",
+        "HARD reset: CLKREQ pinmux, PERST# held, then rail cycle",
     );
 
-    // Full SMC power-cycle FIRST — PERST# alone leaves the dongle PMU's resource
-    // state intact (RAM stays gated); a rail off→on cold-boots the chip so the
-    // PMU reloads its defaults with the SYS_MEM/RAM domain powered.
-    super::apple_smc::wifi_power_cycle();
-
-    // Then the full PERST cycle to bring the freshly-powered chip's link back up.
-    let app = r32(port0 + PORT_APPCLK as u64);
-    w32(port0 + PORT_APPCLK as u64, app | PORT_APPCLK_EN);
-    port_perst_cycle_and_ltssm(port0, port_phy, pinctrl);
+    // cycle_power=true: assert PERST first, *then* drop the rail, then
+    // re-apply pwren + refclk. Powering off with PERST# still deasserted
+    // (the old order) is how the dongle PMU sampled straps wrong.
+    port_perst_cycle_and_ltssm(port0, port_phy, pinctrl, true);
     // A PERST retrain clears the axi2af/RC/config tunables m1n1 applied — without
     // re-applying them MEM outbound stays dead even though config works.
     reapply_host_tunables();
     let (up, st, ls) = wait_link(port0, LINK_WAIT_MS, "port0-hardreset");
     configure_wifi_root_only();
-    let bus_end = if up {
-        REPORT.with(|r| if r.bus_end > 0 { r.bus_end } else { 4 })
-    } else {
-        0
-    };
+    let bus_end = if up { 4 } else { 0 };
     crate::pci::init(REPORT.with(|r| r.ecam), bus_end);
     REPORT.with(|r| {
         r.bus_end = bus_end;
         r.link_up = up;
     });
+    // PCIe: first config request after link-up is often CRS / all-ones.
+    // Give the endpoint 100 ms before the caller scans 01:00.0.
+    if up {
+        mdelay(100);
+    }
     crate::ktrace::log_fmt(format_args!(
         "pcie: hard reset done link={} STATUS={st:#x} LINKSTS={ls:#x}",
         if up { "up" } else { "DOWN" }
@@ -1041,7 +1073,7 @@ pub fn hard_reset_wifi_port() -> bool {
 }
 
 /// Translate a PCI BAR **bus** address to a CPU physical address using the
-/// t8112 `ranges` (Asahi `t8112.dtsi`):
+/// t8112 `ranges` (`t8112.dtsi`):
 ///
 /// - 32-bit non-prefetch `0xc000_0000..` → CPU `0x6c000_0000..`  
 /// - already-high 64-bit (`≥ 0x6_0000_0000`) → identity  
@@ -1239,11 +1271,11 @@ fn prepare_host_mem_path() {
 /// base, enables MEM, then `probe_read32`s the corresponding CPU address.
 /// Returns `(bar0_cpu, bar2_cpu, pci_base_used)` on the first hit.
 ///
-/// Candidates cover the Asahi DTS windows **and** common Apple holes seen on
+/// Candidates cover the DTS windows **and** common Apple holes seen on
 /// M1/M2 (`0x7_…`) in case m1n1's axi2af tunables wired a different aperture
 /// than the Linux `ranges`.
 ///
-/// **Pass 1** skips DesignWare iATU (Asahi Linux never programs it — Apple
+/// **Pass 1** skips DesignWare iATU (the Linux host never programs it — Apple
 /// routes outbound via axi2af). **Pass 2** enables identity iATU regions in
 /// case this silicon needs them.
 pub fn find_working_bar_window(
@@ -1384,8 +1416,14 @@ fn probe_bar_candidates(
             core::hint::spin_loop();
         }
 
-        // HIT if BAR0 (regs) **or** BAR2 (TCM base) responds. Prefer a layout
-        // where BAR2 reads work — required for firmware download.
+        // BAR0 is mandatory.  The caller immediately reads chipcommon through
+        // BAR0 (and uses BAR0_WINDOW for all of the Apple TCM path), so a BAR2
+        // response alone cannot validate this candidate.  Accepting `r2` or
+        // `r2+ram` by themselves used to return a layout whose first direct
+        // chipcommon load external-aborted at the selected BAR0 address.
+        //
+        // BAR2 remains diagnostic only: on some Apple parts it accepts posted
+        // writes yet faults on reads, while the BAR0-window route is sound.
         let bar0_word = super::probe_read32(cpu0);
         let bar2_word = if cpu2 != 0 {
             super::probe_read32(cpu2)
@@ -1403,7 +1441,7 @@ fn probe_bar_candidates(
             "pcie: BAR try pci0={base0:#x} pci2={base2:#x} cpu0={cpu0:#x} cpu2={cpu2:#x} r0={bar0_word:?} r2={bar2_word:?} r2+ram={bar2_ram:?}"
         ));
 
-        if bar0_word.is_some() || bar2_word.is_some() || bar2_ram.is_some() {
+        if bar0_word.is_some() {
             crate::ktrace::log_fmt(format_args!(
                 "pcie: BAR window HIT pci0={base0:#x} pci2={base2:#x} cpu0={cpu0:#x} cpu2={cpu2:#x}"
             ));

@@ -24,10 +24,10 @@
 use super::{context, csr, fw, proto};
 
 // Same API either side — see the note in [`super`] on why nothing here is arch-gated.
-#[cfg(target_arch = "aarch64")]
-use crate::pci::PciDevice;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::pci::PciDevice;
+#[cfg(target_arch = "aarch64")]
+use crate::pci::PciDevice;
 
 /// How long to spin on a hardware handshake before giving up. Generous — these are
 /// microsecond-scale in hardware — and finite, because the alternative is a boot that
@@ -53,9 +53,14 @@ const RB_CLOSED_MASK: u16 = 0x0fff;
 /// Slots in the command queue. A power of two, because the device wraps the index by
 /// masking — and 16 descriptors of 256 bytes is exactly one page.
 const NCMD: usize = 16;
-/// Bytes reserved per command. Startup commands are tens of bytes; a payload larger than
-/// this is refused rather than run off the end of its slot.
-const CMD_SLOT: usize = 256;
+/// Bytes reserved per command.
+///
+/// `SCAN_REQ_UMAC` v17 is a 1,940-byte command.  The original 256-byte slot
+/// was enough for bring-up and NVM queries, but made the fully-built scan
+/// request impossible to submit: `send_cmd` correctly refused it before the
+/// radio ever saw it.  Keep a fixed, DMA-safe stride and reject anything that
+/// does not fit rather than truncating a command on the air interface.
+const CMD_SLOT: usize = 2048;
 /// The command queue's id. Queue 0 on gen2 parts, and it appears in two unrelated places —
 /// the doorbell and every sequence number — which is why it is one constant.
 const CMD_QUEUE_ID: u8 = 0;
@@ -128,13 +133,21 @@ impl IwlDevice {
     /// data comes back from another. Using a `prph` offset directly as a CSR is the
     /// classic porting bug, and it lands in whatever CSR shares that number.
     pub fn prph_read(&self, addr: u32) -> u32 {
-        w32(self.regs, csr::HBUS_TARG_PRPH_RADDR, csr::prph_read_addr(addr));
+        w32(
+            self.regs,
+            csr::HBUS_TARG_PRPH_RADDR,
+            csr::prph_read_addr(addr),
+        );
         r32(self.regs, csr::HBUS_TARG_PRPH_RDAT)
     }
 
     /// Write an indirect peripheral register.
     pub fn prph_write(&self, addr: u32, v: u32) {
-        w32(self.regs, csr::HBUS_TARG_PRPH_WADDR, csr::prph_write_addr(addr));
+        w32(
+            self.regs,
+            csr::HBUS_TARG_PRPH_WADDR,
+            csr::prph_write_addr(addr),
+        );
         w32(self.regs, csr::HBUS_TARG_PRPH_WDAT, v);
     }
 
@@ -145,7 +158,11 @@ impl IwlDevice {
     /// to work and the device never starts.
     fn grab_nic_access(&self) -> bool {
         let v = r32(self.regs, csr::CSR_GP_CNTRL);
-        w32(self.regs, csr::CSR_GP_CNTRL, v | csr::GP_CNTRL_MAC_ACCESS_REQ);
+        w32(
+            self.regs,
+            csr::CSR_GP_CNTRL,
+            v | csr::GP_CNTRL_MAC_ACCESS_REQ,
+        );
         if !wait_bits(
             self.regs,
             csr::CSR_GP_CNTRL,
@@ -172,7 +189,12 @@ impl IwlDevice {
         );
         // NIC_READY going *clear* is the signal preparation finished — the polarity is
         // worth stating, because waiting for it to set never completes.
-        if !wait_bits(regs, csr::CSR_HW_IF_CONFIG_REG, csr::HW_IF_CONFIG_NIC_READY, 0) {
+        if !wait_bits(
+            regs,
+            csr::CSR_HW_IF_CONFIG_REG,
+            csr::HW_IF_CONFIG_NIC_READY,
+            0,
+        ) {
             crate::ktrace::log("iwlwifi", "card never reported ready after PREPARE");
             return false;
         }
@@ -340,7 +362,8 @@ impl IwlDevice {
         let mut rx_virt = [0u64; NRX];
         let mut rx_phys = [0u64; NRX];
         for i in 0..NRX {
-            let (p, v) = crate::mm::alloc_dma(RX_BUF).ok_or("no DMA memory for a receive buffer")?;
+            let (p, v) =
+                crate::mm::alloc_dma(RX_BUF).ok_or("no DMA memory for a receive buffer")?;
             rx_phys[i] = p;
             rx_virt[i] = v;
         }
@@ -349,10 +372,9 @@ impl IwlDevice {
         let (free_rbd, free_virt) =
             crate::mm::alloc_dma(4096).ok_or("no DMA memory for the free RBD list")?;
         // SAFETY: `free_virt` is a whole owned page; the list is NRX u64s, far smaller.
-        unsafe {
-            core::ptr::copy_nonoverlapping(list.as_ptr(), free_virt as *mut u64, list.len())
-        };
-        let (used_rbd, _) = crate::mm::alloc_dma(4096).ok_or("no DMA memory for the used RBD list")?;
+        unsafe { core::ptr::copy_nonoverlapping(list.as_ptr(), free_virt as *mut u64, list.len()) };
+        let (used_rbd, _) =
+            crate::mm::alloc_dma(4096).ok_or("no DMA memory for the used RBD list")?;
         let (status, status_virt) =
             crate::mm::alloc_dma(4096).ok_or("no DMA memory for the status block")?;
 
@@ -366,7 +388,8 @@ impl IwlDevice {
             crate::mm::alloc_dma(NCMD * CMD_SLOT).ok_or("no DMA memory for command payloads")?;
         let (first_tb_phys, first_tb_virt) = crate::mm::alloc_dma(NCMD * proto::FIRST_TB_ALIGN)
             .ok_or("no DMA memory for the command staging buffers")?;
-        let queue = proto::CmdQueue::new(CMD_QUEUE_ID, NCMD).ok_or("command queue size rejected")?;
+        let queue =
+            proto::CmdQueue::new(CMD_QUEUE_ID, NCMD).ok_or("command queue size rejected")?;
 
         let ctxt = context::ContextInfo {
             control: context::ControlBlock {
@@ -407,7 +430,11 @@ impl IwlDevice {
         match self.family {
             fw::Family::Ax210 | fw::Family::Be200 => {
                 w32(self.regs, csr::CSR_CTXT_INFO_ADDR, ctxt_phys as u32);
-                w32(self.regs, csr::CSR_CTXT_INFO_ADDR + 4, (ctxt_phys >> 32) as u32);
+                w32(
+                    self.regs,
+                    csr::CSR_CTXT_INFO_ADDR + 4,
+                    (ctxt_phys >> 32) as u32,
+                );
                 w32(self.regs, csr::CSR_IML_DATA_ADDR, list_phys as u32);
                 w32(self.regs, csr::CSR_IML_SIZE_ADDR, ctxt.fw.img_size);
             }
@@ -500,13 +527,20 @@ impl IwlDevice {
         let slot = rings.free_widx % NRX;
         // SAFETY: `free_list` is an owned DMA page holding NRX u64 entries.
         unsafe {
-            core::ptr::write_volatile((rings.free_list as *mut u64).add(slot), rings.bufs_phys[idx])
+            core::ptr::write_volatile(
+                (rings.free_list as *mut u64).add(slot),
+                rings.bufs_phys[idx],
+            )
         };
         rings.free_widx = rings.free_widx.wrapping_add(1);
         let widx = (rings.free_widx & 0xffff) as u32;
         // Written through the peripheral window, which is a different register space from
         // the transmit doorbell — see `csr::frbdcb_widx`.
-        w32(regs, csr::HBUS_TARG_PRPH_WADDR, csr::prph_write_addr(csr::frbdcb_widx(0)));
+        w32(
+            regs,
+            csr::HBUS_TARG_PRPH_WADDR,
+            csr::prph_write_addr(csr::frbdcb_widx(0)),
+        );
         w32(regs, csr::HBUS_TARG_PRPH_WDAT, widx);
 
         parsed
@@ -520,7 +554,10 @@ impl IwlDevice {
     /// (there are such commands) is not made to.
     pub fn send_cmd(&mut self, group: u8, cmd: u8, payload: &[u8]) -> Result<u16, &'static str> {
         let regs = self.regs;
-        let rings = self.rings.as_mut().ok_or("no command queue; load firmware first")?;
+        let rings = self
+            .rings
+            .as_mut()
+            .ok_or("no command queue; load firmware first")?;
         // Check the size before claiming a slot, so an over-long command does not consume
         // one and leave it in flight forever.
         if proto::CMD_HEADER_WIDE_LEN + payload.len() > CMD_SLOT {
@@ -589,7 +626,10 @@ impl IwlDevice {
         for _ in 0..Self::RESPONSE_SPINS {
             if let Some(n) = self.poll_notification() {
                 if n.group_id == proto::GROUP_LEGACY && n.cmd == proto::UCODE_ERROR_NTFY {
-                    crate::ktrace::log("iwlwifi", "firmware reported an error while a command was in flight");
+                    crate::ktrace::log(
+                        "iwlwifi",
+                        "firmware reported an error while a command was in flight",
+                    );
                     return Err("firmware failed while a command was in flight");
                 }
                 if n.group_id == group && n.cmd == cmd && n.sequence == seq {
@@ -647,8 +687,7 @@ impl IwlDevice {
     /// is only decoded as far as [`proto::NvmInfo`] goes.
     pub fn nvm_info(&mut self) -> Result<proto::NvmInfo, &'static str> {
         let payload = self.cmd(proto::GROUP_REGULATORY_NVM, proto::NVM_GET_INFO, &[])?;
-        proto::NvmInfo::parse(&payload)
-            .ok_or("the NVM response did not decode as NVM information")
+        proto::NvmInfo::parse(&payload).ok_or("the NVM response did not decode as NVM information")
     }
 
     /// Wait for firmware's *alive* notification.
@@ -686,7 +725,9 @@ impl IwlDevice {
         passive: bool,
     ) -> Result<u32, &'static str> {
         let ver = super::scan_supported(image, blob).map_err(|e| match e {
-            super::ScanUnsupported::Version(_) => "firmware speaks a SCAN_REQ_UMAC version this driver does not implement",
+            super::ScanUnsupported::Version(_) => {
+                "firmware speaks a SCAN_REQ_UMAC version this driver does not implement"
+            }
             super::ScanUnsupported::Unstated => "firmware does not state its SCAN_REQ_UMAC version",
         })?;
         debug_assert_eq!(ver, super::scan::VERSION);
@@ -694,8 +735,8 @@ impl IwlDevice {
         // arbitrary but must be non-zero, since zero is what an uninitialised
         // notification carries.
         let uid = 1u32;
-        let (req, n) = super::scan::build_v17(uid, mac, channels, passive)
-            .ok_or("no channels to scan")?;
+        let (req, n) =
+            super::scan::build_v17(uid, mac, channels, passive).ok_or("no channels to scan")?;
         if n < channels.len() {
             crate::ktrace::log_fmt(format_args!(
                 "iwl: scan truncated to {n} of {} channels (the request holds no more)",
@@ -722,11 +763,7 @@ impl IwlDevice {
     /// Bounded by time rather than by a result count: a scan of a quiet band
     /// legitimately finds nothing, and waiting for a number that never arrives
     /// would hang. Pumps `upkeep` and answers Ctrl+C, per the standing rule.
-    pub fn collect_scan(
-        &mut self,
-        out: &mut crate::drivers::wifi::scan::Scan,
-        ms: u64,
-    ) -> usize {
+    pub fn collect_scan(&mut self, out: &mut crate::drivers::wifi::scan::Scan, ms: u64) -> usize {
         let start = crate::arch::now_ms();
         let mut frames = 0usize;
         while crate::arch::now_ms().saturating_sub(start) < ms {
@@ -735,7 +772,9 @@ impl IwlDevice {
                 crate::ktrace::log("iwl", "scan cancelled");
                 break;
             }
-            let Some(n) = self.poll_notification() else { continue };
+            let Some(n) = self.poll_notification() else {
+                continue;
+            };
             if n.group_id != proto::GROUP_LEGACY || n.cmd != super::rx::REPLY_RX_MPDU {
                 continue;
             }

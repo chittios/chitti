@@ -37,6 +37,26 @@ pub fn input_activity_ms() -> u64 {
     INPUT_ACTIVITY_MS.load(Ordering::Relaxed)
 }
 
+/// A keyboard device has enumerated, or someone has already typed.
+pub fn keyboard_present() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let hid = crate::arch::x86_64::xhci::has_keyboard();
+    #[cfg(target_arch = "aarch64")]
+    let hid = crate::arch::aarch64::xhci::has_keyboard();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let hid = false;
+    hid || input_activity_ms() != 0
+}
+
+/// Status-bar chip for the keyboard.
+pub fn keyboard_status() -> crate::icons::DeviceStatus {
+    if keyboard_present() {
+        crate::icons::DeviceStatus::Ready
+    } else {
+        crate::icons::DeviceStatus::Disabled
+    }
+}
+
 /// The next input byte from whichever console has one -- x86: PS/2 keyboard →
 /// USB (xHCI/HID) → serial; aarch64: USB (xHCI/HID) → PL050 PS/2 → virtio-keyboard
 /// → PL011 serial -- or `None` if none is available.

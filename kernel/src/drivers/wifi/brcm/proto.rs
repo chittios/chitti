@@ -143,7 +143,7 @@ pub fn pack_ioctl_ptr_req(
 /// Apple board-type → firmware basename stem (without path). Pure.
 ///
 /// j473 Mac mini M2 (`pci14e4,4434`) chipcommon CHIPID is **0x4388** (BAR0
-/// +0x3000). Asahi firmware names:
+/// +0x3000). brcmfmac firmware names:
 /// - `brcmfmac4388-pcie.apple,miyake.bin` (matches chipcommon)
 /// - also accept `brcmfmac4387c2-pcie.apple,miyake.bin` (older trees / PCI naming)
 pub fn firmware_stem(board_type: &str, chip_id: u16) -> alloc::string::String {
@@ -187,15 +187,19 @@ pub const CC_EROMPTR: u32 = 0xfc;
 /// Chipcommon `watchdog` register offset.
 pub const CC_WATCHDOG: u32 = 0x80;
 
-/// Dongle TCM / sysmem base for a chipcommon chip id. Pure table from
-/// `brcmf_chip_tcm_rambase`. `0x4388` (j473 chipcommon) shares the 4387 base.
+/// Dongle TCM / sysmem base for a chipcommon chip id.
+///
+/// Linux `brcmf_chip_tcm_rambase` has 4387 → `0x740000`. Apple chipcommon
+/// `0x4388` (j473) is **not** that entry: the live backplane table in
+/// m1n1 `WLANBackplane4388` is `SRAM_BASE=0x200000` / `SRAM_SIZE=0x2e0000`.
+/// Probing 4388 at `0x740000` is past the end of SRAM (`0x200000+0x2e0000`
+/// = `0x4e0000`) and aborts even when RAM is up.
 pub fn rambase_for_chip(chip_id: u16) -> Option<u32> {
     Some(match chip_id {
         0x4377 => 0x17_0000,
         0x4378 => 0x35_2000,
-        // BCM4387 + Apple chipcommon 0x4388 (same die family).
-        0x4387 | 0x4388 => 0x74_0000,
-        // Older FullMAC still listed for completeness.
+        0x4387 => 0x74_0000,
+        0x4388 => 0x20_0000,
         0x4364 => 0x16_0000,
         0x4355 | 0x4359 => 0x16_0000,
         0x4365 | 0x4366 => 0x20_0000,
@@ -204,12 +208,227 @@ pub fn rambase_for_chip(chip_id: u16) -> Option<u32> {
     })
 }
 
+/// Known SRAM span for a chip id (m1n1 backplane tables / Linux raminfo).
+pub fn ramsize_for_chip(chip_id: u16) -> u32 {
+    match chip_id {
+        0x4388 => 0x2e_0000,
+        0x4387 => 0x1f_9000,
+        0x4378 => 0x20_0000,
+        0x4377 => 0x18_0000,
+        _ => 0x20_0000,
+    }
+}
+
+/// Apple signed images carry the reset vector in the firmware footer.
+/// Writing TCM[0] (`brcmf_chip_cr4_set_active`) is the Linux default, but
+/// Apple signed images set `skip_reset_vector` — the host must not poke
+/// the vector slot.
+pub fn skip_reset_vector(chip_id: u16) -> bool {
+    matches!(chip_id, 0x4387 | 0x4388)
+}
+
+/// SYS_MEM `coreinfo` is live (powered + decoding). `None` is an external
+/// abort; `0` / `0xffffffff` are the unpowered/unclocked AXI-slave signatures.
+/// Clocking (`FGC|CLK`) a dead core turns `0xffffffff` into an abort and
+/// wedges the Apple APCIE bus — never `ai_core_reset` unless this is true.
+pub fn sysmem_coreinfo_live(coreinfo: Option<u32>) -> bool {
+    matches!(coreinfo, Some(v) if v != 0 && v != 0xffff_ffff)
+}
+
+/// Whether the host may force a clock into the SYS_MEM wrapper.
+pub fn may_clock_sysmem(coreinfo: Option<u32>) -> bool {
+    sysmem_coreinfo_live(coreinfo)
+}
+
+/// A PCI config Vendor/Device dword is a live function — not an empty slot,
+/// a floating bus, or a Configuration Request Retry (CRS = vendor `0x0001`).
+/// After PERST# the endpoint answers CRS or all-ones until its config space
+/// is up; those must be retried, not treated as "no device".
+pub fn pci_config_id_live(id: u32) -> bool {
+    let vend = (id & 0xffff) as u16;
+    vend != 0 && vend != 0xffff && vend != 0x0001
+}
+
+/// Linux `brcmf_pcie_reset_device`: write this value to chipcommon `watchdog`
+/// then wait 100 ms. It is a 4-tick watchdog reset, **not** the F0 SSRESET
+/// enable mask (`0x10000000`). That mask is a different register encoding
+/// and does not re-run the PMU resource defaults that power SYS_MEM.
+pub const CC_WATCHDOG_RESET_TICKS: u32 = 4;
+pub const CC_WATCHDOG_RESET_WAIT_MS: u64 = 100;
+
+/// PCIE2 config-indirection pair (`brcmf_pcie_pcie2reg_configaddr/data`).
+pub const PCIE2_CONFIGADDR: u32 = 0x120;
+pub const PCIE2_CONFIGDATA: u32 = 0x124;
+/// `BRCMF_PCIE_CFGREG_REG_BAR2_CONFIG` — the BAR2 size/window fixup.
+pub const PCIE2_BAR2_CONFIG: u32 = 0x4e0;
+/// PCI config `RBAR_CTRL` (Linux `BRCMF_PCIE_CFGREG_RBAR_CTRL`).
+pub const PCIE2_RBAR_CTRL: u32 = 0x228;
+
+/// BAR0 is a 32 KiB aperture (Linux `BRCMF_PCIE_REG_MAP_SIZE`).
+/// 0x0000 sliding window (config 0x80), 0x1000 wrapper (config 0x70),
+/// 0x2000 PCIE2 enum (fixed), 0x3000 chipcommon (fixed).
+pub const BAR0_MAP_SIZE: u32 = 32 * 1024;
+/// Linux `BRCMF_PCIE_BARO_PCIE_ENUM_OFFSET` — PCIE2 registers without
+/// depending on `BAR0_WINDOW` latching.
+pub const BAR0_PCIE2_ENUM_OFF: u32 = 0x2000;
+/// Fixed chipcommon window inside BAR0.
+pub const BAR0_CC_FIXED_OFF: u32 = 0x3000;
+
+/// Offset of a PCIE2 register through the fixed BAR0 enum window.
+pub fn pcie2_enum_off(reg: u32) -> u32 {
+    BAR0_PCIE2_ENUM_OFF.saturating_add(reg)
+}
+
+/// Offset of a chipcommon register through the fixed BAR0 window.
+pub fn cc_fixed_off(reg: u32) -> u32 {
+    BAR0_CC_FIXED_OFF.saturating_add(reg)
+}
+
+/// Linux `brcmf_pcie_reset_device` only rewrites PCIE2 CONFIGADDR/DATA
+/// for `rev <= 13`. Rev 74 (j473) uses the attach-time 0x4e0 writeback
+/// only, and never that restore loop.
+pub fn pcie2_needs_cfg_restore(rev: u8) -> bool {
+    rev <= 13
+}
+
+/// CONFIGDATA / ECAM 0x4e0 that still equals the PCI vendor/device ID
+/// (or all-ones / zero) means the window missed — writing it back would
+/// smash `BAR2_CONFIG` with the PCI ID.
+pub fn bar2_config_is_window_miss(value: u32, pci_id: u32) -> bool {
+    value == pci_id || value == 0 || value == 0xffff_ffff
+}
+
+/// Whether a BAR2_CONFIG read is safe to write back (Linux attach).
+pub fn bar2_config_may_writeback(value: u32, pci_id: u32) -> bool {
+    !bar2_config_is_window_miss(value, pci_id)
+}
+
+/// Result of the BAR2_CONFIG attach-time writeback (for `/wifi diag`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bar2Fixup {
+    pub pci_id: u32,
+    pub ecam_4e0: u32,
+    pub enum_data: u32,
+    pub slide_win: u32,
+    pub slide_data: u32,
+    pub wrote: bool,
+}
+
+/// Wrapper IOCTL / RESET_CTL of all-ones is a dead AXI slave, not
+/// "core down". Clocking (`FGC|CLK`) that turns the next access into
+/// an abort and wedges APCIE.
+pub fn wrap_regs_live(ioctl: Option<u32>, reset_ctl: Option<u32>) -> bool {
+    match (ioctl, reset_ctl) {
+        (Some(i), Some(r)) => i != 0xffff_ffff && r != 0xffff_ffff,
+        _ => false,
+    }
+}
+
+/// D11 (802.11) wrapper ioctl bits — Linux `D11_BCMA_IOCTL_*`.
+pub const D11_IOCTL_PHYCLOCKEN: u32 = 0x0004;
+pub const D11_IOCTL_PHYRESET: u32 = 0x0008;
+
+// ── Apple host port bring-up (pure, from pcie-apple.c + pinctrl-apple-gpio.c)
+
+/// t8112 `pcie_pins`: CLKREQ on pinctrl_ap pins 162/163/164, function 1
+/// (`APPLE_PINMUX(n, 1)` → `periph1`). Linux applies this via `pinctrl-0`
+/// before `apple_pcie_setup_link`; without it the endpoint cannot assert
+/// CLKREQ# and the dongle PMU never starts the RAM domain.
+pub const PCIE_CLKREQ_PINS: &[u32] = &[162, 163, 164];
+/// Peripheral function for those CLKREQ pins (`periph1`).
+pub const PCIE_CLKREQ_FUNC: u32 = 1;
+/// j473 `reset-gpios = <&pinctrl_ap 166 GPIO_ACTIVE_LOW>` (port00 PERST#).
+pub const PCIE_PERST_GPIO: u32 = 166;
+
+/// pinctrl register fields — `drivers/pinctrl/pinctrl-apple-gpio.c`.
+pub const PINCTRL_REG_DATA: u32 = 1 << 0;
+pub const PINCTRL_REG_MODE: u32 = 0x7 << 1;
+pub const PINCTRL_REG_MODE_OUT: u32 = 1 << 1;
+pub const PINCTRL_REG_PERIPH: u32 = 0x3 << 5;
+pub const PINCTRL_REG_INPUT_ENABLE: u32 = 1 << 9;
+
+/// `apple_gpio_pinmux_set`: replace PERIPH, set INPUT_ENABLE, leave
+/// the rest (MODE/DATA/PULL) alone.
+pub fn pinctrl_pinmux_word(cur: u32, func: u32) -> u32 {
+    (cur & !PINCTRL_REG_PERIPH) | ((func & 0x3) << 5) | PINCTRL_REG_INPUT_ENABLE
+}
+
+/// `apple_gpio_direction_output`: PERIPH=GPIO, MODE=OUT, DATA=level.
+/// ACTIVE_LOW PERST: assert = `level_high=false`, deassert = `true`.
+pub fn pinctrl_gpio_out_word(cur: u32, level_high: bool) -> u32 {
+    let mut v = cur & !(PINCTRL_REG_MODE | PINCTRL_REG_PERIPH | PINCTRL_REG_DATA);
+    v |= PINCTRL_REG_MODE_OUT;
+    if level_high {
+        v |= PINCTRL_REG_DATA;
+    }
+    v
+}
+
+/// Host-side steps of Linux `apple_pcie_setup_link` + `setup_port` tail,
+/// plus the CLKREQ pinmux pinctrl applies before the PCIe driver runs.
+/// `cycle_power` inserts a rail-off **after** PERST is asserted (never
+/// before — powering the module with PERST# deasserted is how the dongle
+/// PMU samples straps wrong and leaves SYS_MEM gated).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortBringupStep {
+    PinmuxClkreq,
+    AppclkOn,
+    PerstAssert,
+    PowerOffWhilePerst,
+    PowerOnWhilePerst,
+    RefclkOn,
+    SettlePwrenMs,
+    PerstDeassert,
+    SettlePerstMs,
+    WaitReady,
+    ClearCgdis,
+    LtssmStart,
+}
+
+/// Canonical host-port bring-up. The two 100 ms settles are `SettlePwrenMs`
+/// (Tpvperl, only meaningful when pwren is present — it always is on j473)
+/// and `SettlePerstMs` (PCIe r5.0 §6.6.1 after PERST# deassert).
+pub fn apple_port_bringup_steps(cycle_power: bool) -> &'static [PortBringupStep] {
+    use PortBringupStep::*;
+    if cycle_power {
+        &[
+            PinmuxClkreq,
+            AppclkOn,
+            PerstAssert,
+            PowerOffWhilePerst,
+            PowerOnWhilePerst,
+            RefclkOn,
+            SettlePwrenMs,
+            PerstDeassert,
+            SettlePerstMs,
+            WaitReady,
+            ClearCgdis,
+            LtssmStart,
+        ]
+    } else {
+        &[
+            PinmuxClkreq,
+            AppclkOn,
+            PerstAssert,
+            PowerOnWhilePerst,
+            RefclkOn,
+            SettlePwrenMs,
+            PerstDeassert,
+            SettlePerstMs,
+            WaitReady,
+            ClearCgdis,
+            LtssmStart,
+        ]
+    }
+}
+
 /// Soft upper bound used only as a sanity cap (not the primary size source).
 /// Download prefers a tight `fw+nv+4` pack — the old 0x280000 default placed
 /// NVRAM past mapped TCM on j473 and external-aborted.
 pub fn default_ramsize_hint(chip_id: u16) -> u32 {
     match chip_id {
-        0x4387 | 0x4388 => 0x26_0000,
+        0x4388 => 0x2e_0000,
+        0x4387 => 0x26_0000,
         0x4378 => 0x20_0000,
         0x4377 => 0x18_0000,
         _ => 0x20_0000,
@@ -348,15 +567,16 @@ pub fn pack_ioctl_request(
 /// True when the shared-info header has enough structure to attempt ring
 /// init (version OK + non-zero ring_info pointer). Does not touch hardware.
 pub fn rings_locatable(shared_flags: u32, shared_header: &[u8]) -> bool {
-    shared_version_ok(shared_version(shared_flags)) && shared_ring_info_addr(shared_header).is_some()
+    shared_version_ok(shared_version(shared_flags))
+        && shared_ring_info_addr(shared_header).is_some()
 }
 
-/// Build firmware search paths for a stem (with Asahi alternate names). Pure.
+/// Build firmware search paths for a stem (with brcmfmac alternate names). Pure.
 pub fn firmware_search_paths(stem: &str) -> alloc::vec::Vec<alloc::string::String> {
     use alloc::{format, string::String, vec::Vec};
     let mut stems: Vec<String> = Vec::new();
     stems.push(String::from(stem));
-    // Always try the j473 / miyake Asahi names as fallbacks.
+    // Always try the j473 / miyake brcmfmac names as fallbacks.
     for alt in [
         "brcmfmac4388-pcie.apple,miyake",
         "brcmfmac4387c2-pcie.apple,miyake",
@@ -452,10 +672,116 @@ pub const BCMA_CORE_PCIE2: u16 = 0x83c;
 pub const BCMA_CORE_80211: u16 = 0x812;
 pub const BCMA_CORE_SYS_MEM: u16 = 0x849;
 pub const BCMA_CORE_INTERNAL_MEM: u16 = 0x80e;
+/// Separate PMU core (`brcmf_chip_get_pmu` when AOB is present).
+pub const BCMA_CORE_PMU: u16 = 0x827;
+
+/// PMU register offsets from the PMU core base (Linux `chipcregs`, 0x600…).
+/// On AOB chips these are **not** at chipcommon+0x600 — that overlay aborts.
+pub const PMU_CONTROL: u32 = 0x600;
+pub const PMU_CAPABILITIES: u32 = 0x604;
+pub const PMU_STATUS: u32 = 0x608;
+pub const PMU_RES_STATE: u32 = 0x60c;
+pub const PMU_MIN_RES_MASK: u32 = 0x618;
+pub const PMU_MAX_RES_MASK: u32 = 0x61c;
+pub const PMU_WATCHDOG: u32 = 0x634;
+pub const PMU_RES_REQ_TIMER: u32 = 0x644;
+/// Resource-request mask (`chipcregs.res_req_mask`). Newer PMUs honour this
+/// when `min_res_mask` is locked by OTP.
+pub const PMU_RES_REQ_MASK: u32 = 0x648;
+pub const PMU_CAPABILITIES_EXT: u32 = 0x64c;
+
+/// `pmuregs_t` layout used when the PMU is its own core (`si_setcore(PMU)`).
+/// `pmucontrol` is at **+0x00**, not +0x600. The 0x600 block can be a
+/// read-only mirror — j473 ignored every store at +0x618.
+pub const PMU_COMPACT_DELTA: u32 = 0x600;
+
+/// Overlay (chipcregs) offset → compact `pmuregs_t` offset.
+pub fn pmu_compact_off(overlay_off: u32) -> u32 {
+    overlay_off.saturating_sub(PMU_COMPACT_DELTA)
+}
+
+/// `res_req_timer` enable + a short ILP-tick timeout (bit 24 + 0xff).
+pub const PMU_RES_REQ_TIMER_GO: u32 = 0x0100_00ff;
+
+/// Chipcommon `clk_ctl_st` (0x1e0).
+pub const CC_CLK_CTL_ST: u32 = 0x1e0;
+pub const CCS_FORCEALP: u32 = 1 << 0;
+pub const CCS_FORCEHT: u32 = 1 << 1;
+pub const CCS_ALPAVAIL: u32 = 1 << 16;
+pub const CCS_HTAVAIL: u32 = 1 << 17;
+
+pub fn ccs_force_ht_word(cur: u32) -> u32 {
+    cur | CCS_FORCEALP | CCS_FORCEHT
+}
+
+pub fn ccs_ht_avail(st: u32) -> bool {
+    st & CCS_HTAVAIL != 0
+}
+
+/// PCIE2 `CLK_CTL` / `PWR_CTL` — m1n1 `WLANPCIE2Regs` on 4388.
+/// These are **not** chipcommon `clk_ctl_st`. Same offset (0x1e0) but only
+/// when BAR0_WINDOW is the PCIE2 core (0x18001000).
+pub const PCIE2_CLK_CTL: u32 = 0x1e0;
+pub const PCIE2_PWR_CTL: u32 = 0x1e8;
+pub const PCIE2_CLK_FORCEALP: u32 = 1 << 0;
+pub const PCIE2_CLK_FORCEHT: u32 = 1 << 1;
+pub const PCIE2_CLK_HAVEALPREQ: u32 = 1 << 3;
+pub const PCIE2_CLK_HAVEHTREQ: u32 = 1 << 4;
+pub const PCIE2_CLK_HQCLKREQ: u32 = 1 << 6;
+pub const PCIE2_CLK_HAVEHT: u32 = 1 << 17;
+/// Request every power domain + the PWRON bits (DMN0–4, PWRON_DMN0–4).
+pub const PCIE2_PWR_ALL_DOMAINS: u32 = 0x1f | (0x1f << 8);
+
+pub fn pcie2_clk_force_word(cur: u32) -> u32 {
+    cur | PCIE2_CLK_FORCEALP
+        | PCIE2_CLK_FORCEHT
+        | PCIE2_CLK_HAVEALPREQ
+        | PCIE2_CLK_HAVEHTREQ
+        | PCIE2_CLK_HQCLKREQ
+}
+
+pub fn pcie2_have_ht(st: u32) -> bool {
+    st & PCIE2_CLK_HAVEHT != 0
+}
+
+/// PMU revision from `pmucapabilities` (low 8 bits).
+pub fn pmu_rev(cap: u32) -> u8 {
+    (cap & 0xff) as u8
+}
+
+/// Mask the host should write to `min_res_mask` to request every resource
+/// the chip advertises. Bits outside `max` make the PMU **reject the whole
+/// write** and leave `min` unchanged (j473: `0xffffffff` was a no-op).
+pub fn pmu_request_mask(min: u32, max: u32) -> u32 {
+    if max == 0 || max == 0xffff_ffff {
+        min
+    } else {
+        max
+    }
+}
+
+/// Resources allowed by `max` but not currently in `res_state`.
+pub fn pmu_off_bits(max: u32, state: u32) -> u32 {
+    max & !state
+}
+
+/// Backplane address of a PMU register.
+pub fn pmu_reg(pmu_base: u32, off: u32) -> u32 {
+    pmu_base.saturating_add(off)
+}
+
+/// A PMU register read is live (powered + decoding).
+pub fn pmu_reg_live(v: Option<u32>) -> bool {
+    matches!(v, Some(x) if x != 0xffff_ffff)
+}
 
 /// Walk a PL-368 EROM, calling `read32(addr)` for each word. Pure relative to
 /// the reader. Caps at `max_cores` to bound work.
-pub fn erom_scan(mut read32: impl FnMut(u32) -> u32, erom_base: u32, max_cores: usize) -> alloc::vec::Vec<EromCore> {
+pub fn erom_scan(
+    mut read32: impl FnMut(u32) -> u32,
+    erom_base: u32,
+    max_cores: usize,
+) -> alloc::vec::Vec<EromCore> {
     use alloc::vec::Vec;
     let mut cores = Vec::new();
     let mut erom = erom_base;
@@ -617,9 +943,15 @@ mod tests {
     #[test_case]
     fn ioctl_ptr_layout() {
         let p = pack_ioctl_ptr_req(BRCMF_C_GET_VERSION, 7, 0, 64, 0x10_0000_4000);
-        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), BRCMF_C_GET_VERSION);
+        assert_eq!(
+            u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+            BRCMF_C_GET_VERSION
+        );
         assert_eq!(u16::from_le_bytes([p[4], p[5]]), 7);
-        assert_eq!(u64::from_le_bytes(p[16..24].try_into().unwrap()), 0x10_0000_4000);
+        assert_eq!(
+            u64::from_le_bytes(p[16..24].try_into().unwrap()),
+            0x10_0000_4000
+        );
     }
 
     #[test_case]
@@ -667,8 +999,12 @@ mod tests {
 
     #[test_case]
     fn rambase_table() {
-        assert_eq!(rambase_for_chip(0x4388), Some(0x74_0000));
+        assert_eq!(rambase_for_chip(0x4388), Some(0x20_0000));
         assert_eq!(rambase_for_chip(0x4387), Some(0x74_0000));
+        assert_eq!(ramsize_for_chip(0x4388), 0x2e_0000);
+        assert_eq!(ramsize_for_chip(0x4387), 0x1f_9000);
+        assert!(0x20_0000 + ramsize_for_chip(0x4388) <= 0x4e_0000);
+        assert!(0x74_0000 >= 0x20_0000 + ramsize_for_chip(0x4388));
         assert_eq!(rambase_for_chip(0x4378), Some(0x35_2000));
         assert_eq!(rambase_for_chip(0x4377), Some(0x17_0000));
         assert_eq!(rambase_for_chip(0x1234), None);
@@ -678,10 +1014,8 @@ mod tests {
     fn fw_ramsize_and_rstvec() {
         let mut fw = [0u8; RAMSIZE_OFFSET + 8];
         fw[0..4].copy_from_slice(&0x0010_0200u32.to_le_bytes()); // fake rstvec
-        fw[RAMSIZE_OFFSET..RAMSIZE_OFFSET + 4]
-            .copy_from_slice(&RAMSIZE_MAGIC.to_le_bytes());
-        fw[RAMSIZE_OFFSET + 4..RAMSIZE_OFFSET + 8]
-            .copy_from_slice(&0x28_0000u32.to_le_bytes());
+        fw[RAMSIZE_OFFSET..RAMSIZE_OFFSET + 4].copy_from_slice(&RAMSIZE_MAGIC.to_le_bytes());
+        fw[RAMSIZE_OFFSET + 4..RAMSIZE_OFFSET + 8].copy_from_slice(&0x28_0000u32.to_le_bytes());
         assert_eq!(fw_reset_vector(&fw), Some(0x0010_0200));
         assert_eq!(fw_embedded_ramsize(&fw), Some(0x28_0000));
         // wrong magic
@@ -709,8 +1043,12 @@ mod tests {
     #[test_case]
     fn firmware_paths_include_alts() {
         let paths = firmware_search_paths("brcmfmac4388-pcie.apple,miyake");
-        assert!(paths.iter().any(|p| p == "/brcm/brcmfmac4388-pcie.apple,miyake.bin"));
-        assert!(paths.iter().any(|p| p == "/brcm/brcmfmac4387c2-pcie.apple,miyake.bin"));
+        assert!(paths
+            .iter()
+            .any(|p| p == "/brcm/brcmfmac4388-pcie.apple,miyake.bin"));
+        assert!(paths
+            .iter()
+            .any(|p| p == "/brcm/brcmfmac4387c2-pcie.apple,miyake.bin"));
         assert!(paths.iter().any(|p| p.contains("/vendorfw/")));
         let nv = nvram_paths_for_fw("/brcm/brcmfmac4388-pcie.apple,miyake.bin");
         assert!(nv.iter().any(|p| p.ends_with(".txt")));
@@ -730,9 +1068,7 @@ mod tests {
         // component desc 1: valid|component, partnum 0x83e
         push(
             &mut words,
-            DMP_DESC_VALID
-                | DMP_DESC_COMPONENT
-                | ((0x83eu32) << DMP_COMP_PARTNUM_S),
+            DMP_DESC_VALID | DMP_DESC_COMPONENT | ((0x83eu32) << DMP_COMP_PARTNUM_S),
         );
         // component desc 2: nmw=1, nsw=1, rev=4
         push(
@@ -782,5 +1118,129 @@ mod tests {
         assert_eq!(cores[0].wrap, 0x1810_3000);
         assert_eq!(find_arm_core(&cores).map(|c| c.wrap), Some(0x1810_3000));
         assert!(find_arm_core(&[]).is_none());
+    }
+
+    #[test_case]
+    fn apple_4388_skips_reset_vector_and_sysmem_liveness() {
+        assert!(skip_reset_vector(0x4388));
+        assert!(skip_reset_vector(0x4387));
+        assert!(!skip_reset_vector(0x4378));
+        assert!(!sysmem_coreinfo_live(None));
+        assert!(!sysmem_coreinfo_live(Some(0)));
+        assert!(!sysmem_coreinfo_live(Some(0xffff_ffff)));
+        assert!(sysmem_coreinfo_live(Some(0x0001_00c0)));
+        assert!(!may_clock_sysmem(Some(0xffff_ffff)));
+        assert!(may_clock_sysmem(Some(0x12)));
+        assert!(!pci_config_id_live(0xffff_ffff));
+        assert!(!pci_config_id_live(0));
+        assert!(!pci_config_id_live(0x0000_0001), "CRS vendor 0x0001");
+        assert!(pci_config_id_live(0x4434_14e4));
+        assert_eq!(CC_WATCHDOG_RESET_TICKS, 4);
+        assert_eq!(CC_WATCHDOG_RESET_WAIT_MS, 100);
+        assert_ne!(CC_WATCHDOG_RESET_TICKS, 0x1000_0000);
+        assert_eq!(PCIE2_BAR2_CONFIG, 0x4e0);
+        assert_eq!(pcie2_enum_off(PCIE2_CONFIGADDR), 0x2120);
+        assert_eq!(pcie2_enum_off(PCIE2_CONFIGDATA), 0x2124);
+        assert_eq!(cc_fixed_off(CC_WATCHDOG), 0x3080);
+        assert!(!pcie2_needs_cfg_restore(74));
+        assert!(pcie2_needs_cfg_restore(13));
+        assert!(!pcie2_needs_cfg_restore(14));
+        // Writing 0x443414e4 back into BAR2_CONFIG is the window-miss bug.
+        assert!(bar2_config_is_window_miss(0x4434_14e4, 0x4434_14e4));
+        assert!(bar2_config_is_window_miss(0, 0x4434_14e4));
+        assert!(bar2_config_is_window_miss(0xffff_ffff, 0x4434_14e4));
+        assert!(!bar2_config_is_window_miss(0x0000_1800, 0x4434_14e4));
+        assert!(bar2_config_may_writeback(0x0000_1800, 0x4434_14e4));
+        assert!(!bar2_config_may_writeback(0x4434_14e4, 0x4434_14e4));
+        assert!(!wrap_regs_live(None, Some(1)));
+        assert!(!wrap_regs_live(Some(0xffff_ffff), Some(0xffff_ffff)));
+        assert!(wrap_regs_live(Some(0x1), Some(0x1)));
+        assert!(wrap_regs_live(Some(0), Some(0)));
+        assert_eq!(D11_IOCTL_PHYRESET | D11_IOCTL_PHYCLOCKEN, 0x000c);
+        assert_eq!(BCMA_CORE_PMU, 0x827);
+        assert_eq!(pmu_reg(0x1801_2000, PMU_CAPABILITIES), 0x1801_2604);
+        assert_eq!(pmu_reg(0x1801_2000, PMU_MIN_RES_MASK), 0x1801_2618);
+        assert_eq!(pmu_reg(0x1801_2000, PMU_MAX_RES_MASK), 0x1801_261c);
+        assert_ne!(pmu_reg(0x1801_2000, PMU_MIN_RES_MASK), 0x1800_0618);
+        assert!(!pmu_reg_live(None));
+        assert!(!pmu_reg_live(Some(0xffff_ffff)));
+        assert!(pmu_reg_live(Some(0x2b)));
+        assert_eq!(PMU_MIN_RES_MASK, 0x618);
+        assert_eq!(PMU_MAX_RES_MASK, 0x61c);
+        assert_eq!(PMU_RES_REQ_MASK, 0x648);
+        // Live j473 values: all-ones was rejected; request must be ⊆ max.
+        let min = 0x0607_7eed;
+        let max = 0x0e4f_7fff;
+        let st = 0x064e_7fed;
+        assert_eq!(pmu_rev(0x0456_6b2b), 43);
+        assert_eq!(pmu_request_mask(min, max), max);
+        assert_eq!(pmu_request_mask(min, max) & !max, 0);
+        assert_eq!(pmu_request_mask(min, 0xffff_ffff), min);
+        assert_eq!(pmu_off_bits(max, st), 0x0801_0012);
+        assert_ne!(pmu_request_mask(min, max), 0xffff_ffff);
+        assert_eq!(pmu_compact_off(PMU_MIN_RES_MASK), 0x18);
+        assert_eq!(pmu_compact_off(PMU_MAX_RES_MASK), 0x1c);
+        assert_eq!(pmu_compact_off(PMU_RES_STATE), 0x0c);
+        assert_eq!(pmu_compact_off(PMU_RES_REQ_MASK), 0x48);
+        assert_eq!(pmu_compact_off(PMU_RES_REQ_TIMER), 0x44);
+        assert_eq!(pmu_reg(0x1801_2000, pmu_compact_off(PMU_MIN_RES_MASK)), 0x1801_2018);
+        assert_eq!(ccs_force_ht_word(0), CCS_FORCEALP | CCS_FORCEHT);
+        assert!(!ccs_ht_avail(0));
+        assert!(ccs_ht_avail(CCS_HTAVAIL | CCS_ALPAVAIL));
+        assert_eq!(CC_CLK_CTL_ST, 0x1e0);
+        assert_eq!(PCIE2_CLK_CTL, 0x1e0);
+        assert_eq!(PCIE2_PWR_CTL, 0x1e8);
+        assert_eq!(pcie2_clk_force_word(0) & PCIE2_CLK_FORCEHT, PCIE2_CLK_FORCEHT);
+        assert!(pcie2_have_ht(PCIE2_CLK_HAVEHT));
+        assert!(!pcie2_have_ht(0x0205_0240), "CC-looking status is not PCIE2 HAVEHT");
+        assert_eq!(PCIE2_PWR_ALL_DOMAINS, 0x1f1f);
+    }
+
+    #[test_case]
+    fn pinctrl_words_match_linux() {
+        // apple_gpio_pinmux_set(func=1): PERIPH=1, INPUT_ENABLE, rest kept.
+        let cur = 0x0000_0005; // leftover DATA + MODE noise
+        let mux = pinctrl_pinmux_word(cur, PCIE_CLKREQ_FUNC);
+        assert_eq!(mux & PINCTRL_REG_PERIPH, PCIE_CLKREQ_FUNC << 5);
+        assert_ne!(mux & PINCTRL_REG_INPUT_ENABLE, 0);
+        assert_eq!(
+            mux & !(PINCTRL_REG_PERIPH | PINCTRL_REG_INPUT_ENABLE),
+            cur & !(PINCTRL_REG_PERIPH | PINCTRL_REG_INPUT_ENABLE)
+        );
+        // apple_gpio_direction_output(0): GPIO, MODE=OUT, DATA=0 (PERST assert).
+        let out_lo = pinctrl_gpio_out_word(mux, false);
+        assert_eq!(out_lo & PINCTRL_REG_PERIPH, 0);
+        assert_eq!(out_lo & PINCTRL_REG_MODE, PINCTRL_REG_MODE_OUT);
+        assert_eq!(out_lo & PINCTRL_REG_DATA, 0);
+        let out_hi = pinctrl_gpio_out_word(0, true);
+        assert_ne!(out_hi & PINCTRL_REG_DATA, 0);
+        assert_eq!(PCIE_CLKREQ_PINS, &[162, 163, 164]);
+        assert_eq!(PCIE_PERST_GPIO, 166);
+    }
+
+    #[test_case]
+    fn port_bringup_asserts_perst_before_power() {
+        use PortBringupStep::*;
+        let cyc = apple_port_bringup_steps(true);
+        let cold = apple_port_bringup_steps(false);
+        // CLKREQ pinmux is first — Linux pinctrl runs before pcie-apple.
+        assert_eq!(cyc[0], PinmuxClkreq);
+        assert_eq!(cold[0], PinmuxClkreq);
+        let perst = cyc.iter().position(|&s| s == PerstAssert).unwrap();
+        let off = cyc.iter().position(|&s| s == PowerOffWhilePerst).unwrap();
+        let on = cyc.iter().position(|&s| s == PowerOnWhilePerst).unwrap();
+        let refc = cyc.iter().position(|&s| s == RefclkOn).unwrap();
+        let de = cyc.iter().position(|&s| s == PerstDeassert).unwrap();
+        assert!(perst < off, "PERST# must be held before the rail drops");
+        assert!(off < on, "rail must drain before it comes back");
+        assert!(on < refc, "pwren before endpoint refclk (setup_link)");
+        assert!(refc < de, "refclk before PERST# deassert (Tperst-clk)");
+        // Cold start never drops the rail (pwren is already the power-on).
+        assert!(!cold.iter().any(|&s| s == PowerOffWhilePerst));
+        assert!(cold.iter().any(|&s| s == PowerOnWhilePerst));
+        // Both 100 ms settles present, in order.
+        let s0 = cyc.iter().position(|&s| s == SettlePwrenMs).unwrap();
+        let s1 = cyc.iter().position(|&s| s == SettlePerstMs).unwrap();
+        assert!(s0 < de && de < s1);
     }
 }

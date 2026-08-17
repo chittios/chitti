@@ -216,8 +216,15 @@ pub(super) fn play_audio(path: &str) {
         bytes.len() / 1024,
         crate::arch::now_ms().saturating_sub(t0)
     );
-    if !crate::sound::is_up() {
-        serial_println!("open> no sound device — decoded OK but cannot play");
+    // `ensure_up`, not `is_up`: discovery otherwise ran once at boot, so a USB
+    // audio device plugged in afterwards was never adopted and this said "no
+    // sound device" for the rest of the session.
+    if !crate::sound::ensure_up() {
+        serial_println!("open> no sound device — decoded OK but cannot play (see the sound: lines in /ktrace)");
+        #[cfg(target_arch = "aarch64")]
+        if crate::arch::aarch64::is_apple() {
+            serial_println!("open>   built-in speaker did not come up — `/audio dump` then `/audio up` to retry");
+        }
         return;
     }
     serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+Tab again returns to shell; Ctrl+C or /close stops");

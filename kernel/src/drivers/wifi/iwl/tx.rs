@@ -115,7 +115,13 @@ pub fn default_flags() -> u32 {
 /// `pn` is the CCMP packet number the firmware will encrypt with; pass 0 for an
 /// unencrypted frame. `rate_n_flags` is the transmit rate, which the caller
 /// takes from its rate-control policy.
-pub fn build(family: fw::Family, frame: &[u8], pn: u64, rate_n_flags: u32, flags: u32) -> Option<Vec<u8>> {
+pub fn build(
+    family: fw::Family,
+    frame: &[u8],
+    pn: u64,
+    rate_n_flags: u32,
+    flags: u32,
+) -> Option<Vec<u8>> {
     if frame.len() < 24 || frame.len() > 4096 {
         return None;
     }
@@ -142,8 +148,10 @@ pub fn build(family: fw::Family, frame: &[u8], pn: u64, rate_n_flags: u32, flags
 
     // The packet number, split low/high — this is what the firmware encrypts
     // with, so it must advance for every frame under one key.
-    b[dram_at + D_PN_LOW..dram_at + D_PN_LOW + 4].copy_from_slice(&((pn & 0xffff_ffff) as u32).to_le_bytes());
-    b[dram_at + D_PN_HIGH..dram_at + D_PN_HIGH + 2].copy_from_slice(&(((pn >> 32) & 0xffff) as u16).to_le_bytes());
+    b[dram_at + D_PN_LOW..dram_at + D_PN_LOW + 4]
+        .copy_from_slice(&((pn & 0xffff_ffff) as u32).to_le_bytes());
+    b[dram_at + D_PN_HIGH..dram_at + D_PN_HIGH + 2]
+        .copy_from_slice(&(((pn >> 32) & 0xffff) as u16).to_le_bytes());
     b[dram_at + D_AUX_INFO..dram_at + D_AUX_INFO + 2].copy_from_slice(&0u16.to_le_bytes());
 
     b[rate_at..rate_at + 4].copy_from_slice(&rate_n_flags.to_le_bytes());
@@ -164,14 +172,27 @@ mod tests {
     fn the_two_layouts_transpose_flags_and_offload_assist() {
         assert_eq!(V9_OFFLOAD_ASSIST, 2);
         assert_eq!(V9_FLAGS, 4);
-        assert_eq!(AX_FLAGS, 2, "the AX210 layout puts FLAGS where v9 puts offload");
+        assert_eq!(
+            AX_FLAGS, 2,
+            "the AX210 layout puts FLAGS where v9 puts offload"
+        );
         assert_eq!(AX_OFFLOAD_ASSIST, 4, "and offload where v9 puts flags");
-        assert_ne!(V9_FLAGS, AX_FLAGS, "they are transposed, not merely resized");
+        assert_ne!(
+            V9_FLAGS, AX_FLAGS,
+            "they are transposed, not merely resized"
+        );
 
         assert_eq!(TX_HDR_LEN_V9, 20);
-        assert_eq!(TX_HDR_LEN_AX210, 28, "eight reserved bytes before the frame");
+        assert_eq!(
+            TX_HDR_LEN_AX210, 28,
+            "eight reserved bytes before the frame"
+        );
         assert_eq!(DRAM_SEC_INFO_LEN, 8);
-        assert_eq!(hdr_len(fw::Family::Ax200), TX_HDR_LEN_V9, "AX200 is 22000-family");
+        assert_eq!(
+            hdr_len(fw::Family::Ax200),
+            TX_HDR_LEN_V9,
+            "AX200 is 22000-family"
+        );
         assert_eq!(hdr_len(fw::Family::Iwl9000), TX_HDR_LEN_V9);
         assert_eq!(hdr_len(fw::Family::Ax210), TX_HDR_LEN_AX210);
         assert_eq!(hdr_len(fw::Family::Be200), TX_HDR_LEN_AX210);
@@ -188,13 +209,23 @@ mod tests {
         let v9 = build(fw::Family::Ax200, &frame, 0, 0, f).unwrap();
         let got = u32::from_le_bytes(v9[V9_FLAGS..V9_FLAGS + 4].try_into().unwrap());
         assert_eq!(got, f, "v9 flags are 32 bits at offset 4");
-        assert_eq!(u16::from_le_bytes([v9[V9_OFFLOAD_ASSIST], v9[V9_OFFLOAD_ASSIST + 1]]), 0);
+        assert_eq!(
+            u16::from_le_bytes([v9[V9_OFFLOAD_ASSIST], v9[V9_OFFLOAD_ASSIST + 1]]),
+            0
+        );
 
         let ax = build(fw::Family::Ax210, &frame, 0, 0, f).unwrap();
         let got = u16::from_le_bytes([ax[AX_FLAGS], ax[AX_FLAGS + 1]]);
         assert_eq!(got, f as u16, "AX210 flags are 16 bits at offset 2");
         // And the 32-bit offload field beside it is untouched by the flags.
-        assert_eq!(u32::from_le_bytes(ax[AX_OFFLOAD_ASSIST..AX_OFFLOAD_ASSIST + 4].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(
+                ax[AX_OFFLOAD_ASSIST..AX_OFFLOAD_ASSIST + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
     }
 
     /// `len` is the **frame's** length, not the command's. A command reporting
@@ -221,7 +252,11 @@ mod tests {
         let frame = alloc::vec![0u8; 24];
         let pn = 0x1234_5678_9abcu64;
         let c = build(fw::Family::Ax200, &frame, pn, 0, 0).unwrap();
-        let lo = u32::from_le_bytes(c[V9_DRAM + D_PN_LOW..V9_DRAM + D_PN_LOW + 4].try_into().unwrap());
+        let lo = u32::from_le_bytes(
+            c[V9_DRAM + D_PN_LOW..V9_DRAM + D_PN_LOW + 4]
+                .try_into()
+                .unwrap(),
+        );
         let hi = u16::from_le_bytes([c[V9_DRAM + D_PN_HIGH], c[V9_DRAM + D_PN_HIGH + 1]]);
         assert_eq!(lo, 0x5678_9abc);
         assert_eq!(hi, 0x1234);
@@ -241,7 +276,11 @@ mod tests {
     fn the_default_flags_ask_for_acknowledgement_and_firmware_sequencing() {
         let f = default_flags();
         assert_ne!(f & TX_FLG_ACK, 0, "a unicast data frame is acknowledged");
-        assert_ne!(f & TX_FLG_SEQ_CTL, 0, "the firmware owns the sequence number");
+        assert_ne!(
+            f & TX_FLG_SEQ_CTL,
+            0,
+            "the firmware owns the sequence number"
+        );
         // Both fit the AX210 layout's 16-bit field.
         assert_eq!(f & 0xffff, f, "the default flags fit 16 bits");
     }

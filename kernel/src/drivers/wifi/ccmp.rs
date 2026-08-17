@@ -134,7 +134,13 @@ fn ctr_xor(key: &[u8; 16], nonce: &[u8], data: &mut [u8]) {
 /// Generic CCM encryption: returns `ciphertext || MIC`.
 ///
 /// `nonce` must be `15 - L` = 13 bytes.
-pub fn ccm_encrypt(key: &[u8; 16], nonce: &[u8], aad: &[u8], plain: &[u8], mic_len: usize) -> Option<Vec<u8>> {
+pub fn ccm_encrypt(
+    key: &[u8; 16],
+    nonce: &[u8],
+    aad: &[u8],
+    plain: &[u8],
+    mic_len: usize,
+) -> Option<Vec<u8>> {
     if nonce.len() != 15 - L || !(4..=16).contains(&mic_len) || mic_len % 2 != 0 {
         return None;
     }
@@ -153,7 +159,13 @@ pub fn ccm_encrypt(key: &[u8; 16], nonce: &[u8], aad: &[u8], plain: &[u8], mic_l
 /// Generic CCM decryption. `None` when the MIC does not verify — and the
 /// plaintext is **not** returned in that case, because a caller handed
 /// unauthenticated bytes will use them.
-pub fn ccm_decrypt(key: &[u8; 16], nonce: &[u8], aad: &[u8], data: &[u8], mic_len: usize) -> Option<Vec<u8>> {
+pub fn ccm_decrypt(
+    key: &[u8; 16],
+    nonce: &[u8],
+    aad: &[u8],
+    data: &[u8],
+    mic_len: usize,
+) -> Option<Vec<u8>> {
     if nonce.len() != 15 - L || data.len() < mic_len {
         return None;
     }
@@ -264,8 +276,8 @@ pub fn aad(hdr: &[u8]) -> Option<Vec<u8>> {
     let mut a = Vec::with_capacity(30);
     a.extend_from_slice(&mask.to_le_bytes());
     a.extend_from_slice(&hdr[4..22]); // A1, A2, A3
-    // Sequence Control: only the fragment number survives. The sequence number
-    // itself advances on retransmission.
+                                      // Sequence Control: only the fragment number survives. The sequence number
+                                      // itself advances on retransmission.
     a.push(hdr[22] & 0x0f);
     a.push(0);
     if has_a4(fc) {
@@ -324,7 +336,13 @@ pub fn read_header(h: &[u8]) -> Option<([u8; PN_LEN], u8)> {
 
 /// Encrypt a frame body. `hdr` is the plaintext 802.11 header, `body` the
 /// payload after it. Returns `CCMP header || ciphertext || MIC`.
-pub fn encrypt(tk: &[u8; 16], hdr: &[u8], pn: &[u8; PN_LEN], key_id: u8, body: &[u8]) -> Option<Vec<u8>> {
+pub fn encrypt(
+    tk: &[u8; 16],
+    hdr: &[u8],
+    pn: &[u8; PN_LEN],
+    key_id: u8,
+    body: &[u8],
+) -> Option<Vec<u8>> {
     let fc = u16::from_le_bytes([*hdr.first()?, *hdr.get(1)?]);
     let a2: [u8; 6] = hdr.get(10..16)?.try_into().ok()?;
     let aad = aad(hdr)?;
@@ -418,7 +436,10 @@ pub struct ReplayGuard {
 
 impl ReplayGuard {
     pub fn new() -> ReplayGuard {
-        ReplayGuard { last: 0, seen: false }
+        ReplayGuard {
+            last: 0,
+            seen: false,
+        }
     }
 
     /// Accept `pn` if it advances. Returns false for a replay or a stale frame.
@@ -478,19 +499,34 @@ mod tests {
         let aad = [0x33u8; 20];
         let plain = [0x44u8; 40];
         let ct = ccm_encrypt(&key, &nonce, &aad, &plain, 8).unwrap();
-        assert_eq!(ccm_decrypt(&key, &nonce, &aad, &ct, 8).as_deref(), Some(&plain[..]));
+        assert_eq!(
+            ccm_decrypt(&key, &nonce, &aad, &ct, 8).as_deref(),
+            Some(&plain[..])
+        );
 
         for flip in [0usize, 20, ct.len() - 1] {
             let mut bad = ct.clone();
             bad[flip] ^= 1;
-            assert_eq!(ccm_decrypt(&key, &nonce, &aad, &bad, 8), None, "byte {flip}");
+            assert_eq!(
+                ccm_decrypt(&key, &nonce, &aad, &bad, 8),
+                None,
+                "byte {flip}"
+            );
         }
         let mut bad_aad = aad;
         bad_aad[0] ^= 1;
-        assert_eq!(ccm_decrypt(&key, &nonce, &bad_aad, &ct, 8), None, "AAD is authenticated");
+        assert_eq!(
+            ccm_decrypt(&key, &nonce, &bad_aad, &ct, 8),
+            None,
+            "AAD is authenticated"
+        );
         let mut bad_nonce = nonce;
         bad_nonce[0] ^= 1;
-        assert_eq!(ccm_decrypt(&key, &bad_nonce, &aad, &ct, 8), None, "the nonce binds too");
+        assert_eq!(
+            ccm_decrypt(&key, &bad_nonce, &aad, &ct, 8),
+            None,
+            "the nonce binds too"
+        );
         // A wrong key, obviously.
         assert_eq!(ccm_decrypt(&[0x99u8; 16], &nonce, &aad, &ct, 8), None);
     }
@@ -532,7 +568,11 @@ mod tests {
 
         // The same PN in the nonce runs the other way.
         let n = nonce(0x0800, &[0xaa; 6], &pn, 0);
-        assert_eq!(&n[7..13], &pn[..], "the nonce is big-endian, the header is not");
+        assert_eq!(
+            &n[7..13],
+            &pn[..],
+            "the nonce is big-endian, the header is not"
+        );
     }
 
     /// ExtIV clear means this is not CCMP — WEP leaves it zero. Reading such a
@@ -582,7 +622,11 @@ mod tests {
         let h = data_hdr(0x0808 | FC_PROTECTED, 0x1230);
         assert_eq!(aad(&h).unwrap(), a);
         assert_eq!(a[0] & 0x08, 0x08, "ToDS survives");
-        assert_ne!(u16::from_le_bytes([a[0], a[1]]) & FC_PROTECTED, 0, "Protected forced on");
+        assert_ne!(
+            u16::from_le_bytes([a[0], a[1]]) & FC_PROTECTED,
+            0,
+            "Protected forced on"
+        );
     }
 
     /// A data frame's subtype is masked; a management frame's is not, because
@@ -646,7 +690,11 @@ mod tests {
         let pn = [0, 0, 0, 0, 0x12, 0x34];
         let enc = encrypt(&tk, &hdr, &pn, 0, body).expect("encrypts");
         assert_eq!(enc.len(), HDR_LEN + body.len() + MIC_LEN);
-        assert_ne!(&enc[HDR_LEN..HDR_LEN + body.len()], &body[..], "must be encrypted");
+        assert_ne!(
+            &enc[HDR_LEN..HDR_LEN + body.len()],
+            &body[..],
+            "must be encrypted"
+        );
 
         let (plain, got_pn) = decrypt(&tk, &hdr, &enc).expect("decrypts");
         assert_eq!(&plain[..], &body[..]);

@@ -134,6 +134,26 @@ pub fn activity_ms() -> u64 {
     ACTIVITY_MS.load(Ordering::Relaxed)
 }
 
+/// A pointer device has enumerated, or the cursor has already moved.
+pub fn pointer_present() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let hid = crate::arch::x86_64::xhci::has_mouse();
+    #[cfg(target_arch = "aarch64")]
+    let hid = crate::arch::aarch64::xhci::has_mouse();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let hid = false;
+    hid || activity_ms() != 0
+}
+
+/// Status-bar chip for the pointer.
+pub fn pointer_status() -> crate::icons::DeviceStatus {
+    if pointer_present() {
+        crate::icons::DeviceStatus::Ready
+    } else {
+        crate::icons::DeviceStatus::Disabled
+    }
+}
+
 /// Poll the transport drivers and fold the state into edge events for this tick.
 pub fn tick() -> Tick {
     crate::arch::mouse_poll();

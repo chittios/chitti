@@ -467,7 +467,10 @@ mod tests {
             0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, // PSK
             0x00, 0x00,
         ];
-        assert!(!Rsn::parse(tkip).unwrap().supported(), "TKIP is not supported");
+        assert!(
+            !Rsn::parse(tkip).unwrap().supported(),
+            "TKIP is not supported"
+        );
 
         let sae = &[
             0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,
@@ -491,7 +494,10 @@ mod tests {
         mfp[n - 2..].copy_from_slice(&RSN_CAP_MFP_REQUIRED.to_le_bytes());
         let mfp = Rsn::parse(&mfp).unwrap();
         assert_eq!(mfp.akm, alloc::vec![Akm::Psk]);
-        assert!(!mfp.supported(), "required MFP must not be claimed as joinable");
+        assert!(
+            !mfp.supported(),
+            "required MFP must not be claimed as joinable"
+        );
     }
 
     #[test_case]
@@ -596,7 +602,11 @@ mod tests {
         assert_eq!(e[1] as usize, e.len() - 2, "the length field must be right");
         let r = Rsn::parse(&e[2..]).expect("our own element must parse");
         assert!(r.supported(), "we advertise security we do not support");
-        assert_eq!(&e[2..], RSN_WPA2_PSK_CCMP, "not the canonical WPA2-PSK element");
+        assert_eq!(
+            &e[2..],
+            RSN_WPA2_PSK_CCMP,
+            "not the canonical WPA2-PSK element"
+        );
     }
 
     #[test_case]

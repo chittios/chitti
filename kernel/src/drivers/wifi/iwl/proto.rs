@@ -519,11 +519,19 @@ mod tests {
     #[test_case]
     fn a_descriptor_refuses_what_the_device_would_act_on_regardless() {
         assert!(build_tfd(&[]).is_none(), "empty descriptor accepted");
-        assert!(build_tfd(&[(0, 8)]).is_none(), "null buffer address accepted");
-        assert!(build_tfd(&[(0x1000, 0)]).is_none(), "zero-length buffer accepted");
-        let many: alloc::vec::Vec<(u64, u16)> = (1..=MAX_TBS as u64 + 1).map(|i| (i * 0x1000, 4)).collect();
+        assert!(
+            build_tfd(&[(0, 8)]).is_none(),
+            "null buffer address accepted"
+        );
+        assert!(
+            build_tfd(&[(0x1000, 0)]).is_none(),
+            "zero-length buffer accepted"
+        );
+        let many: alloc::vec::Vec<(u64, u16)> =
+            (1..=MAX_TBS as u64 + 1).map(|i| (i * 0x1000, 4)).collect();
         assert!(build_tfd(&many).is_none(), "over-long chain accepted");
-        let exact: alloc::vec::Vec<(u64, u16)> = (1..=MAX_TBS as u64).map(|i| (i * 0x1000, 4)).collect();
+        let exact: alloc::vec::Vec<(u64, u16)> =
+            (1..=MAX_TBS as u64).map(|i| (i * 0x1000, 4)).collect();
         // Copy the field out before comparing: a reference into a packed struct is
         // undefined behaviour even when it is never dereferenced.
         let n = { build_tfd(&exact).unwrap().num_tbs };
@@ -593,7 +601,10 @@ mod tests {
         let a = rx_bytes(GROUP_LEGACY, 0x01, 0, &[], 0);
         let b = rx_bytes(GROUP_DATA_PATH, 0x01, 0, &[], 0);
         assert!(parse_rx(&a).unwrap().is_alive());
-        assert!(!parse_rx(&b).unwrap().is_alive(), "group ignored when matching ALIVE");
+        assert!(
+            !parse_rx(&b).unwrap().is_alive(),
+            "group ignored when matching ALIVE"
+        );
     }
 
     #[test_case]
@@ -602,8 +613,16 @@ mod tests {
         assert_eq!(c.len(), CMD_HEADER_WIDE_LEN + 3);
         assert_eq!(c[0], 0x1c, "cmd id first");
         assert_eq!(c[1], GROUP_SYSTEM);
-        assert_eq!(&c[2..4], &0x0304u16.to_le_bytes(), "sequence is little-endian");
-        assert_eq!(&c[4..6], &3u16.to_le_bytes(), "the length counts the payload only");
+        assert_eq!(
+            &c[2..4],
+            &0x0304u16.to_le_bytes(),
+            "sequence is little-endian"
+        );
+        assert_eq!(
+            &c[4..6],
+            &3u16.to_le_bytes(),
+            "the length counts the payload only"
+        );
         assert_eq!(&c[6..8], &[0, 0]);
         assert_eq!(&c[8..], &[0xaa, 0xbb, 0xcc]);
 
@@ -612,7 +631,10 @@ mod tests {
         let mut framed = ((c.len() as u32).to_le_bytes()).to_vec();
         framed.extend_from_slice(&c);
         let p = parse_rx(&framed).unwrap();
-        assert_eq!((p.group_id, p.cmd, p.sequence), (GROUP_SYSTEM, 0x1c, 0x0304));
+        assert_eq!(
+            (p.group_id, p.cmd, p.sequence),
+            (GROUP_SYSTEM, 0x1c, 0x0304)
+        );
         assert_eq!(p.payload, &[0xaa, 0xbb, 0xcc]);
     }
 
@@ -624,7 +646,13 @@ mod tests {
         assert_eq!(split_command(8), CommandSplit { first: 8, rest: 0 });
         assert_eq!(split_command(20), CommandSplit { first: 20, rest: 0 });
         assert_eq!(split_command(21), CommandSplit { first: 20, rest: 1 });
-        assert_eq!(split_command(200), CommandSplit { first: 20, rest: 180 });
+        assert_eq!(
+            split_command(200),
+            CommandSplit {
+                first: 20,
+                rest: 180
+            }
+        );
         // Every split covers the whole command exactly.
         for len in 1..300usize {
             let s = split_command(len);
@@ -691,8 +719,14 @@ mod tests {
         assert!(q.is_inflight(seq));
         assert!(q.retire(seq));
         assert!(!q.is_inflight(seq));
-        assert!(!q.retire(seq), "a duplicate response retired the slot twice");
-        assert!(!q.retire(make_sequence(0, 7)), "an unsent sequence was retired");
+        assert!(
+            !q.retire(seq),
+            "a duplicate response retired the slot twice"
+        );
+        assert!(
+            !q.retire(make_sequence(0, 7)),
+            "an unsent sequence was retired"
+        );
         // A sequence naming a slot past the end of the queue must not index out of bounds.
         assert!(!q.retire(make_sequence(0, 200)));
         assert!(!q.is_inflight(make_sequence(0, 200)));
@@ -710,9 +744,18 @@ mod tests {
         let b = rx_bytes(GROUP_SYSTEM, 0x1c, 0x0405, &[1], 0);
         let p = parse_rx(&b).unwrap();
         assert!(p.answers(GROUP_SYSTEM, 0x1c, 0x0405));
-        assert!(!p.answers(GROUP_SYSTEM, 0x1d, 0x0405), "wrong command matched");
-        assert!(!p.answers(GROUP_MAC_CONF, 0x1c, 0x0405), "wrong group matched");
-        assert!(!p.answers(GROUP_SYSTEM, 0x1c, 0x0406), "wrong sequence matched");
+        assert!(
+            !p.answers(GROUP_SYSTEM, 0x1d, 0x0405),
+            "wrong command matched"
+        );
+        assert!(
+            !p.answers(GROUP_MAC_CONF, 0x1c, 0x0405),
+            "wrong group matched"
+        );
+        assert!(
+            !p.answers(GROUP_SYSTEM, 0x1c, 0x0406),
+            "wrong sequence matched"
+        );
     }
 
     #[test_case]
@@ -735,7 +778,10 @@ mod tests {
             &ALIVE_STATUS_ERR.to_le_bytes(),
             0,
         );
-        assert_eq!(parse_rx(&bad).unwrap().alive_status(), Some(ALIVE_STATUS_ERR));
+        assert_eq!(
+            parse_rx(&bad).unwrap().alive_status(),
+            Some(ALIVE_STATUS_ERR)
+        );
         // A notification too short to carry a status, and a packet that is not one at all.
         let runt = rx_bytes(GROUP_LEGACY, UCODE_ALIVE_NTFY, 0, &[1], 0);
         assert_eq!(parse_rx(&runt).unwrap().alive_status(), None);
@@ -765,7 +811,11 @@ mod tests {
         assert_eq!(n.nvm_version, 0x0c11);
         assert_eq!(n.board_type, 0x12);
         assert_eq!(n.n_hw_addrs, 2);
-        assert_eq!(n.chains, Some((3, 2)), "the PHY section was read from the wrong offset");
+        assert_eq!(
+            n.chains,
+            Some((3, 2)),
+            "the PHY section was read from the wrong offset"
+        );
 
         // A response carrying only the general section is legal on older API versions, and
         // the absence of a chain count is reported rather than invented.
@@ -776,7 +826,10 @@ mod tests {
         // A response that is really a floating read, or one describing a device that cannot
         // address a frame: both mean the command was not answered, not that it was.
         let ones = alloc::vec![0xffu8; 32];
-        assert!(NvmInfo::parse(&ones).is_none(), "a floating read was accepted as NVM data");
+        assert!(
+            NvmInfo::parse(&ones).is_none(),
+            "a floating read was accepted as NVM data"
+        );
         let mut zero_addrs = p.clone();
         zero_addrs[7] = 0;
         assert!(NvmInfo::parse(&zero_addrs).is_none());
@@ -784,7 +837,10 @@ mod tests {
         absurd[7] = 99;
         assert!(NvmInfo::parse(&absurd).is_none());
         for n in 0..NVM_GENERAL_LEN {
-            assert!(NvmInfo::parse(&p[..n]).is_none(), "a truncated response parsed");
+            assert!(
+                NvmInfo::parse(&p[..n]).is_none(),
+                "a truncated response parsed"
+            );
         }
     }
 
@@ -793,7 +849,13 @@ mod tests {
         // A zero entry hands the device physical address 0 to write a packet into.
         assert!(build_rbd_list(&[]).is_none());
         assert!(build_rbd_list(&[0x1000, 0]).is_none());
-        assert!(build_rbd_list(&[0x1001]).is_none(), "unaligned buffer accepted");
-        assert_eq!(build_rbd_list(&[0x1000, 0x2000]).unwrap(), alloc::vec![0x1000, 0x2000]);
+        assert!(
+            build_rbd_list(&[0x1001]).is_none(),
+            "unaligned buffer accepted"
+        );
+        assert_eq!(
+            build_rbd_list(&[0x1000, 0x2000]).unwrap(),
+            alloc::vec![0x1000, 0x2000]
+        );
     }
 }

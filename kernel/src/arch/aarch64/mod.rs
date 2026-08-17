@@ -31,6 +31,8 @@ pub mod virtio_net;
 pub mod virtio_pointer;
 pub mod virtio_snd;
 pub mod virtio_pci;
+/// The SoC watchdog — switched off, so a halt stays halted instead of resetting.
+pub mod wdt;
 pub mod xhci;
 
 use core::arch::asm;

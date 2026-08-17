@@ -1,7 +1,7 @@
 //! Minimal **Apple SMC** client (RTKit over ASC) for GPIO power keys.
 //!
 //! Used to assert WiFi/BT module power: key `gP0d` (GPIO 13) ← `0x800001`
-//! (m1n1 `pcie_enable_devices.py` / Asahi `pwren-gpios = <&smc_gpio 13>`).
+//! (m1n1 `pcie_enable_devices.py` / `pwren-gpios = <&smc_gpio 13>`).
 //!
 //! Boot order matches **proxyclient `mgmt.py` / our AGX path**, not the generic
 //! m1n1 `rtkit.c` wait-IOP-then-AP sequence. SMC (like AGX) stalls after
@@ -180,7 +180,7 @@ fn handle_system_ep(asc: &Asc, ep: u8, msg0: u64) {
                 "smc: oslog ty={ty:#x} low={ty_hi:#x} msg0={msg0:#018x}"
             ));
             if ty == 0x10 || (msg0 & 0xff) == 0x10 {
-                // MSG_OSLOG_INIT → ACK with 0x30 (Linux/asahi)
+                // MSG_OSLOG_INIT → ACK with 0x30 (Linux)
                 let _ = send(asc, 0x30, ep);
             }
         }
@@ -553,12 +553,25 @@ pub fn wifi_power_on() -> bool {
     true
 }
 
+/// Power the WiFi/BT module **off** (GPIO 13 / `gP0d` output-low), then hold for
+/// `hold_ms` so the die's rails actually drain before power is re-applied. Reads
+/// `gP0d` back to prove the write landed — if the rail can't be dropped, a
+/// "power-cycle" is a no-op and the dongle PMU never re-sequences.
+pub fn wifi_power_off_hold(hold_ms: u64) -> bool {
+    let ok = write_u32(KEY_GP0D, GPIO_OFF);
+    // Also drop the companion enable.
+    let _ = write_u32(KEY_GP1A, 0);
+    let back = read_u32(KEY_GP0D);
+    crate::ktrace::log_fmt(format_args!(
+        "smc: WiFi power OFF gP0d=0x800000 write_ok={ok} readback={back:?} hold={hold_ms}ms"
+    ));
+    mdelay(hold_ms);
+    ok
+}
+
 /// Power the WiFi/BT module **off** (GPIO 13 / `gP0d` output-low).
 pub fn wifi_power_off() -> bool {
-    crate::ktrace::log("smc", "de-asserting WiFi power gP0d=0x800000");
-    let ok = write_u32(KEY_GP0D, GPIO_OFF);
-    mdelay(50);
-    ok
+    wifi_power_off_hold(50)
 }
 
 /// **Full power-cycle** of the WiFi/BT module: rail off, settle, rail on. Unlike

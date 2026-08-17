@@ -136,6 +136,10 @@ struct Editor {
     sel_anchor: Option<(usize, usize)>, // (row, col) where Visual selection began
     /// Visual mode is linewise (`V`) rather than charwise (`v`).
     sel_line: bool,
+    /// Height of the **text area** in screen rows — [`crate::framebuffer::editor_dims`]
+    /// has already taken the mode line off the pane. Read it through
+    /// [`Editor::text_rows`]; see that method for why nothing here may subtract
+    /// one from it again.
     rows: usize,
     /// Text columns available after the line-number gutter (pane width − gutter).
     cols: usize,
@@ -319,15 +323,27 @@ impl Editor {
         crate::editor_wrap::vis_index(&self.line_lens(), row, col, self.text_width())
     }
 
+    /// Screen rows of text, which is what [`Self::rows`] already holds.
+    ///
+    /// **The mode line is subtracted exactly once, and not here.**
+    /// [`crate::framebuffer::editor_dims`] returns the pane's rows minus one; the
+    /// painter ([`crate::framebuffer::editor_render`]) independently reserves the
+    /// bottom row of the *pane* for the mode line, so the two agree. Taking
+    /// another row off here made this view one row shorter than the one being
+    /// drawn, with two symptoms that do not look related: the cursor could never
+    /// reach the bottom painted row (`j` scrolled instead, so the last line of a
+    /// file was unreachable), and `render` seeded the highlighter one visual row
+    /// short, so that row was painted with no syntax colour. `cell_at` sizes
+    /// itself from `editor_pane_geom`, which does subtract exactly once — so a
+    /// mouse click could land on the row the keyboard could not reach.
+    fn text_rows(&self) -> usize {
+        self.rows.max(1)
+    }
+
     /// Keep the cursor's visual row inside the viewport (soft-wrap aware).
     fn ensure_visible(&mut self) {
-        let text_rows = self.rows.saturating_sub(1).max(1);
         let vr = self.vis_of(self.cy, self.cx);
-        if vr < self.top {
-            self.top = vr;
-        } else if vr >= self.top + text_rows {
-            self.top = vr + 1 - text_rows;
-        }
+        self.top = crate::editor_wrap::scroll_top(self.top, vr, self.text_rows());
     }
 
     fn handle(&mut self, b: u8) {
@@ -377,8 +393,11 @@ impl Editor {
                     }
                 }
                 5 | 6 => {
-                    // Page up/down by a viewport height.
-                    let page = self.rows.saturating_sub(1).max(1);
+                    // Page up/down by a viewport height, less one row of context
+                    // — the line you were reading at the edge stays on screen,
+                    // as every pager does it. Deliberate, unlike the subtraction
+                    // `text_rows` documents.
+                    let page = self.text_rows().saturating_sub(1).max(1);
                     if param == 5 {
                         self.cy = self.cy.saturating_sub(page);
                     } else {
@@ -858,7 +877,11 @@ impl Editor {
             }
             b'H' => (m::Pos::new(self.top.min(self.lines.len() - 1), 0), m::Kind::Line),
             b'L' => {
-                let row = (self.top + self.rows.saturating_sub(1)).min(self.lines.len() - 1);
+                // Through `text_rows`, never `rows` directly: the mode line is
+                // already off. The -1 here turns a row *count* into the last
+                // row's index, which is not the subtraction that accessor warns
+                // about -- but reading the field raw is how that bug returns.
+                let row = (self.top + self.text_rows().saturating_sub(1)).min(self.lines.len() - 1);
                 (m::Pos::new(row, 0), m::Kind::Line)
             }
             _ => return None,
@@ -1519,7 +1542,7 @@ impl Editor {
         let tw = self.text_width();
         let lenses: Vec<usize> = self.line_lens();
         let (first_line, _) = crate::editor_wrap::unvis(&lenses, self.top, tw);
-        let text_rows = self.rows.saturating_sub(1).max(1);
+        let text_rows = self.text_rows();
         let (last_line, _) =
             crate::editor_wrap::unvis(&lenses, self.top + text_rows.saturating_sub(1), tw);
         let hl: Option<Vec<Vec<Option<(u8, u8, u8)>>>> = crate::highlight::lang_for_path(&self.path).map(|lang| {

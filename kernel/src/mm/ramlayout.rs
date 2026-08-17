@@ -117,11 +117,14 @@ const fn align_up(v: u64) -> u64 {
 }
 
 /// How many free fragments [`carve_free`] can report. A pool of at most 16 RAM
-/// extents cut by ~8 reserved ranges cannot produce more than this in practice;
-/// the overflow is *counted and reported* rather than silently truncated,
-/// because "fewer free frames than the machine has" is a performance bug you
-/// would never notice, whereas a dropped-count in the boot log is a lead.
-pub const MAX_FREE: usize = 32;
+/// extents cut by the reserved ranges cannot produce more than this in practice
+/// — the count grew with the m1n1 path, where the boot loader contributes one
+/// reservation per secondary-CPU stack plus one per firmware carveout on top of
+/// the kernel's own six. The overflow is *counted and reported* rather than
+/// silently truncated, because "fewer free frames than the machine has" is a
+/// performance bug you would never notice, whereas a dropped-count in the boot
+/// log is a lead.
+pub const MAX_FREE: usize = 64;
 
 /// The result of [`carve_free`]: frame-aligned ranges that are in the pool and
 /// in none of the reserved ranges.

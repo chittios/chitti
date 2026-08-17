@@ -227,7 +227,11 @@ pub fn mac_context_sta(
     // Accept group-addressed frames (ARP and DHCP replies arrive that way) and
     // beacons (the scan and the DTIM timing both need them). Without
     // ACCEPT_GRP the link comes up and never resolves an address.
-    w32(&mut b, M_FILTER_FLAGS, MAC_FILTER_ACCEPT_GRP | MAC_FILTER_IN_BEACON);
+    w32(
+        &mut b,
+        M_FILTER_FLAGS,
+        MAC_FILTER_ACCEPT_GRP | MAC_FILTER_IN_BEACON,
+    );
     w32(&mut b, M_QOS_FLAGS, 0);
     // Five access categories with workable EDCA defaults. `fifos_mask` picks
     // the transmit FIFO; zero would leave the category with none.
@@ -245,7 +249,11 @@ pub fn mac_context_sta(
         Some((aid, bi, dtim)) => {
             w32(&mut b, u + STA_IS_ASSOC, 1);
             w32(&mut b, u + STA_BI, bi as u32);
-            w32(&mut b, u + STA_DTIM_INTERVAL, (bi as u32) * (dtim.max(1) as u32));
+            w32(
+                &mut b,
+                u + STA_DTIM_INTERVAL,
+                (bi as u32) * (dtim.max(1) as u32),
+            );
             w32(&mut b, u + STA_ASSOC_ID, aid as u32);
         }
         None => {
@@ -317,7 +325,10 @@ mod tests {
     #[test_case]
     fn the_phy_context_layout_matches_the_header() {
         assert_eq!(PHY_CTXT_LEN, 32);
-        assert_eq!(CHANNEL_INFO_LEN, 8, "u32 channel then three bytes and a pad");
+        assert_eq!(
+            CHANNEL_INFO_LEN, 8,
+            "u32 channel then three bytes and a pad"
+        );
         assert_eq!(P_CI, 8);
         assert_eq!(P_LMAC_ID, 16, "the channel info is 8 bytes, not 4");
         assert_eq!(P_SECONDARY_CTRL, 28);
@@ -385,7 +396,10 @@ mod tests {
     fn the_identifier_packing_agrees_with_the_station_command() {
         assert_eq!(CTXT_COLOR_POS, 8);
         for (id, color) in [(0u8, 0u8), (1, 3), (2, 255)] {
-            assert_eq!(id_and_color(id, color), super::super::sta::mac_id_n_color(id, color));
+            assert_eq!(
+                id_and_color(id, color),
+                super::super::sta::mac_id_n_color(id, color)
+            );
         }
         let c = phy_context_20mhz(3, 7, 1, ACTION_ADD);
         let v = u32::from_le_bytes(c[P_ID_AND_COLOR..P_ID_AND_COLOR + 4].try_into().unwrap());
@@ -398,12 +412,19 @@ mod tests {
     /// correct.
     #[test_case]
     fn the_mac_context_is_sized_for_the_largest_union_arm() {
-        assert_eq!(MAC_UNION_OFF, 100, "common part: 60 + five 8-byte AC entries");
+        assert_eq!(
+            MAC_UNION_OFF, 100,
+            "common part: 60 + five 8-byte AC entries"
+        );
         assert_eq!(M_AC, 60);
         assert_eq!(M_AC + AC_QOS_LEN * AC_COUNT, MAC_UNION_OFF);
         // iwl_mac_data_sta is 44; iwl_mac_data_p2p_sta is that plus a ctwin.
         assert_eq!(MAC_CTXT_LEN, 148, "100 + 48, not 100 + 44");
-        assert_ne!(MAC_CTXT_LEN, MAC_UNION_OFF + 44, "sizing to the sta arm is four short");
+        assert_ne!(
+            MAC_CTXT_LEN,
+            MAC_UNION_OFF + 44,
+            "sizing to the sta arm is four short"
+        );
     }
 
     /// `iwl_mac_types` starts at 1, so a zeroed `mac_type` is not a type at all
@@ -419,12 +440,22 @@ mod tests {
         // Without ACCEPT_GRP the link comes up and never resolves an address:
         // ARP and DHCP replies are group-addressed.
         let f = u32::from_le_bytes(c[M_FILTER_FLAGS..M_FILTER_FLAGS + 4].try_into().unwrap());
-        assert_ne!(f & MAC_FILTER_ACCEPT_GRP, 0, "ARP/DHCP replies are group-addressed");
+        assert_ne!(
+            f & MAC_FILTER_ACCEPT_GRP,
+            0,
+            "ARP/DHCP replies are group-addressed"
+        );
         assert_ne!(f & MAC_FILTER_IN_BEACON, 0);
 
         // A zero rate mask is a station that may transmit at no rate.
-        assert_ne!(u32::from_le_bytes(c[M_CCK_RATES..M_CCK_RATES + 4].try_into().unwrap()), 0);
-        assert_ne!(u32::from_le_bytes(c[M_OFDM_RATES..M_OFDM_RATES + 4].try_into().unwrap()), 0);
+        assert_ne!(
+            u32::from_le_bytes(c[M_CCK_RATES..M_CCK_RATES + 4].try_into().unwrap()),
+            0
+        );
+        assert_ne!(
+            u32::from_le_bytes(c[M_OFDM_RATES..M_OFDM_RATES + 4].try_into().unwrap()),
+            0
+        );
         // Every access category gets a transmit FIFO; zero would leave it none.
         for i in 0..AC_COUNT {
             assert_ne!(c[M_AC + i * AC_QOS_LEN + 5], 0, "ac[{i}] fifos_mask");
@@ -437,16 +468,32 @@ mod tests {
     fn the_mac_context_carries_the_association_state() {
         let before = mac_context_sta(0, 0, &[1; 6], &[2; 6], ACTION_ADD, None);
         let u = MAC_UNION_OFF;
-        assert_eq!(u32::from_le_bytes(before[u..u + 4].try_into().unwrap()), 0, "not associated");
+        assert_eq!(
+            u32::from_le_bytes(before[u..u + 4].try_into().unwrap()),
+            0,
+            "not associated"
+        );
 
         let after = mac_context_sta(0, 0, &[1; 6], &[2; 6], ACTION_MODIFY, Some((7, 100, 3)));
-        assert_eq!(u32::from_le_bytes(after[u..u + 4].try_into().unwrap()), 1, "associated");
-        let aid = u32::from_le_bytes(after[u + STA_ASSOC_ID..u + STA_ASSOC_ID + 4].try_into().unwrap());
+        assert_eq!(
+            u32::from_le_bytes(after[u..u + 4].try_into().unwrap()),
+            1,
+            "associated"
+        );
+        let aid = u32::from_le_bytes(
+            after[u + STA_ASSOC_ID..u + STA_ASSOC_ID + 4]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(aid, 7);
         let bi = u32::from_le_bytes(after[u + STA_BI..u + STA_BI + 4].try_into().unwrap());
         assert_eq!(bi, 100);
         // The DTIM interval is beacons x period, not the period alone.
-        let dtim = u32::from_le_bytes(after[u + STA_DTIM_INTERVAL..u + STA_DTIM_INTERVAL + 4].try_into().unwrap());
+        let dtim = u32::from_le_bytes(
+            after[u + STA_DTIM_INTERVAL..u + STA_DTIM_INTERVAL + 4]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(dtim, 300);
     }
 
@@ -463,7 +510,10 @@ mod tests {
         let mac = id_and_color(0, 0);
         assert_eq!(mac, 0, "id 0 colour 0 really is the value zero");
         let b = binding(0, 0, mac, id_and_color(1, 2), ACTION_ADD);
-        assert_eq!(u32::from_le_bytes(b[B_MACS..B_MACS + 4].try_into().unwrap()), mac);
+        assert_eq!(
+            u32::from_le_bytes(b[B_MACS..B_MACS + 4].try_into().unwrap()),
+            mac
+        );
         for i in 1..MAX_MACS_IN_BINDING {
             let v = u32::from_le_bytes(b[B_MACS + i * 4..B_MACS + i * 4 + 4].try_into().unwrap());
             assert_eq!(v, CTXT_INVALID, "slot {i} must be invalid, not zero");

@@ -44,9 +44,55 @@ pub fn unvis(line_lens: &[usize], vis: usize, tw: usize) -> (usize, usize) {
     (last, soft_wraps(line_lens[last], tw).saturating_sub(1))
 }
 
+/// Where the viewport must start so visual row `vis` is on screen, given the
+/// current `top` and a text area `text_rows` screen rows tall.
+///
+/// The scroll rule itself is two comparisons; what it is really pinning down is
+/// **how many rows there are**, which is the thing that was wrong. `text_rows`
+/// is the count of rows the painter actually fills, so the last reachable row is
+/// `top + text_rows - 1` — off by one here and the bottom row of the editor
+/// exists, is painted, and cannot be reached: `j` on the second-to-last row
+/// scrolls the buffer instead of moving the cursor, which reads as the last line
+/// of the file being unreachable. Pure and outside [`crate::editor`] because that
+/// module is `#[cfg(not(test))]`, so a test written next to the bug could never
+/// have run.
+pub fn scroll_top(top: usize, vis: usize, text_rows: usize) -> usize {
+    let rows = text_rows.max(1);
+    if vis < top {
+        vis
+    } else if vis >= top + rows {
+        vis + 1 - rows
+    } else {
+        top
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case]
+    fn the_bottom_painted_row_is_reachable_without_scrolling() {
+        // A 24-row text area showing rows 0..=23: the cursor on row 23 must not
+        // move the viewport. This is the whole bug — with the row count one short
+        // the editor scrolled here, so the file's last line could never be
+        // selected and never got a syntax-highlight pass.
+        assert_eq!(scroll_top(0, 23, 24), 0);
+        assert_eq!(scroll_top(0, 24, 24), 1, "one past the bottom scrolls by one");
+        assert_eq!(scroll_top(10, 9, 24), 9, "above the top scrolls up to it");
+        assert_eq!(scroll_top(10, 10, 24), 10);
+        assert_eq!(scroll_top(10, 33, 24), 10, "top + rows - 1 is still on screen");
+        assert_eq!(scroll_top(10, 34, 24), 11);
+    }
+
+    #[test_case]
+    fn a_one_row_viewport_still_tracks_the_cursor() {
+        assert_eq!(scroll_top(5, 5, 1), 5);
+        assert_eq!(scroll_top(5, 6, 1), 6);
+        // A zero-height area is nonsense a resize can still produce; treat it as
+        // one row rather than underflowing into a viewport that shows nothing.
+        assert_eq!(scroll_top(5, 6, 0), 6);
+    }
 
     #[test_case]
     fn soft_wraps_empty_and_exact_multiples() {

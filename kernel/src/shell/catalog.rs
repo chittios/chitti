@@ -228,6 +228,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "About ChittiOS", name: "about", shortcut: "" },
     Entry { category: "System & UI", title: "Commands Help", name: "help", shortcut: "Cmd+/ or F1" },
     // Media
+    Entry { category: "Media", title: "Built-in Audio", name: "audio", shortcut: "" },
     Entry { category: "Media", title: "Voice", name: "voice", shortcut: "" },
     Entry { category: "Media", title: "PDF Viewer", name: "pdf", shortcut: "" },
     Entry { category: "Media", title: "ONNX Models", name: "onnx", shortcut: "" },

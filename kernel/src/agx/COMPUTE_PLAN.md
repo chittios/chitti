@@ -90,8 +90,12 @@ grid dims are bound. Findings:
   the firmware/kernel level.
 - m1n1 has **no compute example** and does not annotate the compute registers
   (`RegisterDefinition {number,data}`; USC_EXEC_BASE 0x10069 etc. appear only in
-  the *render* path, uncommented). So there are **no capturable reference bytes**
-  and no doc for the compute USC.
+  the *render* path, uncommented). So there is no doc for the compute USC.
+  **Correction (2026-08): reference bytes for the compute *submission* do exist**
+  — a full `WorkCommandCP` hexdump sits in `fw/agx/cmdqueue.py`'s own docstring
+  (see the encoding audit below), which settles Layer 2 field-for-field. It does
+  **not** contain the USC/register array, so 3b below still stands for the
+  dispatch descriptors.
 - The ONLY complete public reference is **Mesa source** (`src/asahi/lib` +
   the compute launch: USC packing, `ComputeInfo`/register-array construction,
   `libagx`). Reverse-engineering the dispatch = reading that code.
@@ -176,12 +180,212 @@ shader. Falls back to Path A for compute regardless.
 
 ## Immediate next actions
 
+**Superseded — steps 2 and 3 are done and the job is now scheduled on hardware; see
+the encoding audit below for the live next step (A/B the `WaitForIdle` pipe with
+`/agx compute alt`). Step 1 is still the fallback if that does not resolve it.**
+
 1. Boot the M2 into **m1n1 proxy** mode (not ChittiOS) and run
    `tools/agx-extract/capture_render.py` to produce the render replay blob.
 2. Implement Layer 1 (GPU context) + the CP/3D cmdqueue channel `send`/Event poll
    in `hw.rs`, reusing `uat.rs` and the `gpu_read/gpu_write` helpers.
 3. Port the `WorkCommand`/microsequence encoders (pure, tested) from
    `cmdqueue.py`/`microsequence.py`.
+
+## Submission-encoding audit (2026-08) — the reference was in the tree all along
+
+The first dispatch attempt bound the context, placed every object and rang the
+doorbell, and the firmware **never drained the CP channel** (`CL_0` read pointer
+stayed 0). Re-deriving the whole submission from the **vendored** proxyclient —
+`third_party/m1n1/proxyclient/m1n1/{agx,fw/agx}/*.py` — instead of from
+recollection of drm/asahi found five encoding faults. Four are settled by source
+or by real bytes; one is still a two-way guess and is logged as such at run time.
+
+The decisive artefact is the **captured `WorkCommandCP` hexdump in `cmdqueue.py`'s
+own docstring** — real bytes from a live macOS compute submission, i.e. exactly the
+"no capturable reference bytes exist for compute" gap this doc claimed above. Every
+field decodes to something meaningful: `encoder = 0x15_00078000`,
+`encoder_end = 0x15_00078024` (**a 0x24-byte command list — the same length
+`cdm.rs` emits**), `pipeline_base = 0x11_00000000`, `unk_38 = 0x8c60`,
+`microsequence_ptr = 0xffffffa0_0c311cc0`, `stamp_addr = 0xffffffa0_000c8014`.
+
+1. **The bookkeeping objects were in the wrong address space.** The queue, its ring
+   and cursors, the microsequence, the work command, the EventControl and the stamps
+   all lived in the submitting context's TTBR0 (`0x15…`). The capture shows every one
+   of those as a **kernel `0xffffffa0…` TTBR1** VA, and the proxyclient allocates
+   them from `kobj`/`kshared`/`cmdbuf` (all kernel) while only the encoder, shader
+   and USC come from the context (`gobj`/`pobj`). TTBR0 is per-context and **not
+   active in the firmware's own boot context**, so the firmware could not read the
+   queue it was being pointed at. This is the same rule the RTKit crashlog buffer had
+   to learn, and it is the most likely reason nothing was consumed.
+2. **`JobMeta` is 0x2c, not 0x24, and both stamps were null.** m1n1 types
+   `stamp_addr`/`fw_stamp_addr` as `WrappedPointer` = `Int64ul`, and the capture has
+   two kernel VAs there (read as `u32`s, the second decodes as `0xffffffa0` — plainly
+   not a pointer). The 0x24 form shifted every field past `JobMeta` by 8 *and* left
+   the stamps at zero, where drm/asahi types them `NonZeroU64`. This **resolves the
+   "KNOWN UNRESOLVED AMBIGUITY"** `workcmd.rs` used to carry: it was a conflict
+   between drm/asahi's stale `unk_2d4` field *name* and its stamp *type*, and the
+   bytes side with the type. Corroboration: the corrected total is 0x320, and the
+   reference driver allocates work commands with `align = 0x20`.
+3. **`CommandQueueInfo` was 0x18 bytes short in the middle.** `unk_34`, `unk_38`,
+   `unk_40`, `unk_44` and `prio5` were missing, so `uuid` sat at 0x38 instead of 0x50
+   and **`gpu_context_addr` — the scheduler block — at 0x8c instead of 0xa4**, with a
+   total of 0xa0 instead of 0xb8. Also: `event_id`/`unk_4c`/`unk_54` default to **-1**
+   in the reference, and 0 is a legal event id, so zero was the wrong "unset".
+4. **`WaitForIdle` named no pipe.** The header is `0x01 | (pipe << 8)`; the
+   proxyclient's own `WaitForInterruptCmd(1,0,0)` / `(0,1,0)` calls pin
+   `Vertex = 1<<0` and `Fragment = 1<<8`. A bare `0x01` waits on nothing.
+5. **Still a guess: `Pipe::Compute`.** Encoded as `1 << 15` (giving header
+   `0x0080_0001`) from recollection of drm/asahi; the plausible alternative puts the
+   0x80 in byte 3 (`0x8000_0001`), which is what m1n1's "`TimestampCmd.unk_3` —
+   sometimes 0x80" annotation would suggest. `/agx compute` logs the header word it
+   used, and this is the **first thing to flip** if the queue ring is read but the job
+   never completes.
+
+Smaller fixes from the same pass: `ComputeInfo.unk_38 = 0x8c60` ("always", and so in
+the capture), `unk_58 = 1`, `iogpu_unk_40 = 0x1c`,
+`EncoderParams.iogpu_compute_unk44 = 0xffffffff`, `ring_state` is 0x60 not 0x70 with
+`rb_size` 0x500 (the reference default) rather than an invented 0x80,
+`EventControl.submission_id` is a submission counter and starts at **0** (it was
+seeded with the context id), the `gpu_buf` is sized to its documented 0x2c18, and
+`StartComputeCmd.unk_buf_addr` / `unk_28 = 1` are populated.
+
+### Hardware result of that pass (real M2): the job is now SCHEDULED
+
+`/agx compute` on the Mac mini went from "nothing consumed" to:
+
+```text
+queue cursors gpu_doneptr=0x0 gpu_rptr=0x1 cpu_wptr=0x1  ⇒ firmware READ the queue ring
+SGX FAULT_INFO=0x0 faulted=0                              ⇒ no GPU MMU fault
+Stats 0x2a->0x32                                          ⇒ firmware alive throughout
+Event 0x0 unchanged                                       ⇒ no completion, fault or timeout
+```
+
+So the firmware **followed the channel message to the queue and dequeued the work
+command** (`gpu_rptr` 0→1) and the job is *in flight* (`gpu_doneptr` still 0) with no
+fault and no event. That is the signature of a **hung microsequence**, which puts the
+guessed `Pipe::Compute` (item 5) at the top of the list: a `WaitForIdle` on a pipe
+that never raises hangs exactly like this and produces no other signal.
+`/agx compute alt` runs the same submission with the byte-3 reading so one boot
+decides it.
+
+## drm/asahi is cloneable, and it settles the rest (2026-08)
+
+The whole "the dispatch ABI is undocumented, only Mesa has it" framing above is
+about the **USC/register encoding**, and it is still true of that. But the
+*submission* — every struct on this page — is in **drm/asahi**, the Rust GPU driver
+in the Asahi Linux tree, and it clones in a couple of minutes:
+
+```sh
+git clone --filter=blob:none --no-checkout --depth=1 -b asahi \
+    https://github.com/AsahiLinux/linux.git
+cd linux && git sparse-checkout init --cone \
+  && git sparse-checkout set drivers/gpu/drm/asahi && git checkout
+```
+
+Read `fw/compute.rs` (the `RunCompute` struct), `fw/job.rs` (`JobMeta`,
+`EncoderParams`, `TimestampPointers`), `fw/microseq.rs` (opcodes and `Pipe`) and
+`queue/compute.rs` (what a real submission sets). That should have been step one;
+reconstructing it from recollection is what produced every error in this file.
+
+What it settled:
+
+- **`Pipe::Compute = 1 << 15`**, and `WaitForIdle::new` ORs in `pipe << 8`, so the
+  header is `0x0080_0001` — the default was right and the `alt` reading was wrong.
+  `/agx compute alt` is **removed**; a knob for a disproven hypothesis is a trap.
+- **`RetireStamp::HEADER = with_args(0x18, 0x40000000)` = `0x40000018`** — identical
+  to m1n1's `EndCmd`, so our final op was already correct.
+- **The microsequence is exactly StartCompute → WaitForIdle → FinalizeCompute →
+  RetireStamp** for `G < G14X`. `WaitForIdle2` *replaces* `WaitForIdle` on G14X
+  rather than following it, and the `Timestamp` ops are gated on a userspace request.
+  So no op was missing.
+- **`JobMeta` = 0x2c confirmed a second way**: `GpuWeakPointer<T>(NonZeroU64, …)` is
+  8 bytes. Two independent references and the capture now agree.
+- **`preempt_buf1..5` are required** — what m1n1 calls `iogpu_deflake_1..5` is GPU
+  preemption scratch, `compute_preempt1_size` for **t8112 = 0x10000** plus four
+  8-byte slots, allocated per job from the **user** VM and passed unconditionally
+  (and `preempt_buf1` again in `JobParameters2` at +0x28). We were passing null.
+- **`timestamp_pointers` are always `Some`** — a `JobTimestamps` of two `AtomicU64`s
+  that the firmware writes. We were passing null.
+- **`iogpu_unk_40` must be 0, not 0x1c**, together with `helper_program`/`helper_arg`
+  /`helper_cfg`: they are one internal-program group. Copying `0x1c` from the capture
+  (whose job used a helper) while leaving `helper_program` null was self-inconsistent
+  — a fault I *introduced* in the pass above by trusting the capture over the source.
+- **The field at +0x30 is `usc_exec_base_cp`**, not a generic "pipeline base"; ours
+  is consistent with it, but the name matters for the USC short-pointer arithmetic.
+
+So the two remaining nulls the firmware writes through (`preempt_buf`, `timestamps`)
+are now real buffers, and `iogpu_unk_40` is consistent. Those are the best candidates
+for the hang: both are firmware stores through a null pointer, which is precisely a
+job that is dequeued and then produces no fault, no event and no completion.
+
+### The alt A/B was unreadable, and why (second run, same boot)
+
+`/agx compute alt` in the **same boot** reported `gpu_rptr=0x0` and
+`Stats 0x32->0x32` — "never took the ring entry", firmware idle. That is *not*
+evidence about the pipe constant: **the first dispatch's hung job wedges the
+firmware**, so every later submission in that boot reads as ignored no matter what
+changed. Only dispatch #1 of a boot is a clean experiment, and `/agx compute` now
+says which number it is.
+
+Two additions make the loop iterable instead of one-experiment-per-reboot, both
+read straight out of the replayed initdata (the capture recorded these regions):
+
+- **`/agx health`** — `InitData_FWStatus.{halted, halt_count, resume}` and
+  `AGXFaultInfo.{status, do_not_halt, did_not_halt, total_halts}`. The AP-side
+  cursors cannot say "I halted"; this can, and a halted coprocessor explains both
+  the silent job *and* why later dispatches are ignored.
+- **`/agx recover`** — the reference driver's `recover()`: zero `halted`, set
+  `resume`. Turns a wedging job into a retry rather than a reboot.
+
+Also now reported per dispatch: the `CommandQueueInfo` fields the **firmware**
+writes in our own buffer — `busy`, `has_commands`, `inflight_commands`,
+`error_count`. Those separate "the scheduler rejected this" (`error_count > 0`) from
+"it is in flight and stuck" (`inflight > 0`, no completion), which the ring cursors
+cannot.
+
+### `stats_ptr` was a null pointer handed to the firmware — now resolved
+
+`StartComputeCmd.stats_ptr` was 0. The reference always passes a real
+`GpuStatsComp` and the firmware **writes through it**, so 0 is a null dereference
+*inside the firmware* — which produces no GPU MMU fault and no event, i.e. exactly
+"dequeued, then never heard from again". It needed no capture after all:
+`InitData_RegionB` carries `stats_ta_addr`/`stats_3d_addr`/`stats_cp_addr` at +0x170
+/+0x178/+0x180 and RegionB is already replayed, so the pointer is **read at run
+time**. Two of the three neighbours have known values in the capture, so the offset
+arithmetic is **validated on hardware** before the pointer is used, and `stats_cp`
+is refused rather than guessed if they disagree — a plausible wrong pointer handed
+to the firmware is worse than none.
+
+Two things that run also corrected in the harness itself:
+
+- **`gpu_rptr`, not the channel read pointer, is the authority on whether the
+  firmware processed a submission.** CL_0's `READ_PTR` stayed 0 while `gpu_rptr`
+  advanced, so the firmware evidently does not publish that cursor back to shared
+  memory — and the diagnostic that read "never drained the CP channel" was reporting
+  a *success* as a failure.
+- **Both stamps were seeded with the value a completed job writes**, which made
+  completion unobservable (they read `0xc5000000` either way). The reference seeds the
+  **base** and gives submission *n* `base + 0x100 * n`, so the seed and the completion
+  value now differ and a fired stamp is visible.
+
+The wait is also long enough for the firmware's own job timeout to fire, since a
+`TIMEOUT` event names the hang where silence does not.
+
+**Nothing below the scheduler is hardware-verified yet** — the encodings are source-
+and capture-verified, pinned by
+`cargo xtask test` on both arches. What a dispatch now reports, in firmware order, so
+one boot separates the remaining causes instead of one bit: whether the channel
+message was consumed, whether the firmware is alive (Stats), whether it read the
+queue ring (`gpu_rptr`), whether either stamp/`event_count` moved, the **decoded**
+Event-channel messages (Flag = completed vs Fault/Timeout/ChannelError = rejected),
+and the firmware's own log text.
+
+Known-remaining gaps in the submission itself, both null where the reference passes
+a real buffer: `ComputeInfo.iogpu_deflake_1` (a `ComputeArgs` block) and the helper
+program (`helper_program`/`helper_arg`/`helper_cfg` = 0x41 / a GEM buffer / 0x40 in
+the capture). The reference's own note says only the cmdlist and pipeline base are
+*strictly* needed, so these are the next things to fill in if the microsequence
+still hangs with the pipe constant and `stats_ptr` settled.
 
 ## Open questions to resolve during capture
 
