@@ -1,0 +1,44 @@
+{
+  "name": "osaka-jade",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#111c18,#090f0d",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#111c18",
+    "outline": "#f7e8b2"
+  },
+  "palette": {
+    "accent": "#509475",
+    "logo": "#509475",
+    "logo_node": "#f7e8b2",
+    "screen_bg": "#111c18",
+    "chat_bg": "#23372b",
+    "logs_bg": "#090f0d",
+    "chat_fg": "#c1c497",
+    "logs_fg": "#d6d5bc",
+    "border_dim": "#53685b",
+    "title_active": "#509475",
+    "title_dim": "#81b8a8",
+    "sep_dim": "#23372b",
+    "status_bg": "#23372b",
+    "status_fg": "#c1c497",
+    "editor_bg": "#111c18",
+    "editor_fg": "#c1c497",
+    "editor_lineno": "#53685b",
+    "editor_sel": "#32473b",
+    "composer_bg": "#23372b",
+    "composer_border": "#53685b",
+    "composer_hint": "#81b8a8"
+  },
+  "syntax": {
+    "text": "#c1c497",
+    "keyword": "#509475",
+    "string": "#549e6a",
+    "number": "#d2689c",
+    "comment": "#81b8a8",
+    "punct": "#2dd5b7",
+    "heading": "#8cd3cb",
+    "code": "#549e6a"
+  }
+}

@@ -130,6 +130,10 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Model & Agent", title: "Bench: matvec | synapse gates", name: "bench", shortcut: "" },
     Entry { category: "Model & Agent", title: "Red-team the agent boundary", name: "redteam", shortcut: "" },
     Entry { category: "Model & Agent", title: "Audit log: verify | export", name: "audit", shortcut: "" },
+    Entry { category: "Model & Agent", title: "Recall: search memory + files", name: "recall", shortcut: "" },
+    Entry { category: "Model & Agent", title: "Undo the last agent turn", name: "undo-turn", shortcut: "" },
+    Entry { category: "Model & Agent", title: "Per-agent token/call usage", name: "usage", shortcut: "" },
+    Entry { category: "Model & Agent", title: "Preview what an agent would do", name: "dryrun", shortcut: "" },
     // Files
     Entry { category: "Files", title: "List Directory", name: "ls", shortcut: "" },
     Entry { category: "Files", title: "Print File", name: "cat", shortcut: "" },

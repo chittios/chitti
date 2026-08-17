@@ -1,0 +1,44 @@
+{
+  "name": "catppuccin",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#1e1e2e,#101019",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#1e1e2e",
+    "outline": "#cdd6f4"
+  },
+  "palette": {
+    "accent": "#89b4fa",
+    "logo": "#89b4fa",
+    "logo_node": "#cdd6f4",
+    "screen_bg": "#1e1e2e",
+    "chat_bg": "#313244",
+    "logs_bg": "#101019",
+    "chat_fg": "#cdd6f4",
+    "logs_fg": "#bac2de",
+    "border_dim": "#585b70",
+    "title_active": "#89b4fa",
+    "title_dim": "#6c7086",
+    "sep_dim": "#313244",
+    "status_bg": "#313244",
+    "status_fg": "#cdd6f4",
+    "editor_bg": "#1e1e2e",
+    "editor_fg": "#cdd6f4",
+    "editor_lineno": "#585b70",
+    "editor_sel": "#45475a",
+    "composer_bg": "#313244",
+    "composer_border": "#585b70",
+    "composer_hint": "#6c7086"
+  },
+  "syntax": {
+    "text": "#cdd6f4",
+    "keyword": "#89b4fa",
+    "string": "#a6e3a1",
+    "number": "#f5c2e7",
+    "comment": "#6c7086",
+    "punct": "#94e2d5",
+    "heading": "#94e2d5",
+    "code": "#a6e3a1"
+  }
+}

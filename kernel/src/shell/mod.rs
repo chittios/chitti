@@ -757,6 +757,10 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         // Self-evaluation of the determinism boundary: an injection corpus, the
         // benign-task suite that prices its false refusals, and the weaker
         // baselines it is claimed to beat (`security::redteam`).
+        "recall" => run_recall(arg),
+        "undo-turn" | "undoturn" => run_undo_turn(arg),
+        "usage" | "cost" => run_usage(arg),
+        "dryrun" | "dry-run" => run_dry_run(arg),
         "redteam" => {
             crate::security::redteam::run();
         }
@@ -12062,5 +12066,151 @@ mod credential_bypass_tests {
             let _a = crate::synapse::fs::CredentialAccess::new();
             crate::synapse::fs::delete(crate::auth::PATH);
         }
+    }
+}
+
+/// `/recall <query>` — retrieval over the agent's memory and the indexed files.
+///
+/// Builds the index lazily on first use: indexing every file at boot would cost
+/// a visible pause for a feature most boots never use, and the corpus is small
+/// enough that building it on demand is imperceptible.
+fn run_recall(arg: &str) {
+    use crate::agent::memindex::{Embedder, Index, Lexical};
+    let arg = arg.trim();
+    if arg.is_empty() {
+        serial_println!("recall> usage: /recall <query>   |   /recall --index <dir>");
+        serial_println!("recall> indexed: {} chunk(s)", RECALL_INDEX.with(|i| i.len()));
+        return;
+    }
+    let emb = Lexical;
+
+    if let Some(dir) = arg.strip_prefix("--index ") {
+        let dir = resolve_path(dir.trim());
+        let mut n = 0usize;
+        for entry in crate::synapse::fs::list() {
+            if !entry.starts_with(&dir) {
+                continue;
+            }
+            let Some(bytes) = crate::synapse::fs::read(&entry) else { continue };
+            let Ok(text) = alloc::string::String::from_utf8(bytes) else { continue };
+            RECALL_INDEX.with(|i| i.add_document(&emb, &entry, &text));
+            n += 1;
+        }
+        serial_println!("recall> indexed {n} file(s) under {dir}; {} chunk(s) total", RECALL_INDEX.with(|i| i.len()));
+        serial_println!("recall> embedder: {}", emb.name());
+        return;
+    }
+
+    if RECALL_INDEX.with(|i| i.is_empty()) {
+        // Seed from agent memory so a bare `/recall` is useful with no setup.
+        let mut n = 0usize;
+        for entry in crate::synapse::fs::list() {
+            if !entry.contains("memory") && !entry.starts_with("/samples") {
+                continue;
+            }
+            let Some(bytes) = crate::synapse::fs::read(&entry) else { continue };
+            let Ok(text) = alloc::string::String::from_utf8(bytes) else { continue };
+            RECALL_INDEX.with(|i| i.add_document(&emb, &entry, &text));
+            n += 1;
+        }
+        serial_println!("recall> auto-indexed {n} file(s) ({})", emb.name());
+    }
+
+    let hits = RECALL_INDEX.with(|i| i.search(&emb, arg, 5));
+    if hits.is_empty() {
+        serial_println!("recall> nothing matched");
+        return;
+    }
+    for h in hits {
+        serial_println!("recall> [{:.2}] {} #{}", h.score, h.chunk.source, h.chunk.ord);
+        for line in h.chunk.text.lines().take(3) {
+            serial_println!("        {line}");
+        }
+    }
+}
+
+/// The lazily-built retrieval index. One index serves agent memory and files —
+/// the retrieval problem is identical once the text is chunked.
+static RECALL_INDEX: crate::mm::Locked<crate::agent::memindex::Index> =
+    crate::mm::Locked::new(crate::agent::memindex::Index::new_const());
+
+/// `/undo-turn` — roll back the last agent turn's file effects.
+fn run_undo_turn(arg: &str) {
+    use crate::synapse::journal::{self, Undo};
+    if arg.trim() == "list" {
+        let turns = journal::list();
+        if turns.is_empty() {
+            serial_println!("undo-turn> no recorded turns");
+        }
+        for t in turns {
+            serial_println!("undo-turn> {}", t.summary());
+        }
+        return;
+    }
+    let Some(turn) = journal::last() else {
+        serial_println!("undo-turn> no recorded turns");
+        return;
+    };
+    // Show what will happen before doing it -- this reverses real file state.
+    serial_println!("undo-turn> {}", turn.summary());
+    if !turn.fully_reversible() {
+        serial_println!("undo-turn> NOTE: some effects cannot be undone (they already left the machine)");
+    }
+    let turn = journal::take_last().expect("just observed");
+    let (mut done, mut skipped) = (0usize, 0usize);
+    for u in turn.inverse() {
+        match u {
+            Undo::RestoreFile { path, prior } => {
+                crate::synapse::fs::write(path, prior);
+                serial_println!("undo-turn>   restored {path}");
+                done += 1;
+            }
+            Undo::DeleteFile { path } => {
+                crate::synapse::fs::delete(path);
+                serial_println!("undo-turn>   removed {path}");
+                done += 1;
+            }
+            Undo::Irreversible { what, detail } => {
+                serial_println!("undo-turn>   NOT undone: {what} {detail}");
+                skipped += 1;
+            }
+        }
+    }
+    serial_println!("undo-turn> {done} effect(s) reversed, {skipped} could not be");
+}
+
+/// `/usage` — per-agent token, call and time accounting.
+fn run_usage(arg: &str) {
+    if arg.trim() == "reset" {
+        crate::agent::cost::reset();
+        serial_println!("usage> cleared");
+        return;
+    }
+    for line in crate::agent::cost::report().lines() {
+        serial_println!("usage> {line}");
+    }
+}
+
+/// `/dryrun <prompt>` — show what the agent would do, without doing it.
+///
+/// The plan comes from the *executor*, not from asking the model to describe
+/// itself: every call listed cleared the full gate chain and would have run.
+fn run_dry_run(arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        serial_println!("dryrun> usage: /dryrun <prompt>");
+        return;
+    }
+    crate::synapse::executor::begin_dry_run();
+    serial_println!("dryrun> running the turn with all effects suppressed…");
+    run_tool_command("chat", arg);
+    let plan = crate::synapse::executor::end_dry_run();
+    if plan.is_empty() {
+        serial_println!("dryrun> the agent would perform no gated effects");
+        return;
+    }
+    serial_println!("dryrun> {} effect(s) would run:", plan.len());
+    for (i, step) in plan.iter().enumerate() {
+        serial_println!("dryrun>   {}. {step}", i + 1);
     }
 }

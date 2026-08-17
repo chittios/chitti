@@ -134,6 +134,8 @@ pub mod framebuffer;
 #[cfg(not(test))]
 pub mod editor;
 /// Soft-wrap math for the `/open` editor (always built; pure + unit-tested).
+pub mod editor_motion;
+pub mod editor_undo;
 pub mod editor_wrap;
 /// Returning to the prompt after a kernel fault instead of halting the machine.
 pub mod fault_recovery;

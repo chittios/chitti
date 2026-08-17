@@ -528,3 +528,21 @@ carries its own provenance. Sources currently used:
 
 Anyone redistributing a built image with `SAMPLES=1` is redistributing these
 files and should honour those licences; `SAMPLES=` builds an image without them.
+
+## omarchy themes (MIT)
+
+Most of `assets/themes/*.json` are colour palettes converted from
+[omarchy](https://github.com/basecamp/omarchy) (Copyright (c) David Heinemeier
+Hansson, MIT licence) by `tools/import_omarchy_themes.py`.
+
+Only the palettes are imported — the `colors.toml` of each theme, remapped onto
+this OS's own theme schema. omarchy's wallpapers are **not** included (108 MB,
+and collected images carry their own separate licensing); each imported theme
+renders a gradient derived from its own palette instead. Its per-application
+configuration (neovim, vscode, icon and keyboard themes) is also not included,
+being for software this OS does not run.
+
+Themes keep their own names. Both projects ship a `nord` and the palettes are
+not identical, so the import replaced this project's earlier hand-tuned one.
+The six themes that did not come from omarchy are `dark`, `light`,
+`solarized-dark`, `dracula` and `ubuntu` (and `nord`, now omarchy's).

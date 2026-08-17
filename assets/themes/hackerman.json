@@ -1,0 +1,44 @@
+{
+  "name": "hackerman",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#0b0c16,#06060c",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#0b0c16",
+    "outline": "#ddf7ff"
+  },
+  "palette": {
+    "accent": "#82fb9c",
+    "logo": "#82fb9c",
+    "logo_node": "#ddf7ff",
+    "screen_bg": "#0b0c16",
+    "chat_bg": "#151828",
+    "logs_bg": "#06060c",
+    "chat_fg": "#ddf7ff",
+    "logs_fg": "#b5c5db",
+    "border_dim": "#2d3450",
+    "title_active": "#82fb9c",
+    "title_dim": "#6a6e95",
+    "sep_dim": "#151828",
+    "status_bg": "#151828",
+    "status_fg": "#ddf7ff",
+    "editor_bg": "#0b0c16",
+    "editor_fg": "#ddf7ff",
+    "editor_lineno": "#2d3450",
+    "editor_sel": "#1f253a",
+    "composer_bg": "#151828",
+    "composer_border": "#2d3450",
+    "composer_hint": "#6a6e95"
+  },
+  "syntax": {
+    "text": "#ddf7ff",
+    "keyword": "#829dd4",
+    "string": "#4fe88f",
+    "number": "#86a7df",
+    "comment": "#6a6e95",
+    "punct": "#7cf8f7",
+    "heading": "#d1fffe",
+    "code": "#4fe88f"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "tokyo-night",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#1a1b26,#0e0e14",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#1a1b26",
+    "outline": "#c0caf5"
+  },
+  "palette": {
+    "accent": "#7aa2f7",
+    "logo": "#7aa2f7",
+    "logo_node": "#c0caf5",
+    "screen_bg": "#1a1b26",
+    "chat_bg": "#24283b",
+    "logs_bg": "#0e0e14",
+    "chat_fg": "#a9b1d6",
+    "logs_fg": "#b4bee6",
+    "border_dim": "#414868",
+    "title_active": "#7aa2f7",
+    "title_dim": "#565f89",
+    "sep_dim": "#24283b",
+    "status_bg": "#24283b",
+    "status_fg": "#a9b1d6",
+    "editor_bg": "#1a1b26",
+    "editor_fg": "#a9b1d6",
+    "editor_lineno": "#414868",
+    "editor_sel": "#292e42",
+    "composer_bg": "#24283b",
+    "composer_border": "#414868",
+    "composer_hint": "#565f89"
+  },
+  "syntax": {
+    "text": "#a9b1d6",
+    "keyword": "#7aa2f7",
+    "string": "#9ece6a",
+    "number": "#ad8ee6",
+    "comment": "#565f89",
+    "punct": "#449dab",
+    "heading": "#0db9d7",
+    "code": "#9ece6a"
+  }
+}

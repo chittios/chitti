@@ -1,0 +1,44 @@
+{
+  "name": "kanagawa",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#1f1f28,#111116",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#1f1f28",
+    "outline": "#dcd7ba"
+  },
+  "palette": {
+    "accent": "#dcd7ba",
+    "logo": "#dcd7ba",
+    "logo_node": "#dcd7ba",
+    "screen_bg": "#1f1f28",
+    "chat_bg": "#223249",
+    "logs_bg": "#111116",
+    "chat_fg": "#dcd7ba",
+    "logs_fg": "#c8c093",
+    "border_dim": "#54546d",
+    "title_active": "#dcd7ba",
+    "title_dim": "#727169",
+    "sep_dim": "#223249",
+    "status_bg": "#223249",
+    "status_fg": "#dcd7ba",
+    "editor_bg": "#1f1f28",
+    "editor_fg": "#dcd7ba",
+    "editor_lineno": "#54546d",
+    "editor_sel": "#363646",
+    "composer_bg": "#223249",
+    "composer_border": "#54546d",
+    "composer_hint": "#727169"
+  },
+  "syntax": {
+    "text": "#dcd7ba",
+    "keyword": "#7e9cd8",
+    "string": "#76946a",
+    "number": "#957fb8",
+    "comment": "#727169",
+    "punct": "#6a9589",
+    "heading": "#7aa89f",
+    "code": "#76946a"
+  }
+}

@@ -19,7 +19,7 @@
 
 use super::grammar::{self, ArgValue, Call, GrammarError};
 use super::registry::{self, PrimitiveSpec};
-use super::{audit, fs, policy};
+use super::{audit, fs, journal, policy};
 use crate::agent::types::{CapDomain, Rights, Scope};
 use crate::cap::{self, Cap, ChannelId, Right};
 use crate::channel;
@@ -58,6 +58,55 @@ pub enum Invocation {
 /// is Phase 5; here the primitive only mints a stable, auditable request id.
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 
+
+/// **Dry-run mode.** When set, the gate chain runs in full and the *decision* is
+/// reached exactly as it would be, but [`run_primitive`] is never called and the
+/// intended call is recorded instead.
+///
+/// This is the honest way to answer "what would this agent do": the alternative
+/// — asking the model to describe its plan — is the model's account of itself,
+/// which is precisely the untrusted thing the determinism boundary exists to
+/// distrust. Here the *executor* reports, so what you see is what would have run.
+///
+/// Deliberately a mode on the executor rather than a flag threaded through every
+/// caller: an agent must not be able to opt out of it, and a caller that forgot
+/// to pass the flag would silently perform real effects during a preview.
+static DRY_RUN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Calls recorded during the current dry run, in order.
+static PLAN: crate::mm::Locked<alloc::vec::Vec<alloc::string::String>> =
+    crate::mm::Locked::new(alloc::vec::Vec::new());
+
+pub fn dry_run_enabled() -> bool {
+    DRY_RUN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Begin a dry run, clearing any previous plan.
+pub fn begin_dry_run() {
+    PLAN.with(|p| p.clear());
+    DRY_RUN.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// End the dry run and return what the agent would have done.
+pub fn end_dry_run() -> alloc::vec::Vec<alloc::string::String> {
+    DRY_RUN.store(false, core::sync::atomic::Ordering::Relaxed);
+    PLAN.with(|p| core::mem::take(p))
+}
+
+/// Which agent the executor should charge for the calls it is running.
+///
+/// Set by the agent loop around a turn. Zero means "not an agent" -- kernel and
+/// shell calls are not billed to anyone.
+static BILL_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn bill_to(agent: u64) {
+    BILL_TO.store(agent, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn billed_agent() -> u64 {
+    BILL_TO.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Run a tool call emitted by `caller`, with a fully-trusted justification.
 /// This is the pre-Phase-6 entry point; it never trips the taint gate, so
 /// system/kernel-internal callers keep their prior behaviour. Callers that
@@ -72,12 +121,16 @@ pub fn execute(caller: TaskId, raw: &str) -> Invocation {
 /// exactly one audit entry.
 pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Justification) -> Invocation {
     let args_hash = audit::fnv1a(raw.as_bytes());
+    // Charged for every outcome below, refused ones included: the tokens that
+    // produced a denied call were still spent. See `agent::cost`.
+    let billed = billed_agent();
 
     // Gate 1: grammar.
     let call: Call = match grammar::parse(raw) {
         Ok(call) => call,
         Err(err) => {
             audit::record(caller, "<malformed>", args_hash, audit::Outcome::RejectedMalformed, 0);
+            charge(billed, true);
             return Invocation::Rejected(err);
         }
     };
@@ -88,6 +141,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     if !cap::holds(caller, Right::InvokePrimitive(call.id)) {
         cap::record_denial(caller, spec.name);
         audit::record(caller, spec.name, args_hash, audit::Outcome::DeniedNoCapability, 0);
+            charge(billed, true);
         return Invocation::Denied { primitive: spec.name };
     }
 
@@ -115,6 +169,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
             spec.name
         ));
         audit::record(caller, spec.name, args_hash, audit::Outcome::NeedsApproval, 0);
+            charge(billed, true);
         return Invocation::NeedsApproval { primitive: spec.name };
     }
 
@@ -134,6 +189,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
             spec.name, justification.provenance
         ));
         audit::record(caller, spec.name, args_hash, audit::Outcome::RefusedTainted, 0);
+            charge(billed, true);
         return Invocation::RefusedTainted { primitive: spec.name };
     }
 
@@ -164,6 +220,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
             spec.name
         ));
         audit::record(caller, spec.name, args_hash, audit::Outcome::DeniedScope, 0);
+        charge(billed, true);
         return Invocation::DeniedScope { primitive: spec.name };
     }
     if let Some((domain, want, target)) = scope_target(spec, &call.args) {
@@ -173,6 +230,7 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
                 spec.name
             ));
             audit::record(caller, spec.name, args_hash, audit::Outcome::DeniedScope, 0);
+            charge(billed, true);
             return Invocation::DeniedScope { primitive: spec.name };
         }
     }
@@ -180,10 +238,96 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     // Gate 4: execute in isolation, then audit the effect. The justification's
     // provenance goes in so a write can record *who* authorised the bytes it
     // stored -- see `run_primitive`'s MEM_FS_WRITE/EDIT arms.
+    // Dry run: the decision above was reached in full, so this call *would* have
+    // happened. Record it and return without touching anything. The audit entry
+    // is still written -- a preview is an event worth having in the trail.
+    if dry_run_enabled() {
+        let rendered = alloc::format!("{} {}", spec.name, render_args(&call.args));
+        PLAN.with(|p| p.push(rendered.clone()));
+        audit::record(caller, spec.name, args_hash, audit::Outcome::Executed, 0);
+        charge(billed, false);
+        return Invocation::Executed {
+            primitive: spec.name,
+            result: alloc::format!("dry-run: would call {rendered}"),
+        };
+    }
+
+    // Capture the inverse *before* the effect: once a file is overwritten its
+    // prior contents are gone, so there is exactly one moment to record them.
+    let undo = journal_undo(spec, &call.args);
+
     let result = run_primitive(caller, spec, &call.args, justification.provenance);
     let result_hash = audit::fnv1a(result.as_bytes());
     audit::record(caller, spec.name, args_hash, audit::Outcome::Executed, result_hash);
+    charge(billed, false);
+    if let Some(u) = undo {
+        journal::record(spec.name, u);
+    }
     Invocation::Executed { primitive: spec.name, result }
+}
+
+/// Bill one invocation to the agent the loop named, if any.
+fn charge(agent: u64, refused: bool) {
+    if agent != 0 {
+        crate::agent::cost::add_call(agent, refused);
+    }
+}
+
+/// Render a call's arguments for the dry-run plan, truncating long ones so a
+/// preview of a file write does not print the file.
+fn render_args(args: &[grammar::ArgValue]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        match a {
+            grammar::ArgValue::Uint(n) => out.push_str(&alloc::format!("{n}")),
+            grammar::ArgValue::Str(s) => {
+                if s.len() > 60 {
+                    out.push_str(&alloc::format!("\"{}…\" ({} bytes)", &s[..60], s.len()));
+                } else {
+                    out.push_str(&alloc::format!("\"{s}\""));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How to reverse this call, or `None` if it changes nothing durable.
+///
+/// Only store mutations are reversible. A network send or a console write has
+/// already left; those are recorded as [`journal::Undo::Irreversible`] so a
+/// rollback can say what it could not take back rather than implying it did.
+fn journal_undo(
+    spec: &registry::PrimitiveSpec,
+    args: &[grammar::ArgValue],
+) -> Option<journal::Undo> {
+    if !journal::is_open() {
+        return None;
+    }
+    let path = match args.first() {
+        Some(grammar::ArgValue::Str(p)) => p.clone(),
+        _ => alloc::string::String::new(),
+    };
+    match spec.id {
+        registry::MEM_FS_WRITE | registry::MEM_FS_EDIT | registry::MEM_FS_DELETE => {
+            Some(match crate::synapse::fs::read(&path) {
+                Some(prior) => journal::Undo::RestoreFile { path, prior },
+                None => journal::Undo::DeleteFile { path },
+            })
+        }
+        registry::NET_HTTP_GET | registry::NET_HTTP_POST => Some(journal::Undo::Irreversible {
+            what: "network request",
+            detail: path,
+        }),
+        registry::CONSOLE_WRITE => Some(journal::Undo::Irreversible {
+            what: "console output",
+            detail: alloc::string::String::new(),
+        }),
+        _ => None,
+    }
 }
 
 /// Convenience wrapper for the currently-running task (trusted justification).

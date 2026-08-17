@@ -1,0 +1,44 @@
+{
+  "name": "solitude",
+  "font": "Geist Mono",
+  "font_scale": 0,
+  "wallpaper": "gradient:#101315,#080a0b",
+  "opacity": 232,
+  "cursor": {
+    "fill": "#101315",
+    "outline": "#a5aeb4"
+  },
+  "palette": {
+    "accent": "#798186",
+    "logo": "#798186",
+    "logo_node": "#a5aeb4",
+    "screen_bg": "#101315",
+    "chat_bg": "#101315",
+    "logs_bg": "#080a0b",
+    "chat_fg": "#cacccc",
+    "logs_fg": "#cbc2be",
+    "border_dim": "#4b4e55",
+    "title_active": "#798186",
+    "title_dim": "#4b4e55",
+    "sep_dim": "#101315",
+    "status_bg": "#101315",
+    "status_fg": "#cacccc",
+    "editor_bg": "#101315",
+    "editor_fg": "#cacccc",
+    "editor_lineno": "#4b4e55",
+    "editor_sel": "#343d41",
+    "composer_bg": "#101315",
+    "composer_border": "#4b4e55",
+    "composer_hint": "#4b4e55"
+  },
+  "syntax": {
+    "text": "#cacccc",
+    "keyword": "#798186",
+    "string": "#9fa5a9",
+    "number": "#aeaeae",
+    "comment": "#4b4e55",
+    "punct": "#707070",
+    "heading": "#707070",
+    "code": "#9fa5a9"
+  }
+}

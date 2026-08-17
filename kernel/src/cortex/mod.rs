@@ -15,6 +15,7 @@ pub mod iq_tables;
 pub mod prefix;
 pub mod refcheck;
 pub mod sampler;
+pub mod spec;
 pub mod tensor;
 pub mod tokenizer;
 

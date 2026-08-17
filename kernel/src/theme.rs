@@ -27,6 +27,32 @@ pub static BUNDLED_THEMES: &[(&str, &str)] = &[
     ("nord", include_str!("../../assets/themes/nord.json")),
     ("dracula", include_str!("../../assets/themes/dracula.json")),
     ("ubuntu", include_str!("../../assets/themes/ubuntu.json")),
+    // Imported from omarchy (https://github.com/basecamp/omarchy, MIT) by
+    // `tools/import_omarchy_themes.py`. Palettes only: their wallpapers are
+    // 108 MB with their own provenance, so each renders a gradient derived from
+    // the colours instead. `nord` is listed above -- both projects ship one and
+    // the import replaced ours. Regenerate rather than hand-editing.
+    ("catppuccin", include_str!("../../assets/themes/catppuccin.json")),
+    ("catppuccin-latte", include_str!("../../assets/themes/catppuccin-latte.json")),
+    ("ethereal", include_str!("../../assets/themes/ethereal.json")),
+    ("everforest", include_str!("../../assets/themes/everforest.json")),
+    ("flexoki-light", include_str!("../../assets/themes/flexoki-light.json")),
+    ("gruvbox", include_str!("../../assets/themes/gruvbox.json")),
+    ("hackerman", include_str!("../../assets/themes/hackerman.json")),
+    ("kanagawa", include_str!("../../assets/themes/kanagawa.json")),
+    ("last-horizon", include_str!("../../assets/themes/last-horizon.json")),
+    ("lumon", include_str!("../../assets/themes/lumon.json")),
+    ("lupine", include_str!("../../assets/themes/lupine.json")),
+    ("matte-black", include_str!("../../assets/themes/matte-black.json")),
+    ("miasma", include_str!("../../assets/themes/miasma.json")),
+    ("osaka-jade", include_str!("../../assets/themes/osaka-jade.json")),
+    ("retro-82", include_str!("../../assets/themes/retro-82.json")),
+    ("ristretto", include_str!("../../assets/themes/ristretto.json")),
+    ("rose-pine", include_str!("../../assets/themes/rose-pine.json")),
+    ("solitude", include_str!("../../assets/themes/solitude.json")),
+    ("tokyo-night", include_str!("../../assets/themes/tokyo-night.json")),
+    ("vantablack", include_str!("../../assets/themes/vantablack.json")),
+    ("white", include_str!("../../assets/themes/white.json")),
 ];
 
 /// All available theme names: bundled + installed (in the store), de-duplicated.
