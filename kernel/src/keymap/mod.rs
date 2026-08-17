@@ -41,6 +41,7 @@
 //! which is where German puts `<>|` and which no previous table decoded at all.
 
 use alloc::string::String;
+use core::sync::atomic::Ordering;
 use crate::mm::Locked;
 
 pub mod layouts;
@@ -722,6 +723,78 @@ impl ByteRing {
     }
 }
 
+/// Which HID usages are physically down, one bit per usage.
+///
+/// **Why this exists.** `translate` discards every release on its first line
+/// (`if !ev.pressed { return Emit::nothing() }`) because the OS above it consumes a
+/// *byte stream*, and a byte stream has no concept of a key coming back up. That is
+/// right for a shell and an editor, and useless for a game: WASD movement needs to
+/// know a key is still held, and `DG_GetKey(int* pressed, ...)` asks for the edge
+/// directly.
+///
+/// The edges already arrive here — [`KeyEvent`] carries `pressed` — so this is a
+/// *reader* of state the choke point already sees, not a second decoder. That
+/// distinction is the whole reason `keymap/` exists: four independent decoders with
+/// four copies of the modifier state is what it replaced, and adding a fifth to
+/// serve games would undo it.
+///
+/// A bitmap rather than a list because `feed_event` runs inside IRQ1 on x86: this
+/// allocates nothing, and a set/clear is two instructions.
+///
+/// It is **physical** state, deliberately unaffected by the layout, dead keys, the
+/// IME or Caps Lock. A game wants "is the key left of S held", which is a position;
+/// the character it would type is a different question, and `translate` answers
+/// that one.
+static HELD: [core::sync::atomic::AtomicU32; 8] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+/// Record a transition in [`HELD`]. Pure with respect to everything else.
+fn held_set(usage: Usage, down: bool) {
+    let (w, b) = (usage as usize / 32, usage as usize % 32);
+    // A `Usage` is a `u8`, so `w` is always < 8 and this cannot go out of range.
+    let cell = &HELD[w];
+    if down {
+        cell.fetch_or(1 << b, Ordering::Relaxed);
+    } else {
+        cell.fetch_and(!(1 << b), Ordering::Relaxed);
+    }
+}
+
+/// Whether the key at `usage` is physically down right now.
+pub fn is_held(usage: Usage) -> bool {
+    let (w, b) = (usage as usize / 32, usage as usize % 32);
+    HELD[w].load(Ordering::Relaxed) & (1 << b) != 0
+}
+
+/// Every usage currently down, as a raw bitmap (`usage / 32` indexed, LSB-first).
+///
+/// Returned as a snapshot so a caller sees one coherent instant rather than a
+/// bitmap that shifts under it mid-iteration.
+pub fn held_snapshot() -> [u32; 8] {
+    core::array::from_fn(|i| HELD[i].load(Ordering::Relaxed))
+}
+
+/// Forget every held key.
+///
+/// Called when input stops being delivered to whoever was reading edges — losing
+/// focus, or a game tab closing. Without it a key held at the moment focus moved
+/// stays down forever from the game's point of view, and Doom walks into a wall
+/// until that key happens to be pressed and released again. The same reason a
+/// windowing system synthesises key-up on focus loss.
+pub fn clear_held() {
+    for c in &HELD {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 static EVENTS: Locked<EventRing> = Locked::new(EventRing::new());
 static BYTES: Locked<ByteRing> = Locked::new(ByteRing::new());
 static STATE: Locked<State> = Locked::new(State {
@@ -741,6 +814,12 @@ static ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize
 /// allocates nothing and takes only the event-ring lock. Translation happens on
 /// the drain side ([`next_byte`]).
 pub fn feed_event(ev: KeyEvent) {
+    // Physical held state, before anything else can drop the event. Caps Lock
+    // returns early below and the modifier usages never reach `translate` as
+    // characters, so tracking here rather than lower down is what makes *every*
+    // key observable — including the ones a byte stream cannot express.
+    held_set(ev.usage, ev.pressed);
+
     // Caps Lock is a toggle whose state must outlive any one driver, so it is
     // applied here rather than in whichever driver saw the press.
     if ev.usage == U_CAPSLOCK {
@@ -863,6 +942,128 @@ pub fn preedit() -> String {
 /// Take any pending refusal message ("no such compose sequence", …).
 pub fn take_message() -> Option<&'static str> {
     MESSAGE.with(|m| m.take())
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    fn ev(usage: Usage, pressed: bool) -> KeyEvent {
+        KeyEvent { usage, mods: Mods(0), pressed, src: Source::UsbHid }
+    }
+
+    /// The property the byte stream cannot express: a key stays held between its
+    /// press and its release, so a game can ask "is W down" rather than having to
+    /// infer it from repeat arrivals.
+    #[test_case]
+    fn a_key_is_held_between_press_and_release() {
+        clear_held();
+        let w = 0x1a; // HID usage for the physical `w` position
+        assert!(!is_held(w));
+        feed_event(ev(w, true));
+        assert!(is_held(w), "a pressed key must read as held");
+        feed_event(ev(w, false));
+        assert!(!is_held(w), "a released key must not read as held");
+        clear_held();
+    }
+
+    /// Simultaneous keys, which is the case software typematic structurally cannot
+    /// do: `Typematic::press` *replaces* the held key, so W+A for a diagonal is not
+    /// merely awkward through the byte stream, it is impossible.
+    #[test_case]
+    fn several_keys_are_held_at_once() {
+        clear_held();
+        let (w, a, s, d) = (0x1a, 0x04, 0x16, 0x07);
+        for k in [w, a, s, d] {
+            feed_event(ev(k, true));
+        }
+        assert!(is_held(w) && is_held(a) && is_held(s) && is_held(d));
+        // Releasing one must not disturb the others.
+        feed_event(ev(a, false));
+        assert!(is_held(w) && !is_held(a) && is_held(s) && is_held(d));
+        clear_held();
+    }
+
+    /// Every usage must land in its own bit. A `usage / 32` split with the wrong
+    /// shift would alias distinct keys onto one bit — and the symptom would be two
+    /// unrelated keys appearing to be the same key, which reads as a stuck input
+    /// rather than as an indexing bug.
+    #[test_case]
+    fn every_usage_gets_its_own_bit() {
+        clear_held();
+        for u in 0..=255u16 {
+            let u = u as Usage;
+            feed_event(ev(u, true));
+            assert!(is_held(u), "usage {u:#04x} did not set");
+            // Nothing else may have been disturbed.
+            let set = held_snapshot().iter().map(|w| w.count_ones()).sum::<u32>();
+            assert_eq!(set, 1, "usage {u:#04x} set {set} bits, not 1");
+            feed_event(ev(u, false));
+            assert_eq!(held_snapshot(), [0; 8], "usage {u:#04x} did not clear");
+        }
+        clear_held();
+    }
+
+    /// Caps Lock returns early in `feed_event` (it is a toggle, not a character),
+    /// and the modifiers never reach `translate` as text — so both are exactly the
+    /// keys a byte-stream reader cannot see, and both must still be observable
+    /// here. Ctrl and Shift are held modifiers in most games.
+    #[test_case]
+    fn modifiers_and_caps_lock_are_still_tracked() {
+        clear_held();
+        for k in [U_LCTRL, U_LSHIFT, U_RALT, U_CAPSLOCK] {
+            feed_event(ev(k, true));
+            assert!(is_held(k), "modifier {k:#04x} must be observable");
+            feed_event(ev(k, false));
+            assert!(!is_held(k));
+        }
+        clear_held();
+    }
+
+    /// A repeated press with no intervening release (hardware typematic on PS/2 and
+    /// virtio-input does exactly this) must leave the key held, not toggle it.
+    #[test_case]
+    fn a_repeated_press_does_not_toggle() {
+        clear_held();
+        let w = 0x1a;
+        for _ in 0..5 {
+            feed_event(ev(w, true));
+            assert!(is_held(w));
+        }
+        feed_event(ev(w, false));
+        assert!(!is_held(w));
+        clear_held();
+    }
+
+    /// Focus loss must forget everything, or a key held as focus moved stays down
+    /// forever and the game walks into a wall until that key is pressed again.
+    #[test_case]
+    fn clear_held_forgets_everything() {
+        clear_held();
+        for k in [0x1a, 0x04, U_LSHIFT] {
+            feed_event(ev(k, true));
+        }
+        assert!(held_snapshot().iter().any(|&w| w != 0));
+        clear_held();
+        assert_eq!(held_snapshot(), [0; 8], "focus loss must release every key");
+    }
+
+    /// Tracking must not change what the byte stream produces — every existing
+    /// consumer (shell, editor, modals, e2e) has to be unaffected.
+    #[test_case]
+    fn tracking_does_not_disturb_translation() {
+        clear_held();
+        let mut st = State::default();
+        let layout = &layouts::US;
+        // HID usage 0x1a is the physical `w` position.
+        let down = translate(&mut st, layout, ev(0x1a, true));
+        assert_eq!(down.bytes, "w");
+        // A release still emits nothing, which is what keeps `read_byte` a byte
+        // stream rather than an event stream.
+        let up = translate(&mut st, layout, ev(0x1a, false));
+        assert!(up.bytes.is_empty(), "a release must still emit no bytes");
+        clear_held();
+    }
 }
 
 #[cfg(test)]
