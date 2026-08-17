@@ -1,630 +1,267 @@
-# Hardware support
+# ChittiOS — hardware support
 
-What ChittiOS drives on a real machine, what is written but has never met the
-silicon it targets, and what is simply absent.
+What the OS actually drives, on both architectures, and how far each driver has
+been proven. This is a status document, not a wish list: everything marked
+**Working** has been exercised, and everything that has *not* been run against
+the real part says so.
 
-**Read this before booting on hardware you care about.** ChittiOS is developed
-and verified against QEMU, VirtualBox and UTM. Several drivers here are written
-from a specification and logged verbosely but have **never run on a physical
-device**, because nothing in this environment emulates the part — that is a
-different claim from "works", and this file keeps the two apart.
+The project rule that shapes this table is in [CLAUDE.md](CLAUDE.md): drivers
+target real, standards-based hardware — ACPI/PCIe ECAM, UEFI GOP, EDID, HID
+report descriptors, PrimeCell IDs — never an emulator quirk. A feature that only
+works under QEMU is not done.
 
-## Legend
+## How to read this
 
-| Mark | Meaning |
+**Status**
+
+| | |
 |---|---|
-| ✅ | Implemented and exercised — by the e2e suite, the unit suite, or a real boot. |
-| ⚠️ | Implemented, but **unverified on the hardware it targets** (no emulator models the part), or verified with a stated limit. |
-| ❌ | Not implemented. A machine that needs this does not get the feature. |
+| **Working** | Implemented and exercised end to end. |
+| **Partial** | Useful but incomplete; the gap is named in Notes. |
+| **Identify only** | The device is recognised and reported, but deliberately not driven — see Notes for why. |
+| **Absent** | Not implemented. |
 
-A ⚠️ driver is not a stub: it is complete code written from the vendor
-specification or from Linux's own headers, with every wait bounded and every
-refusal logged. It has just never been proven. Treat it the way we treat
-`r8169` — plausible, and unproven.
+**Verified on** — where the code has actually been run. This distinction matters
+more than status: a driver can be complete and still never have met its device.
 
-### How a ✅ was earned
-
-The marks are not judgement calls. Each one has a specific thing behind it:
-
-| Kind of evidence | Example |
+| | |
 |---|---|
-| An **independent published vector** — the strongest, because our encoder and decoder share every table and would round-trip a wrong answer perfectly | CCMP against RFC 3610 packet vector 1; WPA2 against the 802.11i vectors; the PNG encoder against our own separately-written inflater |
-| A **real boot with the device attached**, asserted against a known value | SD/eMMC: `CHITTI_DISK_IF=sd` reports 8192 blocks against a backing image that is exactly 4 MiB. USB audio: `CHITTI_USB=audio` reaches `tone done` through an isochronous endpoint |
-| A **second implementation** disagreeing or not | video decoders frame-for-frame against PyAV/FFmpeg; `browser::flex` against taffy to within 1 px |
-| The **e2e suite** driving the real shell over serial | the `agents`, `net` and `os` groups |
-| **Header arithmetic only** — this is what ⚠️ means for a driver written from a spec | every Intel WiFi command: offsets checked against Linux's `fw/api/*.h` field lists and against nothing else |
+| **HW** | Run against the physical part. |
+| **QEMU** / **VBox** / **UTM** | Run against that emulator or hypervisor only. |
+| **Tests** | Pure logic covered by `cargo xtask test`; the hardware path is unexercised. |
 
-The last row is the one to keep in mind. Sixty correct offsets do not add up to
-a working driver, because the failures in that class are commands the hardware
-*accepts*.
+Arch column: **x86** = x86_64, **arm** = aarch64, **both** = one code path serving
+each behind the same API.
 
 ---
 
-## Summary — booting a typical laptop today
+## Boot and platform
 
-| Subsystem | On a typical laptop |
-|---|---|
-| Console + shell | ✅ works, at the firmware's resolution |
-| Keyboard, trackpad | ✅ basic input works (no gestures, no media keys) |
-| Internal disk | ✅ SATA / NVMe / SD / eMMC — **unless** the firmware is in Intel VMD / "RST" mode |
-| Wired Ethernet | ✅ Intel, ⚠️ Realtek |
-| **WiFi** | ❌ **no machine can join a network** (USB tether works) |
-| **Bluetooth peripherals** | ❌ won't pair (no SSP, no BLE) |
-| Audio | ✅ stereo (WAV/MP3), ✅ USB headsets; ⚠️ AAC mono; ❌ no jack detect |
-| USB peripherals | ✅ hubs to 5 tiers, storage, keyboard/mouse, audio out, CDC-ECM + RNDIS tethering |
-| Screen brightness | ❌ |
-| Suspend / lid close | ⚠️ unverified (devices do come back) / ❌ no lid switch |
-| Battery + charger reporting | ⚠️ unverified |
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| Limine boot protocol | x86 | Working | QEMU, VBox | Memory map, HHDM, framebuffer, boot modules. |
+| UEFI stub (`stub/`) | arm | Working | QEMU (AAVMF), VBox, UTM | Own bootloader; GOP mode selection, EDID capture, boot-info handoff. |
+| `-kernel` direct boot | arm | Working | QEMU | Dev loop; no PCI (ECAM comes from the stub's ACPI). |
+| m1n1 chainload | arm | Working | HW (Apple M2 / t8112) | `cargo xtask m1n1`. |
+| Device tree (FDT) | arm | Working | QEMU | `/memory`, PSCI, GICv3 discovery. |
+| ACPI tables | both | Working | QEMU, VBox | RSDP/XSDT/FADT/MADT/MCFG. x86 maps each table explicitly — the tables sit outside the HHDM. |
+| AML interpreter | both | Working | QEMU | Fail-closed subset: `_S5_`, `_CRS`, `_STA`, `_BST`, `_BIX`/`_BIF`, `_PSR`, `_DSM`. Unsupported opcode returns nothing rather than guessing. |
+| fw_cfg | both | Working | QEMU | RAM size, ramfb. |
+| Apple SMC | arm | Partial | HW (M2) | System endpoints; used for platform info. |
 
-The honest short version: on real hardware ChittiOS is a **wired-network console
-OS**. In a VM it is the whole system.
+## CPU, memory, privilege
 
----
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| SMP bring-up | x86 | Working | QEMU, VBox | Limine/MADT; APs woken by IPI, parked in `hlt`. |
+| SMP bring-up | arm | Working | QEMU, HW (M2) | PSCI `CPU_ON`; `WFE`-parked workers with a counter event-stream fallback. Degrades to single-core where a hypervisor traps `WFE` (VirtualBox-ARM). |
+| MMU / paging | both | Working | QEMU, VBox, HW | 4-level PML4 (x86); L1/L2/L3 walker plus GiB/2 MiB blocks (arm). |
+| Physical frame allocator | both | Working | Tests, QEMU | Shared bitmap allocator; constructor takes usable regions, so each arch feeds it from its own source. |
+| Per-task address spaces | both | Working | QEMU | `mm/space.rs`, `mm/walk.rs`. |
+| Ring 3 / EL0 | both | Working | QEMU | Tenants run unprivileged; a tenant fault is contained and reported, not fatal. |
+| Heap growth + OOM policy | both | Working | Tests, QEMU | Grow → reclaim hooks → retry → OOM-kill the offending task. Bootstrap/shell still panics — nowhere safe to land. |
+| Fault isolation | both | Working | QEMU | A faulting task is killed and reaped; the machine survives. Double fault stays fatal. |
+| NEON / SIMD | arm | Working | HW (M2), QEMU | Hot loops use inline-asm loads — `+strict-align` scalarises intrinsics. |
+| AVX2 / XSAVE | x86 | Working | QEMU | Per-task FPU save area. |
 
-## Input
+## Interrupts and timers
 
-### Keyboard — ✅
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| Local APIC timer | x86 | Working | QEMU, VBox | Calibrated against the HPET. |
+| HPET | x86 | Working | QEMU | Reference clock, with a counter-liveness probe. |
+| PIT / 8259 PIC | x86 | Working | QEMU | Fallback where a UEFI-only machine omits the APIC path. |
+| GICv3 | arm | Working | QEMU, VBox, UTM | Base from FDT, else the ACPI MADT. Apple Silicon has neither — stays cooperative by design. |
+| ARM generic timer | arm | Working | QEMU, HW | Virtual counter (`CNTVCT_EL0`). |
+| RTC / wall clock | both | Working | QEMU, VBox | CMOS RTC, UEFI `GetTime`, or the virtual counter. |
+| SNTP | both | Working | QEMU | Network time; IANA timezones with DST. |
 
-| Transport | Status |
-|---|---|
-| USB HID boot keyboard (xHCI) | ✅ |
-| PS/2 set-1 (x86 i8042) | ✅ |
-| PS/2 set-2 (PL050, ARM) | ✅ |
-| virtio-input | ✅ |
+## Buses
 
-Every transport funnels through [`keymap/`](kernel/src/keymap/) — one decoder,
-one modifier state, one caps-lock rule. Nine layouts with four levels each
-(Base / Shift / AltGr / Shift+AltGr), dead keys, Compose, software auto-repeat
-with an accelerating streak amplifier, and a romaji→kana IME. `/keyboard test
-<layout> <keys>` asserts the tables from a running kernel.
-
-**Not supported:**
-
-- ❌ **HID consumer page** — volume, brightness, media transport, airplane mode
-  and most laptop Fn-layer keys are simply not decoded. Only the boot-keyboard
-  usage page is read.
-- ❌ Report-protocol-only keyboards (a few gaming boards expose no boot protocol).
-- ❌ Caps-lock / num-lock LEDs, keyboard backlight.
-- ❌ Hangul, pinyin and kanji IMEs. Hangul composition is implemented and
-  **deliberately refused** because the bundled font has no Hangul glyphs — it
-  would compose correctly and render tofu.
-
-### Mouse / pointer — ✅
-
-| Transport | Status |
-|---|---|
-| USB HID (report-descriptor driven) | ✅ |
-| PS/2 aux port, x86 (incl. IntelliMouse wheel) | ✅ |
-| PL050 aux, ARM | ✅ |
-| virtio-pointer / tablet | ✅ |
-| HID-over-I2C | ⚠️ |
-
-Absolute and relative motion, buttons, scroll wheel. USB and I2C share one
-report decoder ([`xhci::feed_pointer_report`]) so a touchpad and a mouse cannot
-drift apart.
-
-**Not supported:** ❌ pointer acceleration or sensitivity settings; ❌ Bluetooth
-mice in practice (see [Bluetooth](#bluetooth--️-wont-pair-with-modern-devices)).
-
-### Touchpad — ⚠️ works as a plain mouse
-
-[`drivers/i2c_hid.rs`](kernel/src/drivers/i2c_hid.rs) is the correct driver for
-laptops from ~2016 onward, which have no PS/2 aux port. It locates the device by
-asking the ACPI namespace which one claims `PNP0C50` (an I2C device cannot be
-probed for — its address comes from `_CRS`), reads the descriptor register from
-`_DSM`, validates the HID descriptor, then powers the device on and resets it.
-
-**⚠️ Unverified on hardware** — QEMU emulates no LPSS/DesignWare I2C controller,
-so none of this has met a real touchpad. Identification only ever *reads*,
-because the same bus commonly carries the embedded controller.
-
-**Not supported:**
-
-- ❌ **Multi-touch and gestures** — first contact only. No two-finger scroll, no
-  pinch, no three-finger swipe.
-- ❌ Tap-to-click configuration, palm rejection, pointer settings.
-- ❌ Native Synaptics/ELAN PS/2 protocols. An older laptop's touchpad falls back
-  to the generic 3-byte PS/2 mouse protocol — it moves the cursor and clicks,
-  and that is all.
-
-### Touchscreen / digitizer — ⚠️
-
-HID digitizers decode through the same pointer path (Tip Switch → left click,
-absolute X/Y scaled to the framebuffer). First contact only; no gestures.
-`/touchscreen` reports the live state.
-
----
-
-## Display
-
-### What always works — ✅
-
-The kernel holds **no resolution of its own**. Geometry arrives from the
-firmware and every layout is a ratio of whatever the panel turned out to be:
-
-| Path | Platform |
-|---|---|
-| Limine GOP framebuffer | x86_64 UEFI/BIOS |
-| UEFI GOP via the `stub/` bootloader | aarch64 |
-| QEMU ramfb | aarch64 `-kernel` dev loop |
-| m1n1-prepared framebuffer | Apple Silicon bare metal |
-
-Mode selection is **EDID-preferred → keep the firmware's current mode → largest
-advertised mode**, with `\chitti-display.cfg` on the ESP outranking all of them
-because it is the one size a human typed on purpose. On a multi-output machine
-the stub picks the display carrying the firmware's console-out marker — the one
-you were watching boot messages on.
-
-Display settings are stored **per monitor**, keyed on the panel's own EDID
-vendor/product/serial, the way `monitors.xml` does it.
-
-### Kernel mode setting — partial
-
-| Backend | Status |
-|---|---|
-| virtio-gpu | ✅ verified by device screendump |
-| VMSVGA (VirtualBox, QEMU `vmware-svga`) | ✅ x86 I/O-port path; ⚠️ ARM MMIO path **declines by design** — its register layout is unverified and acting on the guess mis-programmed a real display |
-| Intel i915 | ❌ |
-| AMD amdgpu | ❌ |
-| NVIDIA | ❌ |
-| Apple AGX | ⚠️ coprocessor boots to RUNNING on a real M2; **drives no display** |
-
-### What this means on a real machine — ⚠️
-
-With no bound KMS backend the compositor keeps the loader's framebuffer. That
-is exactly the position Linux is in with `efifb`/`simpledrm` under `nomodeset`:
-
-- ❌ **No runtime mode change.** `/display set` letterboxes a smaller logical
-  desktop inside the physical framebuffer (rendered 1:1, so text stays sharp) —
-  it does not reprogram the panel. `/display boot` records a preference the
-  loader would have to apply, and says so rather than implying a reboot fixes it.
-- ❌ **No external-monitor hotplug.** Plugging in a second display does nothing.
-- ❌ **No acceleration.** Everything is CPU compositing into a linear framebuffer.
-- ❌ **No backlight or brightness control anywhere.** There is no ACPI `_BCM`
-  path and no GPU backlight path. You cannot dim a laptop screen.
-
-Console legibility on a high-resolution panel is handled by font size instead:
-`/display scale <1-4>|auto`.
-
----
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| PCIe (ECAM) | both | Working | QEMU, VBox | From ACPI MCFG. 64-bit BARs above 512 GiB are mapped correctly. |
+| Apple PCIe | arm | Partial | HW (M2) | Port bring-up. |
+| DART IOMMU | arm | Partial | HW (M2) | Apple's IOMMU, for AGX. |
+| USB — xHCI | both | Working | QEMU, VBox, HW | Control, bulk, isochronous; hot-plug and hot-unplug teardown. |
+| I²C (DesignWare/LPSS) | x86 | Partial | Tests | Master implemented; **unverified on hardware** — QEMU has no LPSS controller. Identification only ever reads, since the same bus carries the EC. |
+| virtio-mmio / virtio-PCI | both | Working | QEMU | Shared transport for blk/net/input/snd/gpu/9p/serial. |
 
 ## Storage
 
-### Controllers
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| virtio-blk | both | Working | QEMU | |
+| NVMe | both | Working | QEMU, VBox | Namespaces via IDENTIFY CNS=2 — NSIDs are sparse on VirtualBox. |
+| AHCI / SATA | both | Working | QEMU | Every HBA × every populated port, not just the first. |
+| USB mass storage | both | Working | QEMU | Bulk-Only Transport + SCSI, over the shared xHCI bulk pair. |
+| SDHCI (SD / eMMC) | both | Partial | Tests | The storage on tablets, Chromebook-class laptops and SBCs. Pure layer tested; controller path unverified on hardware. |
+| GPT / MBR | both | Working | QEMU, VBox | Free-extent planning for install-alongside. |
+| Volume encryption (C4VE v1) | both | Working | Tests, QEMU | Chitti data partition. Not LUKS2 — same idea, smaller, pure Rust. |
 
-| Controller | Status |
-|---|---|
-| AHCI / SATA | ✅ every HBA on the bus × every implemented, populated port |
-| NVMe | ✅ namespaces via IDENTIFY CNS=2 active list (never "walk NSIDs until empty" — they are sparse on real machines) |
-| virtio-blk | ✅ mmio and PCI |
-| USB mass storage (BOT/SCSI) | ✅ read **and** write, hot-plug with mount prune |
-| Apple ANS2 NVMe (via DART) | ⚠️ Apple Silicon bare metal |
-| SD / eMMC (SDHCI) | ✅ PCI class 08:05, PIO transfers; verified against QEMU's `sdhci-pci` |
-| Intel VMD / RST | ❌ |
+## Filesystems
 
-Exercise the real-hardware paths in QEMU with
-`CHITTI_DISK_IF=ahci|nvme|virtio-blk cargo xtask run -arch x86_64`.
+| Filesystem | Access | Verified on | Notes |
+|---|---|---|---|
+| ext4 | read + write | Tests, QEMU | Default filesystem; images are e2fsck-clean by construction. |
+| FAT12/16/32 | read + write | Tests, QEMU | ESP; the install-alongside writer preserves the existing loader. |
+| exFAT | read + write | Tests | |
+| NTFS | read only | Tests | |
+| 9P (virtio-9p) | read + write | QEMU | Host shared folder (`-virtfs`). |
+| VFS + mount table | — | QEMU | `fs/vfs.rs`, `fs/mount.rs`. |
 
-**⚠️ Intel VMD is the one that bites.** Many 2020+ Dell and Lenovo machines ship
-with the firmware in "RAID"/"Intel RST" mode, which hides the NVMe behind a VMD
-bridge on a separate PCI domain that is not visible in the main ECAM. ChittiOS
-finds **no disk at all** on such a machine. The workaround is to switch the
-firmware's SATA/NVMe mode to **AHCI**; there is no driver-side fix today.
+## Input
 
-**SD/eMMC works**, so tablets, Chromebook-class machines and SBCs now have a
-disk. Exercise it with `CHITTI_DISK_IF=sd cargo xtask run -arch x86_64`. Only
-SDHCI-over-PCI is discovered; the memory-mapped SDHCI on many ARM SBCs comes
-from the device tree and is not wired up. **SDXC cards, which default to exFAT,
-mount read + write** (see [Filesystems](#filesystems)).
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| USB HID keyboard | both | Working | QEMU, VBox, HW | Report-descriptor driven; software typematic (boot keyboards report press edges only). |
+| USB HID mouse | both | Working | QEMU, VBox, HW | Shared report decode with the I²C touchpad. |
+| USB touchscreen digitizer | both | Working | QEMU | |
+| PS/2 (i8042) | x86 | Working | QEMU, VBox | Keyboard + aux mouse. |
+| PL050 | arm | Working | QEMU | |
+| virtio-input | arm | Working | QEMU | |
+| HID-over-I²C touchpad | x86 | Partial | Tests | The touchpad on laptops from ~2016. Address from `_CRS`, descriptor register from `_DSM`. **Unverified on hardware.** |
+| Bluetooth HID | both | Partial | Tests | USB HCI transport, classic host, PIN pairing. Radio path unverified. |
+| Keyboard layouts | — | Working | QEMU | `/keyboard`. |
 
-### USB external disks — ✅ with limits
+## Display
 
-- LUN 0 only, and `probe_nth(0)` — **one** mass-storage device at a time.
-- 512-byte logical blocks only; a 4Kn drive is refused rather than mis-read.
-- No bulk-stall recovery: a stalled endpoint fails closed on the CSW.
-- ✅ **exFAT read + write** — the default filesystem on large sticks, so the
-  drive a dock usually holds just works (see [Filesystems](#filesystems)).
-- ✅ **USB hubs are enumerated to the full 5 tiers USB allows**, so a drive
-  behind a dock behind a monitor's built-in hub is reached. A position the xHCI
-  route string cannot express is refused and logged rather than truncated into
-  one naming a different device.
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| Firmware framebuffer | both | Working | QEMU, VBox, UTM, HW | Limine (x86), GOP via the stub (arm), m1n1 (Apple). Geometry comes from the firmware — the kernel holds no resolution. |
+| EDID | both | Working | QEMU, VBox | Base block parsed; drives loader mode choice and per-monitor settings. |
+| ramfb | arm | Working | QEMU | Fallback. |
+| KMS — virtio-gpu | both | Working | QEMU (screendump) | Scans out of our own DMA pages; damage-driven flush. |
+| KMS — VMSVGA | x86 | Working | QEMU (screendump) | VirtualBox/`vmware-svga`. The **MMIO BAR0 transport is unverified and declines** rather than risk mis-programming a real display; only the I/O-port path is proven. |
+| KMS — Bochs VBE | x86 | Working | QEMU | QEMU's default adapter (`1234:1111`), so the stock VM can mode-set. |
+| Multi-output selection | arm | Working | QEMU | Console-out marker → EDID → output 0. |
+| GPU acceleration | — | **Absent** | — | See AGX below. No i915/AMD/Intel drivers. |
 
-### Filesystems
+## Network
 
-| Item | Status |
-|---|---|
-| ext4 | ✅ read + write (the default filesystem) |
-| FAT12/16/32 | ✅ read + write |
-| exFAT | ✅ read + write (ASCII names on write; full UTF-16 names on read) |
-| NTFS | ⚠️ read only |
-| GPT / MBR | ✅ |
-| 9P (host shared folder) | ✅ |
-| C4VE encrypted volumes | ✅ |
-| btrfs, XFS, APFS | ❌ |
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| virtio-net | both | Working | QEMU | mmio and PCI. |
+| Intel e1000 / e1000e | both | Working | QEMU | Covers I217/I218/I219 — the NIC in most business laptops. Unknown Intel IDs fall back here, logged as a guess. |
+| Intel igb / igc | both | Working | QEMU | 82575–I350, I225/I226. Advanced descriptors, different ring registers. |
+| Realtek r8169/8168/8125 | both | Partial | — | **Unverified on hardware** — QEMU models no r8169-family part. Per-chip register map is unit-tested. |
+| USB CDC-ECM | both | Working | QEMU | Matched by interface class, not an ID list. |
+| USB RNDIS | both | Partial | Tests | Android tethering; pure wire layer done. |
+| ASIX / Realtek USB NICs | both | Identify only | — | Recognised then refused: they need per-chip setup and packet headers, and treating framed packets as raw would hand the stack garbage. |
+| TCP/IP (smoltcp) | both | Working | QEMU | DHCPv4, DNS, ICMP, TCP/UDP, loopback, **dual-stack IPv6**. |
+| TLS client | both | Working | QEMU | TLS 1.3 with real certificate verification against an embedded Mozilla root store. No CRL/OCSP. |
+| TLS server | — | **Absent** | — | Client only, so service agents serve plaintext. |
 
-**exFAT is full read + write** — `block/exfat_rw` (format, create/replace,
-unlink/mkdir, readdir, stat) plus `/mkexfat` to format a disk from the shell.
-It is the format a large USB stick or an SDXC card is usually wearing, and it
-is verified against an **independent implementation**, not just itself: the e2e
-mounts a volume formatted by macOS's `newfs_exfat` or Linux's `mkfs.exfat` on
-the real kernel, writes to it, remounts (persistence), and then runs
-`fsck_exfat` over the image — clean after our writes. Two findings from that
-interop, each load-bearing:
+## Wireless
 
-- **The allocation bitmap is not decorative.** exFAT allocates by bitmap and
-  the FAT only records chains; every allocation and free updates **both**, or a
-  reader that allocates from the bitmap would overwrite our data. A volume
-  without a bitmap entry is refused entirely.
-- **Stream flags: bit 0 is AllocationPossible, and "contiguous" is exactly
-  `0x03`.** Writing `0x00` for a file with data made `fsck_exfat` report
-  "File has no stream allocation" on a volume that read back perfectly. The
-  writer emits `0x01` (FAT chain); the reader treats only `0x03`
-  (Linux's `ALLOC_NO_FAT_CHAIN`) as contiguous and everything else as a FAT
-  chain.
-
-The same e2e caught a **detection** bug that a real tool's volume was needed to
-expose: a super-floppy exFAT was misread as an MBR, because FAT/exFAT boot
-sectors share MBR's `0x55AA` signature and `newfs_exfat` fills the boot-code
-region (which overlaps the MBR partition-entry area) with `0xF4`. Detection now
-recognises a filesystem at LBA 0 *before* the MBR interpretation.
-
-Names are **ASCII-only on write** — a non-ASCII name's hash cannot be
-reproduced by a reader folding with the volume's up-case table — while reading
-lists full UTF-16 names.
-
-`/install` writes a fresh GPT (whole-disk) or `/install alongside` adds a loader
-to an existing ESP without touching the partition table. `/install plan` is
-read-only and reports what it would do.
-
----
-
-## Networking
-
-### Wired Ethernet
-
-| Driver | Parts | Status |
-|---|---|---|
-| `e1000` | Intel 82540–82547 | ✅ |
-| `e1000e` | Intel 82571 … **I217/I218/I219** | ✅ — the NIC in most business laptops |
-| `igb` | Intel 82575–I350, I210/I211 | ✅ |
-| `igc` | Intel I225/I226 2.5GbE | ✅ |
-| `virtio-net` | mmio + PCI | ✅ |
-| `r8169` | Realtek RTL8168/8111/8125 | ⚠️ **unverified** — QEMU models no r8169-family part |
-| `rtl8139` | Realtek RTL8139 | ❌ recognised, deliberately not implemented |
-| Broadcom `tg3` | many Dell/HP desktops and older laptops | ❌ |
-| Atheros / Killer `alx` | | ❌ |
-| Aquantia AQC | 2.5/10GbE on newer boards | ❌ |
-| Marvell / Yukon | | ❌ |
-
-A NIC is claimed by **vendor + device ID**, never vendor alone — all Intel
-Ethernet reports `8086`/class `02:00:00` while the families are
-register-incompatible. Unknown Intel IDs fall back to `e1000e` (the only
-open-ended family) with the ID logged as a guess. Test the dispatch against
-every family QEMU can emulate with `CHITTI_NIC=e1000|e1000e|igb|rtl8139|
-virtio-net-pci cargo xtask run -arch x86_64`.
-
-❌ **No MSI or MSI-X anywhere.** Every driver in this OS polls. That is an
-architectural choice, not an oversight — it costs latency and CPU, and it means
-no driver depends on interrupt routing being correct.
-
-### USB Ethernet / tethering
-
-| Shape | Status |
-|---|---|
-| CDC-ECM | ⚠️ implemented, **unverified** — QEMU emulates only RNDIS |
-| RNDIS (Android USB tethering, QEMU `usb-net`) | ✅ |
-| ASIX AX88179 | ❌ recognised and refused (needs per-chip register setup) |
-| Realtek RTL8152 | ❌ recognised and refused |
-
-Tried **last** in `autodetect`, after virtio and PCI, so a built-in NIC always
-wins. An iPhone tether presents CDC-ECM (so it *should* work, unproven);
-**Android tethers over RNDIS**, which is implemented — bring-up over the control
-pipe (`INITIALIZE` → MAC query → packet filter), a 44-byte per-packet header, and
-several frames per transfer. RNDIS is identified by its *control* interface's
-class triple, because its data interface is class `0x0A` exactly like CDC-ECM's.
-
-### WiFi — ❌ no machine can join a network
-
-Still the largest gap, but it has moved: everything **above** the radio is now
-built and verified off-hardware, and the Intel driver has every command it needs
-— none of them proven. The parts that exist:
-
-| Layer | Status |
-|---|---|
-| WPA2-PSK supplicant (PBKDF2 → PMK → PTK, EAPOL MIC, RFC 3394 key unwrap) | ✅ pure, pinned to the published 802.11i vectors |
-| 802.11 frame + beacon + RSN element parsing | ✅ |
-| **CCMP** (AES-CTR + CBC-MAC) | ✅ pinned to RFC 3610's published packet vector |
-| **802.11 data path** (ToDS/FromDS addressing, LLC/SNAP, 802.11↔802.3) | ✅ |
-| **Association state machine** (auth → assoc → 4-way → keys) | ✅ pure, tested against a simulated AP |
-| **Scan aggregation** (dedupe by BSSID, strongest-first) | ✅ |
-| `/wifi psk <ssid> <passphrase>` — derive and print a key | ✅ (checkable against `wpa_passphrase` on any Linux box) |
-
-Everything **above** the radio is complete and verified off-hardware — the
-cipher, the frame conversion, the join sequencer and the scan list. A driver's
-remaining job is to carry frames and run the commands.
-
-Note that on a radio with **crypto offload — which Intel has — the hardware
-encrypts**: the driver installs the key and hands over plaintext. The software
-CCMP is what a SoftMAC part with no offload needs (`mac80211` carries the same
-code for the same reason) and what validates the key material.
-
-The radios are what is missing:
-
-| Radio | Status |
-|---|---|
-| Intel `iwlwifi` (AX200 and later) | ⚠️ **every command an association needs is now written** — bring-up, firmware load, *alive*, the MAC, `SCAN_REQ_UMAC` v17, the RX MPDU descriptor, PHY/MAC/binding contexts, `ADD_STA`, `ADD_STA_KEY` and `TX_CMD`. All from Linux's headers and **none of it verified against a radio**; nothing has driven the sequence end to end. A firmware whose scan version is not implemented is refused with the version named rather than sent a guess. |
-| Broadcom FullMAC (Apple Silicon) | ⚠️ blocked — BAR2/TCM reads take an external abort |
-| Realtek RTL8852 / RTL8821 | ❌ |
-| MediaTek MT7921 / MT7922 | ❌ |
-| Qualcomm Atheros ath10k/11k/12k | ❌ |
-
-Bring-up is **command-driven** (`/wifi up`), never automatic at boot: an
-untested driver should not touch a device just because the machine started.
-
-#### What "written but unverified" means for Intel specifically
-
-Every command an association needs now exists, in the order it goes out
-([`iwl/assoc.rs`](kernel/src/drivers/wifi/iwl/assoc.rs)):
-
-```text
-PHY_CONTEXT -> MAC_CONTEXT -> BINDING -> ADD_STA
-  -> (802.11 auth + assoc) -> MAC_CONTEXT again, with the AID
-  -> (four-way handshake) -> ADD_STA_KEY
-```
-
-That is roughly **sixty struct offsets and a dozen enum values**, every one
-taken from Linux's `fw/api/*.h` and checked against the header's own field list
-— and against nothing else. No emulator provides an Intel WiFi part, so not one
-byte of it has reached silicon.
-
-The reason to be blunt about that: **almost every mistake in this area produces
-a command the firmware accepts.** The ones already found and fixed, each of
-which would have looked entirely correct in review:
-
-- `flags` and `offload_assist` **swap position and width** between the AX200 and
-  AX210 transmit layouts. Both are bitmasks of small numbers.
-- `PHY_BAND_5` is **0** and `PHY_BAND_24` is **1** — the intuitive reading tunes
-  the radio to a 5 GHz channel number on the 2.4 GHz band.
-- `FW_CTXT_ACTION_ADD` is **1**, and these commands are built by zeroing a
-  buffer, which lands on `INVALID`.
-- An unused binding slot must be `FW_CTXT_INVALID`, **not zero** — zero is a
-  valid id/colour pair, so a zeroed array binds contexts that were never
-  configured.
-- `STA_KEY_FLG_KEY_32BYTES` shares bit 12 with `WEP_13BYTES`; set on a 16-byte
-  CCMP key the firmware reads 32 bytes out of a 16-byte field.
-- The RX descriptor is 48 or 64 bytes by hardware generation, with no marker in
-  the frame. Wrong, the 802.11 frame is read a few bytes inside itself and
-  `parse_beacon` returns a plausible network with a wrong BSSID.
-
-So the honest expectation is that driving this end to end on real hardware will
-surface **two or three more of the same kind**. That work is a boot on an
-Intel laptop, not more code.
-
-If you have an AX200/AX201 or AX210 machine, `/wifi up` then a scan is the first
-thing to try: the version gate reports immediately whether your firmware speaks
-a `SCAN_REQ_UMAC` layout that is implemented, and every refusal names itself in
-the ktrace.
-
-**Until then, plan for a wireless machine to use Ethernet, a USB Ethernet dongle
-(CDC-ECM), or an iPhone tether.**
-
-### Protocols — ✅
-
-Full TCP/IP on vendored smoltcp: DHCPv4, static IP, DNS, ICMP, TCP/UDP,
-loopback (a second interface with its own socket set). HTTP/1.1 client with
-streaming, **HTTPS with real certificate verification** against an embedded
-121-root Mozilla store (RSA PKCS#1 v1.5 + PSS on `crypto-bigint`, ECDSA P-256/
-P-384), WebSockets, MCP, SNTP, SSH version exchange.
-
-❌ Out of scope and documented as such: CRL/OCSP revocation. ❌ No IPv6.
-
----
-
-## Bluetooth — ⚠️ won't pair with modern devices
-
-| Layer | Status |
-|---|---|
-| USB HCI transport (class `E0/01/01`) | ✅ — dongles, and most laptop combo cards, which are internally USB |
-| HCI command/event codec | ✅ pure, unit-tested |
-| Classic BR/EDR inquiry (`/bluetooth scan`) | ✅ |
-| L2CAP + HID profile (PSM 0x11/0x13) | ✅ |
-| Durable bond store | ✅ |
-| **Secure Simple Pairing (SSP)** | ❌ |
-| **Bluetooth Low Energy (BLE)** | ❌ |
-| **A2DP / AVDTP / SBC (audio)** | ❌ |
-| UART / SDIO HCI transport | ❌ |
-
-Only **legacy PIN pairing** is implemented. SSP has been mandatory since
-Bluetooth 2.1 (2007), so in practice **a modern mouse, keyboard or headset will
-not pair.** And most current peripherals are BLE-only, which is absent
-entirely.
-
-Bluetooth today is best understood as staged infrastructure — the transport,
-codec and HID plumbing are real and the pairing model is a generation behind
-the devices people own.
-
----
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| WPA2-PSK supplicant | both | Working | Tests | Pure and vector-pinned: PBKDF2→PMK, PRF-384→PTK, EAPOL MIC, RFC 3394 unwrap. `/wifi psk` is checkable against `wpa_passphrase`. |
+| 802.11 frame parsing | both | Working | Tests | Beacons/RSN. Attacker-controlled, so a lying length is refused, never clamped. |
+| CCMP | both | Working | Tests | |
+| Broadcom (brcm) | arm | Partial | — | Firmware load and shared-ring location for scan/connect. Cannot associate yet. |
+| Intel (iwl) | x86 | Partial | — | Firmware handover and the alive notification. **Cannot scan or associate** — the configuration commands are large per-API-version structures and no emulator provides the part; writing them from memory would send well-formed garbage to a real radio. |
+| Realtek RTL8852, Qualcomm/Killer | — | **Absent** | — | |
 
 ## Audio
 
-### Controllers
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| Intel HDA | both | Working | QEMU, VBox | Built-in codecs; the VirtualBox path. |
+| virtio-snd | both | Working | QEMU | PCM in/out over mmio and PCI. |
+| AC'97 | x86 | Working | QEMU | |
+| Sound Blaster 16 | x86 | Working | QEMU | Uses bounded DMA allocation for the 8237's real constraints (<16 MiB, no 128 KiB straddle). |
+| USB audio (UAC 1.0) | both | Partial | Tests | Headsets and DACs over the isochronous OUT path. Descriptor layer tested. |
 
-| Driver | Platform | Status |
-|---|---|---|
-| Intel HDA | real Intel/ARM machines, VirtualBox (x86 *and* ARM), QEMU `intel-hda` | ✅ |
-| virtio-snd | QEMU (mmio + PCI) | ✅ |
-| AC'97 | x86 legacy | ✅ |
-| Sound Blaster 16 | x86 legacy | ✅ |
-| USB Audio Class (UAC1) | USB headsets, DACs | ✅ playback; ❌ capture — verified against QEMU's `usb-audio` |
-| Bluetooth A2DP | | ❌ |
+## Camera and video
 
-The HDA driver does a genuine codec-graph walk rather than guessing: it ranks
-the output pin complexes by `CONFIG_DEFAULT` (speaker, then headphone, then
-line-out, refusing pins the board wired nowhere and any SPDIF/HDMI pin belonging
-to the graphics device), then **searches the graph** from that pin back to a
-DAC — because the common shape is `pin ← mixer ← dac` and pointing the pin
-straight at "the first DAC we saw" leaves the codec mute. Every widget along the
-path gets its input select pointed at the next hop, its amp unmuted and power
-set to D0.
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| UVC camera | both | Partial | Tests | Descriptor parse, PROBE/COMMIT, bulk or isoc pick, frame reassembly. `/camera` grabs stills. Unverified against a physical camera. |
+| H.264 decode | both | Working | Tests (bit-exact vs ffmpeg) | Baseline + Main/High, CABAC, B-frames, deblocking. |
+| AAC / MP3 / WAV | both | Working | Tests | |
+| PNG / JPEG decode | both | Working | QEMU | Runs in **ring 3** — a malformed file becomes a status word from a discarded tenant. |
 
-### The limits — ⚠️
+## Power and thermal
 
-- ✅ **Stereo plays** on HDA for WAV and MP3 — the channel count rides on
-  `Audio` and the decoders keep their interleaving. Anything wider than stereo
-  is folded to stereo rather than to its first two channels, so a 5.1 track
-  keeps its centre.
-- ⚠️ **AAC still folds to mono**, so a video's audio track is mono. Its
-  downmix is a weighted BS.775 matrix rather than an average, so stereo means
-  writing a second matrix into a decoder that is bit-exact-validated against
-  Symphonia — deliberately not disturbed for a channel count.
-- ⚠️ Drivers other than HDA (virtio-snd, AC'97, SB16) fold to mono via the
-  default `SndDevice::play_ch`, so they are unchanged.
-- ❌ **No jack detection** (no unsolicited responses / pin sense). Plugging
-  headphones in does not switch output away from the speakers.
-- ⚠️ **Volume is software-only** — a gain applied in `sound::play`, so every
-  backend gets it without per-driver wiring (↑/↓ on the media tabs, plus mute).
-  The codec's own amps are set once to a 0 dB offset and never touched again, so
-  there is no hardware mixer and no per-stream levels.
-- ✅ **USB headsets and DACs play** (UAC1, isochronous OUT). Tried **last** in
-  autodetect, deliberately: this implements output only, so adopting a headset
-  as *the* sound device would take the microphone away and `/voice` is a
-  mic-to-model loop. It therefore serves machines that would otherwise have no
-  audio at all, and stays out of the way where a full-duplex device exists.
-  `/voice test` reports what was found either way.
-- ❌ **No USB audio capture** — a UAC capture stream is a second
-  AudioStreaming interface with an isochronous IN endpoint. `capture_start`
-  refuses by name rather than delivering silence.
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| ACPI S5 poweroff | x86 | Working | QEMU | Real `SLP_TYPa` from the DSDT's `\_S5_`, not just the debug-exit port. |
+| ACPI S3 suspend/resume | x86 | Partial | QEMU | Real-mode resume trampoline. |
+| PSCI suspend / poweroff | arm | Working | QEMU | |
+| Fixed-feature power button | x86 | Working | QEMU (`system_powerdown`) | Polled; write-1-to-clear on only the button bit. |
+| Control-method button (GPE) | x86 | Working | QEMU | `PNP0C0C` — what most laptops use. |
+| Battery (ACPI `_BST`/`_BIX`) | both | Partial | Tests | Reports remaining/last-full, sums multiple packs, `_PSR` for AC. **Unverified on hardware** — no emulator models an ACPI EC or battery. |
+| Embedded controller | both | Partial | Tests | `PNP0C09` via `_CRS`; bounded spins, unclaimed-port rejection. Unverified. |
+| Energy policy (EPB) | x86 | Working | QEMU | `/power performance\|powersave\|auto`. |
+| CPU frequency scaling | — | **Absent** | — | No P-states or governor. |
+| Thermal management | — | **Absent** | — | No trip points, no fan control. |
+| Backlight / brightness | — | **Absent** | — | |
 
-### Decoders — ✅
+## GPU compute
 
-WAV (PCM 8/16/24/32-bit + float32, any channel count), MP3 (a no_std port of
-minimp3, validated ±1 LSB against its own scalar decode), AAC-LC and HE-AAC
-with SBR/PS. `/open <file>.wav|.mp3|.aac` plays with transport controls.
+| Component | Arch | Status | Verified on | Notes |
+|---|---|---|---|---|
+| AGX coprocessor bring-up | arm | Working | **HW (Apple M2, t8112)** | PMGR power-on → GFXHandoff → RTKit HELLO/EPMAP/START_EP → RUNNING. UAT is real 16 KiB ARMv8 paging with the G14 bit-39 TTBR select. |
+| AGX compute dispatch | arm | Partial | HW (M2) | A hello-world dispatch returns the expected magic. |
+| GPU-accelerated inference | — | **Absent** | — | `cortex` is CPU-only on every machine; the matmul path is not wired to the GPU. This is the largest available performance win. |
+
+## Virtual-machine guest integration
+
+| Component | Status | Verified on | Notes |
+|---|---|---|---|
+| VirtualBox VMMDev / HGCM | Working | **VBox** | PCI `80ee:cafe`. |
+| VirtualBox shared clipboard | Working | **VBox** | Over HGCM. |
+| virtio-serial / vdagent clipboard | Working | QEMU | |
+| OSC 52 clipboard bridge | Working | QEMU, VBox | Works over a serial console with no guest driver at all. |
+| virtio-9p shared folder | Working | QEMU | |
 
 ---
 
-## Power and battery
+## Not implemented
 
-Everything in this section that touches a laptop is **⚠️ unverified**: QEMU
-emulates no ACPI embedded controller, no battery and no AC adapter.
+Grouped by what it would take, so the list is actionable rather than a lament.
 
-### Working — ✅
+**Needs a machine with the part in it** — the code cannot be written honestly
+without one, because a plausible-looking implementation would send well-formed
+garbage to real hardware and report success:
 
-| Capability | Status |
-|---|---|
-| ACPI S5 poweroff | ✅ real `SLP_TYPa` from the DSDT's `\_S5_`, not a QEMU debug port |
-| ACPI fixed-feature power button | ✅ verified in a VM via QEMU's `system_powerdown` |
-| CPU idle (`hlt` / `wfi`) | ✅ — the single biggest real-world power win here |
-| Local APIC timer calibrated against HPET, PIT fallback | ✅ |
+- WiFi scan/associate on Intel and Broadcom (and thus any wireless connectivity).
+- Realtek r8169 verification; Broadcom `tg3`, Atheros/Killer `alx`, Aquantia NICs.
+- HID-over-I²C touchpad, ACPI battery and EC — all unverified.
+- VMSVGA's MMIO BAR0 transport.
+- SDHCI, UVC and USB-audio hardware paths.
 
-### Written, unverified — ⚠️
+**Needs design, not just porting:**
 
-| Capability | Status |
-|---|---|
-| Battery percentage | ⚠️ ACPI `_BST` with `_BIX`/`_BIF` last-full capacity (never design capacity, or a worn pack reads permanently below 100%), evaluated through the AML interpreter over the embedded controller. Multiple packs summed; `_STA` bit 4 checks a bay is populated. |
-| AC adapter / charging | ⚠️ `ACPI0003._PSR`. Reported as *unknown* rather than guessed when no adapter device exists — once a pack is full, `_BST` reports neither charging nor discharging, so `_PSR` is the only signal that distinguishes plugged-in from running down. |
-| Embedded controller | ⚠️ `PNP0C09._CRS`-driven, bounded spins, `0xff` status rejected as an unclaimed port before any command is written |
-| Suspend to RAM | ⚠️ x86 ACPI **S3** (real-mode resume trampoline via the FACS waking vector); aarch64 **PSCI `SYSTEM_SUSPEND`** |
+- GPU-accelerated inference (AGX compute → `cortex` GEMM).
+- Real GPU drivers: i915, AMD, Apple AGX graphics.
+- CPU frequency scaling, thermal management, backlight.
+- TLS server (the client exists; the server side does not).
 
-`/suspend plan` is read-only and enumerates every precondition; the transition
-**refuses** unless all of them hold, because a suspend that does not resume is
-the worst failure this kernel can have.
-
-### Missing — ❌
-
-- ⚠️ **Resume re-probes the polled subsystems**: xHCI (so a USB keyboard comes
-  back), the NIC, and the sound device, alongside the APIC/GIC + timer, the
-  i8042 and the I2C-HID touchpad. Disks need nothing — they re-probe on first
-  access. Two documented costs: each re-probe **leaks its previous instance's
-  DMA pages** (bounded per resume; the frame allocator has no free path), and
-  the NIC comes back **unaddressed**, so a pre-suspend DHCP lease is not
-  re-asserted and `/network dhcp` is needed. `/suspend plan` says so before you
-  commit. All of it is still **unverified on real hardware**.
-- ❌ **Lid switch** (`PNP0C0D`) — closing a laptop lid does nothing.
-- ❌ **Thermal zones** (`_TMP`), fan control, thermal throttling. Under
-  sustained load the machine relies entirely on firmware and hardware thermal
-  protection.
-- ❌ **Control-method (GPE) power button** — reported when the FADT declares one
-  (flags bit 4), but GPE dispatch is unimplemented. Many laptops use this rather
-  than the fixed-feature button.
-- ❌ **CPU frequency scaling.** x86 gets `IA32_ENERGY_PERF_BIAS` (MSR `0x1B0`)
-  and three human modes; there is no HWP, no `_PSS`, no cpufreq governor.
-  aarch64 records the policy and applies nothing.
-- ❌ USB-C Power Delivery, charge thresholds, battery health limits.
-- ❌ Screen backlight (see [Display](#display)).
+**Absent outright:** printing, and any cross-device sync or sharing.
 
 ---
 
-## Other peripherals
-
-| Item | Status |
-|---|---|
-| USB webcam (UVC) | ⚠️ descriptor parse, PROBE/COMMIT, MJPEG/YUY2 frame assembly, `/camera grab` → one still. Unverified against a physical camera. |
-| Host shared folder (virtio-9p) | ✅ verified byte-exact both directions |
-| Host clipboard — OSC 52 over serial | ✅ (needs the console attached to a terminal) |
-| Host clipboard — SPICE vdagent over virtio-serial | ⚠️ link verified against QEMU's own trace; ❌ **does not reach the macOS pasteboard** (QEMU's `cocoa` display registers no clipboard peer — use OSC 52 or VirtualBox there) |
-| VirtualBox guest integration (HGCM) | ❌ transport only; the clipboard and shared-folder services are not implemented |
-| Printers, scanners, game controllers, MIDI, TPM, fingerprint readers, smartcards | ❌ |
-
----
-
-## Firmware and discovery
-
-Discovery follows what real firmware does, never an emulator quirk:
-ACPI/PCIe ECAM, UEFI GOP, fw_cfg, HID report descriptors, PrimeCell IDs, EDID,
-device tree. ACPI tables are explicitly mapped on x86 (they live in
-firmware-reserved regions outside Limine's HHDM, so both the physical address
-and its translation are unmapped and touching either faults the boot).
-
-The AML interpreter evaluates a **fail-closed subset** — an unsupported opcode
-returns nothing rather than a guessed value, because an evaluator that invents
-an integer is worse than the validated default it would replace.
-
-Interrupt-controller bases come from the device tree where there is one and from
-the ACPI MADT where there is not — which matters because those are *different
-real platforms*: QEMU `virt` boots with an FDT, while VirtualBox-ARM, UTM and
-real SBSA machines boot the UEFI stub with none.
-
----
-
-## Reporting a hardware failure
-
-The boot log is the diagnosis. Every driver here logs what it found, what it
-refused and why, through `ktrace` — a refusal is always a named reason, never
-silence. When filing an issue please include:
-
-1. `/lspci`, `/disks`, `/mounts`, `/network`, `/battery`, `/power` output.
-2. The serial boot log (`-serial mon:stdio` under QEMU; a USB-serial adapter or
-   a photo of the screen on bare metal).
-3. The exact machine — vendor, model, and for a NIC/WiFi/audio failure the PCI
-   vendor:device ID from `/lspci`.
-
-An unrecognised PCI ID is the single most useful thing you can send: several
-families here (`e1000e` in particular) grow by ID, and the log prints the one it
-guessed at.
-
-### Reproducing a claim in QEMU
-
-Most of the ✅ marks above can be re-checked without hardware. The device a run
-attaches is chosen by environment variable:
-
-| Knob | What it attaches |
-|---|---|
-| `CHITTI_DISK_IF=ahci\|nvme\|virtio-blk\|sd` | the storage controller — `sd` builds an `sdhci-pci` with a card in it |
-| `CHITTI_NIC=e1000\|e1000e\|igb\|rtl8139\|virtio-net-pci` | the NIC, so the by-device-ID dispatch can be exercised against every family QEMU emulates |
-| `CHITTI_USB=audio` | a UAC1 `usb-audio` device; with `CHITTI_AUDIO=off` it becomes the machine's only sound device, which is the configuration USB audio exists for |
-| `CHITTI_AUDIO=coreaudio\|pa\|none\|off` | the host audio backend, or none at all |
-| `CHITTI_SHARE=<dir>` | a host folder over virtio-9p |
-| `CHITTI_RESOLUTION=WxH` | the framebuffer geometry the loader asks for |
-
-For example, the SD/eMMC and USB-audio claims in this file were established
-with:
+## Verifying a change
 
 ```sh
-CHITTI_DISK_IF=sd cargo xtask run -arch x86_64 --release
-CHITTI_AUDIO=off CHITTI_USB=audio cargo xtask run -arch x86_64 --release
+cargo xtask build -arch x86_64 && cargo xtask build -arch aarch64
+cargo xtask test -arch x86_64  && cargo xtask test -arch aarch64
+make e2e                                   # boots the real kernel, drives the shell
 ```
 
-The pure layers — CCMP, the 802.11 data path, every Intel command's offsets,
-the codecs — are covered by `cargo xtask test`, which needs no devices at all.
+Exercising specific hardware paths under emulation:
 
+```sh
+CHITTI_DISK_IF=ahci|nvme|virtio-blk cargo xtask run -arch x86_64
+CHITTI_NIC=e1000|e1000e|igb|rtl8139|virtio-net-pci cargo xtask run -arch x86_64
+cargo xtask run -arch aarch64 --uefi        # the PCI/ACPI path (no PCI on plain -kernel)
+cargo xtask m1n1                            # Apple Silicon, bare metal
+```
+
+In the booted OS: `/lspci`, `/disks`, `/mounts`, `/battery`, `/power`, `/display`,
+`/network`, `/wifi info`, `/bluetooth`, `/camera`, `/touchscreen`, `/keyboard`,
+`/vbox diag`, and `/top`. Each reports how far bring-up got rather than failing
+silently — "the driver did not bind" and "the driver bound and the device is
+quiet" are different diagnoses, and the ktrace says which.
