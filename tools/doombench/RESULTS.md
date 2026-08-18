@@ -54,6 +54,12 @@ has no such margin, because the input size is the attacker's choice.
 
 ## Two numbers that constrain the port
 
+- **Fuel: ~50.1 M for init**, and that is the number a per-call ceiling has to
+  cover, because the largest single call is what a per-call budget must fit.
+  Init loads and indexes a 28 MB WAD and builds Doom's tables, so it is nothing
+  like a frame. `package_ui` hardcoded 2,000,000 and never read `wasm.fuel` at
+  all, so a package could declare a budget, appear to be granted it, and trap at
+  25x under what it needed. Found by booting the OS, not by a test.
 - **Fuel: ~2.32 M per frame**, measured on a *quiet* map start;
   `service/package_ui.rs`'s `CALL_FUEL` is **2,000,000 per export call**, so a Doom
   frame already exceeds the default by 1.2x before anything is happening on screen.
@@ -75,9 +81,11 @@ cargo run --release -- /path/to/freedoom1.wad 1200
 ```
 
 Freedoom is 3-clause BSD and freely redistributable:
-<https://github.com/freedoom/freedoom/releases>. It is deliberately **not** in
-`SAMPLE_FILES` — that corpus is embedded in the kernel image and is kept small, and
-this WAD is ~29 MB. On the running OS, fetch it with `/http -O`.
+<https://github.com/freedoom/freedoom/releases>. The OS ships a copy at
+`agents/freedoom/assets/freedoom1.wad`, so this harness can be pointed at that rather
+than at a download. It is deliberately **not** in `SAMPLE_FILES` — that corpus is
+fetched-never-committed to avoid taking a redistribution decision, which Freedoom's
+licence makes for us.
 
 ## Two things this harness found on the way
 

@@ -2065,6 +2065,24 @@ impl Xhci {
                             bits |= crate::keymap::Mods::GUI;
                         }
                         let mods = crate::keymap::Mods(bits);
+                        // **A modifier-only change still has to be reported.**
+                        // Everything below keys off the *usage array*, so pressing
+                        // Ctrl on its own — which changes `report[0]` and nothing
+                        // else — used to emit no event at all. The held-key state
+                        // is derived from `mods` inside `feed_event`, so with no
+                        // event it never updated and Ctrl read as permanently up.
+                        // Doom's fire button is Ctrl, and it silently never fired.
+                        //
+                        // `usage: 0` is "no key" and carries no character; the
+                        // event exists only to refresh the modifier derivation.
+                        if report[0] != k.prev[0] {
+                            crate::keymap::feed_event(crate::keymap::KeyEvent {
+                                usage: 0,
+                                mods,
+                                pressed: false,
+                                src: crate::keymap::Source::UsbHid,
+                            });
+                        }
                         // Releases first, so a key held across two reports is not
                         // re-pressed and the software typematic sees the edge.
                         for &usage in &k.prev[2..8] {

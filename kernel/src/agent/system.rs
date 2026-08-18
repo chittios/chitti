@@ -163,6 +163,35 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         )],
     },
     SystemAgentDef {
+        name: "freedoom",
+        soul: include_str!("../../../agents/freedoom/SOUL.md"),
+        manifest_json: include_str!("../../../agents/freedoom/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 48),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 48),
+        // The IWAD ships with the OS. Freedoom is 3-clause BSD, so redistribution
+        // is permitted **provided the licence and credits travel with it** — which
+        // is why those two files are assets and not just a note in the SOUL.
+        assets: &[],
+        binary_assets: &[
+            (
+                "tools.wasm",
+                include_bytes!("../../../agents/freedoom/assets/tools.wasm"),
+            ),
+            (
+                "freedoom1.wad",
+                include_bytes!("../../../agents/freedoom/assets/freedoom1.wad"),
+            ),
+            (
+                "FREEDOOM-COPYING.txt",
+                include_bytes!("../../../agents/freedoom/assets/FREEDOOM-COPYING.txt"),
+            ),
+            (
+                "FREEDOOM-CREDITS.txt",
+                include_bytes!("../../../agents/freedoom/assets/FREEDOOM-CREDITS.txt"),
+            ),
+        ],
+    },
+    SystemAgentDef {
         name: "snake",
         soul: include_str!("../../../agents/snake/SOUL.md"),
         manifest_json: include_str!("../../../agents/snake/manifest.json"),
@@ -648,6 +677,20 @@ pub fn manifest_frame_ms(id: u64) -> Option<u32> {
     let j = Json::parse(def.manifest_json)?;
     let v = j.get("wasm")?.get("frame_ms")?.as_i64()?;
     Some(v.clamp(8, 180) as u32)
+}
+
+/// Whether this package's module is built against a libc (`wasm.native`).
+///
+/// Opt-in because the extra imports are a (read-only) filesystem view, and an app
+/// that does not need one should not be handed it. A Rust `no_std` guest imports
+/// nothing from WASI and must stay on the narrower surface.
+pub fn manifest_native(id: u64) -> bool {
+    SYSTEM_AGENTS
+        .iter()
+        .find(|d| d.agent_id.0 == id)
+        .and_then(|def| Json::parse(def.manifest_json))
+        .and_then(|j| j.get("wasm").and_then(|w| w.get("native")).and_then(|v| v.as_bool()))
+        .unwrap_or(false)
 }
 
 pub fn manifest_pages(id: u64) -> Option<u32> {
@@ -1522,12 +1565,13 @@ mod tests {
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
         // SOUL + package agents (no network/http plumbing as agents).
-        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git.
-        assert_eq!(SYSTEM_AGENTS.len(), 47);
+        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git + freedoom.
+        assert_eq!(SYSTEM_AGENTS.len(), 48);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "browser"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "notes"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "freedoom"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "snake"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "todo"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "download"));

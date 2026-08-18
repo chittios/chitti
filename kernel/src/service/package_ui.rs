@@ -688,12 +688,35 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
         task,
         surface,
     };
+    // Per-call fuel from the manifest. This was hardcoded to `CALL_FUEL`, so
+    // `wasm.fuel` was read for chat tool calls and **silently ignored for the app
+    // itself** — a package could declare a budget, appear to be granted it, and
+    // still trap at 2 M. It is a ceiling, not a cost: an app that finishes in
+    // 50 k is unaffected by a large number here.
+    let call_fuel = crate::agent::system::manifest_fuel(agent_id).unwrap_or(CALL_FUEL);
     let limits = Limits::default()
-        .with_fuel(CALL_FUEL)
+        .with_fuel(call_fuel)
         // 64 pages (4 MiB) unless the manifest asks for more — every existing app
         // declares none and so keeps exactly its old ceiling.
-        .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64));
-    let session = Session::instantiate(&wasm, limits, bind).map_err(|e| {
+        .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64))
+        // A libc-built guest is full of function pointers; the default 256 is far
+        // too tight (the PDF renderer needed 693). Raised only for `wasm.native`
+        // packages so every existing guest keeps exactly its old bound.
+        .with_table_elems(if crate::agent::system::manifest_native(agent_id) {
+            4096
+        } else {
+            crate::agent::wasm_rt::DEFAULT_MAX_TABLE_ELEMS
+        });
+    // A libc-built guest (`wasm.native`) imports WASI whether or not it uses it,
+    // so it needs the wider import set or it fails at instantiation with
+    // `missing imports` — a message that names nothing. Opt-in per package: an
+    // app that does not need a filesystem view is not handed one.
+    let instantiate = if crate::agent::system::manifest_native(agent_id) {
+        Session::instantiate_native
+    } else {
+        Session::instantiate
+    };
+    let session = instantiate(&wasm, limits, bind).map_err(|e| {
         crate::serial_println!("package_ui> {name}: wasm instantiate failed: {e}");
         let raw = format!(
             r#"{{"name":"ui_surface_close","arguments":{{"surface":{surface}}}}}"#
@@ -740,7 +763,7 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
                 task,
                 surface,
                 session,
-                fuel: CALL_FUEL,
+                fuel: call_fuel,
                 asking: false,
                 frame_ms,
                 // Zero, not `now`, so the first frame runs on the very next pump
@@ -755,8 +778,22 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
     let init_args = format!(r#"{{"app":"{name}","surface":{surface},"model":{model}}}"#);
     let mut init_result: Result<String, &'static str> = Err("init not run");
     crate::synapse::ui::with_deferred_present(|| {
-        init_result = call_surface(surface, &start_owned, &init_args)
-            .or_else(|_| call_surface(surface, "app_start", &init_args));
+        init_result = match call_surface(surface, &start_owned, &init_args) {
+            Ok(v) => Ok(v),
+            Err(primary) => {
+                // `app_start` is the older convention; try it, but **report the
+                // primary export's error** if both fail. Returning the fallback's
+                // told you "export missing or wrong type" about a name the package
+                // never claimed, while the real failure — a fuel trap inside
+                // `doom_start` — went unmentioned. A diagnostic that names the
+                // wrong symbol is worse than none: it sends you to look at the ABI
+                // when the ABI was fine.
+                match call_surface(surface, "app_start", &init_args) {
+                    Ok(v) => Ok(v),
+                    Err(_) => Err(primary),
+                }
+            }
+        };
     });
     match init_result {
         Ok(s) if s.starts_with("ask:") => {
@@ -950,14 +987,56 @@ fn forward_key(key: &str) -> bool {
 
 /// Forward an arrow key (CSI final byte) to the focused package app.
 pub fn nav(fin: u8) -> bool {
+    let polls = focused_app_polls_input();
     match nav_key_name(fin) {
-        Some(key) => forward_key(key),
+        Some(key) => forward_key(key) || polls,
         None => false,
     }
 }
 
 /// Forward a printable / Enter / Esc key to the focused package app.
+/// Whether the focused app reads input by **polling** rather than by `on_key`.
+///
+/// A realtime app (one that declared `wasm.frame_ms`) reads `host_keys_held`
+/// once per frame, so it exports no `on_key` and the push path would find
+/// nothing to call — leaving every keystroke to fall through to the shell. That
+/// is not merely untidy: with a chat agent behind the prompt, typing `w` to walk
+/// forward sends `w` to a language model. It cost a 16-second remote inference
+/// to discover.
+///
+/// So a focused realtime app consumes **everything** the shell would otherwise
+/// take as chat. Partial consumption is the wrong shape here — the composer gets
+/// the remainder, which is how an image tab once turned a typed URL into
+/// `http://1..2.2:81/ogo.png` by eating only `0` and `l`.
+///
+/// The escapes are unaffected because they are handled **before** this: Ctrl+Tab
+/// moves focus, Ctrl+C interrupts, Ctrl+W closes the tab. Without one of those
+/// this would be a keyboard trap, which is why it is worth naming them here.
+fn focused_app_polls_input() -> bool {
+    let Some(surface) = input_target_surface() else {
+        return false;
+    };
+    APPS.with(|m| {
+        m.get(&surface)
+            .is_some_and(|r| r.frame_ms != HOUSEKEEPING_MS)
+    })
+}
+
 pub fn key(c: u8) -> bool {
+    // A polling app still gets the key *forwarded*, it just also consumes it
+    // unconditionally. Both halves matter and I had only the second:
+    //
+    // Held-key state answers "is W down", which is movement. It cannot answer
+    // "what character did the user type", because that is layout-dependent and
+    // `keymap` has already done that work — a guest re-deriving it from physical
+    // usages would be a second, worse layout table. So text entry (Doom's save
+    // menu) needs the *byte*, and discarding it made the menu unusable.
+    //
+    // Consuming regardless is what keeps a keystroke out of the chat agent even
+    // when the guest ignores it. **Not** the other control bytes: Ctrl+C (0x03),
+    // Ctrl+W (0x17) and Ctrl+Tab are the OS escapes, and swallowing them would
+    // turn a focused game into a keyboard trap with no way out.
+    let polls = focused_app_polls_input();
     let key: String = match c {
         b'\r' | b'\n' => "enter".to_string(),
         b' ' => "space".to_string(),
@@ -965,7 +1044,7 @@ pub fn key(c: u8) -> bool {
         0x21..=0x7e => (c as char).to_string(),
         _ => return false,
     };
-    forward_key(&key)
+    forward_key(&key) || polls
 }
 
 #[cfg(test)]
