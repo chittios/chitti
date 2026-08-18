@@ -528,11 +528,18 @@ mod wasm {
             .ok()?
             .call(&mut store, (dst as u32, wad.len() as u32))
             .ok()?;
+        let pre_init = store.get_fuel().ok()?;
         inst.get_typed_func::<(), ()>(&store, "dg_create")
             .ok()?
             .call(&mut store, ())
             .ok()?;
+        let post_init = store.get_fuel().ok()?;
+        println!("fuel: {} for init (WAD load + tables)", pre_init.saturating_sub(post_init));
 
+        // Init is measured separately: it loads and indexes a 28 MB WAD and builds
+        // Doom's tables, so it is nothing like a frame — and it is the number that
+        // decides the manifest's per-call budget, because the *largest* single call
+        // is what a per-call ceiling has to cover.
         let tick = inst.get_typed_func::<(), ()>(&store, "dg_tick").ok()?;
         let before = store.get_fuel().ok()?;
         for _ in 0..frames {

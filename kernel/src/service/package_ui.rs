@@ -688,8 +688,14 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
         task,
         surface,
     };
+    // Per-call fuel from the manifest. This was hardcoded to `CALL_FUEL`, so
+    // `wasm.fuel` was read for chat tool calls and **silently ignored for the app
+    // itself** — a package could declare a budget, appear to be granted it, and
+    // still trap at 2 M. It is a ceiling, not a cost: an app that finishes in
+    // 50 k is unaffected by a large number here.
+    let call_fuel = crate::agent::system::manifest_fuel(agent_id).unwrap_or(CALL_FUEL);
     let limits = Limits::default()
-        .with_fuel(CALL_FUEL)
+        .with_fuel(call_fuel)
         // 64 pages (4 MiB) unless the manifest asks for more — every existing app
         // declares none and so keeps exactly its old ceiling.
         .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64))
@@ -757,7 +763,7 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
                 task,
                 surface,
                 session,
-                fuel: CALL_FUEL,
+                fuel: call_fuel,
                 asking: false,
                 frame_ms,
                 // Zero, not `now`, so the first frame runs on the very next pump
@@ -772,8 +778,22 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
     let init_args = format!(r#"{{"app":"{name}","surface":{surface},"model":{model}}}"#);
     let mut init_result: Result<String, &'static str> = Err("init not run");
     crate::synapse::ui::with_deferred_present(|| {
-        init_result = call_surface(surface, &start_owned, &init_args)
-            .or_else(|_| call_surface(surface, "app_start", &init_args));
+        init_result = match call_surface(surface, &start_owned, &init_args) {
+            Ok(v) => Ok(v),
+            Err(primary) => {
+                // `app_start` is the older convention; try it, but **report the
+                // primary export's error** if both fail. Returning the fallback's
+                // told you "export missing or wrong type" about a name the package
+                // never claimed, while the real failure — a fuel trap inside
+                // `doom_start` — went unmentioned. A diagnostic that names the
+                // wrong symbol is worse than none: it sends you to look at the ABI
+                // when the ABI was fine.
+                match call_surface(surface, "app_start", &init_args) {
+                    Ok(v) => Ok(v),
+                    Err(_) => Err(primary),
+                }
+            }
+        };
     });
     match init_result {
         Ok(s) if s.starts_with("ask:") => {
