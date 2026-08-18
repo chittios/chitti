@@ -1178,3 +1178,31 @@ pub fn present_pixels(task: TaskId, id: u32, w: usize, h: usize) -> Result<usize
 pub fn surface_dims(id: u32) -> Option<(usize, usize)> {
     SURFACES.with(|m| m.get(&id).map(|s| (s.w, s.h)))
 }
+
+/// Resize a surface, from the **kernel** side.
+///
+/// Deliberately not a primitive and not reachable from a guest. A package UI's
+/// resolution is a property of its signed manifest, fixed at install time and
+/// approved by the human then — not something the running guest asks for. So this
+/// widens no authority: `ui_surface_request` still takes only a `kind`, the
+/// grammar is unchanged, and the primitive count is unaffected.
+///
+/// The contents are dropped rather than rescaled. A resize happens once, at
+/// startup, before anything has been drawn; scaling an empty buffer would only be
+/// a slower way to clear it, and scaling a *drawn* one would invent pixels.
+pub fn resize(owner: TaskId, id: u32, w: usize, h: usize) -> Result<(usize, usize), DrawErr> {
+    let (w, h) = clamp_surface_dims(w, h);
+    SURFACES.with(|m| {
+        let s = m.get_mut(&id).ok_or(DrawErr::NoSuchSurface)?;
+        if s.owner != owner {
+            return Err(DrawErr::NotOwner);
+        }
+        if s.w != w || s.h != h {
+            s.w = w;
+            s.h = h;
+            s.back = vec![0u32; w * h];
+            s.labels.clear();
+        }
+        Ok((w, h))
+    })
+}

@@ -1113,6 +1113,24 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
     linker
         .func_wrap(
             "chitti",
+            "host_surface_size",
+            |caller: Caller<'_, HostState>| -> i64 {
+                // (w << 32) | h, or 0 if this binding owns no surface. Inert: it
+                // reports the geometry the kernel already chose for this guest
+                // from its own manifest, so there is nothing to gate — the same
+                // reason `host_surface_id` and `host_now_ms` are plain imports.
+                let sid = caller.data().bind.surface;
+                match crate::synapse::ui::surface_dims(sid) {
+                    Some((w, h)) => ((w as i64) << 32) | (h as i64 & 0xffff_ffff),
+                    None => 0,
+                }
+            },
+        )
+        .map_err(|_| "define host_surface_size")?;
+
+    linker
+        .func_wrap(
+            "chitti",
             "host_surface_id",
             |caller: Caller<'_, HostState>| -> i32 { caller.data().bind.surface as i32 },
         )

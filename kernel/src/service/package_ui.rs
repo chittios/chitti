@@ -50,6 +50,13 @@ struct Running {
     fuel: u64,
     /// Model ask in flight for this app: surface input is dropped.
     asking: bool,
+    /// Target frame interval. `HOUSEKEEPING_MS` for an ordinary event-driven app;
+    /// a smaller value for a **realtime** one that declared `wasm.frame_ms`.
+    frame_ms: u64,
+    /// When this app last ticked. Per-app, not global: one shared timestamp meant
+    /// the first app to tick set it for everyone, so N apps each ticked at 1/N of
+    /// the intended rate — invisible with one app open, which is the usual case.
+    last_tick_ms: u64,
 }
 
 /// All live package-UI apps, keyed by surface id.
@@ -63,7 +70,12 @@ static TITLES: Locked<BTreeMap<u32, String>> = Locked::new(BTreeMap::new());
 static STOP_PENDING: Locked<alloc::vec::Vec<u32>> = Locked::new(alloc::vec::Vec::new());
 /// Most recently started / focused package surface (for stop() without a tab).
 static FOCUS_SURFACE: AtomicU32 = AtomicU32::new(0);
-static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+/// Housekeeping cadence for an ordinary, event-driven package UI.
+///
+/// Unchanged at 180 ms: these apps redraw on input, and a faster poll would cost
+/// a ring-3 crossing, an audit entry and a full pane-scale present per app per
+/// tick for no benefit. A **realtime** app opts out via `wasm.frame_ms`.
+const HOUSEKEEPING_MS: u64 = 180;
 /// True while any guest export is running (prevents re-entrant map take-out).
 static IN_GUEST: AtomicBool = AtomicBool::new(false);
 /// Global gate: only one model ask at a time (ui_agent_reply is shell-global).
@@ -685,6 +697,31 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
         clear_title(surface);
         e
     })?;
+    // A package UI's native resolution and frame budget come from its **signed
+    // manifest**, not from the running guest — so the kernel applies both here
+    // and `ui_surface_request` keeps taking only a `kind`. That is why neither
+    // needed a grammar change or a new primitive: the guest's authority is
+    // exactly what it was.
+    if let Some((mw, mh)) = crate::agent::system::manifest_surface(agent_id) {
+        match crate::synapse::ui::resize(task, surface, mw as usize, mh as usize) {
+            Ok((w, h)) => {
+                crate::serial_println!("package_ui> {name}: surface {surface} sized {w}x{h}")
+            }
+            Err(e) => crate::serial_println!(
+                "package_ui> {name}: surface resize to {mw}x{mh} refused ({e:?}) — keeping default"
+            ),
+        }
+    }
+    let frame_ms = crate::agent::system::manifest_frame_ms(agent_id)
+        .map(|v| v as u64)
+        .unwrap_or(HOUSEKEEPING_MS);
+    if frame_ms != HOUSEKEEPING_MS {
+        crate::serial_println!(
+            "package_ui> {name}: realtime, {frame_ms} ms/frame ({} fps target)",
+            1000 / frame_ms.max(1)
+        );
+    }
+
     let start_owned = start_export_name(name);
     crate::serial_println!("package_ui> {name}: wasm ready, calling {start_owned}…");
 
@@ -699,6 +736,10 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
                 session,
                 fuel: CALL_FUEL,
                 asking: false,
+                frame_ms,
+                // Zero, not `now`, so the first frame runs on the very next pump
+                // rather than after a full frame of nothing.
+                last_tick_ms: 0,
             },
         );
     });
@@ -803,22 +844,38 @@ pub fn tick() {
     }
 
     let now = crate::arch::now_ms();
-    if now.saturating_sub(LAST_TICK_MS.load(Ordering::Relaxed)) < 180 {
-        return;
-    }
-    LAST_TICK_MS.store(now, Ordering::Relaxed);
 
-    // Re-read after click handling (map may have changed).
-    let apps: Vec<(String, u32, bool)> = APPS.with(|m| {
+    // Re-read after click handling (map may have changed). Each app carries its
+    // own cadence and its own last-tick stamp, so a realtime game runs at its
+    // frame rate without dragging every other app up to it — and, more to the
+    // point, without every other app dragging *it* down.
+    let apps: Vec<(String, u32, bool, u64)> = APPS.with(|m| {
         m.values()
-            .map(|x| (x.name.clone(), x.surface, x.asking))
+            .filter(|x| now.saturating_sub(x.last_tick_ms) >= x.frame_ms)
+            .map(|x| (x.name.clone(), x.surface, x.asking, x.frame_ms))
             .collect()
     });
-    for (name, surface, asking) in apps {
+    for (name, surface, asking, frame_ms) in apps {
         if is_stop_pending(surface) {
             continue;
         }
-        if let Ok(out) = call_surface(surface, "tick", &format!(r#"{{"app":"{name}"}}"#)) {
+        // Stamp *before* the call, not after. A frame that takes longer than its
+        // budget would otherwise schedule the next one immediately on return, so
+        // a heavy app would monopolise `upkeep` and starve the clock, the mouse
+        // and the net stack — the cooperative-scheduler failure this whole file
+        // is careful about.
+        APPS.with(|m| {
+            if let Some(r) = m.get_mut(&surface) {
+                r.last_tick_ms = now;
+            }
+        });
+        // The guest is handed the elapsed time so it can advance its own
+        // simulation honestly. `dt` rather than a frame counter because the pump
+        // is driven by `upkeep()`, whose cadence is opportunistic — a fixed step
+        // would drift against the wall clock whenever the machine is busy.
+        let dt = frame_ms;
+        let args = format!(r#"{{"app":"{name}","dt":{dt}}}"#);
+        if let Ok(out) = call_surface(surface, "tick", &args) {
             if !asking {
                 let _ = handle_result(surface, out);
             }

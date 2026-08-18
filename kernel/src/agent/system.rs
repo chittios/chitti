@@ -621,6 +621,35 @@ pub fn manifest_fuel(id: u64) -> Option<u64> {
 /// two are not interchangeable. The default 2 MiB suits a tool that digests one
 /// small argument, and is well under what a guest handling a whole *document*
 /// needs — the git agent's clone holds a packfile plus every object it unpacks.
+/// A package UI's native surface size, from `wasm.surface_w` / `wasm.surface_h`.
+///
+/// Both must be present; a half-specified size is ignored rather than mixed with
+/// the default, because 320x192 is a shape nobody asked for and the symptom would
+/// be a subtly squashed picture rather than an error.
+pub fn manifest_surface(id: u64) -> Option<(u32, u32)> {
+    let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
+    let j = Json::parse(def.manifest_json)?;
+    let w = j.get("wasm")?.get("surface_w")?.as_i64()?;
+    let h = j.get("wasm")?.get("surface_h")?.as_i64()?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some((w as u32, h as u32))
+}
+
+/// Target frame interval in ms for a **realtime** package UI (`wasm.frame_ms`).
+///
+/// Presence is what marks an app realtime: an ordinary app is event-driven and
+/// keeps the shared 180 ms housekeeping tick, while a game needs a frame budget.
+/// Clamped to a sane band — 0 would spin and anything over the housekeeping tick
+/// is just an ordinary app with extra steps.
+pub fn manifest_frame_ms(id: u64) -> Option<u32> {
+    let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
+    let j = Json::parse(def.manifest_json)?;
+    let v = j.get("wasm")?.get("frame_ms")?.as_i64()?;
+    Some(v.clamp(8, 180) as u32)
+}
+
 pub fn manifest_pages(id: u64) -> Option<u32> {
     let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
     let j = Json::parse(def.manifest_json)?;
