@@ -1008,9 +1008,12 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                 if bind.task == 0 || bind.surface == 0 {
                     return -2;
                 }
+                // -3 is distinct from -1 on purpose: "one of your ops is too long"
+                // is a guest bug it can fix, "refused" is not.
                 match syn_ui_draw(bind.task, bind.surface, &ops) {
-                    true => 0,
-                    false => -1,
+                    Ok(()) => 0,
+                    Err(UiDrawErr::Refused) => -1,
+                    Err(UiDrawErr::Unsplittable) => -3,
                 }
             },
         )
@@ -1929,12 +1932,99 @@ fn syn_ui_hud(task: TaskId, surface: u32, text: &str) -> bool {
     syn_in_userspace(task, &raw)
 }
 
-fn syn_ui_draw(task: TaskId, surface: u32, ops: &str) -> bool {
-    let ops_esc = ops.replace('\\', "\\\\").replace('"', "\\\"");
-    let raw = format!(
-        r#"{{"name":"ui_draw","arguments":{{"surface":{surface},"ops":"{ops_esc}"}}}}"#
-    );
-    syn_in_userspace(task, &raw)
+/// JSON-escape the two characters that can appear inside an op program's text.
+fn esc_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Render one `ui_draw` call envelope around **already-escaped** ops.
+fn render_ui_draw(surface: u32, ops_esc: &str) -> String {
+    format!(r#"{{"name":"ui_draw","arguments":{{"surface":{surface},"ops":"{ops_esc}"}}}}"#)
+}
+
+/// Split a `;`-separated draw program into the fewest calls whose rendered
+/// envelopes each fit `cap` bytes. Returns escaped op runs, ready for
+/// [`render_ui_draw`].
+///
+/// This exists because a guest `ui_draw` crosses into ring 3, and
+/// [`crate::synapse::tenant::block::CAPACITY`] (1920) bounds the whole call
+/// text — envelope included. Before chunking, a program over that limit was
+/// **silently not drawn**: `invoke_in_userspace` returned `None`, `host_ui_draw`
+/// returned -1, and the guest had no way to tell that from any other failure. A
+/// fresh 9×9 minesweeper board is ~2.2 KB of ops, so it never rendered at all,
+/// and snake stopped repainting past roughly length 65.
+///
+/// Splitting is safe because ops are independent statements applied in order
+/// (`apply_surface` in a loop), so N calls leave `back` in exactly the state one
+/// call would have. The caller defers presents so the frame still presents once.
+///
+/// The envelope overhead is **measured, not counted by hand** — a miscounted
+/// constant here would reintroduce the silent-drop bug at a slightly different
+/// threshold, which is strictly harder to find than the original.
+///
+/// `None` means a *single* statement cannot fit even alone. That is reported
+/// rather than truncated: a partial statement is either a parse error or, worse,
+/// a valid statement with different arguments.
+fn split_ops(surface: u32, ops: &str, cap: usize) -> Option<Vec<String>> {
+    let budget = cap.checked_sub(render_ui_draw(surface, "").len())?;
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for stmt in ops.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let e = esc_json(stmt);
+        if e.len() > budget {
+            return None;
+        }
+        // +1 for the `;` that would rejoin it.
+        let need = if cur.is_empty() { e.len() } else { cur.len() + 1 + e.len() };
+        if need > budget {
+            out.push(core::mem::take(&mut cur));
+        } else if !cur.is_empty() {
+            cur.push(';');
+        }
+        cur.push_str(&e);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+/// What `host_ui_draw` reports, so a guest can tell the three cases apart.
+enum UiDrawErr {
+    /// One statement is too long to cross the boundary even by itself.
+    Unsplittable,
+    /// A chunk was refused by the gates, or userspace never ran it.
+    Refused,
+}
+
+fn syn_ui_draw(task: TaskId, surface: u32, ops: &str) -> Result<(), UiDrawErr> {
+    let cap = crate::synapse::tenant::block::CAPACITY;
+    let Some(chunks) = split_ops(surface, ops, cap) else {
+        crate::ktrace::log_fmt(format_args!(
+            "ui_draw: a single op is longer than the {cap}-byte ring-3 call block — not drawn"
+        ));
+        return Err(UiDrawErr::Unsplittable);
+    };
+    // One present for the whole program, not one per chunk: presenting re-rasterizes
+    // every label at pane scale, so a chunked frame would pay that N times.
+    let mut ok = true;
+    crate::synapse::ui::with_deferred_present(|| {
+        for c in &chunks {
+            if !syn_in_userspace(task, &render_ui_draw(surface, c)) {
+                ok = false;
+                break;
+            }
+        }
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(UiDrawErr::Refused)
+    }
 }
 
 fn map_trap(err: wasmi::Error) -> &'static str {
@@ -2056,6 +2146,113 @@ pub const FIXTURE_HOST_STORAGE: &[u8] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every chunk must actually fit the ring-3 call block once enveloped —
+    /// which is the whole point, and the thing a hand-counted overhead
+    /// constant would get subtly wrong.
+    fn assert_chunks_fit(surface: u32, ops: &str, cap: usize) -> Vec<String> {
+        let chunks = split_ops(surface, ops, cap).expect("splittable");
+        for c in &chunks {
+            let rendered = render_ui_draw(surface, c);
+            assert!(
+                rendered.len() <= cap,
+                "chunk renders to {} bytes, over the {cap}-byte block: {rendered}",
+                rendered.len()
+            );
+        }
+        chunks
+    }
+
+    /// Rejoining the chunks must reproduce the original program, statement for
+    /// statement — a chunker that dropped or duplicated one would still produce
+    /// a plausible picture, which is exactly the failure mode being fixed.
+    #[test_case]
+    fn split_ops_preserves_every_statement() {
+        let ops = (0..200)
+            .map(|i| format!("rect {i} {i} 4 4 ff0000"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let chunks = assert_chunks_fit(7, &ops, crate::synapse::tenant::block::CAPACITY);
+        assert!(chunks.len() > 1, "200 rects must need more than one call");
+        assert_eq!(chunks.join(";"), ops);
+    }
+
+    /// A program that already fits must stay exactly one call, so the common
+    /// case pays nothing for chunking existing.
+    #[test_case]
+    fn a_small_program_is_one_call() {
+        let ops = "clear 000000;rect 1 2 3 4 ffffff";
+        let chunks = assert_chunks_fit(1, ops, crate::synapse::tenant::block::CAPACITY);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], ops);
+    }
+
+    /// The two shipped regressions, pinned as cases: a fresh 9x9 minesweeper
+    /// board (~2.2 KB) and a long snake body both exceed the block and must now
+    /// split rather than vanish.
+    #[test_case]
+    fn the_boards_that_silently_did_not_draw_now_split() {
+        let cap = crate::synapse::tenant::block::CAPACITY;
+        // Shape of mines::paint — a cell rect plus a label per cell.
+        let mut ops = String::from("clear 1a1a2e");
+        for r in 0..9 {
+            for c in 0..9 {
+                ops.push_str(&format!(";rect {} {} 18 18 303048", 16 + c * 20, 6 + r * 20));
+            }
+        }
+        assert!(ops.len() > cap, "fixture must exceed the block to be a regression test");
+        let chunks = assert_chunks_fit(3, &ops, cap);
+        assert_eq!(chunks.join(";"), ops);
+
+        // Shape of snake::paint at a length that used to stop repainting.
+        let mut snake = String::from("clear 000000");
+        for i in 0..90 {
+            snake.push_str(&format!(";rect {} {} 6 6 00ff00", i % 40 * 6, i / 40 * 6));
+        }
+        assert!(snake.len() > cap);
+        let chunks = assert_chunks_fit(4, &snake, cap);
+        assert_eq!(chunks.join(";"), snake);
+    }
+
+    /// A single unsplittable statement is reported, never truncated: half a
+    /// statement is either a parse error or a valid statement with different
+    /// arguments, and both are worse than an error the guest can see.
+    #[test_case]
+    fn one_oversized_statement_is_refused_not_truncated() {
+        let huge = format!("text 0 0 12 ffffff {}", "x".repeat(4096));
+        assert!(split_ops(1, &huge, crate::synapse::tenant::block::CAPACITY).is_none());
+        // And it is refused even when other statements would have fit.
+        let mixed = format!("clear 000000;{huge};rect 0 0 1 1 ffffff");
+        assert!(split_ops(1, &mixed, crate::synapse::tenant::block::CAPACITY).is_none());
+    }
+
+    /// Escaping happens before the fit check, so a program of quotes cannot
+    /// pass the budget and then overflow the block once escaped.
+    #[test_case]
+    fn escaping_is_counted_against_the_budget() {
+        let cap = crate::synapse::tenant::block::CAPACITY;
+        // Each `"` becomes two bytes; unescaped this fits, escaped it must split.
+        let one = "text 0 0 12 ffffff ".to_string() + &"\"".repeat(64);
+        let ops = (0..20).map(|_| one.clone()).collect::<Vec<_>>().join(";");
+        assert!(ops.len() < cap * 4);
+        let _ = assert_chunks_fit(2, &ops, cap);
+    }
+
+    /// Empty and separator-only programs are not calls at all. `draw` with an
+    /// empty program would still present, so emitting zero chunks is correct.
+    #[test_case]
+    fn an_empty_program_makes_no_calls() {
+        let cap = crate::synapse::tenant::block::CAPACITY;
+        assert_eq!(split_ops(1, "", cap).expect("ok").len(), 0);
+        assert_eq!(split_ops(1, ";;  ;", cap).expect("ok").len(), 0);
+    }
+
+    /// A capacity smaller than the envelope itself must not underflow into a
+    /// vast budget — `checked_sub` is load-bearing here.
+    #[test_case]
+    fn a_capacity_below_the_envelope_is_none() {
+        assert!(split_ops(1, "clear 000000", 4).is_none());
+    }
 
     #[test_case]
     fn add_i32_fixture() {
