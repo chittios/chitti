@@ -398,12 +398,30 @@ pub fn primitives_for(caps: &[CapabilityRequest]) -> Vec<PrimitiveId> {
                 }
                 if c.rights.contains(Rights::WRITE) {
                     prims.push(registry::UI_DRAW);
+                    // Presenting a frame is drawing — same authority, same
+                    // ownership gate, different payload shape. Omitting it here is
+                    // how a primitive can exist, be registered, pass its grammar
+                    // and still be unreachable by **every** agent: the denial is
+                    // `no matching capability`, which reads like a manifest
+                    // mistake rather than a missing line in this table.
+                    prims.push(registry::UI_PRESENT);
                     prims.push(registry::BOARD_SET);
                     prims.push(registry::BOARD_MARK);
                     prims.push(registry::UI_HUD);
                 }
                 if c.rights.contains(Rights::DELETE) {
                     prims.push(registry::UI_SURFACE_CLOSE);
+                }
+                // Audio rides on `Ui` + WRITE rather than a domain of its own.
+                // Honest reasoning: sound from an app *is* part of how it presents
+                // itself, no existing domain fits better, and it widens nothing in
+                // practice — `host_sound_play` is already reachable by any bound
+                // agent, limited only by a rate counter. If audio ever grows past
+                // "an app makes its own noises" (capture, mixing policy, per-app
+                // volume), it should get a real `CapDomain::Audio` and a line on
+                // the consent screen; that is a deliberate change, not this one.
+                if c.rights.contains(Rights::WRITE) {
+                    prims.push(registry::AUDIO_SUBMIT);
                 }
             }
             CapDomain::Inference | CapDomain::Todo | CapDomain::Ipc | CapDomain::SkillManage => {}
@@ -447,6 +465,70 @@ pub fn render_cap(c: &CapabilityRequest) -> String {
         }
     };
     alloc::format!("{:?} {:?} @ {}", c.domain, c.rights, scope)
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+    use crate::synapse::registry;
+
+    /// **Every registered primitive must be reachable through some capability.**
+    ///
+    /// This is a whole bug class, and it is invisible from either end. Adding a
+    /// primitive means a registry entry, a grammar signature and an executor arm —
+    /// all of which can be right while no `CapabilityRequest` maps to it, leaving
+    /// it registered, callable by name, grammatically valid, and refused for every
+    /// agent that ever asks. The denial reads `no matching capability`, which
+    /// points at the *caller's manifest* rather than at the missing line here, so
+    /// the natural response is to widen the manifest and watch that not help.
+    ///
+    /// Both `ui_present` and `audio_submit` shipped in exactly that state and were
+    /// found by booting the OS and reading a ktrace. This test is the cheaper way.
+    #[test_case]
+    fn every_primitive_is_reachable_through_some_capability() {
+        // `sleep` is deliberately outside the capability system: it yields the
+        // scheduler, has no effect to gate, and is available to any task that can
+        // make a call at all. It is the one primitive for which "no domain grants
+        // it" is the intended answer rather than an omission.
+        const UNGATED: &[u16] = &[registry::SLEEP];
+
+        // Every domain at full rights and the widest scope: the union of
+        // everything the capability system can express.
+        let all = [
+            CapDomain::Fs,
+            CapDomain::Console,
+            CapDomain::Spawn,
+            CapDomain::Channel,
+            CapDomain::Net,
+            CapDomain::Ui,
+            CapDomain::Inference,
+            CapDomain::Todo,
+            CapDomain::Ipc,
+            CapDomain::SkillManage,
+        ]
+        .map(|d| {
+            CapabilityRequest::new(
+                d,
+                // Every right, including LIST — omitting one makes this test
+                // report a correctly-mapped primitive as unreachable.
+                Rights::all(),
+                Scope::Any,
+            )
+        });
+        let reachable = primitives_for(&all);
+
+        for spec in registry::REGISTRY {
+            if UNGATED.contains(&spec.id) {
+                continue;
+            }
+            assert!(
+                reachable.contains(&spec.id),
+                "primitive `{}` (id {}) is registered but no capability grants it —                  it would be refused for every agent with `no matching capability`.                  Add it to `primitives_for`, or to UNGATED with a reason.",
+                spec.name,
+                spec.id
+            );
+        }
+    }
 }
 
 #[cfg(test)]

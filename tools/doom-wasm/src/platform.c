@@ -12,6 +12,7 @@
 #include "doomgeneric.h"
 #include "doomkeys.h"
 #include "i_video.h"
+#include "doomstat.h"
 
 /* ---- host imports (see kernel/src/agent/wasm_rt.rs) ---------------------- */
 
@@ -296,6 +297,24 @@ int64_t tick(int32_t p, int32_t n) {
     (void)p; (void)n;
     if (!started) return reply("ok");
     poll_input();
+    /* Suppress the screen-melt wipe. `D_Display` takes the wipe branch when
+     * `gamestate != wipegamestate`, and that branch is a **blocking spin loop**:
+     *
+     *     do { do { nowtime = I_GetTime(); tics = nowtime - wipestart;
+     *               I_Sleep(1); } while (tics <= 0);
+     *          ... I_FinishUpdate(); } while (!done);
+     *
+     * It runs the whole ~1 s melt inside a single `doomgeneric_Tick`, spinning on
+     * the clock thousands of times per tic. That is exactly the pathology
+     * `DG_SleepMs` is written to avoid, and here it is worse: one guest call that
+     * neither returns nor yields, so it exhausts the frame's fuel *and* freezes
+     * `upkeep()` — the clock, the mouse and the net stack — for a second.
+     *
+     * Holding the two equal keeps Doom on its normal per-frame path. The cost is
+     * a cosmetic transition; the alternative is a frozen shell. Done here rather
+     * than by editing `d_main.c`, per VENDORING.md.
+     */
+    wipegamestate = gamestate;
     doomgeneric_Tick();
     return reply("ok");
 }
