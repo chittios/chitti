@@ -814,10 +814,36 @@ static ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize
 /// allocates nothing and takes only the event-ring lock. Translation happens on
 /// the drain side ([`next_byte`]).
 pub fn feed_event(ev: KeyEvent) {
-    // Physical held state, before anything else can drop the event. Caps Lock
-    // returns early below and the modifier usages never reach `translate` as
-    // characters, so tracking here rather than lower down is what makes *every*
-    // key observable — including the ones a byte stream cannot express.
+    // **Modifiers come from `mods`, not only from usages.** A USB boot keyboard
+    // reports Ctrl/Shift/Alt as a *bitmask byte*, never as entries in the key
+    // array — so a driver reading that byte fills in `ev.mods` and emits no
+    // `KeyEvent` whose usage is `U_LCTRL`. Tracking usages alone therefore left
+    // every modifier permanently "not held", which is invisible until something
+    // asks: Doom's fire button is Ctrl, and it simply never fired.
+    //
+    // Derived on *every* event so a modifier released while another key is still
+    // down is seen. A boot report ORs left and right together, so the side is not
+    // recoverable and both are set — "is Ctrl down" is the only question anyone
+    // asks, and nothing here needs to tell the two apart.
+    for (bit, l, r) in [
+        (Mods::CTRL, U_LCTRL, U_RCTRL),
+        (Mods::SHIFT, U_LSHIFT, U_RSHIFT),
+        (Mods::ALT, U_LALT, U_RALT),
+    ] {
+        let down = ev.mods.has(bit);
+        held_set(l, down);
+        held_set(r, down);
+    }
+
+    // The event's own usage is applied **last**, so a transport that really does
+    // deliver modifier keys as usages (evdev, PS/2) wins over the derivation
+    // above. Ordered the other way, the loop clears the very modifier this event
+    // is reporting the press of — which is exactly what the first version did.
+    //
+    // Caps Lock returns early below and the modifier usages never reach
+    // `translate` as characters, so tracking here rather than lower down is what
+    // makes *every* key observable — including the ones a byte stream cannot
+    // express.
     held_set(ev.usage, ev.pressed);
 
     // Caps Lock is a toggle whose state must outlive any one driver, so it is
@@ -984,7 +1010,10 @@ mod held_tests {
         clear_held();
     }
 
-    /// Every usage must land in its own bit. A `usage / 32` split with the wrong
+    /// Every usage must land in its own bit. Note this also pins the ordering
+    /// rule: a modifier pressed *as a usage* with no matching `mods` bit — what
+    /// evdev and PS/2 deliver — must stay held, so the event's own usage is
+    /// applied after the `mods` derivation rather than before it. A `usage / 32` split with the wrong
     /// shift would alias distinct keys onto one bit — and the symptom would be two
     /// unrelated keys appearing to be the same key, which reads as a stuck input
     /// rather than as an indexing bug.
@@ -1016,6 +1045,44 @@ mod held_tests {
             assert!(is_held(k), "modifier {k:#04x} must be observable");
             feed_event(ev(k, false));
             assert!(!is_held(k));
+        }
+        clear_held();
+    }
+
+    /// **The fire-button bug.** A USB boot keyboard reports Ctrl/Shift/Alt as a
+    /// bitmask byte, never as entries in the key array — so the driver fills in
+    /// `mods` and emits no event whose *usage* is `U_LCTRL`. Tracking usages alone
+    /// left every modifier permanently unheld, and Doom's fire button is Ctrl, so
+    /// it simply never fired. The earlier test passed only because it synthesised
+    /// usage `U_LCTRL` directly, which no real boot keyboard ever sends.
+    #[test_case]
+    fn a_modifier_reported_only_in_mods_still_reads_as_held() {
+        clear_held();
+        let w = 0x1a;
+        // What a boot keyboard actually delivers: the letter, with CTRL in mods.
+        feed_event(KeyEvent { usage: w, mods: Mods(Mods::CTRL), pressed: true, src: Source::UsbHid });
+        assert!(is_held(U_LCTRL), "Ctrl must read as held from the mods bits alone");
+        assert!(is_held(w));
+        // Releasing the modifier while the letter is still down must be seen.
+        // (The event's usage is the letter, so the derivation is what decides.)
+        feed_event(KeyEvent { usage: w, mods: Mods(0), pressed: true, src: Source::UsbHid });
+        assert!(!is_held(U_LCTRL), "a dropped mods bit must clear the held state");
+        assert!(is_held(w), "the letter is still down");
+        clear_held();
+    }
+
+    /// Shift and Alt take the same path, and a mods bit sets both sides: a boot
+    /// report ORs left and right together, so the distinction is not recoverable
+    /// and a game asking "is Shift down" must still get yes.
+    #[test_case]
+    fn shift_and_alt_come_through_mods_on_both_sides() {
+        clear_held();
+        feed_event(KeyEvent { usage: 0x04, mods: Mods(Mods::SHIFT | Mods::ALT), pressed: true, src: Source::UsbHid });
+        for k in [U_LSHIFT, U_RSHIFT, U_LALT, U_RALT] {
+            assert!(is_held(k), "{k:#04x} must be held");
+        }
+        for k in [U_LCTRL, U_RCTRL] {
+            assert!(!is_held(k), "{k:#04x} must not be held");
         }
         clear_held();
     }

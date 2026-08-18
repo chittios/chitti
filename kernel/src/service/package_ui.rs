@@ -987,11 +987,9 @@ fn forward_key(key: &str) -> bool {
 
 /// Forward an arrow key (CSI final byte) to the focused package app.
 pub fn nav(fin: u8) -> bool {
-    if focused_app_polls_input() {
-        return true;
-    }
+    let polls = focused_app_polls_input();
     match nav_key_name(fin) {
-        Some(key) => forward_key(key),
+        Some(key) => forward_key(key) || polls,
         None => false,
     }
 }
@@ -1025,14 +1023,20 @@ fn focused_app_polls_input() -> bool {
 }
 
 pub fn key(c: u8) -> bool {
-    if focused_app_polls_input() {
-        // Printable ASCII, Enter and Esc — what a game binds. **Not** the other
-        // control bytes: Ctrl+C (0x03), Ctrl+W (0x17) and friends are the OS
-        // escapes, and swallowing them here would turn a focused game into a
-        // keyboard trap with no way out. Modifiers like Ctrl-to-fire never arrive
-        // as bytes at all; the guest reads those from the held-key bitmap.
-        return matches!(c, 0x20..=0x7e | b'\r' | b'\n' | 0x1b);
-    }
+    // A polling app still gets the key *forwarded*, it just also consumes it
+    // unconditionally. Both halves matter and I had only the second:
+    //
+    // Held-key state answers "is W down", which is movement. It cannot answer
+    // "what character did the user type", because that is layout-dependent and
+    // `keymap` has already done that work — a guest re-deriving it from physical
+    // usages would be a second, worse layout table. So text entry (Doom's save
+    // menu) needs the *byte*, and discarding it made the menu unusable.
+    //
+    // Consuming regardless is what keeps a keystroke out of the chat agent even
+    // when the guest ignores it. **Not** the other control bytes: Ctrl+C (0x03),
+    // Ctrl+W (0x17) and Ctrl+Tab are the OS escapes, and swallowing them would
+    // turn a focused game into a keyboard trap with no way out.
+    let polls = focused_app_polls_input();
     let key: String = match c {
         b'\r' | b'\n' => "enter".to_string(),
         b' ' => "space".to_string(),
@@ -1040,7 +1044,7 @@ pub fn key(c: u8) -> bool {
         0x21..=0x7e => (c as char).to_string(),
         _ => return false,
     };
-    forward_key(&key)
+    forward_key(&key) || polls
 }
 
 #[cfg(test)]

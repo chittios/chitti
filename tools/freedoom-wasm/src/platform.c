@@ -292,6 +292,70 @@ int64_t freedoom_start(int32_t p, int32_t n) {
     return reply("ok");
 }
 
+/* Read the value of `"key":"..."` out of the pump's tiny JSON. No parser: the
+ * host builds this string itself and it has exactly one such field. */
+static int json_key(const char *j, unsigned n, char *out, unsigned cap) {
+    const char *pat = "\"key\":\"";
+    unsigned pl = 7;
+    for (unsigned i = 0; i + pl < n; i++) {
+        unsigned k = 0;
+        while (k < pl && j[i + k] == pat[k]) k++;
+        if (k != pl) continue;
+        unsigned o = 0, p = i + pl;
+        while (p < n && j[p] != '"' && o + 1 < cap) out[o++] = j[p++];
+        out[o] = 0;
+        return (int)o;
+    }
+    return 0;
+}
+
+/* Typed characters, which held-key state cannot provide.
+ *
+ * Movement comes from the held-key bitmap (continuous, and it must express
+ * several keys at once). Text does not: what character a key produces is
+ * layout-dependent and the kernel's keymap has already resolved it, so a guest
+ * re-deriving it from physical usages would be a second and worse layout table.
+ * Doom's save-game menu wants exactly that character, which is why it accepted
+ * nothing while this export did not exist.
+ */
+__attribute__((export_name("on_key")))
+int64_t on_key(int32_t p, int32_t n) {
+    char name[24];
+    if (json_key((const char *)(uintptr_t)p, (unsigned)(n < 0 ? 0 : n), name, sizeof name) <= 0) {
+        return reply("ok");
+    }
+    unsigned char k = 0;
+    if (name[1] == 0) {
+        /* A single character: Doom's TranslateKey is the identity and its menu
+         * reads the byte straight through, so lowercase ASCII is what it wants. */
+        k = (unsigned char)name[0];
+        if (k >= 'A' && k <= 'Z') k = (unsigned char)(k - 'A' + 'a');
+    } else if (!strcmp(name, "enter")) {
+        k = KEY_ENTER;
+    } else if (!strcmp(name, "esc")) {
+        k = KEY_ESCAPE;
+    } else if (!strcmp(name, "space")) {
+        k = ' ';
+    } else if (!strcmp(name, "up")) {
+        k = KEY_UPARROW;
+    } else if (!strcmp(name, "down")) {
+        k = KEY_DOWNARROW;
+    } else if (!strcmp(name, "left")) {
+        k = KEY_LEFTARROW;
+    } else if (!strcmp(name, "right")) {
+        k = KEY_RIGHTARROW;
+    }
+    if (k) {
+        /* Press and release together: the byte path carries no release edge, and
+         * a menu key that never came up would repeat forever. Movement keys are
+         * unaffected — those come from the held bitmap. */
+        push_key(1, k);
+        push_key(0, k);
+    }
+    /* Anything but "ok" tells the pump the key was consumed. */
+    return reply("used");
+}
+
 __attribute__((export_name("tick")))
 int64_t tick(int32_t p, int32_t n) {
     (void)p; (void)n;
