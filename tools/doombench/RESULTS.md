@@ -82,7 +82,7 @@ cargo run --release -- /path/to/freedoom1.wad 1200
 
 Freedoom is 3-clause BSD and freely redistributable:
 <https://github.com/freedoom/freedoom/releases>. The OS ships a copy at
-`agents/doom/assets/freedoom1.wad`, so this harness can be pointed at that rather
+`agents/freedoom/assets/freedoom1.wad`, so this harness can be pointed at that rather
 than at a download. It is deliberately **not** in `SAMPLE_FILES` — that corpus is
 fetched-never-committed to avoid taking a redistribution decision, which Freedoom's
 licence makes for us.

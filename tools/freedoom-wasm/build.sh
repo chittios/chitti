@@ -11,7 +11,7 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 DG="$ROOT/third_party/doomgeneric/doomgeneric"
-OUT="$ROOT/agents/doom/assets/tools.wasm"
+OUT="$ROOT/agents/freedoom/assets/tools.wasm"
 
 CLANG="$(brew --prefix llvm)/bin/clang"
 SYSROOT="$(brew --prefix wasi-libc)/share/wasi-sysroot"
@@ -47,7 +47,7 @@ mkdir -p "$(dirname "$OUT")"
   -nostartfiles -Wl,--no-entry -Wl,--export-dynamic \
   -Wl,-z,stack-size=1048576 -Wl,--initial-memory=134217728 \
   -o "$OUT" \
-  $SRCS "$ROOT/tools/doom-wasm/src/platform.c" \
+  $SRCS "$ROOT/tools/freedoom-wasm/src/platform.c" \
   "$ROOT/tools/doombench/src/w_file_memory.c"
 
 echo "built $OUT ($(wc -c < "$OUT") bytes)"

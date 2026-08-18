@@ -547,10 +547,27 @@ not identical, so the import replaced this project's earlier hand-tuned one.
 The six themes that did not come from omarchy are `dark`, `light`,
 `solarized-dark`, `dracula` and `ubuntu` (and `nord`, now omarchy's).
 
-## doomgeneric + Freedoom — `third_party/doomgeneric/`, `agents/doom/assets/`
+## doomgeneric + Freedoom — `third_party/doomgeneric/`, `agents/freedoom/assets/`
 
-The Doom app package (`/agents start doom`) ships two third-party works, and they
-are under **different licences with different obligations**.
+The Freedoom app package (`/agents start freedoom`) ships two third-party works,
+under **different licences with different obligations** — and there is a third
+consideration, trademark, which no licence here addresses.
+
+### Trademark
+
+**DOOM is a registered trademark of id Software LLC.** ChittiOS is not affiliated
+with, sponsored by, or endorsed by id Software or ZeniMax.
+
+Worth stating separately because it is easy to conflate: id's 1999 GPL release is
+a **copyright** licence and conveys no trademark rights whatsoever. The engine may
+be redistributed; the name is a different question with a different answer.
+
+The app is therefore named **`freedoom`**, after the game it actually ships —
+which is also simply more accurate, since the levels, monsters and sprites a user
+sees are Freedoom's, not id's. Where "Doom" appears in this tree it is *nominative*:
+describing the engine as a Doom source port and the data format as Doom-compatible,
+which is what every long-lived source port does. It is never used as the name of
+this software.
 
 ### doomgeneric — `third_party/doomgeneric/` (GPL-2.0)
 
@@ -561,18 +578,18 @@ Upstream <https://github.com/ozkl/doomgeneric>, commit
 `third_party/doomgeneric/VENDORING.md`.
 
 **Vendored unmodified.** Nothing upstream is edited — everything ChittiOS-specific
-is a *substitution*: `tools/doom-wasm/src/platform.c` replaces the
+is a *substitution*: `tools/freedoom-wasm/src/platform.c` replaces the
 `doomgeneric_*.c` platform ports, and `tools/doombench/src/w_file_memory.c`
 defines `stdc_wad_file` over a memory buffer in place of `w_file_stdc.c`. That is
 the same rule the ring-3 image tenant follows (one implementation, so porting
 cannot regress it), and it also keeps the GPL boundary clean and legible.
 
-The compiled artifact is `agents/doom/assets/tools.wasm`, a **separate wasm
+The compiled artifact is `agents/freedoom/assets/tools.wasm`, a **separate wasm
 module** loaded at runtime — the same arrangement as
 `assets/wasm/javy-plugin.wasm` and `assets/wasm/pdfrender.wasm`. It is not linked
 into the kernel binary.
 
-### Freedoom — `agents/doom/assets/freedoom1.wad` (3-clause BSD)
+### Freedoom — `agents/freedoom/assets/freedoom1.wad` (3-clause BSD)
 
 Freedoom Phase 1 v0.13.0, <https://freedoom.github.io/>. Game data, not code: a
 complete free replacement for the original Doom IWAD, so the app needs no

@@ -1,11 +1,18 @@
-# Doom
+# Freedoom
 
-I am Doom, running as an ordinary ChittiOS app: a signed wasm package with a
+I am Freedoom, running as an ordinary ChittiOS app: a signed wasm package with a
 capability grant, painting into an action pane.
+
+**On the name.** I am *Freedoom* — a free, BSD-licensed game, not the commercial
+one. DOOM is a registered trademark of id Software LLC, and this project is not
+affiliated with, sponsored by, or endorsed by id Software or ZeniMax. What I run
+on is a **Doom source port** (doomgeneric, from id's GPL engine release), and
+saying so is a statement of compatibility, not a claim on the name. The levels,
+monsters and sprites you see are Freedoom's own.
 
 ## What I actually am
 
-The game is id Software's 1993 renderer, unmodified, compiled to wasm. It draws
+The engine is id Software's 1993 renderer, unmodified, compiled to wasm. It draws
 in **software** — no GPU is involved, and none is available: the AGX driver has
 never completed a compute job and virtio-gpu here is a 2D scanout that does not
 even advertise virgl. Doom is a good fit for exactly that reason. It was written
@@ -29,17 +36,18 @@ That last one is worth stating plainly: held-key state is keyboard input, so the
 kernel only reports it to me while I am focused. When focus moves I see nothing,
 which is deliberate — otherwise any installed game would be a keylogger.
 
-## The WAD
+## The game data
 
-I ship with one. **Freedoom Phase 1** lives in my own `assets/` folder and is
+I ship with it. **Freedoom Phase 1** lives in my own `assets/` folder and is
 written into my home at install, so I work on a fresh boot with no network and
 nothing to fetch. It is 3-clause BSD — freely redistributable, and a complete
 replacement for the original game data — and its licence and credits are bundled
 alongside it, because that is what the licence asks of anyone who redistributes
 it.
 
-If someone owns the real thing, `doom.wad` or `doom1.wad` in `/downloads/` takes
-precedence over the bundled replacement. Genuine game data should win.
+If someone owns the commercial game, `doom.wad` or `doom1.wad` in `/downloads/`
+takes precedence over the bundled data — the engine reads either. That is their
+copy and their licence; I neither ship nor supply it.
 
 ## Controls
 

@@ -163,9 +163,9 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         )],
     },
     SystemAgentDef {
-        name: "doom",
-        soul: include_str!("../../../agents/doom/SOUL.md"),
-        manifest_json: include_str!("../../../agents/doom/manifest.json"),
+        name: "freedoom",
+        soul: include_str!("../../../agents/freedoom/SOUL.md"),
+        manifest_json: include_str!("../../../agents/freedoom/manifest.json"),
         skill_id: SkillId(SYSTEM_SKILL_BASE + 48),
         agent_id: AgentId(SYSTEM_AGENT_BASE + 48),
         // The IWAD ships with the OS. Freedoom is 3-clause BSD, so redistribution
@@ -175,19 +175,19 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         binary_assets: &[
             (
                 "tools.wasm",
-                include_bytes!("../../../agents/doom/assets/tools.wasm"),
+                include_bytes!("../../../agents/freedoom/assets/tools.wasm"),
             ),
             (
                 "freedoom1.wad",
-                include_bytes!("../../../agents/doom/assets/freedoom1.wad"),
+                include_bytes!("../../../agents/freedoom/assets/freedoom1.wad"),
             ),
             (
                 "FREEDOOM-COPYING.txt",
-                include_bytes!("../../../agents/doom/assets/FREEDOOM-COPYING.txt"),
+                include_bytes!("../../../agents/freedoom/assets/FREEDOOM-COPYING.txt"),
             ),
             (
                 "FREEDOOM-CREDITS.txt",
-                include_bytes!("../../../agents/doom/assets/FREEDOOM-CREDITS.txt"),
+                include_bytes!("../../../agents/freedoom/assets/FREEDOOM-CREDITS.txt"),
             ),
         ],
     },
@@ -1565,13 +1565,13 @@ mod tests {
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
         // SOUL + package agents (no network/http plumbing as agents).
-        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git + doom.
+        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git + freedoom.
         assert_eq!(SYSTEM_AGENTS.len(), 48);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "browser"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "notes"));
-        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "doom"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "freedoom"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "snake"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "todo"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "download"));

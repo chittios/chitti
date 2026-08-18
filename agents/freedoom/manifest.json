@@ -1,11 +1,11 @@
 {
-  "name": "doom",
+  "name": "freedoom",
   "version": "1.0.0",
   "kind": "skill_agent",
-  "description": "Doom, rendered in software and presented a frame at a time.",
+  "description": "Freedoom, rendered in software and presented a frame at a time.",
   "package_ui": true,
   "toolset": [
-    "doom_start"
+    "freedoom_start"
   ],
   "capabilities": [
     {

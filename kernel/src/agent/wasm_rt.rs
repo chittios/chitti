@@ -2691,7 +2691,7 @@ mod tests {
         assert!(split_ops(1, "clear 000000", 4).is_none());
     }
 
-    /// The Doom package's real module must instantiate against the real import
+    /// The Freedoom package's real module must instantiate against the real import
     /// set. This is the test that would otherwise not exist until someone booted
     /// the OS and typed `/agents start doom`.
     ///
@@ -2701,8 +2701,8 @@ mod tests {
     /// naming neither the function nor the type. A libc-built guest imports ~14
     /// WASI functions it may never call, and every one of them has to be present.
     #[test_case]
-    fn the_doom_module_instantiates_against_the_native_import_set() {
-        const DOOM: &[u8] = include_bytes!("../../../agents/doom/assets/tools.wasm");
+    fn the_freedoom_module_instantiates_against_the_native_import_set() {
+        const DOOM: &[u8] = include_bytes!("../../../agents/freedoom/assets/tools.wasm");
         // Same limits the package manifest declares, so this fails here rather
         // than at `/agents start` if a limit is too tight — the table-elems trap
         // the PDF renderer hit at 693 against a hardcoded 256.
@@ -2715,7 +2715,7 @@ mod tests {
             .with_pages(2048)
             .with_table_elems(4096);
         let s = Session::instantiate_native(DOOM, limits, HostBindings::default())
-            .expect("doom module must instantiate against HostImportSet::Native");
+            .expect("freedoom module must instantiate against HostImportSet::Native");
         drop(s);
 
         // And it must *not* instantiate on the narrow set — otherwise `wasm.native`

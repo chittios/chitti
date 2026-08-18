@@ -240,8 +240,8 @@ static char iwad_path[128];
 
 static int started;
 
-__attribute__((export_name("doom_start")))
-int64_t doom_start(int32_t p, int32_t n) {
+__attribute__((export_name("freedoom_start")))
+int64_t freedoom_start(int32_t p, int32_t n) {
     (void)p; (void)n;
     if (started) return reply("ok");
 
@@ -267,7 +267,7 @@ int64_t doom_start(int32_t p, int32_t n) {
          * should be unreachable. It means the asset did not land — worth saying
          * plainly rather than blaming the user for not fetching something that
          * ships with the OS. */
-        logs("doom: no WAD found, including the bundled one in my own assets");
+        logs("freedoom: no WAD found, including the bundled one in my own assets");
         return reply(
             "ask:I could not find a WAD, not even the Freedoom one bundled in my own "
             "assets folder — so my install may be incomplete. Tell the user they can "
@@ -288,7 +288,7 @@ int64_t doom_start(int32_t p, int32_t n) {
     char *argv[] = {a0, a1, iwad_path, 0};
     doomgeneric_Create(3, argv);
     started = 1;
-    logs("doom: started");
+    logs("freedoom: started");
     return reply("ok");
 }
 
