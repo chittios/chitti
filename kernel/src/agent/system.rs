@@ -662,6 +662,20 @@ pub fn manifest_frame_ms(id: u64) -> Option<u32> {
     Some(v.clamp(8, 180) as u32)
 }
 
+/// Whether this package's module is built against a libc (`wasm.native`).
+///
+/// Opt-in because the extra imports are a (read-only) filesystem view, and an app
+/// that does not need one should not be handed it. A Rust `no_std` guest imports
+/// nothing from WASI and must stay on the narrower surface.
+pub fn manifest_native(id: u64) -> bool {
+    SYSTEM_AGENTS
+        .iter()
+        .find(|d| d.agent_id.0 == id)
+        .and_then(|def| Json::parse(def.manifest_json))
+        .and_then(|j| j.get("wasm").and_then(|w| w.get("native")).and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
 pub fn manifest_pages(id: u64) -> Option<u32> {
     let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
     let j = Json::parse(def.manifest_json)?;

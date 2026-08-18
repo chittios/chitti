@@ -31,8 +31,9 @@
     "surface_w": 320,
     "surface_h": 200,
     "frame_ms": 28,
-    "memory_pages": 1024,
-    "fuel": 200000000
+    "memory_pages": 2048,
+    "fuel": 200000000,
+    "native": true
   },
   "autostart": false
 }

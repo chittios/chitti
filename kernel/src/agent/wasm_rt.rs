@@ -402,6 +402,20 @@ impl Session {
         Self::instantiate_with(wasm, limits, bind, HostImportSet::Js)
     }
 
+    /// Instantiate a guest built against a libc — [`HostImportSet::Native`].
+    ///
+    /// The `chitti.*` half is identical to [`Self::instantiate`]; the addition is
+    /// the WASI surface a libc imports whether or not the program uses it. Opt-in
+    /// per package (`wasm.native`) rather than always-on, so an app that does not
+    /// need a filesystem view does not get one.
+    pub fn instantiate_native(
+        wasm: &[u8],
+        limits: Limits,
+        bind: HostBindings,
+    ) -> Result<Self, &'static str> {
+        Self::instantiate_with(wasm, limits, bind, HostImportSet::Native)
+    }
+
     /// Present `bytes` as the guest's stdin, from the start. A WASI guest reads
     /// its arguments here; rewindable because a Javy plugin consumes one stream
     /// during `initialize-runtime` and the tool's arguments must follow as a new
@@ -2675,6 +2689,45 @@ mod tests {
     #[test_case]
     fn a_capacity_below_the_envelope_is_none() {
         assert!(split_ops(1, "clear 000000", 4).is_none());
+    }
+
+    /// The Doom package's real module must instantiate against the real import
+    /// set. This is the test that would otherwise not exist until someone booted
+    /// the OS and typed `/agents start doom`.
+    ///
+    /// It is worth its cost because the failure mode is uniquely unhelpful: wasmi
+    /// resolves an import by name **and** `FuncType`, so one missing function or
+    /// one wrong arity fails the whole module with `missing imports/limits?` —
+    /// naming neither the function nor the type. A libc-built guest imports ~14
+    /// WASI functions it may never call, and every one of them has to be present.
+    #[test_case]
+    fn the_doom_module_instantiates_against_the_native_import_set() {
+        const DOOM: &[u8] = include_bytes!("../../../agents/doom/assets/tools.wasm");
+        // Same limits the package manifest declares, so this fails here rather
+        // than at `/agents start` if a limit is too tight — the table-elems trap
+        // the PDF renderer hit at 693 against a hardcoded 256.
+        // 2048 pages = the module's own `--initial-memory` of 128 MiB. A limit
+        // below a module's *initial* memory is refused at instantiation, and the
+        // message says `missing imports/limits?` without saying which — this test
+        // caught exactly that at 1024.
+        let limits = Limits::default()
+            .with_fuel(200_000_000)
+            .with_pages(2048)
+            .with_table_elems(4096);
+        let s = Session::instantiate_native(DOOM, limits, HostBindings::default())
+            .expect("doom module must instantiate against HostImportSet::Native");
+        drop(s);
+
+        // And it must *not* instantiate on the narrow set — otherwise `wasm.native`
+        // is decorative and a future guest would silently lose its WASI imports.
+        let limits = Limits::default()
+            .with_fuel(200_000_000)
+            .with_pages(2048)
+            .with_table_elems(4096);
+        assert!(
+            Session::instantiate(DOOM, limits, HostBindings::default()).is_err(),
+            "a libc guest must need the native set; if this passes, the opt-in is meaningless"
+        );
     }
 
     #[test_case]

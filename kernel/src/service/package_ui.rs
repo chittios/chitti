@@ -692,8 +692,25 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
         .with_fuel(CALL_FUEL)
         // 64 pages (4 MiB) unless the manifest asks for more — every existing app
         // declares none and so keeps exactly its old ceiling.
-        .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64));
-    let session = Session::instantiate(&wasm, limits, bind).map_err(|e| {
+        .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64))
+        // A libc-built guest is full of function pointers; the default 256 is far
+        // too tight (the PDF renderer needed 693). Raised only for `wasm.native`
+        // packages so every existing guest keeps exactly its old bound.
+        .with_table_elems(if crate::agent::system::manifest_native(agent_id) {
+            4096
+        } else {
+            crate::agent::wasm_rt::DEFAULT_MAX_TABLE_ELEMS
+        });
+    // A libc-built guest (`wasm.native`) imports WASI whether or not it uses it,
+    // so it needs the wider import set or it fails at instantiation with
+    // `missing imports` — a message that names nothing. Opt-in per package: an
+    // app that does not need a filesystem view is not handed one.
+    let instantiate = if crate::agent::system::manifest_native(agent_id) {
+        Session::instantiate_native
+    } else {
+        Session::instantiate
+    };
+    let session = instantiate(&wasm, limits, bind).map_err(|e| {
         crate::serial_println!("package_ui> {name}: wasm instantiate failed: {e}");
         let raw = format!(
             r#"{{"name":"ui_surface_close","arguments":{{"surface":{surface}}}}}"#
