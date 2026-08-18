@@ -13,9 +13,11 @@
 //!   `@import` + `@layer` cascade layers; `!important`
 //! - `var(--name)` / nested fallback; `calc()` on lengths (px/em/%)
 //! - Flex / grid / float / absolute; popular paint props (see REPORT.md)
+//! - Tailwind/shadcn class escapes (`.bg-primary\/20` → class `bg-primary/20`)
+//! - `@keyframes` + `animation` (opacity / transform at the current clock)
+//! - `:hover` (matches the pointer target and its ancestors; see `set_hover_elems`)
 //!
-//! Not in scope: timed animations/transitions, `:hover` restyle, sticky
-//! compositing, full Grid Level 2, complete css3test.com.
+//! Not in scope: sticky compositing, full Grid Level 2, complete css3test.com.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -81,6 +83,11 @@ pub struct ComputedStyle {
     pub text_align: Align,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    /// Unresolved `width: N%` / `height: N%` (0–100). Applied against the
+    /// parent's explicit size in [`compute_el`], so Tailwind `w-full` /
+    /// `h-full` on a sized parent become real pixels.
+    pub width_pct: Option<f32>,
+    pub height_pct: Option<f32>,
     pub max_width: Option<i32>,
     pub min_width: Option<i32>,
     pub min_height: Option<i32>,
@@ -494,6 +501,8 @@ impl Default for ComputedStyle {
             text_align: Align::Left,
             width: None,
             height: None,
+            width_pct: None,
+            height_pct: None,
             max_width: None,
             min_width: None,
             min_height: None,
@@ -770,6 +779,10 @@ struct Compound {
     /// `::before` / `::after` (pseudo-element; matching is on the owning element,
     /// and layout emits generated content from rules tagged with this).
     pseudo_el: PseudoElement,
+    /// `:hover` — matches only while the element (or a descendant) is under
+    /// the pointer. Dropping this used to discard every Tailwind
+    /// `.hover\:bg-*:hover` rule, so hover backgrounds never applied.
+    hover: bool,
 }
 
 /// Combinator between two compounds in a complex selector.
@@ -875,6 +888,9 @@ impl Compound {
                 return false;
             }
         }
+        if self.hover && !el.hovered {
+            return false;
+        }
         // `:not()` last: it is the only clause that can be expensive, and by
         // here every cheap test has already had its chance to reject.
         if self.not.iter().any(|n| n.matches_el(el)) {
@@ -886,7 +902,8 @@ impl Compound {
     fn spec(&self) -> (u32, u32, u32) {
         let classy = self.classes.len() as u32
             + self.attrs.len() as u32
-            + self.nth_child.is_some() as u32;
+            + self.nth_child.is_some() as u32
+            + self.hover as u32;
         let (mut ids, mut cls, mut tags) = (
             self.id.is_some() as u32,
             classy,
@@ -1002,6 +1019,9 @@ pub struct ElemRef<'a> {
     /// does not yet thread siblings, so it passes `None` and behaves exactly as
     /// it did before.
     pub prev: Option<&'a [ElemRef<'a>]>,
+    /// True when this element is the hover target or an ancestor of it.
+    /// Feeds `:hover` matching; false for callers that have no pointer.
+    pub hovered: bool,
 }
 
 impl<'a> ElemRef<'a> {
@@ -1015,6 +1035,7 @@ impl<'a> ElemRef<'a> {
             input_type: None,
             extra: &[],
             prev: None,
+            hovered: false,
         }
     }
 }
@@ -1045,6 +1066,14 @@ struct Rule {
 /// Parsed stylesheet (LibCSS-inspired: rules sorted by cascade order).
 /// Supports CSS **cascade layers** (`@layer name, …` / `@layer name { … }`)
 /// and viewport-filtered `@media` (min/max-width).
+/// One stop of an `@keyframes` rule (`from`/`to`/`N%` → declarations).
+#[derive(Clone, Debug)]
+pub struct KeyframeStop {
+    /// 0–100.
+    pub pct: u16,
+    pub decls: Vec<(String, String)>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Stylesheet {
     rules: Vec<Rule>,
@@ -1057,6 +1086,8 @@ pub struct Stylesheet {
     /// `0` means “unknown” — width queries are treated as matching (fail-open
     /// for sheets parsed without a viewport, e.g. unit tests of cascade alone).
     viewport_w: i32,
+    /// `@keyframes name { … }` — looked up by `animation-name`.
+    keyframes: alloc::collections::BTreeMap<String, Vec<KeyframeStop>>,
 }
 
 impl Stylesheet {
@@ -1084,6 +1115,15 @@ impl Stylesheet {
 
     pub fn has_layer(&self, name: &str) -> bool {
         self.layer_order.contains_key(name)
+    }
+
+    /// Stops of `@keyframes <name>`, if the sheet declared that animation.
+    pub fn keyframes(&self, name: &str) -> Option<&[KeyframeStop]> {
+        self.keyframes.get(name).map(|v| v.as_slice())
+    }
+
+    pub fn keyframe_count(&self) -> usize {
+        self.keyframes.len()
     }
 
     fn ensure_layer(&mut self, name: &str) -> u32 {
@@ -1214,6 +1254,46 @@ impl Stylesheet {
                 }
                 // Nested layer names: @layer framework.layout { } → dotted name
                 // (already handled by @layer name { } with full name string)
+
+                // @keyframes name { 0% {…} 50% {…} to {…} }
+                if (at_header.starts_with("@keyframes")
+                    || at_header.starts_with("@-webkit-keyframes"))
+                    && i < bytes.len()
+                    && bytes[i] == b'{'
+                {
+                    let name = at_header
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_string();
+                    i += 1;
+                    let body_start = i;
+                    let mut depth = 1i32;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == b'{' {
+                            depth += 1;
+                        } else if bytes[i] == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    let body = core::str::from_utf8(&bytes[body_start..i]).unwrap_or("");
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    if !name.is_empty() {
+                        let stops = parse_keyframe_body(body);
+                        if !stops.is_empty() {
+                            self.keyframes.insert(name, stops);
+                        }
+                    }
+                    continue;
+                }
 
                 // @media … { … } — evaluate width queries against viewport_w.
                 if at_header.starts_with("@media") && i < bytes.len() && bytes[i] == b'{' {
@@ -1383,8 +1463,66 @@ fn specificity(key: &Compound, ancestors: &[AncestorHop]) -> (u8, u8, u8) {
     (a.min(255) as u8, b.min(255) as u8, c.min(255) as u8)
 }
 
-/// Parse one compound selector. Keeps `:link`, `:nth-child`, attrs, and
-/// `::before`/`::after`; drops state-dependent `:hover`/`:visited`/etc.
+/// Parse one compound selector. Keeps `:link`, `:hover`, `:nth-child`, attrs,
+/// and `::before`/`::after`; drops the other state-dependent pseudos
+/// (`:visited` / `:active` / `:focus`) so they cannot apply unconditionally.
+/// Read a CSS identifier starting at `start`, honoring escapes.
+///
+/// Tailwind writes opacity modifiers as `.bg-primary\/20` so the class name
+/// is the HTML class `bg-primary/20`. Without unescaping, the `\` stopped
+/// the ident and the whole rule was dropped — every `bg-*/10` track, skeleton
+/// and hover wash on a shadcn page vanished.
+fn read_css_ident(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+    let mut i = start;
+    let mut out = String::new();
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            if bytes[i].is_ascii_hexdigit() {
+                let hex_start = i;
+                let mut n = 0;
+                while i < bytes.len() && n < 6 && bytes[i].is_ascii_hexdigit() {
+                    i += 1;
+                    n += 1;
+                }
+                if let Ok(cp) = u32::from_str_radix(&s[hex_start..i], 16) {
+                    if let Some(ch) = char::from_u32(cp) {
+                        out.push(ch);
+                    }
+                }
+                if i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            } else if bytes[i] == b'\n' {
+                i += 1;
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        let is_name = c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80;
+        if !is_name {
+            break;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some((out, i))
+    }
+}
+
 fn parse_compound(s: &str) -> Option<Compound> {
     let s = s.trim();
     if s.is_empty() {
@@ -1396,44 +1534,23 @@ fn parse_compound(s: &str) -> Option<Compound> {
     // Leading type / `*`.
     if i < bytes.len() && bytes[i] == b'*' {
         i += 1;
-    } else {
-        let start = i;
-        while i < bytes.len()
-            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
-        {
-            i += 1;
-        }
-        if i > start {
-            c.tag = Some(s[start..i].to_ascii_lowercase());
-        }
+    } else if let Some((tag, ni)) = read_css_ident(s, i) {
+        c.tag = Some(tag.to_ascii_lowercase());
+        i = ni;
     }
     while i < bytes.len() {
         match bytes[i] {
             b'.' => {
                 i += 1;
-                let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
-                {
-                    i += 1;
-                }
-                if i == start {
-                    return None;
-                }
-                c.classes.push(s[start..i].to_string());
+                let (name, ni) = read_css_ident(s, i)?;
+                i = ni;
+                c.classes.push(name);
             }
             b'#' => {
                 i += 1;
-                let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b'_')
-                {
-                    i += 1;
-                }
-                if i == start {
-                    return None;
-                }
-                c.id = Some(s[start..i].to_string());
+                let (name, ni) = read_css_ident(s, i)?;
+                i = ni;
+                c.id = Some(name);
             }
             b'[' => {
                 i += 1;
@@ -1500,7 +1617,8 @@ fn parse_compound(s: &str) -> Option<Compound> {
                             c.tag = Some(String::from("html"));
                         }
                     }
-                    "visited" | "hover" | "active" | "focus" | "focus-visible"
+                    "hover" => c.hover = true,
+                    "visited" | "active" | "focus" | "focus-visible"
                     | "focus-within" | "target" => return None,
                     "not" => {
                         // The argument is a comma-separated compound list.
@@ -1898,6 +2016,76 @@ fn parse_decls(block: &str) -> Vec<Decl> {
     out
 }
 
+/// Parse the body of `@keyframes name { … }`.
+///
+/// Selectors are `from` / `to` / `N%` / comma lists (`0%, 100%`). Each
+/// block's declarations are stored verbatim and applied at compute time.
+fn parse_keyframe_body(body: &str) -> Vec<KeyframeStop> {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    let mut out: Vec<KeyframeStop> = Vec::new();
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let sel_start = i;
+        while i < bytes.len() && bytes[i] != b'{' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let sel = core::str::from_utf8(&bytes[sel_start..i]).unwrap_or("").trim();
+        i += 1;
+        let decl_start = i;
+        let mut depth = 1i32;
+        while i < bytes.len() && depth > 0 {
+            if bytes[i] == b'{' {
+                depth += 1;
+            } else if bytes[i] == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let decl_part = core::str::from_utf8(&bytes[decl_start..i]).unwrap_or("");
+        if i < bytes.len() && bytes[i] == b'}' {
+            i += 1;
+        }
+        let decls: Vec<(String, String)> = parse_decls(decl_part)
+            .into_iter()
+            .map(|d| (d.name, d.value))
+            .collect();
+        for part in sel.split(',') {
+            if let Some(pct) = parse_keyframe_sel(part.trim()) {
+                out.push(KeyframeStop {
+                    pct,
+                    decls: decls.clone(),
+                });
+            }
+        }
+    }
+    out.sort_by_key(|s| s.pct);
+    out
+}
+
+fn parse_keyframe_sel(s: &str) -> Option<u16> {
+    let t = s.trim().to_ascii_lowercase();
+    if t == "from" {
+        return Some(0);
+    }
+    if t == "to" {
+        return Some(100);
+    }
+    let n = t.strip_suffix('%')?.trim().parse::<f32>().ok()?;
+    Some(n.clamp(0.0, 100.0) as u16)
+}
+
 /// Split a declaration value into whitespace-separated tokens, keeping
 /// `(...)` groups whole.
 ///
@@ -2215,6 +2403,53 @@ pub fn parse_px(s: &str) -> Option<i32> {
     parse_px_rel(s, None)
 }
 
+/// `50%` / `100%` → the number (0–100+). `None` if the token is not a percent.
+pub fn parse_pct(s: &str) -> Option<f32> {
+    s.trim().strip_suffix('%')?.trim().parse().ok()
+}
+
+fn is_css_time(s: &str) -> bool {
+    let t = s.trim().to_ascii_lowercase();
+    let body = if let Some(b) = t.strip_suffix("ms") {
+        b
+    } else if let Some(b) = t.strip_suffix('s') {
+        b
+    } else {
+        return false;
+    };
+    !body.is_empty() && body.parse::<f32>().is_ok()
+}
+
+fn is_timing_fn(s: &str) -> bool {
+    let t = s.trim().to_ascii_lowercase();
+    t == "ease"
+        || t == "linear"
+        || t == "ease-in"
+        || t == "ease-out"
+        || t == "ease-in-out"
+        || t == "step-start"
+        || t == "step-end"
+        || t.starts_with("cubic-bezier(")
+        || t.starts_with("steps(")
+}
+
+/// CSS time token → milliseconds. `2s` → 2000, `150ms` → 150, else 0.
+pub fn parse_time_ms(s: &str) -> u32 {
+    let t = s.trim().to_ascii_lowercase();
+    if let Some(b) = t.strip_suffix("ms") {
+        return b.trim().parse::<f32>().ok().map(|v| v.max(0.0) as u32).unwrap_or(0);
+    }
+    if let Some(b) = t.strip_suffix('s') {
+        return b
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|v| (v.max(0.0) * 1000.0) as u32)
+            .unwrap_or(0);
+    }
+    0
+}
+
 /// The CSS root font size `rem` is relative to.
 ///
 /// 16px — the browser default every design system's scale is calibrated
@@ -2231,6 +2466,84 @@ pub const REM_PX: f32 = 16.0;
 /// SAFETY (`Sync`): `mm::Locked` is unconditionally `Sync`, and layout runs
 /// only on the single-threaded shell task and is not reentrant.
 static VIEWPORT: crate::mm::Locked<(i32, i32)> = crate::mm::Locked::new((1024, 768));
+
+/// Animation clock. Tests default to 0 (the 0% / identity stop) so a page
+/// that uses `animate-pulse` stays deterministic; the live browser uses the
+/// wall clock, and tests that want a mid-animation snapshot call
+/// [`set_animation_now_ms`].
+static ANIM_NOW_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ANIM_OVERRIDE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PAGE_WANTS_ANIM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Element indices that currently match `:hover` (the pointer target and its
+/// ancestors). Empty when the pointer is not over a laid-out element.
+///
+/// SAFETY (`Sync`): same as `VIEWPORT` — layout and the hover handler run on
+/// the single-threaded shell task.
+static HOVER_ELEMS: crate::mm::Locked<alloc::vec::Vec<usize>> =
+    crate::mm::Locked::new(alloc::vec::Vec::new());
+
+/// Replace the hovered-element set. Returns `true` when it changed so the
+/// caller can restyle (a Tailwind `.hover\:bg-*:hover` rule only matches
+/// after the next layout).
+pub fn set_hover_elems(idxs: &[usize]) -> bool {
+    HOVER_ELEMS.with(|h| {
+        if h.as_slice() == idxs {
+            return false;
+        }
+        h.clear();
+        h.extend_from_slice(idxs);
+        true
+    })
+}
+
+/// True when `elem_idx` is the hover target or an ancestor of it.
+pub fn elem_is_hovered(elem_idx: usize) -> bool {
+    HOVER_ELEMS.with(|h| h.iter().any(|&i| i == elem_idx))
+}
+
+/// Pin the animation clock (tests). `None` restores the default (0 in the
+/// unit suite, the wall clock on a running kernel).
+pub fn set_animation_now_ms(ms: Option<u32>) {
+    match ms {
+        Some(v) => {
+            ANIM_OVERRIDE.store(true, core::sync::atomic::Ordering::Relaxed);
+            ANIM_NOW_MS.store(v, core::sync::atomic::Ordering::Relaxed);
+        }
+        None => {
+            ANIM_OVERRIDE.store(false, core::sync::atomic::Ordering::Relaxed);
+            ANIM_NOW_MS.store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn animation_now_ms() -> u32 {
+    if ANIM_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed) {
+        return ANIM_NOW_MS.load(core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(not(test))]
+    {
+        crate::arch::now_ms() as u32
+    }
+}
+
+/// Cleared at the start of a layout; set when any element actually applies a
+/// keyframe. The browser tick uses this to know a live page needs a repaint.
+pub fn clear_animation_flag() {
+    PAGE_WANTS_ANIM.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn page_wants_animation() -> bool {
+    PAGE_WANTS_ANIM.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn mark_page_wants_animation() {
+    PAGE_WANTS_ANIM.store(true, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// Record the viewport for viewport-relative units. Called once per layout.
 pub fn set_viewport(w: i32, h: i32) {
@@ -2654,19 +2967,6 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
                 st.flex_grow = n;
             }
         }
-        "flex" => {
-            // flex: grow shrink basis — take first number as grow
-            if let Some(g) = value
-                .split_whitespace()
-                .next()
-                .and_then(|t| t.parse::<u32>().ok())
-            {
-                st.flex_grow = g;
-            }
-            if value.contains("wrap") {
-                st.flex_wrap = super::flex::FlexWrap::Wrap;
-            }
-        }
         "grid-auto-flow" => {
             if value.to_ascii_lowercase().contains("dense") {
                 st.grid_dense = true;
@@ -2691,11 +2991,17 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         "width" => {
             if let Some(px) = parse_px(value) {
                 st.width = Some(px);
+                st.width_pct = None;
+            } else if let Some(p) = parse_pct(value) {
+                st.width_pct = Some(p);
             }
         }
         "height" => {
             if let Some(px) = parse_px(value) {
                 st.height = Some(px);
+                st.height_pct = None;
+            } else if let Some(p) = parse_pct(value) {
+                st.height_pct = Some(p);
             }
         }
         "max-width" => {
@@ -2767,7 +3073,15 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             };
         }
         "border-radius" => {
-            let first = value.split_whitespace().next().unwrap_or(value).trim();
+            // `calc(var(--radius) - 2px)` is one value; splitting on
+            // whitespace took `calc(.5rem` and dropped the radius.
+            let first = if value.trim().len() >= 5
+                && value.trim()[..5].eq_ignore_ascii_case("calc(")
+            {
+                value.trim()
+            } else {
+                value.split_whitespace().next().unwrap_or(value).trim()
+            };
             if first.ends_with('%') {
                 // A percentage radius is relative to the box; the painter clamps
                 // radius to half the shorter side, so a large sentinel yields a
@@ -2985,18 +3299,42 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
             st.webkit_text_size_adjust = value.trim().to_string();
         }
         "animation" | "webkit-animation" => {
-            let parts: Vec<&str> = value.split_whitespace().collect();
-            if let Some(p) = parts.first() {
-                st.animation_name = (*p).to_string();
-            }
-            if let Some(d) = parts.get(1) {
-                st.animation_duration = (*d).to_string();
-            }
-            if let Some(t) = parts.get(2) {
-                st.animation_timing = (*t).to_string();
-            }
-            if let Some(delay) = parts.get(3) {
-                st.animation_delay = (*delay).to_string();
+            // `animation: pulse 2s cubic-bezier(.4,0,.6,1) infinite`
+            // — times, timing functions, iteration counts and fill modes are
+            // classified; whatever is left is the name. `value_tokens` keeps
+            // `cubic-bezier(...)` whole so we do not steal `infinite` as a delay.
+            for tok in value_tokens(value) {
+                let t = tok.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if is_css_time(t) {
+                    if st.animation_duration.is_empty() {
+                        st.animation_duration = t.to_string();
+                    } else {
+                        st.animation_delay = t.to_string();
+                    }
+                } else if is_timing_fn(t) {
+                    st.animation_timing = t.to_string();
+                } else if t.eq_ignore_ascii_case("infinite")
+                    || t.parse::<f32>().is_ok()
+                {
+                    st.animation_iteration_count = t.to_ascii_lowercase();
+                } else if matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "forwards" | "backwards" | "both" | "none"
+                ) {
+                    st.animation_fill_mode = t.to_ascii_lowercase();
+                } else if matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "normal" | "reverse" | "alternate" | "alternate-reverse"
+                ) {
+                    // direction — stored on timing only so it is not lost
+                } else if !t.eq_ignore_ascii_case("running")
+                    && !t.eq_ignore_ascii_case("paused")
+                {
+                    st.animation_name = t.to_string();
+                }
             }
         }
         "animation-name" => st.animation_name = value.trim().to_string(),
@@ -3165,21 +3503,36 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         "border-top-width" => {
             if let Some(px) = parse_px(value) {
                 st.border_top_width = px;
+                if px > 0 && st.border_top_style == BorderStyle::None {
+                    st.border_top_style = BorderStyle::Solid;
+                }
             }
         }
         "border-bottom-width" => {
             if let Some(px) = parse_px(value) {
                 st.border_bottom_width = px;
+                // Tailwind `border-b` is only a width; preflight `*` sets
+                // `border-style:solid`. If that rule missed, a width with
+                // style `none` would never paint (table row rules, cards).
+                if px > 0 && st.border_bottom_style == BorderStyle::None {
+                    st.border_bottom_style = BorderStyle::Solid;
+                }
             }
         }
         "border-left-width" => {
             if let Some(px) = parse_px(value) {
                 st.border_left_width = px;
+                if px > 0 && st.border_left_style == BorderStyle::None {
+                    st.border_left_style = BorderStyle::Solid;
+                }
             }
         }
         "border-right-width" => {
             if let Some(px) = parse_px(value) {
                 st.border_right_width = px;
+                if px > 0 && st.border_right_style == BorderStyle::None {
+                    st.border_right_style = BorderStyle::Solid;
+                }
             }
         }
         "border-top-left-radius" | "border-top-right-radius" | "border-bottom-left-radius"
@@ -3436,15 +3789,19 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
         }
         "flex" => {
             // Shorthand `flex: grow [shrink] [basis]`.
+            // Tailwind `.flex-1` is `flex: 1 1 0%` — basis `0%` is zero, not
+            // "unresolved percentage", or a `flex-1` separator never grows.
             let parts: Vec<&str> = value.split_whitespace().collect();
             match parts.as_slice() {
                 ["none"] => {
                     st.flex_grow = 0;
                     st.flex_shrink = 0;
+                    st.flex_basis = None;
                 }
                 ["auto"] => {
                     st.flex_grow = 1;
                     st.flex_shrink = 1;
+                    st.flex_basis = None;
                 }
                 _ => {
                     if let Some(g) = parts.first().and_then(|s| s.parse().ok()) {
@@ -3453,11 +3810,19 @@ fn apply_one(st: &mut ComputedStyle, name: &str, value: &str) {
                     if let Some(s) = parts.get(1).and_then(|s| s.parse().ok()) {
                         st.flex_shrink = s;
                     }
-                    if let Some(b) = parts.get(2).and_then(|s| parse_px(s)) {
-                        st.flex_basis = Some(b);
+                    if let Some(b) = parts.get(2) {
+                        let t = b.trim();
+                        if t == "0" || t == "0%" || t == "0px" {
+                            st.flex_basis = Some(0);
+                        } else if let Some(px) = parse_px(t) {
+                            st.flex_basis = Some(px);
+                        }
                     } else if parts.len() == 1 {
                         // `flex: <number>` sets basis 0 (grow from nothing).
                         st.flex_basis = Some(0);
+                    }
+                    if value.contains("wrap") {
+                        st.flex_wrap = super::flex::FlexWrap::Wrap;
                     }
                 }
             }
@@ -3596,12 +3961,105 @@ pub fn compute_el(
         }
     }
     apply_decls(&mut st, &decls);
+    // Percentage width/height against the parent's *explicit* size. Tailwind
+    // `h-full` / `w-full` is `100%`; without a containing block `parse_px`
+    // returns None and a progress indicator or avatar fallback collapses to
+    // empty. A parent with no explicit size leaves the % unresolved so a
+    // block still fills the line the usual way.
+    if st.width.is_none() {
+        if let (Some(p), Some(pw)) = (st.width_pct, parent.width) {
+            st.width = Some(f32_to_i32(p / 100.0 * pw as f32).max(0));
+        }
+    }
+    if st.height.is_none() {
+        if let (Some(p), Some(ph)) = (st.height_pct, parent.height) {
+            st.height = Some(f32_to_i32(p / 100.0 * ph as f32).max(0));
+        }
+    }
+    // `@keyframes` — apply the stop(s) for the current animation clock.
+    apply_animation(&mut st, sheet);
     // `filter` is approximated as a colour transform over the element's own
     // colours (grayscale/invert/brightness/opacity) — blur is not rasterized.
     if !st.filter.is_empty() {
         apply_filter_colors(&mut st);
     }
     st
+}
+
+/// Apply the current `@keyframes` snapshot onto `st`.
+///
+/// Only properties we already honour (opacity, transform, background, colour)
+/// are interpolated / applied. A missing 0%/100% stop is the element's
+/// pre-animation value, which is what `animate-pulse` (`50%{opacity:.5}`)
+/// relies on.
+fn apply_animation(st: &mut ComputedStyle, sheet: &Stylesheet) {
+    let name = st.animation_name.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("none") {
+        return;
+    }
+    let Some(stops) = sheet.keyframes(name) else {
+        return;
+    };
+    if stops.is_empty() {
+        return;
+    }
+    mark_page_wants_animation();
+    let dur = parse_time_ms(&st.animation_duration);
+    if dur == 0 {
+        // Fill-mode / a nameless duration: apply the last stop as a still.
+        if let Some(last) = stops.last() {
+            for (n, v) in &last.decls {
+                apply_one(st, n, v);
+            }
+        }
+        return;
+    }
+    let delay = parse_time_ms(&st.animation_delay);
+    let now = animation_now_ms().saturating_sub(delay);
+    let t = (now % dur) as f32 / dur as f32;
+    let pct = (t * 100.0).clamp(0.0, 100.0);
+    // Surrounding stops; implied 0%/100% carry the pre-animation values.
+    let mut lo_pct = 0.0f32;
+    let mut hi_pct = 100.0f32;
+    let mut lo: Option<&KeyframeStop> = None;
+    let mut hi: Option<&KeyframeStop> = None;
+    for s in stops {
+        let p = s.pct as f32;
+        if p <= pct {
+            lo_pct = p;
+            lo = Some(s);
+        }
+        if p >= pct && hi.is_none() {
+            hi_pct = p;
+            hi = Some(s);
+        }
+    }
+    let span = (hi_pct - lo_pct).max(0.001);
+    let u = ((pct - lo_pct) / span).clamp(0.0, 1.0);
+    // Opacity is the one property pulse/fade actually animate; lerp it.
+    let base_op = st.opacity;
+    let op_at = |stop: Option<&KeyframeStop>, fallback: u8| -> u8 {
+        stop.and_then(|s| {
+            s.decls.iter().find(|(n, _)| n == "opacity").and_then(|(_, v)| {
+                v.trim().parse::<f32>().ok().map(|f| (f.clamp(0.0, 1.0) * 255.0) as u8)
+            })
+        })
+        .unwrap_or(fallback)
+    };
+    let a = op_at(lo, base_op);
+    let b = op_at(hi, base_op);
+    st.opacity = (a as f32 + (b as i32 - a as i32) as f32 * u) as u8;
+    // Other decls (transform, background, colour) take the nearest stop —
+    // interpolating a translate string is not worth it here.
+    let nearest = if u < 0.5 { lo.or(hi) } else { hi.or(lo) };
+    if let Some(s) = nearest {
+        for (n, v) in &s.decls {
+            if n == "opacity" {
+                continue;
+            }
+            apply_one(st, n, v);
+        }
+    }
 }
 
 /// Resolve `::before` / `::after` generated-content style for an element.
@@ -4088,6 +4546,7 @@ mod tests {
             input_type: None,
             extra: &[],
             prev: Some(sibs.as_slice()),
+            hovered: false,
         };
 
         for (sel, want) in [
@@ -4125,6 +4584,7 @@ mod tests {
             input_type: None,
             extra: &[],
             prev,
+            hovered: false,
         };
         assert!(key.matches_el(&base(None)));
         // Context absent -> approximate, so an unmatched chain still passes the
@@ -4160,6 +4620,7 @@ mod tests {
             input_type: None,
             extra: &extra,
             prev: None,
+            hovered: false,
         };
         for (sel, want) in [
             ("[data-state]", true),
@@ -4210,9 +4671,32 @@ mod tests {
             let c = parse_compound(sel).unwrap_or_else(|| panic!("{sel} did not parse"));
             assert_eq!(c.matches_el(&el), want, "{sel}");
         }
-        // Unsupported inside `:not()` -> the selector is dropped entirely.
-        assert!(parse_compound("div:not(:hover)").is_none());
+        // `:hover` is a real pseudo, so `:not(:hover)` parses (and matches
+        // an element that is not under the pointer).
+        let not_hover = parse_compound("div:not(:hover)").expect(":not(:hover) parses");
+        assert!(not_hover.matches_el(&el));
+        let mut hovered = el;
+        hovered.hovered = true;
+        assert!(!not_hover.matches_el(&hovered));
         assert!(parse_compound("div:not()").is_none());
+    }
+
+    #[test_case]
+    fn hover_matches_only_when_the_element_is_hovered() {
+        let rule = parse_compound("button:hover").expect("a:hover used to be dropped");
+        let cold = ElemRef::basic("button", None, Some("hover:bg-accent"));
+        assert!(!rule.matches_el(&cold), ":hover must not apply unconditionally");
+        let mut hot = cold;
+        hot.hovered = true;
+        assert!(rule.matches_el(&hot));
+        // Tailwind `.hover\\:bg-accent:hover` is a class AND :hover.
+        let tw = parse_compound(".hover\\:bg-accent:hover").expect("hover\\: utility + :hover");
+        assert!(!tw.matches_el(&cold));
+        assert!(tw.matches_el(&hot));
+        assert_eq!(
+            tw.classes,
+            alloc::vec![String::from("hover:bg-accent")]
+        );
     }
 
     /// `:not()` contributes its most specific argument's specificity, not its own.
@@ -4270,6 +4754,62 @@ mod tests {
     }
 
     #[test_case]
+    fn escaped_slash_class_matches_tailwind_opacity_utility() {
+        // `.bg-primary\/20` is how Tailwind spells the class `bg-primary/20`.
+        // Before unescape the rule never matched, so every shadcn track /
+        // skeleton / `/10` wash painted as "no background".
+        let c = parse_compound(".bg-primary\\/20").expect("escaped class parses");
+        assert_eq!(c.classes, alloc::vec![String::from("bg-primary/20")]);
+        let el = ElemRef::basic("div", None, Some("h-2 w-full bg-primary/20 rounded-full"));
+        assert!(c.matches_el(&el), "HTML class bg-primary/20 matches .bg-primary\\/20");
+        // Hex-escape form (`\2f` is `/`) plus a hover\: prefix.
+        let hover = parse_compound(".hover\\:bg-primary\\/90").expect("hover\\: utility");
+        assert_eq!(hover.classes, alloc::vec![String::from("hover:bg-primary/90")]);
+        let sheet = Stylesheet::parse(
+            ".bg-primary\\/20{background-color:hsl(222.2 47.4% 11.2% / .2)}",
+        );
+        let mut parent = ComputedStyle::default();
+        parent.custom_props.insert(String::from("--primary"), String::from("222.2 47.4% 11.2%"));
+        let st = compute(&sheet, "div", None, Some("bg-primary/20"), None, &parent);
+        assert!(st.background.is_some(), "escaped class applies a background");
+    }
+
+    #[test_case]
+    fn keyframes_pulse_applies_midpoint_opacity() {
+        let sheet = Stylesheet::parse(
+            "@keyframes pulse{50%{opacity:.5}} .s{animation:pulse 2s infinite;background:#112233}",
+        );
+        assert_eq!(sheet.keyframe_count(), 1);
+        // Default test clock is 0 → 0% → identity opacity.
+        let st0 = compute(&sheet, "div", None, Some("s"), None, &ComputedStyle::default());
+        assert_eq!(st0.opacity, 255);
+        assert_eq!(st0.animation_name, "pulse");
+        assert_eq!(st0.animation_duration, "2s");
+        assert_eq!(st0.animation_iteration_count, "infinite");
+        // Halfway through a 2s pulse is the 50% stop.
+        set_animation_now_ms(Some(1000));
+        let st = compute(&sheet, "div", None, Some("s"), None, &ComputedStyle::default());
+        set_animation_now_ms(None);
+        assert!(
+            st.opacity > 100 && st.opacity < 160,
+            "pulse midpoint opacity, got {}",
+            st.opacity
+        );
+        assert_eq!(st.background, Some(0x112233));
+    }
+
+    #[test_case]
+    fn percent_height_resolves_against_parent() {
+        let mut parent = ComputedStyle::default();
+        apply_one(&mut parent, "height", "40px");
+        apply_one(&mut parent, "width", "40px");
+        let sheet = Stylesheet::parse(".fill{height:100%;width:100%;background:#abc}");
+        let st = compute(&sheet, "span", None, Some("fill"), None, &parent);
+        assert_eq!(st.height, Some(40), "h-full of a 40px parent");
+        assert_eq!(st.width, Some(40), "w-full of a 40px parent");
+    }
+
+    #[test_case]
     fn hsl_colors_parse() {
         // shadcn/ui defines its entire palette as HSL triples in custom
         // properties and reads them back as `hsl(var(--name))`.
@@ -4314,6 +4854,48 @@ mod tests {
         assert_eq!(parse_px("50vw"), Some(400));
         assert_eq!(parse_px("100vmin"), Some(600));
         assert_eq!(parse_px("100vmax"), Some(800));
+    }
+
+    #[test_case]
+    fn flex_one_shorthand_is_grow_and_zero_basis() {
+        // `.flex-1{flex:1 1 0%}` — a separator with this class fills the row
+        // only if basis is 0 (not "unresolved %") and grow is 1.
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "flex", "1 1 0%");
+        assert_eq!(st.flex_grow, 1);
+        assert_eq!(st.flex_shrink, 1);
+        assert_eq!(st.flex_basis, Some(0));
+    }
+
+    #[test_case]
+    fn rounded_md_resolves_calc_of_radius_var() {
+        // shadcn `.rounded-md{border-radius:calc(var(--radius) - 2px)}` with
+        // `:root{--radius:.5rem}` → 8-2 = 6. An empty var made calc(-2px) → 0
+        // and every button/card looked square.
+        let mut parent = ComputedStyle::default();
+        parent
+            .custom_props
+            .insert(String::from("--radius"), String::from(".5rem"));
+        let sheet = Stylesheet::parse(".rounded-md{border-radius:calc(var(--radius) - 2px)}");
+        let st = compute(
+            &sheet,
+            "button",
+            None,
+            Some("rounded-md"),
+            None,
+            &parent,
+        );
+        assert_eq!(st.border_radius, 6, "0.5rem - 2px");
+    }
+
+    #[test_case]
+    fn border_b_width_is_a_visible_solid_edge() {
+        let mut st = ComputedStyle::default();
+        apply_one(&mut st, "border-bottom-width", "1px");
+        apply_one(&mut st, "border-bottom-color", "#e2e8f0");
+        assert_eq!(st.border_bottom_width, 1);
+        assert_eq!(st.border_bottom_style, BorderStyle::Solid);
+        assert_eq!(st.border_bottom_color, Some(0xe2e8f0));
     }
 
     #[test_case]
@@ -4642,8 +5224,12 @@ mod tests {
         assert!(anc[0]
             .compound
             .matches_el(&ElemRef::basic("div", None, Some("card foo"))));
-        // State-dependent pseudos drop the rule (not applied unconditionally).
-        assert!(parse_complex("a:hover").is_none());
+        // `:hover` is kept and only matches a hovered element.
+        let (hover_key, _) = parse_complex("a:hover").expect("a:hover parses");
+        assert!(!hover_key.matches_el(&ElemRef::basic("a", None, None)));
+        let mut hovered_a = ElemRef::basic("a", None, None);
+        hovered_a.hovered = true;
+        assert!(hover_key.matches_el(&hovered_a));
         // `:link` / `:visited` strip to the base compound — HN needs this.
         let (k, _) = parse_complex("a:link").expect("a:link");
         assert!(k.matches_el(&ElemRef::basic("a", None, None)));

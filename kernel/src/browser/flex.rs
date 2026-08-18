@@ -222,6 +222,23 @@ pub fn flex_place(
             .max()
             .unwrap_or(0)
             .max(1);
+        // A single-line flex container with a definite cross size (`h-9` +
+        // `items-center`) sizes the line to that inner height so items
+        // center in the painted box, not in their own ink. `container_h == 0`
+        // (row, height:auto) keeps the item-sized line.
+        let line_cross = if lines.len() == 1 {
+            let definite = match direction {
+                FlexDirection::Row => container_h,
+                FlexDirection::Column => container_w,
+            };
+            if definite > 0 {
+                line_cross.max(definite)
+            } else {
+                line_cross
+            }
+        } else {
+            line_cross
+        };
         if let Some(max_h) = max_content_h {
             if cross_cursor + line_cross > max_h && !placed.is_empty() {
                 break; // fragmentation: stop adding lines
@@ -418,5 +435,44 @@ mod tests {
             None,
         );
         assert!(p.iter().any(|x| x.y > 0), "second line y>0: {p:?}");
+    }
+
+    #[test_case]
+    fn flex_row_centers_in_the_container_cross_size() {
+        // `h-9` + `items-center`: a 16px label sits in the middle of 36px,
+        // not at y=0 of its own ink.
+        let w = [40i32];
+        let h = [16i32];
+        let g = [0u32];
+        let p = flex_place(
+            &w,
+            &h,
+            &g,
+            80,
+            36,
+            0,
+            FlexDirection::Row,
+            Justify::Start,
+            AlignItems::Center,
+            FlexWrap::NoWrap,
+            None,
+        );
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].y, 10, "((36-16)/2) = 10, got {}", p[0].y);
+        // Auto height (0) must not invent a cross size.
+        let auto = flex_place(
+            &w,
+            &h,
+            &g,
+            80,
+            0,
+            0,
+            FlexDirection::Row,
+            Justify::Start,
+            AlignItems::Center,
+            FlexWrap::NoWrap,
+            None,
+        );
+        assert_eq!(auto[0].y, 0, "auto-height line is the item itself");
     }
 }

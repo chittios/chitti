@@ -8158,6 +8158,9 @@ fn ui_tick() {
             WIN_START_MS.store(now, Ordering::Relaxed);
         }
         crate::framebuffer::blink(now);
+        if browser_loaded() {
+            browser_anim_tick();
+        }
         let icons = icon_state(now);
         let icons_changed = ICON_STATE.swap(icons, Ordering::Relaxed) != icons;
         if icons_changed || now.saturating_sub(LAST_STATUS_MS.load(Ordering::Relaxed)) >= 1000 {

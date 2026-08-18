@@ -826,22 +826,80 @@ fn find_mut_by_elem_idx(n: &mut Node, i: usize) -> Option<&mut Node> {
 }
 
 pub fn commit_to_tree(root: &mut Node, dom: &JsDom) {
-    for er in &dom.elements {
-        if let Some(id) = er.id.as_deref() {
-            if let Some(n) = find_mut_by_id(root, id) {
+    // Prefer the stamped `elem_idx` — it is the same slot `JsDom.elements`
+    // uses. Walking by id / parse order missed `setAttribute('data-state')`
+    // on Radix Switch/Checkbox/Tabs/Accordion, so a click updated JsDom
+    // and the next layout still painted the unchecked chrome.
+    commit_walk_elem_idx(root, dom);
+}
+
+fn commit_walk_elem_idx(n: &mut Node, dom: &JsDom) {
+    if let Some(i) = n.elem_idx {
+        if let Some(er) = dom.elements.get(i) {
+            apply_elem_ref(n, er);
+        }
+    } else if let NodeKind::Element { id: Some(id), .. } = &n.kind {
+        // One-shot `layout_html_ex` used to commit by id before any stamp.
+        let id = id.clone();
+        if let Some(i) = dom.find_id(&id) {
+            if let Some(er) = dom.elements.get(i) {
                 apply_elem_ref(n, er);
             }
         }
     }
-    // Index-based fallback for nodes without id (in pre-order element order).
-    let mut idx = 0usize;
-    commit_walk_index(root, dom, &mut idx);
+    let n_ptr = n as *mut Node;
+    // SAFETY: single-threaded exclusive walk.
+    let n = unsafe { &mut *n_ptr };
+    for i in 0..n.children.len() {
+        commit_walk_elem_idx(&mut n.children[i], dom);
+    }
 }
 
 fn apply_elem_ref(n: &mut Node, er: &ElemRef) {
-    if let NodeKind::Element { style_attr, .. } = &mut n.kind {
+    if let NodeKind::Element {
+        style_attr,
+        class,
+        extra_attrs,
+        value,
+        ..
+    } = &mut n.kind
+    {
         if !er.style.is_empty() {
             *style_attr = Some(er.style.clone());
+        }
+        if er.class.is_some() {
+            *class = er.class.clone();
+        }
+        if !er.value.is_empty() {
+            *value = Some(er.value.clone());
+        }
+        // Live attributes (data-state, hidden, aria-*, role). Drop previous
+        // extras and rebuild from JsDom so a removed `hidden` un-hides.
+        extra_attrs.clear();
+        for (k, v) in &er.attrs {
+            if k.starts_with("on")
+                || matches!(
+                    k.as_str(),
+                    "id" | "class" | "style" | "href" | "src" | "type"
+                        | "name" | "value" | "placeholder"
+                )
+            {
+                continue;
+            }
+            extra_attrs.push((k.clone(), v.clone()));
+        }
+        for (k, v) in &er.dataset {
+            let name = if k.starts_with("data-") {
+                k.clone()
+            } else {
+                alloc::format!("data-{k}")
+            };
+            if !extra_attrs.iter().any(|(ek, _)| ek == &name) {
+                extra_attrs.push((name, v.clone()));
+            }
+        }
+        if er.hidden && !extra_attrs.iter().any(|(k, _)| k == "hidden") {
+            extra_attrs.push((String::from("hidden"), String::new()));
         }
     }
     // Replace visible text content.
@@ -855,44 +913,6 @@ fn apply_elem_ref(n: &mut Node, er: &ElemRef) {
         if let NodeKind::Text(t) = &mut n.children[0].kind {
             *t = er.text.clone();
         }
-    }
-}
-
-fn find_mut_by_id<'a>(n: &'a mut Node, id: &str) -> Option<&'a mut Node> {
-    if matches!(&n.kind, NodeKind::Element { id: Some(i), .. } if i.as_str() == id) {
-        return Some(n);
-    }
-    let n_ptr = n as *mut Node;
-    // SAFETY: single-threaded tree walk; at most one exclusive ref returned.
-    let n = unsafe { &mut *n_ptr };
-    for i in 0..n.children.len() {
-        let child_ptr = &mut n.children[i] as *mut Node;
-        if let Some(found) = find_mut_by_id(unsafe { &mut *child_ptr }, id) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn commit_walk_index(n: &mut Node, dom: &JsDom, idx: &mut usize) {
-    if let NodeKind::Element { tag, id, .. } = &n.kind {
-        if !matches!(tag.as_str(), "script" | "style" | "noscript") {
-            // Prefer id-based path above; only fill nodes that still need it.
-            let skip = id.is_some();
-            if !skip {
-                if let Some(er) = dom.elements.get(*idx) {
-                    apply_elem_ref(n, er);
-                }
-            }
-            *idx += 1;
-        }
-    }
-    // Re-borrow for children after mutating n.
-    let n_ptr = n as *mut Node;
-    let n = unsafe { &mut *n_ptr };
-    for i in 0..n.children.len() {
-        let c = &mut n.children[i];
-        commit_walk_index(c, dom, idx);
     }
 }
 
@@ -4043,6 +4063,39 @@ mod tests {
         assert!(
             !plain.contains("loading React bundle"),
             "placeholder survived prune: {plain:?}"
+        );
+    }
+
+    #[test_case]
+    fn commit_full_copies_data_state_so_radix_toggles_paint() {
+        // Switch/Checkbox/Tabs/Accordion style themselves with
+        // `[data-state=checked]`. setAttribute updates JsDom; without copying
+        // extras back onto the HTML node the next layout still sees unchecked.
+        let mut doc = html::parse(
+            r#"<html><body><button id="sw" data-state="unchecked">x</button></body></html>"#,
+        );
+        let mut dom = JsDom::from_document(&doc);
+        crate::browser::js::stamp_elem_indices(&mut doc.root);
+        let i = dom.find_id("sw").expect("sw");
+        dom.elements[i]
+            .attrs
+            .insert(String::from("data-state"), String::from("checked"));
+        commit_full(&mut doc.root, &dom);
+        fn extra_of<'a>(n: &'a html::Node, want: &str) -> Option<&'a str> {
+            if let html::NodeKind::Element {
+                extra_attrs, id, ..
+            } = &n.kind
+            {
+                if id.as_deref() == Some(want) {
+                    return extra_attrs.iter().find(|(k, _)| k == "data-state").map(|(_, v)| v.as_str());
+                }
+            }
+            n.children.iter().find_map(|c| extra_of(c, want))
+        }
+        assert_eq!(
+            extra_of(&doc.root, "sw"),
+            Some("checked"),
+            "data-state must survive commit_full"
         );
     }
 

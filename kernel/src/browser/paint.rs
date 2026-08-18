@@ -36,11 +36,18 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
     let mut buf = vec![layout.bg; w * h];
 
     // Background rects under content (blurred shadow / rounded / square).
-    for r in &layout.rects {
+    for (i, r) in layout.rects.iter().enumerate() {
+        let clip = clip_for(&layout.clips, i, ClipKind::Rect);
         if r.blur > 0 {
             paint_blur_shadow(&mut buf, w, h, r, scroll_y);
         } else if r.radius > 0 {
-            fill_round_rect(&mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color, r.radius);
+            fill_round_rect_clip(
+                &mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color, r.radius, clip, scroll_y,
+            );
+        } else if let Some(c) = clip {
+            if let Some((x, y, rw, rh)) = intersect_box(r.x, r.y - scroll_y, r.w, r.h, c, scroll_y) {
+                fill_rect(&mut buf, w, h, x, y, rw, rh, r.color);
+            }
         } else {
             fill_rect(&mut buf, w, h, r.x, r.y - scroll_y, r.w, r.h, r.color);
         }
@@ -72,26 +79,33 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
     }
 
     // Images (already decoded RGB).
-    for im in &layout.images {
+    for (ii, im) in layout.images.iter().enumerate() {
+        let _ = clip_for(&layout.clips, ii, ClipKind::Image);
         let y0 = im.y - scroll_y;
         if y0 + im.h < 0 || y0 >= layout.height {
             continue;
         }
         if let Some(ref px) = im.pixels {
-            blit_image_fit(
-                &mut buf,
-                w,
-                h,
-                im.x,
-                y0,
-                im.w,
-                im.h,
-                px,
-                im.src_w,
-                im.src_h,
-                im.object_fit,
-                &im.object_position,
-            );
+            if im.knockout {
+                blit_image_knockout(
+                    &mut buf, w, h, im.x, y0, im.w, im.h, px, im.src_w.max(1), im.src_h.max(1),
+                );
+            } else {
+                blit_image_fit(
+                    &mut buf,
+                    w,
+                    h,
+                    im.x,
+                    y0,
+                    im.w,
+                    im.h,
+                    px,
+                    im.src_w,
+                    im.src_h,
+                    im.object_fit,
+                    &im.object_position,
+                );
+            }
         } else {
             fill_rect(&mut buf, w, h, im.x, y0, im.w, im.h, 0xe0e0e0);
             for dx in 0..im.w {
@@ -162,7 +176,16 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
     }
 
     // Form controls.
-    for c in &layout.controls {
+    for (ci, c) in layout.controls.iter().enumerate() {
+        if let Some(clip) = clip_for(&layout.clips, ci, ClipKind::Control) {
+            if c.x >= clip.0 + clip.2
+                || c.y >= clip.1 + clip.3
+                || c.x + c.w <= clip.0
+                || c.y + c.h <= clip.1
+            {
+                continue;
+            }
+        }
         paint_control(&mut buf, w, h, c, scroll_y, layout.height);
     }
 
@@ -177,7 +200,18 @@ pub fn paint_chrome(layout: &Layout, scroll_y: i32, chrome: Chrome) -> Vec<u32> 
     }
 
     // Text runs (baseline-correct TTF).
-    for run in &layout.runs {
+    for (i, run) in layout.runs.iter().enumerate() {
+        if let Some(c) = clip_for(&layout.clips, i, ClipKind::Run) {
+            // Skip a run whose origin sits outside the clip (overflow:hidden).
+            // Clip is in content space, same as `run.y`.
+            if run.x >= c.0 + c.2
+                || run.y >= c.1 + c.3
+                || run.y + run.font_size < c.1
+                || run.x + 1 < c.0
+            {
+                continue;
+            }
+        }
         let px = run.font_size.max(8) as f32;
         let line_h = font_ttf::line_height(px) as i32;
         let y = run.y - scroll_y;
@@ -247,20 +281,25 @@ fn paint_control(
     }
     match c.kind {
         ControlKind::Text | ControlKind::Password | ControlKind::TextArea => {
-            // White field with the control's own CSS background/radius (a text
-            // input's UA default box is a sharp rectangle, not rounded).
-            let bg = c.bg.unwrap_or(if c.focused { 0xffffff } else { 0xfafafa });
-            let border = if c.focused { 0x1a73e8 } else { 0x888888 };
-            fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius);
-            // border
-            for dx in 0..c.w {
-                put(buf, bw, bh, c.x + dx, y0, border);
-                put(buf, bw, bh, c.x + dx, y0 + c.h - 1, border);
+            // shadcn Input is `bg-transparent border border-input rounded-md`.
+            // The UA grey chip + square 1px stroke hid the author chrome.
+            let border = if c.focused {
+                c.border_color.unwrap_or(0x1a73e8)
+            } else {
+                c.border_color.unwrap_or(0xc4c4c8)
+            };
+            let edge = if c.focused {
+                c.border_width.max(1) + 1
+            } else {
+                c.border_width.max(1)
+            };
+            if let Some(bg) = c.bg {
+                fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius);
+            } else if !c.transparent {
+                let bg = if c.focused { 0xffffff } else { 0xfafafa };
+                fill_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, bg, c.radius);
             }
-            for dy in 0..c.h {
-                put(buf, bw, bh, c.x, y0 + dy, border);
-                put(buf, bw, bh, c.x + c.w - 1, y0 + dy, border);
-            }
+            stroke_round_rect(buf, bw, bh, c.x, y0, c.w, c.h, border, c.radius, edge);
             let text_owned: alloc::string::String = if c.value.is_empty() && !c.placeholder.is_empty()
             {
                 c.placeholder.clone()
@@ -275,9 +314,10 @@ fn paint_control(
             } else {
                 0x222222u32
             };
-            let _ = blit_text(buf, bw, bh, c.x + 6, y0 + 4, &text_owned, 13.0, color, "");
+            let fs = c.font_size.max(8.0);
+            let _ = blit_text(buf, bw, bh, c.x + 6, y0 + 4, &text_owned, fs, color, "");
             if c.focused {
-                let tw = font_ttf::measure(&text_owned, 13.0) as i32;
+                let tw = font_ttf::measure(&text_owned, fs) as i32;
                 let cx = c.x + 6 + tw.min(c.w - 10);
                 for dy in 4..(c.h - 4).max(5) {
                     put(buf, bw, bh, cx, y0 + dy, 0x1a73e8);
@@ -285,6 +325,12 @@ fn paint_control(
             }
         }
         ControlKind::Submit | ControlKind::Button => {
+            // A CSS-styled button (inline-flex / Ghost / Link) is already
+            // painted as a box + text runs. Drawing the UA chip on top made
+            // Ghost/Link look like grey system buttons.
+            if c.transparent {
+                return;
+            }
             // Honor the control's own CSS background colour; else the **UA
             // default button** — a light system-grey box with a 1px border (the
             // genuine cross-browser default for `<button>`/submit; the previous
@@ -312,15 +358,18 @@ fn paint_control(
             } else {
                 c.value.as_str()
             };
-            let tw = font_ttf::measure(label, 13.0) as i32;
+            let fs = c.font_size.max(8.0);
+            let tw = font_ttf::measure(label, fs) as i32;
             let tx = c.x + ((c.w - tw) / 2).max(4);
+            let th = font_ttf::line_height(fs) as i32;
+            let ty = y0 + ((c.h - th) / 2).max(1);
             // Label colour: the control's `color`; else dark on the light UA
             // button, or white on a dark author background.
             let fg = c.fg.unwrap_or(match styled {
                 Some(col) if col_luma(col) < 140 => 0xffffff,
                 _ => 0x202124,
             });
-            let _ = blit_text(buf, bw, bh, tx, y0 + 5, label, 13.0, fg, "");
+            let _ = blit_text(buf, bw, bh, tx, ty, label, fs, fg, "");
         }
         ControlKind::Checkbox => {
             fill_rect(buf, bw, bh, c.x, y0, c.w, c.h, 0xffffff);
@@ -650,6 +699,34 @@ fn blit_image_crop(
 /// Blit an image into a `box_w`×`box_h` box honoring `object-fit`
 /// (fill/contain/cover/none/scale-down) and `object-position` keywords.
 #[allow(clippy::too_many_arguments)]
+fn blit_image_knockout(
+    buf: &mut [u32],
+    bw: usize,
+    bh: usize,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    src: &[u32],
+    sw: usize,
+    sh: usize,
+) {
+    if sw == 0 || sh == 0 || dw <= 0 || dh <= 0 {
+        return;
+    }
+    for row in 0..dh {
+        let sy = (row as usize * sh) / dh as usize;
+        for col in 0..dw {
+            let sx = (col as usize * sw) / dw as usize;
+            let p = src[sy * sw + sx];
+            if p & 0x00ff_ffff == 0x00ff_ffff {
+                continue;
+            }
+            put(buf, bw, bh, dx + col, dy + row, p);
+        }
+    }
+}
+
 fn blit_image_fit(
     buf: &mut [u32], bw: usize, bh: usize, bx: i32, by: i32, box_w: i32, box_h: i32,
     src: &[u32], sw: usize, sh: usize, fit: super::css::ObjectFit, object_pos: &str,
@@ -753,6 +830,121 @@ fn align_pos(free: i32, pos: f32) -> i32 {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ClipKind {
+    Rect,
+    Run,
+    Image,
+    Control,
+}
+
+/// Content-space clip covering primitive index `i`, if any. Nested clips
+/// (an overflow:hidden inside another) are intersected.
+fn clip_for(clips: &[super::layout::ClipOp], i: usize, kind: ClipKind) -> Option<(i32, i32, i32, i32)> {
+    let mut acc: Option<(i32, i32, i32, i32)> = None;
+    for c in clips {
+        let hit = match kind {
+            ClipKind::Rect => i >= c.rects_from && i < c.rects_to,
+            ClipKind::Run => i >= c.runs_from && i < c.runs_to,
+            ClipKind::Image => i >= c.images_from && i < c.images_to,
+            ClipKind::Control => i >= c.controls_from && i < c.controls_to,
+        };
+        if !hit {
+            continue;
+        }
+        acc = Some(match acc {
+            None => (c.x, c.y, c.w, c.h),
+            Some(a) => {
+                let x = a.0.max(c.x);
+                let y = a.1.max(c.y);
+                let x2 = (a.0 + a.2).min(c.x + c.w);
+                let y2 = (a.1 + a.3).min(c.y + c.h);
+                (x, y, (x2 - x).max(0), (y2 - y).max(0))
+            }
+        });
+    }
+    acc.filter(|c| c.2 > 0 && c.3 > 0)
+}
+
+/// Intersect a paint-space box `(x,y,w,h)` with a content-space clip, after
+/// scrolling the clip by `scroll_y`.
+fn intersect_box(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    clip: (i32, i32, i32, i32),
+    scroll_y: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    let (cx, cy, cw, ch) = (clip.0, clip.1 - scroll_y, clip.2, clip.3);
+    let x2 = x.max(cx);
+    let y2 = y.max(cy);
+    let x3 = (x + w).min(cx + cw);
+    let y3 = (y + h).min(cy + ch);
+    if x3 <= x2 || y3 <= y2 {
+        None
+    } else {
+        Some((x2, y2, x3 - x2, y3 - y2))
+    }
+}
+
+fn fill_round_rect_clip(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    x: i32,
+    y: i32,
+    rw: i32,
+    rh: i32,
+    color: u32,
+    radius: i32,
+    clip: Option<(i32, i32, i32, i32)>,
+    scroll_y: i32,
+) {
+    let Some(clip) = clip else {
+        fill_round_rect(buf, w, h, x, y, rw, rh, color, radius);
+        return;
+    };
+    let (cx, cy, cw, ch) = (clip.0, clip.1 - scroll_y, clip.2, clip.3);
+    let r = radius.min(rw / 2).min(rh / 2).max(0);
+    let r2 = (r * r) as i64;
+    for dy in 0..rh {
+        let py = y + dy;
+        if py < cy || py >= cy + ch {
+            continue;
+        }
+        for dx in 0..rw {
+            let px = x + dx;
+            if px < cx || px >= cx + cw {
+                continue;
+            }
+            if r > 0 {
+                let ccx = if dx < r {
+                    r
+                } else if dx >= rw - r {
+                    rw - r
+                } else {
+                    dx
+                };
+                let ccy = if dy < r {
+                    r
+                } else if dy >= rh - r {
+                    rh - r
+                } else {
+                    dy
+                };
+                if ccx != dx && ccy != dy {
+                    let (ddx, ddy) = ((dx - ccx) as i64, (dy - ccy) as i64);
+                    if ddx * ddx + ddy * ddy > r2 {
+                        continue;
+                    }
+                }
+            }
+            put(buf, w, h, px, py, color);
+        }
+    }
+}
+
 fn fill_rect(buf: &mut [u32], w: usize, h: usize, x: i32, y: i32, rw: i32, rh: i32, color: u32) {
     for dy in 0..rh {
         for dx in 0..rw {
@@ -805,6 +997,80 @@ fn fill_round_rect(
                 }
             }
             put(buf, w, h, x + dx, y + dy, color);
+        }
+    }
+}
+
+/// Outline of a rounded rect (author `border` on a `rounded-md` input/card).
+fn stroke_round_rect(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    x: i32,
+    y: i32,
+    rw: i32,
+    rh: i32,
+    color: u32,
+    radius: i32,
+    width: i32,
+) {
+    let width = width.max(1);
+    if radius <= 0 {
+        for t in 0..width {
+            for dx in 0..rw {
+                put(buf, w, h, x + dx, y + t, color);
+                put(buf, w, h, x + dx, y + rh - 1 - t, color);
+            }
+            for dy in 0..rh {
+                put(buf, w, h, x + t, y + dy, color);
+                put(buf, w, h, x + rw - 1 - t, y + dy, color);
+            }
+        }
+        return;
+    }
+    // Ring = inside the outer rounded rect and outside the inset one.
+    let r_out = radius.min(rw / 2).min(rh / 2).max(0);
+    let inner_w = (rw - 2 * width).max(0);
+    let inner_h = (rh - 2 * width).max(0);
+    let r_in = (r_out - width).max(0);
+    let inside = |dx: i32, dy: i32, ww: i32, hh: i32, r: i32| -> bool {
+        if ww <= 0 || hh <= 0 {
+            return false;
+        }
+        if dx < 0 || dy < 0 || dx >= ww || dy >= hh {
+            return false;
+        }
+        if r <= 0 {
+            return true;
+        }
+        let cx = if dx < r {
+            r
+        } else if dx >= ww - r {
+            ww - r
+        } else {
+            dx
+        };
+        let cy = if dy < r {
+            r
+        } else if dy >= hh - r {
+            hh - r
+        } else {
+            dy
+        };
+        if cx != dx && cy != dy {
+            let (ddx, ddy) = ((dx - cx) as i64, (dy - cy) as i64);
+            ddx * ddx + ddy * ddy <= (r as i64) * (r as i64)
+        } else {
+            true
+        }
+    };
+    for dy in 0..rh {
+        for dx in 0..rw {
+            if inside(dx, dy, rw, rh, r_out)
+                && !inside(dx - width, dy - width, inner_w, inner_h, r_in)
+            {
+                put(buf, w, h, x + dx, y + dy, color);
+            }
         }
     }
 }

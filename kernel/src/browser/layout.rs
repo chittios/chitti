@@ -100,6 +100,78 @@ pub struct BgBox {
 /// `border_color`, then the text colour). This is why bordered boxes/tables/
 /// cards finally render an outline — previously borders were computed but never
 /// painted.
+/// A phrasing tag (`span`, `label`, …) is only inline when the author left
+/// it that way. `display:block` / explicit `h-4 w-4` (the Switch thumb) must
+/// generate a real box — the inline arm hugs text runs and an empty span
+/// painted nothing.
+fn phrasing_is_inline(st: &ComputedStyle) -> bool {
+    matches!(st.display, DisplayMode::Inline) && st.width.is_none() && st.height.is_none()
+}
+
+fn visible_border_width(st: &ComputedStyle) -> i32 {
+    let edge = |style: css::BorderStyle, width: i32| -> i32 {
+        if style.is_visible() { width.max(0) } else { 0 }
+    };
+    edge(st.border_top_style, st.border_top_width)
+        .max(edge(st.border_bottom_style, st.border_bottom_width))
+        .max(edge(st.border_left_style, st.border_left_width))
+        .max(edge(st.border_right_style, st.border_right_width))
+}
+
+fn visible_border_color(st: &ComputedStyle) -> Option<u32> {
+    st.border_top_color
+        .or(st.border_bottom_color)
+        .or(st.border_left_color)
+        .or(st.border_right_color)
+        .or(st.border_color)
+}
+
+/// When the box is rounded, square 1px edge rects sit on top of the fill and
+/// make every card/button look sharp. Emit a same-size rounded rect of the
+/// border colour *behind* the (inset) fill instead.
+fn apply_rounded_border(
+    rects: &mut Vec<RectBox>,
+    bg_idx: Option<usize>,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    st: &ComputedStyle,
+) -> bool {
+    let radius = st.border_radius;
+    let bw = visible_border_width(st);
+    if radius <= 0 || bw <= 0 {
+        return false;
+    }
+    let Some(bc) = visible_border_color(st).or(st.border_color) else {
+        return false;
+    };
+    let ring = RectBox {
+        x,
+        y,
+        w,
+        h,
+        color: bc,
+        radius,
+        blur: 0,
+    };
+    if let Some(i) = bg_idx {
+        if i < rects.len() {
+            rects[i].x += bw;
+            rects[i].y += bw;
+            rects[i].w = (rects[i].w - 2 * bw).max(1);
+            rects[i].h = (rects[i].h - 2 * bw).max(1);
+            // Keep the author's radius on the fill so a 1px inset still
+            // reads as the same corner (and tests pin 0.5rem → 8).
+            rects[i].radius = radius;
+            rects.insert(i, ring);
+            return true;
+        }
+    }
+    rects.push(ring);
+    true
+}
+
 fn push_box_borders(rects: &mut Vec<RectBox>, x: i32, y: i32, w: i32, h: i32, st: &ComputedStyle) {
     if w <= 0 || h <= 0 {
         return;
@@ -155,6 +227,8 @@ pub struct ImageBox {
     pub object_fit: css::ObjectFit,
     /// `object-position` keywords (e.g. `right bottom`); empty = center.
     pub object_position: String,
+    /// Skip near-white pixels (inline SVG icons rasterized on a white page).
+    pub knockout: bool,
 }
 
 /// Form control kind (Ladybird `HTMLInputElement` type subset).
@@ -261,6 +335,12 @@ pub struct FormControl {
     /// background shows through (e.g. google.com's `.lsb` button over its grey
     /// `.lsbb` wrapper), instead of painting an opaque UA default over it.
     pub transparent: bool,
+    /// CSS `font-size` used to measure and paint the label (so `text-sm` /
+    /// `text-xs` buttons don't clip).
+    pub font_size: f32,
+    /// Author border (shadcn Input `border border-input`). `None` / 0 → UA.
+    pub border_color: Option<u32>,
+    pub border_width: i32,
 }
 
 /// Hit-test result in content coordinates (y includes scroll offset).
@@ -293,7 +373,32 @@ pub struct Layout {
     pub bg_boxes: Vec<BgBox>,
     /// `transform: rotate(...)` regions for the paint bitmap-rotation pass.
     pub rotates: Vec<RotateOp>,
+    /// `overflow: hidden` clip regions (content-space) covering the descendant
+    /// primitives listed by index range. Progress indicators (`translateX(-N%)`
+    /// of a full-width child) need this or the leftover  N% paints past the track.
+    pub clips: Vec<ClipOp>,
+    /// True when any element applied an `@keyframes` animation. The browser
+    /// tick uses this to decide whether a live page needs another paint.
+    pub has_animation: bool,
     pub bg: u32,
+}
+
+/// An `overflow: hidden` clip. Primitives whose index falls in `[from, to)`
+/// are intersected with `(x, y, w, h)` at paint time.
+#[derive(Clone, Copy, Debug)]
+pub struct ClipOp {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub rects_from: usize,
+    pub rects_to: usize,
+    pub runs_from: usize,
+    pub runs_to: usize,
+    pub images_from: usize,
+    pub images_to: usize,
+    pub controls_from: usize,
+    pub controls_to: usize,
 }
 
 /// Extra outputs threaded through the walk: interactive element hit boxes and
@@ -317,6 +422,10 @@ struct Aux<'a> {
     elem_boxes: Vec<ElemBox>,
     bg_boxes: Vec<BgBox>,
     rotates: Vec<RotateOp>,
+    clips: Vec<ClipOp>,
+    /// Border box of the node most recently laid out as a CSS box (flex/block).
+    /// Used to hang a hit-only `<button>` control over a painted box.
+    last_box: Option<(i32, i32, i32, i32)>,
     interactive: &'a [usize],
 }
 
@@ -404,6 +513,7 @@ pub fn layout_document_ex(
     // `vh`/`vw` lengths resolve against this — recorded before any style is
     // computed, since a length is parsed lazily per declaration.
     css::set_viewport(vw, vh);
+    css::clear_animation_flag();
     let mut runs = Vec::new();
     let mut links = Vec::new();
     let mut rects = Vec::new();
@@ -442,6 +552,8 @@ pub fn layout_document_ex(
         elem_boxes: Vec::new(),
         bg_boxes: Vec::new(),
         rotates: Vec::new(),
+        clips: Vec::new(),
+        last_box: None,
         interactive,
     };
     walk(
@@ -479,6 +591,8 @@ pub fn layout_document_ex(
         elem_boxes: aux.elem_boxes,
         bg_boxes: aux.bg_boxes,
         rotates: aux.rotates,
+        clips: aux.clips,
+        has_animation: css::page_wants_animation(),
         bg: page_bg,
     }
 }
@@ -594,6 +708,8 @@ pub fn layout_reader(title: &str, plain: &str, vw: i32, vh: i32) -> Layout {
         elem_boxes: Vec::new(),
         bg_boxes: Vec::new(),
         rotates: Vec::new(),
+        clips: Vec::new(),
+        has_animation: false,
         bg: 0xf5f0e8,
     }
 }
@@ -627,6 +743,7 @@ fn elem_ref_for<'a>(n: &'a Node) -> Option<css::ElemRef<'a>> {
             input_type: input_type.as_deref(),
             extra: extra_attrs.as_slice(),
             prev: None,
+            hovered: n.elem_idx.map(css::elem_is_hovered).unwrap_or(false),
         }),
         _ => None,
     }
@@ -771,6 +888,7 @@ fn walk<'a>(
                 // for a first child, and is deliberately not `None` — see
                 // `css::ElemRef::prev`.
                 prev: Some(prev),
+                hovered: n.elem_idx.map(css::elem_is_hovered).unwrap_or(false),
             };
             let mut st = css::compute_el(sheet, el_ref, style_attr.as_deref(), parent_st, chain);
             // Presentational attrs (bgcolor / width%) — also applied in
@@ -801,13 +919,18 @@ fn walk<'a>(
 
             // Flex / Grid formatting context — children become independently
             // measured fragments, then translated into place (not block-stacked).
+            //
+            // Text-only flex boxes must take this path too. A shadcn Ghost
+            // button is `<button class="inline-flex …">Ghost</button>` with no
+            // element child; treating it as a form control painted the UA grey
+            // chip over a style that has no background. An AvatarFallback is
+            // `<span class="flex h-full w-full">CH</span>` — the inline span
+            // arm ignored the 40×40 size and the circle never painted.
             if matches!(st.display, DisplayMode::Flex | DisplayMode::InlineFlex | DisplayMode::Grid)
-                && n.children
-                    .iter()
-                    .any(|c| matches!(c.kind, NodeKind::Element { .. }))
                 && !matches!(
                     tag,
                     "img" | "input" | "br" | "hr" | "iframe" | "canvas" | "video" | "audio"
+                        | "textarea" | "select"
                 )
             {
                 layout_flex_grid_container(
@@ -831,6 +954,9 @@ fn walk<'a>(
                     line_h,
                     chain,
                 );
+                if tag == "button" {
+                    push_hit_button(aux, controls, n, form, &st);
+                }
                 if let Some(pst) =
                     css::compute_pseudo(sheet, el_ref, &st, chain, css::PseudoElement::After)
                 {
@@ -1098,6 +1224,37 @@ fn walk<'a>(
                     cur.y += 4 + st.margin_bottom;
                     cur.content_bottom = cur.content_bottom.max(cur.y);
                 }
+                "svg" => {
+                    // Inline SVG (lucide icons). Rasterize and treat as an
+                    // image so a checkbox tick / accordion chevron is visible.
+                    let iw = width_attr
+                        .or(st.width)
+                        .unwrap_or(st.height.unwrap_or(16))
+                        .clamp(8, 128);
+                    let ih = height_attr.or(st.height).unwrap_or(iw).clamp(8, 128);
+                    let sbox = super::svg::collect_svg(n, iw as f32, ih as f32);
+                    let pixels = super::svg::raster(&sbox);
+                    if cur.x > cur.margin_x + cur.max_w - iw && cur.x > cur.margin_x {
+                        new_line(cur);
+                    }
+                    images.push(ImageBox {
+                        x: cur.x.max(cur.margin_x),
+                        y: cur.y,
+                        w: iw,
+                        h: ih,
+                        src: String::new(),
+                        alt: String::new(),
+                        pixels: Some(pixels),
+                        src_w: sbox.w.max(1) as usize,
+                        src_h: sbox.h.max(1) as usize,
+                        object_fit: css::ObjectFit::Contain,
+                        object_position: String::new(),
+                        knockout: true,
+                    });
+                    cur.x += iw + 2;
+                    cur.line_h = cur.line_h.max(ih);
+                    cur.content_bottom = cur.content_bottom.max(cur.y + ih);
+                }
                 "img" => {
                     if cur.x > cur.margin_x {
                         new_line(cur);
@@ -1127,6 +1284,7 @@ fn walk<'a>(
                         src_h: 0,
                         object_fit: st.object_fit,
                         object_position: st.object_position.clone(),
+                        knockout: false,
                     });
                     cur.y += ih + st.margin_bottom.max(0);
                     cur.x = cur.margin_x;
@@ -1246,6 +1404,11 @@ fn walk<'a>(
                     block_after(cur, st.margin_bottom.max(6));
                 }
                 "input" | "button" | "textarea" | "select" => {
+                    let css_w = st.width.or_else(|| {
+                        st.width_pct
+                            .map(|p| ((p / 100.0) * cur.max_w.max(1) as f32) as i32)
+                    });
+                    let author_border = visible_border_width(&st) > 0;
                     push_control(
                         cur,
                         controls,
@@ -1260,9 +1423,14 @@ fn walk<'a>(
                         st.border_radius.max(0),
                         st.background,
                         if st.color != parent_st.color { Some(st.color) } else { None },
-                        st.background.is_none() && !st.background_image.is_empty(),
-                        st.width,
-                        st.height,
+                        st.background.is_none()
+                            && (!st.background_image.is_empty() || author_border),
+                        css_w,
+                        st.height.or(st.min_height),
+                        st.padding_left.max(0) + st.padding_right.max(0),
+                        st.font_size.max(8) as f32,
+                        visible_border_color(&st),
+                        visible_border_width(&st),
                     );
                 }
                 "table" => {
@@ -1363,7 +1531,18 @@ fn walk<'a>(
                     // `box-sizing` (content-box: `width` is the content;
                     // border-box: `width` includes padding+border).
                     let avail = (old_max - st.margin_left - st.margin_right).max(1);
-                    let (mut content_w, mut box_w) = match st.width {
+                    // `w-full` is `width:100%`. Resolve it against the
+                    // containing block, then cap with max-width (so
+                    // `w-full max-w-md` is 28rem, not 100%+padding).
+                    let used_width = st.width.or_else(|| {
+                        st.width_pct
+                            .map(|p| ((p / 100.0) * avail as f32) as i32)
+                    })
+                    .map(|w| {
+                        let w = st.max_width.map(|m| w.min(m)).unwrap_or(w);
+                        st.min_width.map(|m| w.max(m)).unwrap_or(w)
+                    });
+                    let (mut content_w, mut box_w) = match used_width {
                         Some(w) => match st.box_sizing {
                             css::BoxSizing::BorderBox => {
                                 ((w - h_extra).max(1), w.min(avail).max(1))
@@ -1531,15 +1710,49 @@ fn walk<'a>(
                     aux.push_bg_box(&st, block_x0, block_y0, box_w, block_h);
                     {
                         // Borders go in front of this block's own background but
-                        // still behind its children.
-                        let mut edges = Vec::new();
-                        push_box_borders(&mut edges, block_x0, block_y0, box_w, block_h, &st);
-                        for e in edges {
-                            rects.insert(rect0 + deco, e);
+                        // still behind its children. Rounded boxes get a
+                        // matching rounded ring — square 1px edges on top of a
+                        // rounded fill is why cards/buttons looked sharp.
+                        let bg_i = st.background.map(|_| rect0 + deco - 1);
+                        if apply_rounded_border(
+                            rects,
+                            bg_i,
+                            block_x0,
+                            block_y0,
+                            box_w,
+                            block_h,
+                            &st,
+                        ) {
                             deco += 1;
+                        } else {
+                            let mut edges = Vec::new();
+                            push_box_borders(&mut edges, block_x0, block_y0, box_w, block_h, &st);
+                            for e in edges {
+                                rects.insert(rect0 + deco, e);
+                                deco += 1;
+                            }
                         }
                     }
                     aux.push_elem_box(n.elem_idx, block_x0, block_y0, box_w, block_h);
+                    if matches!(st.overflow, css::Overflow::Hidden) {
+                        // Clip descendants — everything after this box's own
+                        // decoration — to the padding box. The progress
+                        // indicator is a full-width child translated by -N%.
+                        aux.clips.push(ClipOp {
+                            x: block_x0,
+                            y: block_y0,
+                            w: box_w,
+                            h: block_h,
+                            rects_from: rect0 + deco,
+                            rects_to: rects.len(),
+                            runs_from: r0,
+                            runs_to: runs.len(),
+                            images_from: i0,
+                            images_to: images.len(),
+                            controls_from: c0,
+                            controls_to: controls.len(),
+                        });
+                    }
                     // Honor `text-align` for this block's own **inline** content.
                     // Gated on the alignment differing from the parent's, so a
                     // uniform-`center` subtree is shifted once (at the `<center>`
@@ -1577,7 +1790,7 @@ fn walk<'a>(
                         if (sx, sy) != (1.0, 1.0) {
                             scale_frag(tm, block_x0, block_y0, sx, sy, runs, links, rects, images, controls);
                         }
-                        let (tx, ty) = parse_transform_translate(&st.transform);
+                        let (tx, ty) = parse_transform_translate(&st.transform, box_w, block_h);
                         if (tx, ty) != (0, 0) {
                             translate_frag(tm, tx, ty, runs, links, rects, images, controls, frames, aux);
                         }
@@ -1659,21 +1872,71 @@ fn walk<'a>(
                     if matches!(tag, "strong" | "b") {
                         st_i.bold = true;
                     }
-                    cur.line_h = line_h.max(cur.line_h);
-                    let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
-                    cur.x += st_i.padding_left.max(0) + st_i.border_left_width.max(0);
-                    let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
-                    for c in &n.children {
-                        walk(
-                            c, sheet, &st_i, cur, runs, links, rects, images, controls, frames,
-                            aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
-                        );
-                        if let Some(r) = elem_ref_for(c) {
-                            sibs.push(r);
+                    // Switch thumb: `<span class="block h-4 w-4 rounded-full bg-background">`.
+                    // The inline path only paints a box around text runs, so an
+                    // empty sized span vanished. Give it a real box.
+                    if !phrasing_is_inline(&st_i) {
+                        let w = st_i
+                            .width
+                            .or(st_i.min_width)
+                            .unwrap_or(line_h)
+                            .max(1);
+                        let h = st_i
+                            .height
+                            .or(st_i.min_height)
+                            .unwrap_or(line_h)
+                            .max(1);
+                        let x = cur.x.max(cur.margin_x);
+                        let y = cur.y;
+                        let bg_idx = st_i.background.map(|bg| {
+                            let i = rects.len();
+                            rects.push(RectBox {
+                                x,
+                                y,
+                                w,
+                                h,
+                                color: fade(bg, st_i.opacity),
+                                radius: st_i.border_radius.max(0),
+                                blur: 0,
+                            });
+                            i
+                        });
+                        if !apply_rounded_border(rects, bg_idx, x, y, w, h, &st_i) {
+                            push_box_borders(rects, x, y, w, h, &st_i);
                         }
+                        aux.push_elem_box(n.elem_idx, x, y, w, h);
+                        aux.last_box = Some((x, y, w, h));
+                        let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
+                        for c in &n.children {
+                            walk(
+                                c, sheet, &st_i, cur, runs, links, rects, images, controls, frames,
+                                aux, link, form, next_form_id, page_bg, vw, in_head, child_chain,
+                                &sibs,
+                            );
+                            if let Some(r) = elem_ref_for(c) {
+                                sibs.push(r);
+                            }
+                        }
+                        cur.x = x + w;
+                        cur.line_h = cur.line_h.max(h);
+                        cur.content_bottom = cur.content_bottom.max(y + h);
+                    } else {
+                        cur.line_h = line_h.max(cur.line_h);
+                        let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+                        cur.x += st_i.padding_left.max(0) + st_i.border_left_width.max(0);
+                        let mut sibs: Vec<css::ElemRef<'a>> = Vec::new();
+                        for c in &n.children {
+                            walk(
+                                c, sheet, &st_i, cur, runs, links, rects, images, controls, frames,
+                                aux, link, form, next_form_id, page_bg, vw, in_head, child_chain, &sibs,
+                            );
+                            if let Some(r) = elem_ref_for(c) {
+                                sibs.push(r);
+                            }
+                        }
+                        cur.x += st_i.padding_right.max(0) + st_i.border_right_width.max(0);
+                        paint_inline_box(mark, &st_i, runs, rects);
                     }
-                    cur.x += st_i.padding_right.max(0) + st_i.border_right_width.max(0);
-                    paint_inline_box(mark, &st_i, runs, rects);
                 }
                 "ul" | "ol" | "body" | "html" => {
                     cur.line_h = line_h;
@@ -2084,11 +2347,22 @@ fn apply_presentational(n: &Node, st: &mut ComputedStyle, avail_w: i32) {
         width_pct,
         align_attr,
         height_attr,
+        extra_attrs,
         ..
     } = &n.kind
     else {
         return;
     };
+    // HTML `hidden` (and JS `.hidden = true`) is display:none. The gallery's
+    // `[hidden]{display:none}` is wrapped in `:where()` which we drop, so
+    // Radix Accordion/Tabs closed panels would stay visible without this.
+    if extra_attrs
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("hidden") && v != "until-found")
+    {
+        st.display_none = true;
+        st.display = DisplayMode::None;
+    }
     // Presentational bgcolor always wins over an unset background; if CSS set
     // one, leave it. HN's orange header/cream body are *only* presentational.
     if st.background.is_none() {
@@ -2153,6 +2427,18 @@ fn cell_rowspan(n: &Node) -> u32 {
 /// through `<thead>`/`<tbody>`/`<tfoot>`. Rowspan is not modeled; colspan is
 /// carried on each cell for placement.
 fn collect_table_rows<'a>(n: &'a Node, rows: &mut Vec<Vec<TableCellRef<'a>>>) {
+    collect_table_rows_ex(n, rows, None);
+}
+
+fn collect_table_rows_ex<'a>(
+    n: &'a Node,
+    rows: &mut Vec<Vec<TableCellRef<'a>>>,
+    trs: Option<&mut Vec<&'a Node>>,
+) {
+    // `trs` is taken as a local so the recursive tbody walk can pass it
+    // back in. Two collects stay in lockstep: rows[i] came from trs[i].
+    let mut owned: Vec<&'a Node> = Vec::new();
+    let trs = trs.unwrap_or(&mut owned);
     for child in &n.children {
         if let NodeKind::Element { tag, .. } = &child.kind {
             match tag.as_str() {
@@ -2171,8 +2457,11 @@ fn collect_table_rows<'a>(n: &'a Node, rows: &mut Vec<Vec<TableCellRef<'a>>>) {
                         })
                         .collect();
                     rows.push(cells);
+                    trs.push(child);
                 }
-                "thead" | "tbody" | "tfoot" => collect_table_rows(child, rows),
+                "thead" | "tbody" | "tfoot" => {
+                    collect_table_rows_ex(child, rows, Some(trs));
+                }
                 _ => {}
             }
         }
@@ -2339,7 +2628,8 @@ fn layout_table<'a>(
     let cell_chain = push_chain(chain, tt, tid, tc);
     let cell_chain = cell_chain.as_slice();
     let mut rows: Vec<Vec<TableCellRef<'a>>> = Vec::new();
-    collect_table_rows(n, &mut rows);
+    let mut row_trs: Vec<&'a Node> = Vec::new();
+    collect_table_rows_ex(n, &mut rows, Some(&mut row_trs));
     if rows.is_empty() {
         return;
     }
@@ -2521,7 +2811,7 @@ fn layout_table<'a>(
     };
     let mut row_y = cur.y + spacing;
     let mut pending = alloc::vec![0u32; ncols]; // rowspan cover remaining
-    for row in &rows {
+    for (ri, row) in rows.iter().enumerate() {
         for p in pending.iter_mut() {
             if *p > 0 {
                 *p -= 1;
@@ -2600,6 +2890,28 @@ fn layout_table<'a>(
             }
             push_box_borders(rects, col_x[*ci], row_y, span_w, cell_h, cst);
         }
+        // `tr { border-b }` — shadcn TableRow. Cells own their own edges;
+        // the row rule is a single line under the row box.
+        if let Some(tr) = row_trs.get(ri) {
+            let (ttag, tid, tclass, tstyle) = elem_parts(tr);
+            let rst = css::compute_ex(sheet, ttag, tid, tclass, tstyle, table_st, cell_chain);
+            if rst.border_bottom_style.is_visible() && rst.border_bottom_width > 0 {
+                let bw = rst.border_bottom_width.max(1);
+                let c = rst
+                    .border_bottom_color
+                    .or(rst.border_color)
+                    .unwrap_or(rst.color);
+                rects.push(RectBox {
+                    x: box_x,
+                    y: row_y + row_h - bw,
+                    w: table_w,
+                    h: bw,
+                    color: c,
+                    radius: 0,
+                    blur: 0,
+                });
+            }
+        }
         row_y += row_h + spacing;
     }
 
@@ -2646,14 +2958,20 @@ fn layout_flex_grid_container<'a>(
     let item_chain = push_chain(chain, nt, nid, nc);
     let item_chain = item_chain.as_slice();
     block_before(cur, st.margin_top.max(0));
-    cur.y += st.padding_top;
     let box_x = cur.margin_x + st.margin_left;
     let box_y = cur.y;
+    let pad_l = st.padding_left.max(0);
+    let pad_r = st.padding_right.max(0);
+    let pad_t = st.padding_top.max(0);
+    let pad_b = st.padding_bottom.max(0);
     // The space the container may use. An inline-level flex container is
     // shrink-to-fit: this is its *upper bound*, and the real width comes from
     // the items once they have been measured (see `shrink_to_fit` below).
+    // Width/height are the border box under `box-sizing: border-box` (Tailwind
+    // preflight); items are placed in the content box inside the padding.
     let avail_w = (cur.max_w - st.margin_left - st.margin_right).max(1);
-    let container_w = st.width.or(st.max_width).unwrap_or(avail_w).max(1);
+    let outer_w = st.width.or(st.max_width).unwrap_or(avail_w).max(1);
+    let container_w = (outer_w - pad_l - pad_r).max(1);
     let shrink_to_fit = st.display == DisplayMode::InlineFlex && st.width.is_none();
 
     let children: Vec<&Node> = n
@@ -2661,6 +2979,12 @@ fn layout_flex_grid_container<'a>(
         .iter()
         .filter(|c| matches!(c.kind, NodeKind::Element { .. }))
         .collect();
+    // A flex box whose only child is text (Ghost/Link buttons, AvatarFallback)
+    // has no element items — synthesize one fragment from the inline content.
+    let text_only = children.is_empty()
+        && n.children
+            .iter()
+            .any(|c| matches!(c.kind, NodeKind::Text(ref t) if !t.trim().is_empty()));
     let n_items = children.len().max(1);
 
     // Equal-share item width for row flex / grid (overridden by child width).
@@ -2689,8 +3013,8 @@ fn layout_flex_grid_container<'a>(
             y: box_y,
             w: container_w,
             h: 1,
-            color: bg,
-            radius: 0,
+            color: fade(bg, st.opacity),
+            radius: st.border_radius.max(0),
             blur: 0,
         });
         i
@@ -2714,7 +3038,121 @@ fn layout_flex_grid_container<'a>(
     // first". Without the accumulator the `~` was approximated as descendant and
     // the margin landed on the first item too.
     let mut item_sibs: Vec<css::ElemRef<'a>> = Vec::new();
-    for child in &children {
+    if text_only {
+        let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+        let mut child_cur = Cursor {
+            x: 0,
+            y: 0,
+            max_w: container_w.max(1),
+            margin_x: 0,
+            line_h,
+            content_bottom: 0,
+            float_l_w: 0,
+            float_l_bottom: 0,
+            float_r_w: 0,
+            float_r_bottom: 0,
+        };
+        for c in &n.children {
+            walk(
+                c,
+                sheet,
+                st,
+                &mut child_cur,
+                runs,
+                links,
+                rects,
+                images,
+                controls,
+                frames,
+                aux,
+                link,
+                form,
+                next_form_id,
+                page_bg,
+                vw,
+                in_head,
+                item_chain,
+                &[],
+            );
+        }
+        let (x0, y0, x1, y1) =
+            frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
+        let w = (x1 - x0).max(1);
+        let h = (y1 - y0).max(child_cur.content_bottom).max(line_h / 2).max(1);
+        let end = mark_frag(runs, links, rects, images, controls, frames, aux);
+        items.push(Item {
+            mark,
+            end,
+            x0,
+            y0,
+            w,
+            h,
+            grow: 0,
+            order: 0,
+        });
+    }
+    // Mixed flex items (accordion trigger = text + chevron SVG) must keep
+    // anonymous text as its own item. The element-only walk dropped the
+    // question and left a blank header.
+    let item_nodes: Vec<&Node> = if text_only {
+        Vec::new()
+    } else {
+        n.children.iter().collect()
+    };
+    for child in item_nodes {
+        if let NodeKind::Text(ref t) = child.kind {
+            if t.trim().is_empty() {
+                continue;
+            }
+            let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
+            let mut child_cur = Cursor {
+                x: 0,
+                y: 0,
+                max_w: container_w.max(1),
+                margin_x: 0,
+                line_h,
+                content_bottom: 0,
+                float_l_w: 0,
+                float_l_bottom: 0,
+                float_r_w: 0,
+                float_r_bottom: 0,
+            };
+            walk(
+                child,
+                sheet,
+                st,
+                &mut child_cur,
+                runs,
+                links,
+                rects,
+                images,
+                controls,
+                frames,
+                aux,
+                link,
+                form,
+                next_form_id,
+                page_bg,
+                vw,
+                in_head,
+                item_chain,
+                &[],
+            );
+            let (x0, y0, x1, y1) =
+                frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
+            let end = mark_frag(runs, links, rects, images, controls, frames, aux);
+            items.push(Item {
+                mark,
+                end,
+                x0,
+                y0,
+                w: (x1 - x0).max(1),
+                h: (y1 - y0).max(child_cur.content_bottom).max(line_h / 2).max(1),
+                grow: 0,
+                order: 0,
+            });
+            continue;
+        }
         // Child style for preferred width / flex-grow.
         let (ctag, cid, cclass, cstyle) = match &child.kind {
             NodeKind::Element {
@@ -2733,16 +3171,31 @@ fn layout_flex_grid_container<'a>(
         };
         let cst = css::compute_ex(sheet, ctag, cid, cclass, cstyle, st, item_chain);
         // `flex-basis` is the item's initial main size (overrides `width`).
-        let item_w = cst
-            .flex_basis
-            .filter(|&b| b > 0)
-            .or(cst.width)
-            .or(cst.max_width)
-            .unwrap_or(default_item_w)
-            // `container_w` can be below the 16px floor for a deeply-nested or
-            // zero-width flex item (google.com's modern layout hits this) —
-            // guard the upper bound so `clamp` never sees min > max (panic).
-            .clamp(16, container_w.max(16));
+        // `flex: 1 1 0%` must start at 0 so grow can fill the leftover row
+        // (the Separator). A floor of 16px made every grow item a chip.
+        let resolved_w = {
+            let mut w = cst.width.or_else(|| {
+                cst.width_pct
+                    .map(|p| ((p / 100.0) * container_w as f32) as i32)
+            });
+            if let Some(ref mut ww) = w {
+                if let Some(mw) = cst.max_width {
+                    *ww = (*ww).min(mw);
+                }
+                if let Some(mn) = cst.min_width {
+                    *ww = (*ww).max(mn);
+                }
+            } else {
+                w = cst.max_width;
+            }
+            w
+        };
+        let item_w = match cst.flex_basis {
+            Some(0) => 0,
+            Some(b) if b > 0 => b,
+            _ => resolved_w.or(cst.max_width).unwrap_or(default_item_w),
+        }
+        .clamp(0, container_w.max(0));
 
         let mark = mark_frag(runs, links, rects, images, controls, frames, aux);
         // Isolated cursor at origin so fragment coords start near (0,0).
@@ -2800,12 +3253,15 @@ fn layout_flex_grid_container<'a>(
             frag_bbox(mark, runs, links, rects, images, controls, frames, aux);
         let mut w = (x1 - x0).max(1);
         let mut h = (y1 - y0).max(1);
-        if let Some(eh) = cst.height {
+        if let Some(eh) = cst.height.or(cst.min_height) {
             h = h.max(eh);
         } else {
             h = h.max(child_cur.content_bottom.max(1));
         }
-        if let Some(ew) = cst.width {
+        if cst.flex_basis == Some(0) && cst.flex_grow > 0 {
+            // Grow from nothing; `flex_place` assigns the leftover.
+            w = 0;
+        } else if let Some(ew) = resolved_w {
             w = ew.clamp(1, container_w.max(1));
         } else if st.display.is_flex()
             && st.flex_direction == FlexDirection::Row
@@ -2813,11 +3269,14 @@ fn layout_flex_grid_container<'a>(
                 || st.display == DisplayMode::InlineFlex)
         {
             // Natural content width for wrapping.
-            w = w.min(container_w).max(16);
+            w = w.min(container_w).max(1);
         }
-        if w <= 1 && h <= 1 {
-            w = item_w.min(container_w).max(24);
-            h = line_h.max(16);
+        // An empty 1px rule (`h-[1px] w-full flex-1`) must stay 1px tall.
+        // The old "no geometry → 24×line" fallback turned the separator
+        // into a short fat chip in the middle of the row.
+        if w <= 1 && h <= 1 && cst.height.is_none() && cst.flex_basis != Some(0) {
+            w = item_w.min(container_w).max(1);
+            h = line_h.max(1);
         }
         let grow = if cst.flex_grow > 0 {
             cst.flex_grow
@@ -2849,11 +3308,17 @@ fn layout_flex_grid_container<'a>(
     let container_w = if shrink_to_fit {
         let sum: i32 = items.iter().map(|it| it.w.max(0)).sum();
         let gaps = gap * (items.len() as i32 - 1).max(0);
-        (sum + gaps + st.padding_left.max(0) + st.padding_right.max(0))
+        (sum + gaps)
             .max(1)
-            .min(avail_w)
+            .min((avail_w - pad_l - pad_r).max(1))
     } else {
         container_w
+    };
+    // 0 = height:auto — `flex_place` then uses the item-sized line.
+    let inner_h = match st.height {
+        Some(h) if st.box_sizing == css::BoxSizing::BorderBox => (h - pad_t - pad_b).max(0),
+        Some(h) => h.max(0),
+        None => 0,
     };
 
     let mut content_h = line_h;
@@ -2866,13 +3331,12 @@ fn layout_flex_grid_container<'a>(
             let widths: Vec<i32> = visual.iter().map(|&i| items[i].w).collect();
             let heights: Vec<i32> = visual.iter().map(|&i| items[i].h).collect();
             let grows: Vec<u32> = visual.iter().map(|&i| items[i].grow).collect();
-            let container_h = st.height.unwrap_or(10_000).max(1);
             let placed = flex::flex_place(
                 &widths,
                 &heights,
                 &grows,
                 container_w,
-                container_h,
+                inner_h,
                 gap,
                 st.flex_direction,
                 st.justify_content,
@@ -2884,9 +3348,20 @@ fn layout_flex_grid_container<'a>(
             let mut max_y = line_h;
             for p in &placed {
                 if let Some(it) = visual.get(p.index).and_then(|&i| items.get(i)) {
-                    let dx = box_x + p.x - it.x0;
-                    let dy = box_y + p.y - it.y0;
+                    let dx = box_x + pad_l + p.x - it.x0;
+                    let dy = box_y + pad_t + p.y - it.y0;
                     translate_frag_range(it.mark, it.end, dx, dy, runs, links, rects, images, controls, frames, aux);
+                    // `flex-grow` assigns a slot wider than the measured box.
+                    // An empty `flex-1` separator is measured at 0/1px; stretch
+                    // its own rects to the grown width or the rule stays a chip.
+                    if p.w > it.w {
+                        let extra = p.w - it.w.max(0);
+                        for r in &mut rects[it.mark.rects..it.end.rects] {
+                            if r.w <= it.w.max(1) + 2 {
+                                r.w = (r.w + extra).max(1);
+                            }
+                        }
+                    }
                     max_x = max_x.max(p.x + p.w);
                     max_y = max_y.max(p.y + p.h);
                 }
@@ -2914,8 +3389,8 @@ fn layout_flex_grid_container<'a>(
                             flex::flex_cross_offset(it.w.min(cell_w), cell_w, st.align_items);
                         let iy =
                             flex::flex_cross_offset(it.h.min(cell_h), cell_h, st.align_items);
-                        let dx = box_x + p.x + ix - it.x0;
-                        let dy = box_y + p.y + iy - it.y0;
+                        let dx = box_x + pad_l + p.x + ix - it.x0;
+                        let dy = box_y + pad_t + p.y + iy - it.y0;
                         translate_frag_range(
                             it.mark, it.end, dx, dy, runs, links, rects, images, controls, frames, aux,
                         );
@@ -2944,8 +3419,8 @@ fn layout_flex_grid_container<'a>(
                     let gy = row as i32 * (cell_h + gap);
                     let ix = flex::flex_cross_offset(it.w.min(cw), cw, st.align_items);
                     let iy = flex::flex_cross_offset(it.h.min(cell_h), cell_h, st.align_items);
-                    let dx = box_x + gx + ix - it.x0;
-                    let dy = box_y + gy + iy - it.y0;
+                    let dx = box_x + pad_l + gx + ix - it.x0;
+                    let dy = box_y + pad_t + gy + iy - it.y0;
                     translate_frag_range(it.mark, it.end, dx, dy, runs, links, rects, images, controls, frames, aux);
                 }
                 let rows = (items.len() + ncols - 1) / ncols;
@@ -2960,20 +3435,72 @@ fn layout_flex_grid_container<'a>(
         _ => {}
     }
 
-    if let Some(h) = st.height {
-        content_h = content_h.max(h);
+    if inner_h > 0 {
+        content_h = content_h.max(inner_h);
+    } else if let Some(h) = st.min_height {
+        let inner_min = if st.box_sizing == css::BoxSizing::BorderBox {
+            (h - pad_t - pad_b).max(0)
+        } else {
+            h
+        };
+        content_h = content_h.max(inner_min);
     }
-    let box_w = content_w.max(container_w);
-    let box_h = content_h.max(1);
+    let box_w = content_w.max(container_w) + pad_l + pad_r;
+    let mut box_h = content_h + pad_t + pad_b;
+    if let Some(h) = st.height.or(st.min_height) {
+        box_h = if st.box_sizing == css::BoxSizing::BorderBox {
+            h.max(box_h)
+        } else {
+            (h + pad_t + pad_b).max(box_h)
+        };
+    }
+    let box_h = box_h.max(1);
     if let Some(i) = bg_idx {
         rects[i].w = box_w;
         rects[i].h = box_h;
     }
-    push_box_borders(rects, box_x, box_y, box_w, box_h, st);
+    let shadow = parse_box_shadow(&st.box_shadow);
+    if let Some((sdx, sdy, blur, scol)) = shadow {
+        let at = bg_idx.unwrap_or(rects.len());
+        rects.insert(
+            at,
+            RectBox {
+                x: box_x + sdx,
+                y: box_y + sdy,
+                w: box_w.max(1),
+                h: box_h.max(1),
+                color: scol,
+                radius: st.border_radius.max(0),
+                blur: blur.clamp(0, 40),
+            },
+        );
+    }
+    let bg_after_shadow = bg_idx.map(|i| if shadow.is_some() { i + 1 } else { i });
+    if !apply_rounded_border(rects, bg_after_shadow, box_x, box_y, box_w, box_h, st) {
+        push_box_borders(rects, box_x, box_y, box_w, box_h, st);
+    }
     aux.push_bg_box(st, box_x, box_y, box_w, box_h);
     aux.push_elem_box(n.elem_idx, box_x, box_y, box_w, box_h);
+    aux.last_box = Some((box_x, box_y, box_w, box_h));
+    if matches!(st.overflow, css::Overflow::Hidden) {
+        let first = items.first().map(|it| it.mark);
+        aux.clips.push(ClipOp {
+            x: box_x,
+            y: box_y,
+            w: box_w,
+            h: box_h,
+            rects_from: first.map(|m| m.rects).unwrap_or(rects.len()),
+            rects_to: rects.len(),
+            runs_from: first.map(|m| m.runs).unwrap_or(runs.len()),
+            runs_to: runs.len(),
+            images_from: first.map(|m| m.images).unwrap_or(images.len()),
+            images_to: images.len(),
+            controls_from: first.map(|m| m.controls).unwrap_or(controls.len()),
+            controls_to: controls.len(),
+        });
+    }
 
-    cur.y = box_y + content_h + st.padding_bottom;
+    cur.y = box_y + box_h;
     cur.x = cur.margin_x;
     cur.content_bottom = cur.content_bottom.max(cur.y);
     block_after(cur, st.margin_bottom);
@@ -2996,6 +3523,10 @@ fn push_control(
     transparent: bool,
     css_w: Option<i32>,
     css_h: Option<i32>,
+    pad_x: i32,
+    font_px: f32,
+    border_color: Option<u32>,
+    border_width: i32,
 ) {
     let kind = ControlKind::from_input_type(input_type, tag);
     if kind == ControlKind::Hidden {
@@ -3023,37 +3554,15 @@ fn push_control(
             bg: None,
             fg: None,
             transparent: false,
+            font_size: 13.0,
+            border_color: None,
+            border_width: 0,
         });
         return;
     }
-    let (w, h) = match kind {
-        ControlKind::Text | ControlKind::Password => (
-            css_w
-                .map(|w| w.clamp(24, cur.max_w.max(24)))
-                .unwrap_or_else(|| cur.max_w.min(280).max(120)),
-            css_h.map(|h| h.max(line_h)).unwrap_or(line_h + 10),
-        ),
-        ControlKind::TextArea => (
-            css_w
-                .map(|w| w.clamp(24, cur.max_w.max(24)))
-                .unwrap_or_else(|| cur.max_w.min(320).max(160)),
-            css_h.map(|h| h.max(line_h)).unwrap_or(line_h * 4 + 12),
-        ),
-        ControlKind::Submit | ControlKind::Button => {
-            let label = value
-                .filter(|s| !s.is_empty())
-                .or(Some(if kind == ControlKind::Submit {
-                    "Submit"
-                } else {
-                    "Button"
-                }))
-                .unwrap();
-            let tw = (crate::font_ttf::measure(label, 13.0) as i32) + 24;
-            (tw.clamp(64, cur.max_w.max(64)), line_h + 12)
-        }
-        ControlKind::Checkbox => (18, 18),
-        ControlKind::Hidden => (0, 0),
-    };
+    // Collect the label *before* measuring. A `<button>Destructive</button>`
+    // has no `value` attribute — the previous path sized every button as the
+    // word "Button" + 24px, which is why "Destructive" rendered as "Destructi".
     let mut val = value.unwrap_or("").to_string();
     if tag == "textarea" && val.is_empty() {
         val = super::html::collect_text(node);
@@ -3067,6 +3576,33 @@ fn push_control(
     if kind == ControlKind::Submit && val.is_empty() {
         val = String::from("Submit");
     }
+    let (w, h) = match kind {
+        ControlKind::Text | ControlKind::Password => (
+            css_w
+                .map(|w| w.clamp(24, cur.max_w.max(24)))
+                .unwrap_or_else(|| cur.max_w.min(280).max(120)),
+            css_h.map(|h| h.max(line_h)).unwrap_or(line_h + 10),
+        ),
+        ControlKind::TextArea => (
+            css_w
+                .map(|w| w.clamp(24, cur.max_w.max(24)))
+                .unwrap_or_else(|| cur.max_w.min(320).max(160)),
+            // shadcn Textarea is `flex min-h-[60px] w-full`. Honour the
+            // author's min-height (passed in as `css_h`). With no height at
+            // all, default to a multi-line box, never a single line.
+            css_h.map(|h| h.max(line_h)).unwrap_or((line_h * 4 + 12).max(60)),
+        ),
+        ControlKind::Submit | ControlKind::Button => {
+            let fs = font_px.max(8.0);
+            let pad = pad_x.max(16);
+            let tw = (crate::font_ttf::measure(&val, fs) as i32) + pad + 2;
+            let hh = css_h.unwrap_or(line_h + 12).max(line_h);
+            let ww = css_w.unwrap_or(tw).clamp(1, cur.max_w.max(tw).max(1));
+            (ww, hh)
+        }
+        ControlKind::Checkbox => (18, 18),
+        ControlKind::Hidden => (0, 0),
+    };
     // Inline-block flow: a form control is `inline-block` by default, so keep it
     // on the current line when it fits — sibling controls (e.g. Google's two
     // search buttons) then sit side by side and an enclosing `text-align`
@@ -3101,9 +3637,63 @@ fn push_control(
         bg,
         fg,
         transparent,
+        font_size: font_px.max(8.0),
+        border_color,
+        border_width,
     });
     cur.x = ctrl_x + w + CTRL_GAP;
     cur.content_bottom = cur.content_bottom.max(ctrl_y + h);
+}
+
+/// Hit-test overlay for a `<button>` that was painted as a CSS box.
+///
+/// `transparent` tells the painter to skip the UA grey chip — Ghost/Link
+/// buttons have no background on purpose, and drawing one made them look
+/// like unstyled system buttons.
+fn push_hit_button(
+    aux: &Aux,
+    controls: &mut Vec<FormControl>,
+    node: &Node,
+    form: Option<&FormCtx>,
+    st: &ComputedStyle,
+) {
+    let Some((x, y, w, h)) = aux.last_box else {
+        return;
+    };
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let mut val = super::html::collect_text(node);
+    if val.is_empty() {
+        val = String::from("Button");
+    }
+    let idx = controls.len();
+    controls.push(FormControl {
+        index: idx,
+        kind: ControlKind::Button,
+        name: String::new(),
+        value: val,
+        placeholder: String::new(),
+        form_action: form.map(|f| f.action.clone()).unwrap_or_default(),
+        form_method: form
+            .map(|f| f.method.clone())
+            .unwrap_or_else(|| String::from("get")),
+        form_id: form.map(|f| f.id).unwrap_or(0),
+        x,
+        y,
+        w,
+        h,
+        focused: false,
+        checked: false,
+        elem_idx: node.elem_idx,
+        radius: st.border_radius.max(0),
+        bg: st.background,
+        fg: Some(st.color),
+        transparent: true,
+        font_size: st.font_size.max(8) as f32,
+        border_color: visible_border_color(st),
+        border_width: visible_border_width(st),
+    });
 }
 
 fn block_before(cur: &mut Cursor, gap: i32) {
@@ -3233,9 +3823,11 @@ fn run_family(st: &ComputedStyle) -> String {
 }
 
 /// Extract the `(tx, ty)` translation from a CSS `transform` value
-/// (`translate(x,y)`, `translateX(x)`, `translateY(y)`). Scale/rotate/skew are
-/// not applied (they need re-rasterisation); only the offset is honored.
-fn parse_transform_translate(s: &str) -> (i32, i32) {
+/// (`translate(x,y)`, `translateX(x)`, `translateY(y)`). Percentages resolve
+/// against the element's own border box (`box_w`/`box_h`) — that is how a
+/// shadcn Progress indicator (`translateX(-38%)` of a `w-full` child) shows
+/// 62% fill. Scale/rotate/skew are handled elsewhere.
+fn parse_transform_translate(s: &str, box_w: i32, box_h: i32) -> (i32, i32) {
     let low = s.to_ascii_lowercase();
     let arg = |key: &str| -> Option<&str> {
         let start = low.find(key)? + key.len();
@@ -3245,14 +3837,20 @@ fn parse_transform_translate(s: &str) -> (i32, i32) {
     let (mut tx, mut ty) = (0, 0);
     if let Some(a) = arg("translate(") {
         let mut it = a.split(',');
-        tx = it.next().and_then(|v| css::parse_px(v.trim())).unwrap_or(0);
-        ty = it.next().and_then(|v| css::parse_px(v.trim())).unwrap_or(0);
+        tx = it
+            .next()
+            .and_then(|v| css::parse_px_rel(v.trim(), Some(box_w)))
+            .unwrap_or(0);
+        ty = it
+            .next()
+            .and_then(|v| css::parse_px_rel(v.trim(), Some(box_h)))
+            .unwrap_or(0);
     }
     if let Some(a) = arg("translatex(") {
-        tx = css::parse_px(a).unwrap_or(tx);
+        tx = css::parse_px_rel(a, Some(box_w)).unwrap_or(tx);
     }
     if let Some(a) = arg("translatey(") {
-        ty = css::parse_px(a).unwrap_or(ty);
+        ty = css::parse_px_rel(a, Some(box_h)).unwrap_or(ty);
     }
     (tx, ty)
 }
@@ -4479,6 +5077,431 @@ mod tests {
     }
 
     #[test_case]
+    fn a_button_sizes_to_its_own_label_not_the_word_button() {
+        // `<button>Destructive</button>` has no value= attribute. Sizing from
+        // the fallback word "Button" clipped the label to "Destructi".
+        let doc = html::parse(
+            r#"<html><head><style>
+                button{display:inline-flex;padding-left:16px;padding-right:16px;
+                       height:36px;font-size:14px;background:#dc2626;color:#fff}
+            </style></head><body>
+                <button>Destructive</button><button>Go</button>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert_eq!(lay.controls.len(), 2);
+        let dest = &lay.controls[0];
+        let go = &lay.controls[1];
+        assert_eq!(dest.value, "Destructive");
+        assert_eq!(dest.h, 36, "h-9");
+        let need = crate::font_ttf::measure("Destructive", 14.0) as i32 + 16;
+        assert!(
+            dest.w >= need,
+            "Destructive button w={} must hold the label+padding (>= {})",
+            dest.w,
+            need
+        );
+        assert!(go.w < dest.w, "short label is narrower ({} vs {})", go.w, dest.w);
+    }
+
+    #[test_case]
+    fn a_ghost_button_is_not_a_ua_grey_chip() {
+        // Ghost/Link have no background. Painting the UA default #f0f0f2 over
+        // them was the "grey rectangle where Ghost should be text" bug.
+        let doc = html::parse(
+            r#"<html><head><style>
+                .ghost{display:inline-flex;align-items:center;height:36px;padding:0 16px;
+                       border-radius:6px;color:#0f172a}
+                .solid{display:inline-flex;align-items:center;height:36px;padding:0 16px;
+                       border-radius:6px;background:#0f172a;color:#fff}
+            </style></head><body>
+                <div style="display:flex;gap:8px">
+                    <button class="solid">Default</button>
+                    <button class="ghost">Ghost</button>
+                </div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert!(
+            !lay.rects.iter().any(|r| r.color == 0xf0f0f2 && r.h >= 20),
+            "UA grey chip must not be painted for a CSS Ghost button: {:?}",
+            lay.rects.iter().map(|r| (r.color, r.w, r.h)).collect::<alloc::vec::Vec<_>>()
+        );
+        assert!(
+            lay.rects.iter().any(|r| r.color == 0x0f172a && r.h >= 30),
+            "solid button still paints its author background"
+        );
+        let ghost = lay.runs.iter().find(|r| r.text.contains("Ghost"));
+        assert!(ghost.is_some(), "Ghost label is a text run, not a control chip");
+    }
+
+    #[test_case]
+    fn a_button_label_is_vertically_centered() {
+        // shadcn default button: `h-9 py-2 items-center`. The label must sit
+        // in the middle of the painted 36px box, not on its top edge.
+        let doc = html::parse(
+            r#"<html><head><style>
+                button{display:inline-flex;align-items:center;justify-content:center;
+                       height:36px;padding:8px 16px;background:#0f172a;color:#fff;
+                       font-size:14px;box-sizing:border-box}
+            </style></head><body><button>Default</button></body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let bg = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0x0f172a && r.h >= 30)
+            .expect("button background");
+        assert_eq!(bg.h, 36, "h-9 border-box, got {}", bg.h);
+        let run = lay
+            .runs
+            .iter()
+            .find(|r| r.text.contains("Default"))
+            .expect("label");
+        let box_mid = bg.y + bg.h / 2;
+        let run_mid = run.y + run.font_size / 2;
+        assert!(
+            (run_mid - box_mid).abs() <= 4,
+            "label mid {run_mid} vs box mid {box_mid} (box y={} h={}, run y={} fs={})",
+            bg.y,
+            bg.h,
+            run.y,
+            run.font_size
+        );
+    }
+
+    #[test_case]
+    fn hover_background_applies_when_the_element_is_hovered() {
+        let mut doc = html::parse(
+            r#"<html><head><style>
+                .b{display:inline-flex;height:36px;padding:0 16px;background:#111111;color:#fff}
+                .b:hover{background:#ff0000}
+            </style></head><body><button class="b">Hi</button></body></html>"#,
+        );
+        crate::browser::js::stamp_elem_indices(&mut doc.root);
+        let mut btn_idx = None;
+        fn find_btn(n: &html::Node, out: &mut Option<usize>) {
+            if let html::NodeKind::Element { tag, .. } = &n.kind {
+                if tag.eq_ignore_ascii_case("button") {
+                    *out = n.elem_idx;
+                }
+            }
+            for c in &n.children {
+                find_btn(c, out);
+            }
+        }
+        find_btn(&doc.root, &mut btn_idx);
+        let btn_idx = btn_idx.expect("stamped button");
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let cold = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert!(
+            cold.rects.iter().any(|r| r.color == 0x111111 && r.h >= 30),
+            "unhovered button keeps its rest fill"
+        );
+        assert!(
+            !cold.rects.iter().any(|r| r.color == 0xff0000 && r.h >= 30),
+            ":hover must not apply with an empty hover set"
+        );
+        css::set_hover_elems(&[btn_idx]);
+        let hot = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        css::set_hover_elems(&[]);
+        assert!(
+            hot.rects.iter().any(|r| r.color == 0xff0000 && r.h >= 30),
+            "hovered button takes :hover background, rects={:?}",
+            hot.rects
+                .iter()
+                .map(|r| (r.color, r.w, r.h))
+                .collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
+    #[test_case]
+    fn a_flex_span_with_explicit_size_paints_its_box() {
+        // AvatarFallback: `<span class="flex h-10 w-10 rounded-full bg-muted">CH</span>`
+        // used to take the inline-span path and hug the letters.
+        let doc = html::parse(
+            r#"<html><head><style>
+                .av{display:flex;width:40px;height:40px;border-radius:9999px;
+                    background:#f1f5f9;align-items:center;justify-content:center}
+            </style></head><body>
+                <div style="display:flex"><span class="av">CH</span></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let av = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xf1f5f9)
+            .expect("avatar circle background");
+        assert!(av.w >= 36 && av.h >= 36, "h-10 w-10 box, got {}x{}", av.w, av.h);
+        assert!(av.radius > 0, "rounded-full");
+        assert!(lay.runs.iter().any(|r| r.text.contains("CH")), "fallback letters");
+    }
+
+    #[test_case]
+    fn a_flex_textarea_honours_min_height() {
+        // shadcn Textarea: `<textarea class="flex min-h-[60px] w-full">`.
+        // `display:flex` used to take the flex-container path and skip
+        // `push_control`, so the box hugged a single line (~16 px).
+        let doc = html::parse(
+            r#"<html><head><style>
+                textarea{display:flex;min-height:60px;width:100%;
+                         border-radius:6px;background:transparent}
+            </style></head><body>
+                <textarea placeholder="Type your message here."></textarea>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert_eq!(lay.controls.len(), 1, "textarea is a form control, not a flex box");
+        let ta = &lay.controls[0];
+        assert_eq!(ta.kind, ControlKind::TextArea);
+        assert!(
+            ta.h >= 60,
+            "min-h-[60px] must size the control, got h={}",
+            ta.h
+        );
+        assert!(ta.w >= 200, "w-full, got w={}", ta.w);
+    }
+
+    #[test_case]
+    fn a_switch_thumb_is_a_circle_inside_the_track() {
+        // Radix Switch: track is inline-flex h-5 w-9, thumb is an empty
+        // `block h-4 w-4 rounded-full` span. The inline-span path used to
+        // paint nothing (no text runs → no box).
+        let doc = html::parse(
+            r#"<html><head><style>
+                .track{display:inline-flex;height:20px;width:36px;border-radius:9999px;
+                       background:#e2e8f0;align-items:center}
+                .thumb{display:block;height:16px;width:16px;border-radius:9999px;
+                       background:#ffffff}
+            </style></head><body>
+                <button class="track"><span class="thumb"></span></button>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let track = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xe2e8f0 && r.w >= 30)
+            .expect("track");
+        let thumb = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xffffff && r.w >= 12 && r.w <= 20 && r.h >= 12 && r.h <= 20)
+            .expect("thumb circle");
+        assert!(thumb.radius > 4, "rounded-full thumb, radius={}", thumb.radius);
+        assert!(
+            thumb.x >= track.x && thumb.x + thumb.w <= track.x + track.w + 2,
+            "thumb sits inside the track"
+        );
+    }
+
+    #[test_case]
+    fn a_flex_1_rule_fills_the_row_between_labels() {
+        let doc = html::parse(
+            r#"<html><head><style>
+                .row{display:flex;align-items:center;width:300px}
+                .rule{flex:1 1 0%;height:1px;background:#e2e8f0}
+            </style></head><body>
+                <div class="row"><span>above</span><div class="rule"></div><span>below</span></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let rule = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xe2e8f0 && r.h <= 4)
+            .expect("separator rule");
+        assert!(rule.w >= 150, "flex-1 rule spans the leftover, got w={}", rule.w);
+        assert!(rule.h <= 2, "h-[1px], got h={}", rule.h);
+    }
+
+    #[test_case]
+    fn accordion_trigger_keeps_its_label_next_to_the_icon() {
+        // `<button class="flex">What is…?<svg></svg></button>` used to drop
+        // the text (only element children became flex items).
+        let doc = html::parse(
+            r#"<html><head><style>
+                button{display:flex;justify-content:space-between;width:300px}
+                svg{width:16px;height:16px}
+            </style></head><body>
+                <button>What is the determinism boundary?<svg viewBox="0 0 16 16"></svg></button>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert!(
+            lay.runs.iter().any(|r| r.text.contains("determinism") || r.text.contains("What")),
+            "accordion question is a text run: {:?}",
+            lay.runs.iter().map(|r| r.text.as_str()).collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
+    #[test_case]
+    fn a_full_width_input_uses_the_author_border_not_a_grey_chip() {
+        let doc = html::parse(
+            r#"<html><head><style>
+                .wrap{width:320px;padding:16px}
+                input{display:block;width:100%;height:36px;border-radius:6px;
+                      border-width:1px;border-color:#e2e8f0;background:transparent}
+            </style></head><body>
+                <div class="wrap"><input placeholder="chitti"></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert_eq!(lay.controls.len(), 1);
+        let inp = &lay.controls[0];
+        assert!(inp.w >= 250, "w-full of a 320px wrap, got w={}", inp.w);
+        assert!(inp.h >= 32, "h-9, got h={}", inp.h);
+        assert_eq!(inp.border_color, Some(0xe2e8f0));
+        assert!(inp.border_width >= 1);
+        assert!(inp.radius >= 4, "rounded-md, radius={}", inp.radius);
+        assert!(inp.transparent, "bg-transparent must not paint the UA grey chip");
+    }
+
+    #[test_case]
+    fn a_table_row_paints_a_bottom_rule() {
+        let doc = html::parse(
+            r#"<html><head><style>
+                tr{border-bottom-width:1px;border-bottom-color:#e2e8f0}
+                td{padding:8px}
+            </style></head><body>
+                <table><tr><td>Drivers</td><td>0</td></tr><tr><td>Agents</td><td>3</td></tr></table>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let rules = lay
+            .rects
+            .iter()
+            .filter(|r| r.color == 0xe2e8f0 && r.h <= 3 && r.w >= 40)
+            .count();
+        assert!(
+            rules >= 1,
+            "at least one row rule, rects={:?}",
+            lay.rects.iter().map(|r| (r.color, r.w, r.h)).collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
+    #[test_case]
+    fn avatar_fallback_letters_sit_in_the_circle() {
+        let doc = html::parse(
+            r#"<html><head><style>
+                .av{display:flex;width:40px;height:40px;border-radius:9999px;
+                    overflow:hidden;background:#f1f5f9}
+                .fb{display:flex;width:100%;height:100%;align-items:center;
+                    justify-content:center;border-radius:9999px;background:#e2e8f0}
+            </style></head><body>
+                <span class="av"><span class="fb">CH</span></span>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        assert!(
+            lay.runs.iter().any(|r| r.text.contains("CH")),
+            "fallback letters present: {:?}",
+            lay.runs.iter().map(|r| r.text.as_str()).collect::<alloc::vec::Vec<_>>()
+        );
+    }
+
+    #[test_case]
+    fn a_hidden_attribute_drops_the_box() {
+        let doc = html::parse(
+            r#"<html><head><style>.box{width:80px;height:20px;background:#0f172a}</style></head>
+            <body><div class="box" hidden>secret</div><div class="box">shown</div></body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let dark = lay.rects.iter().filter(|r| r.color == 0x0f172a).count();
+        assert_eq!(dark, 1, "only the un-hidden box paints");
+        assert!(
+            !lay.runs.iter().any(|r| r.text.contains("secret")),
+            "hidden content is not a text run"
+        );
+    }
+
+    #[test_case]
+    fn progress_indicator_translates_by_percent_and_is_clipped() {
+        // shadcn Progress: a full-width child shifted by translateX(-(100-value)%).
+        let doc = html::parse(
+            r#"<html><head><style>
+                .track{position:relative;height:8px;width:200px;overflow:hidden;background:#e5e7eb}
+                .fill{height:100%;width:100%;background:#0f172a;transform:translateX(-38%)}
+            </style></head><body>
+                <div class="track"><div class="fill"></div></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let track = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0xe5e7eb)
+            .expect("track");
+        let fill = lay
+            .rects
+            .iter()
+            .find(|r| r.color == 0x0f172a)
+            .expect("indicator");
+        assert_eq!(track.h, 8, "h-2");
+        assert!(fill.h >= 8, "h-full of the 8px track, got {}", fill.h);
+        // -38% of the fill's width (≈ track width) shifts it left.
+        assert!(
+            fill.x < track.x,
+            "translateX(-38%) moves the indicator left of the track ({} vs {})",
+            fill.x,
+            track.x
+        );
+        assert!(
+            !lay.clips.is_empty(),
+            "overflow:hidden recorded a clip so the leftover 38% does not paint past the track"
+        );
+    }
+
+    #[test_case]
+    fn skeleton_and_escaped_opacity_utility_paint() {
+        // `.bg-primary\/10` + explicit rem size — the skeleton used to be an
+        // empty box because the escaped class never matched.
+        let doc = html::parse(
+            r#"<html><head><style>
+                :root{--primary: 222.2 47.4% 11.2%}
+                .skel{height:1rem;width:10rem;border-radius:0.375rem;
+                      background-color:hsl(var(--primary) / .1)}
+                .bg-primary\/10{background-color:hsl(var(--primary) / .1)}
+                .box{height:2rem;width:2rem}
+            </style></head><body>
+                <div class="skel"></div>
+                <div class="box bg-primary/10"></div>
+            </body></html>"#,
+        );
+        let sheet = Stylesheet::parse_with_viewport(&doc.stylesheets, DEFAULT_W);
+        let lay = layout_document(&doc.root, &sheet, DEFAULT_W, DEFAULT_H);
+        let skels: Vec<_> = lay
+            .rects
+            .iter()
+            .filter(|r| r.w >= 16 && r.h >= 8 && r.color != 0xf5f0e8)
+            .collect();
+        assert!(
+            skels.len() >= 2,
+            "both skeleton boxes painted, got {} rects: {:?}",
+            skels.len(),
+            lay.rects.iter().map(|r| (r.w, r.h, r.color)).collect::<alloc::vec::Vec<_>>()
+        );
+        assert!(
+            skels.iter().any(|r| r.w >= 140),
+            "w-40 (10rem) skeleton is wide"
+        );
+    }
+
+    #[test_case]
     fn box_shadow_skips_transparent_placeholder_entries() {
         // Tailwind puts the real shadow LAST:
         // `var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)`.
@@ -4596,7 +5619,12 @@ mod tests {
             .iter()
             .find(|r| r.color == 0xffffff && r.w > 100)
             .expect("card background");
-        assert_eq!(card.w, 448, "max-width: 28rem");
+        // Border-box is 28rem; the fill is inset 1px for the rounded ring.
+        assert!(
+            card.w >= 440 && card.w <= 448,
+            "max-width: 28rem (fill may be inset by the border), got {}",
+            card.w
+        );
         assert_eq!(card.radius, 12, "border-radius: 0.75rem");
         assert!(
             lay.rects.iter().any(|r| r.blur > 0),
@@ -4624,10 +5652,13 @@ mod tests {
 
     #[test_case]
     fn parse_transform_translate_offsets() {
-        assert_eq!(parse_transform_translate("translate(10px, 20px)"), (10, 20));
-        assert_eq!(parse_transform_translate("translateX(15px)"), (15, 0));
-        assert_eq!(parse_transform_translate("translateY(-8px)"), (0, -8));
-        assert_eq!(parse_transform_translate("scale(2)"), (0, 0)); // scale not applied
+        assert_eq!(parse_transform_translate("translate(10px, 20px)", 0, 0), (10, 20));
+        assert_eq!(parse_transform_translate("translateX(15px)", 0, 0), (15, 0));
+        assert_eq!(parse_transform_translate("translateY(-8px)", 0, 0), (0, -8));
+        assert_eq!(parse_transform_translate("scale(2)", 0, 0), (0, 0)); // scale not applied
+        // Progress: translateX(-38%) of a 200px track is -76px.
+        assert_eq!(parse_transform_translate("translateX(-38%)", 200, 8), (-76, 0));
+        assert_eq!(parse_transform_translate("translateY(50%)", 10, 20), (0, 10));
     }
 
     #[test_case]
