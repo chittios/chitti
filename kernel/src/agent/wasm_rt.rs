@@ -145,6 +145,13 @@ pub struct HostState {
     /// arrives on fd 0, the result leaves on fd 1). Empty and untouched for
     /// every other guest.
     fds: Fds,
+    /// The one file a WASI guest may have open, if this surface grants any.
+    ///
+    /// One slot rather than a table because the only guest on this surface opens
+    /// exactly one file, once, to check it exists — see [`register_wasi_fs_imports`].
+    /// A table would be more general and would need an eviction policy for a case
+    /// that does not arise.
+    wasi_file: Option<(String, u64)>,
 }
 
 /// fd 0/1/2 backing for a WASI guest, held host-side.
@@ -285,6 +292,7 @@ pub fn js_store(
         last_error: None,
         log_count: 0,
         fds: Fds::default(),
+        wasi_file: None,
     };
     let mut store = Store::new(&engine, host);
     store.limiter(|s| &mut s.limiter);
@@ -425,6 +433,7 @@ impl Session {
             last_error: None,
             log_count: 0,
             fds: Fds::default(),
+            wasi_file: None,
         };
         let mut store = Store::new(&engine, host);
         store.limiter(|s| &mut s.limiter);
@@ -444,6 +453,11 @@ impl Session {
             HostImportSet::Js => {
                 register_host_imports(&mut linker)?;
                 register_wasi_imports(&mut linker)?;
+            }
+            HostImportSet::Native => {
+                register_host_imports(&mut linker)?;
+                register_wasi_imports(&mut linker)?;
+                register_wasi_fs_imports(&mut linker)?;
             }
         }
         // wasmi 1.x runs the start function as part of instantiation.
@@ -630,6 +644,15 @@ enum HostImportSet {
     Agent,
     /// Browser page surface: `env` + WASI stubs only (no agent effects).
     Page,
+    /// A native guest built against a libc: the agent surface, WASI stdio, and a
+    /// **read-only** WASI file view of the store.
+    ///
+    /// This exists for ported C programs, which reach a file through `fopen`
+    /// whatever else they are given. Doom is the case in hand: its WAD arrives in
+    /// linear memory via `host_fs_read` and its lumps never touch WASI at all, but
+    /// `D_FindWADByName` still checks the file *exists* before opening it, and
+    /// without that it reports "Game mode indeterminate" and refuses to start.
+    Native,
     /// A JavaScript guest: the **whole** agent surface plus WASI stdio, because
     /// a QuickJS module reads its arguments from fd 0 and writes its result to
     /// fd 1. The `chitti.*` half is the identical, already-gated set a wasm
@@ -2254,6 +2277,177 @@ fn syn_audio_submit(task: TaskId, frames: usize, rate: u32, channels: u8) -> boo
         r#"{{"name":"audio_submit","arguments":{{"frames":{frames},"rate":{rate},"channels":{channels}}}}}"#
     );
     syn_in_userspace(task, &raw)
+}
+
+/// The WASI file surface a ported C program needs, **read-only** and backed by
+/// the Synapse store.
+///
+/// `register_wasi_imports` covers stdio; this adds the eight preview1 functions a
+/// libc reaches for `fopen`. Together they are exactly the 14 imports a
+/// doomgeneric build emits — a list obtained by parsing the module's import
+/// section rather than by guessing, because wasmi resolves an import by name
+/// **and `FuncType`** and a single wrong arity makes the whole module fail with
+/// `missing imports`, a message that names nothing.
+///
+/// **Read-only, and every mutator fails honestly.** `path_rename`,
+/// `path_unlink_file`, `path_create_directory` and `path_remove_directory` return
+/// `NOENT`. A guest that needs to write has `host_fs_write`, which is home-scoped;
+/// routing writes through a second, unscoped path would widen authority by way of
+/// a compatibility shim. A C program treats a failed config write as "no config"
+/// and carries on, which is the behaviour wanted here.
+///
+/// **One open file, one offset.** The guest this exists for opens one file once.
+/// A descriptor table would need an eviction policy for a case that does not
+/// arise.
+///
+/// **`path_open` succeeds but reading through it does not.** `fd_read`/`fd_seek`/
+/// `fd_close` belong to the stdio set and answer `BADF` for any descriptor they do
+/// not own, so this surface answers *"does this file exist"* and nothing more.
+/// That is the whole requirement — a ported program gets its actual bytes through
+/// `host_fs_read` into linear memory, where it can address them directly, rather
+/// than streaming them a `fread` at a time across the boundary. Stated because the
+/// asymmetry is surprising: an `fopen` that works followed by an `fread` that
+/// returns nothing. If a guest ever genuinely needs to stream a file, give this
+/// its own `fd_read` arm keyed on `FILE_FD` and serve it from `synapse::fs`;
+/// do not widen the stdio one.
+fn register_wasi_fs_imports(linker: &mut Linker<HostState>) -> Result<(), &'static str> {
+    const W: &str = "wasi_snapshot_preview1";
+    const NOENT: i32 = 44;
+    const BADF: i32 = 8;
+    /// The preopened directory. A libc will not resolve any path — absolute or
+    /// relative — without at least one preopen; it fails inside its own path
+    /// resolution before ever calling `path_open`.
+    const PREOPEN_FD: i32 = 3;
+    /// The single file descriptor this surface can hand out. Above stdio and the
+    /// preopen so it cannot collide with either.
+    const FILE_FD: i32 = 4;
+
+    fn read_path(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
+        let mem = caller.get_export("memory").and_then(|e| e.into_memory())?;
+        let data = mem.data(caller);
+        let start = ptr.max(0) as usize;
+        let end = start.checked_add(len.max(0) as usize)?;
+        if end > data.len() {
+            return None;
+        }
+        core::str::from_utf8(&data[start..end]).ok().map(String::from)
+    }
+
+    /// Resolve a guest path against the store.
+    ///
+    /// A guest path arrives relative to the preopen, so a leading `/` is stripped
+    /// and one added back: the store is rooted, and a path that kept the guest's
+    /// own notion of `/` would name a different file on every libc.
+    fn store_path(p: &str) -> String {
+        let t = p.trim_start_matches('/');
+        format!("/{t}")
+    }
+
+    linker
+        .func_wrap(
+            W,
+            "fd_prestat_get",
+            |mut caller: Caller<'_, HostState>, fd: i32, out: i32| -> i32 {
+                if fd != PREOPEN_FD {
+                    return BADF;
+                }
+                // { u8 tag = dir, pad[3], u32 name_len }. The padding is real:
+                // name_len is at offset 4, not 1.
+                if let Some(m) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let mut buf = [0u8; 8];
+                    buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+                    let _ = m.write(&mut caller, out as usize, &buf);
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.fd_prestat_get")?;
+
+    linker
+        .func_wrap(
+            W,
+            "fd_prestat_dir_name",
+            |mut caller: Caller<'_, HostState>, fd: i32, path: i32, len: i32| -> i32 {
+                if fd != PREOPEN_FD || len < 1 {
+                    return BADF;
+                }
+                if let Some(m) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let _ = m.write(&mut caller, path as usize, b"/");
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.fd_prestat_dir_name")?;
+
+    linker
+        .func_wrap(
+            W,
+            "path_open",
+            |mut caller: Caller<'_, HostState>,
+             _dirfd: i32,
+             _dirflags: i32,
+             path: i32,
+             path_len: i32,
+             oflags: i32,
+             _base: i64,
+             _inherit: i64,
+             _fdflags: i32,
+             out_fd: i32|
+             -> i32 {
+                // OFLAGS_CREAT (1) | OFLAGS_TRUNC (8) mean the guest intends to
+                // write. Refused rather than silently opened read-only, which
+                // would look like success and then lose the data.
+                if oflags & 0b1001 != 0 {
+                    return NOENT;
+                }
+                let Some(p) = read_path(&caller, path, path_len) else {
+                    return NOENT;
+                };
+                let full = store_path(&p);
+                if !crate::synapse::fs::exists(&full) {
+                    return NOENT;
+                }
+                caller.data_mut().wasi_file = Some((full, 0));
+                if let Some(m) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let _ = m.write(&mut caller, out_fd as usize, &FILE_FD.to_le_bytes());
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.path_open")?;
+
+    linker
+        .func_wrap(
+            W,
+            "fd_fdstat_set_flags",
+            |_: Caller<'_, HostState>, _: i32, _: i32| -> i32 { 0 },
+        )
+        .map_err(|_| "define wasi.fd_fdstat_set_flags")?;
+
+    // Every mutator: refused. See the function doc — writes go through the
+    // home-scoped `host_fs_write`, not through a compatibility shim.
+    for name in [
+        "path_create_directory",
+        "path_remove_directory",
+        "path_unlink_file",
+    ] {
+        linker
+            .func_wrap(W, name, |_: Caller<'_, HostState>, _: i32, _: i32, _: i32| -> i32 {
+                NOENT
+            })
+            .map_err(|_| "define wasi path mutator")?;
+    }
+    linker
+        .func_wrap(
+            W,
+            "path_rename",
+            |_: Caller<'_, HostState>, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32| -> i32 {
+                NOENT
+            },
+        )
+        .map_err(|_| "define wasi.path_rename")?;
+
+    Ok(())
 }
 
 fn map_trap(err: wasmi::Error) -> &'static str {
