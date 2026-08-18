@@ -119,7 +119,7 @@ pub fn layout_html_ex(
     let scripts = doc.scripts.clone();
     let _ = js::run_scripts(&mut dom, &scripts);
     doc.title = dom.title.clone();
-    js::commit_to_tree(&mut doc.root, &dom);
+    js::commit_full(&mut doc.root, &dom);
     let effects = ScriptEffects {
         log: dom.log.clone(),
         navigate: dom.navigate.clone(),
@@ -526,7 +526,7 @@ pub fn page_text(html_src: &str) -> String {
     let mut dom = js::JsDom::from_document(&doc);
     let scripts = doc.scripts.clone();
     let _ = js::run_scripts(&mut dom, &scripts);
-    js::commit_to_tree(&mut doc.root, &dom);
+    js::commit_full(&mut doc.root, &dom);
     html::collect_text(&doc.root)
 }
 

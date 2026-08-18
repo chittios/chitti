@@ -298,6 +298,7 @@ pub(super) fn browser_is_loading() -> bool {
 pub(super) fn browser_begin_load() {
     BROWSER_LOADING.store(true, core::sync::atomic::Ordering::Relaxed);
     let _ = crate::browser::set_hover_link(None);
+    let _ = crate::browser::css::set_hover_elems(&[]);
     BROWSER_LAYOUT.with(|s| *s = None);
     // Drop the previous page's present cache so a mid-load `repaint_active_tab`
     // can't re-blit old pixels. The next `browser_present` will refill it.
@@ -1524,6 +1525,39 @@ pub(super) fn browser_represent_cached() -> bool {
     })
 }
 
+/// Advance CSS animations on the open page. Called from `ui_tick` so a
+/// skeleton `animate-pulse` actually pulses instead of sitting at the 0%
+/// stop. Relayouts at ~12 Hz — cheap (no script re-run) and slow enough
+/// that a heavy gallery does not fight the input loop.
+pub(super) fn browser_anim_tick() {
+    if !browser_loaded() || browser_is_loading() {
+        return;
+    }
+    // `page_dispatch` holds `JS_PAGE` for the whole click handler. The JS
+    // host tick pumps `upkeep` → here → `layout_session` → the same lock.
+    // A blocking take freezes the machine with interrupts off (Radix
+    // Switch/Checkbox handlers run long enough to hit the 80 ms cadence;
+    // a one-line `setCount` often does not).
+    if crate::browser::js_just::page_lock_held() {
+        return;
+    }
+    let wants = BROWSER_LAYOUT.with(|s| s.as_ref().is_some_and(|l| l.has_animation));
+    if !wants {
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        static LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let now = crate::arch::now_ms();
+        let last = LAST_MS.load(core::sync::atomic::Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < 80 {
+            return;
+        }
+        LAST_MS.store(now, core::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = browser_repaint();
+}
+
 pub(super) fn browser_repaint() -> alloc::string::String {
     // Mid-navigation: never re-layout the previous session HTML. Re-blit the
     // last progressive stage (or no-op if nothing has painted yet).
@@ -1594,19 +1628,12 @@ pub(super) fn browser_click(x: i32, y: i32) -> alloc::string::String {
                     })
                     .map(|e| e.elem_idx);
                 if let Some(ei) = covering {
-                    let prevented = crate::browser::js_just::page_dispatch(&[
-                        crate::browser::js_just::PageEvent {
-                            target: ei,
-                            type_: alloc::string::String::from("click"),
-                            x,
-                            y: content_y,
-                        },
-                    ]);
+                    let prevented = crate::browser::js_just::page_click(ei, x, content_y);
                     crate::serial_println!("browser> dispatched click → elem {}", ei);
                     if let Some(out) = browser_dispatch_nav(&base) {
                         return out;
                     }
-                    if prevented.first().copied().unwrap_or(false) {
+                    if prevented {
                         browser_repaint();
                         return alloc::string::String::from("ok:click handled (default prevented)");
                     }
@@ -1618,14 +1645,7 @@ pub(super) fn browser_click(x: i32, y: i32) -> alloc::string::String {
         crate::browser::layout::Hit::Elem(ei) => {
             // JS-interactive element: deliver the click into page JS, then
             // follow any handler navigation, else repaint the mutated DOM.
-            let _prevented = crate::browser::js_just::page_dispatch(&[
-                crate::browser::js_just::PageEvent {
-                    target: ei,
-                    type_: alloc::string::String::from("click"),
-                    x,
-                    y: content_y,
-                },
-            ]);
+            let _prevented = crate::browser::js_just::page_click(ei, x, content_y);
             crate::serial_println!("browser> dispatched click → elem {}", ei);
             if let Some(out) = browser_dispatch_nav(&base) {
                 return out;
@@ -1663,17 +1683,7 @@ pub(super) fn browser_click(x: i32, y: i32) -> alloc::string::String {
                 let mut prevented = false;
                 if crate::browser::js_just::page_active() {
                     if let Some(ei) = c.elem_idx {
-                        prevented = crate::browser::js_just::page_dispatch(&[
-                            crate::browser::js_just::PageEvent {
-                                target: ei,
-                                type_: alloc::string::String::from("click"),
-                                x,
-                                y: content_y,
-                            },
-                        ])
-                        .first()
-                        .copied()
-                        .unwrap_or(false);
+                        prevented = crate::browser::js_just::page_click(ei, x, content_y);
                         crate::serial_println!("browser> dispatched click → elem {}", ei);
                         if let Some(out) = browser_dispatch_nav(&base) {
                             return out;
@@ -1870,7 +1880,7 @@ pub(super) fn browser_hover(sx: i32, sy: i32) {
     }
     let scroll = BROWSER.with(|s| s.as_ref().map(|b| b.scroll_y).unwrap_or(0));
     let content_y = sy + scroll;
-    let (kind, link_rect) = BROWSER_LAYOUT.with(|slot| match slot.as_ref() {
+    let (kind, link_rect, hover_idx) = BROWSER_LAYOUT.with(|slot| match slot.as_ref() {
         Some(lay) => {
             let kind = crate::browser::layout::cursor_at(lay, sx, content_y);
             // Content-space rect of the link under the cursor, for hover
@@ -1881,14 +1891,65 @@ pub(super) fn browser_hover(sx: i32, sy: i32) {
                 .rev()
                 .find(|b| sx >= b.x && sx < b.x + b.w && content_y >= b.y && content_y < b.y + b.h)
                 .map(|b| (b.x, b.y, b.w, b.h));
-            (kind, rect)
+            // Buttons are hit-tested as form controls (push_hit_button), not
+            // as elem_boxes (those are only the JS-interactive set — React
+            // delegates to the root, so the button itself is often absent).
+            // Hover styles live on the button (`.hover\:bg-*:hover`).
+            let ei = lay
+                .controls
+                .iter()
+                .rev()
+                .find(|c| {
+                    c.w > 0
+                        && c.h > 0
+                        && sx >= c.x
+                        && sx < c.x + c.w
+                        && content_y >= c.y
+                        && content_y < c.y + c.h
+                })
+                .and_then(|c| c.elem_idx)
+                .or_else(|| {
+                    lay.elem_boxes
+                        .iter()
+                        .rev()
+                        .find(|e| {
+                            sx >= e.x
+                                && sx < e.x + e.w
+                                && content_y >= e.y
+                                && content_y < e.y + e.h
+                        })
+                        .map(|e| e.elem_idx)
+                });
+            (kind, rect, ei)
         }
-        None => (crate::browser::layout::CursorKind::Default, None),
+        None => (crate::browser::layout::CursorKind::Default, None, None),
     });
-    // Underline the hovered link (repaint only when the hovered link changes).
-    // Use a paint-from-cached-layout path so we don't re-run the full layout
-    // pipeline on every hover change (still needed for underline chrome).
-    if crate::browser::set_hover_link(link_rect) {
+    // `:hover` restyle: record the target + ancestors so the next layout
+    // matches Tailwind `.hover\:bg-*:hover`. Relayout only when the set
+    // changes — a mouse move inside the same element is free.
+    let mut hover_idxs = alloc::vec::Vec::new();
+    if let Some(i) = hover_idx {
+        hover_idxs.push(i);
+        if let Some(ancs) = crate::browser::js_just::page_with_dom(|dom| {
+            let mut out = alloc::vec::Vec::new();
+            let mut cur = dom.elements.get(i).and_then(|e| e.parent);
+            while let Some(p) = cur {
+                out.push(p);
+                cur = dom.elements.get(p).and_then(|e| e.parent);
+                if out.len() > 32 {
+                    break;
+                }
+            }
+            out
+        }) {
+            hover_idxs.extend(ancs);
+        }
+    }
+    let style_changed = crate::browser::css::set_hover_elems(&hover_idxs);
+    if style_changed {
+        let _ = browser_repaint();
+    } else if crate::browser::set_hover_link(link_rect) {
+        // Underline-only change: paint the cached layout, no re-cascade.
         browser_repaint_hover();
     }
     #[cfg(not(test))]

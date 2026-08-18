@@ -1481,11 +1481,24 @@ impl PluginResolver for DomResolver {
             }
             ("Event", "preventDefault") => {
                 set_own_prop(&this, "__default_prevented__", JsValue::Boolean(true), false);
+                set_own_prop(&this, "defaultPrevented", JsValue::Boolean(true), true);
                 JsValue::Undefined
             }
             ("Event", "stopPropagation") | ("Event", "stopImmediatePropagation") => {
                 set_own_prop(&this, "__stopped__", JsValue::Boolean(true), false);
                 JsValue::Undefined
+            }
+            ("Event", "isPropagationStopped") => {
+                let stopped = get_own_prop_value(&this, "__stopped__")
+                    .map(|v| to_boolean(&v))
+                    .unwrap_or(false);
+                JsValue::Boolean(stopped)
+            }
+            ("Event", "isDefaultPrevented") => {
+                let p = get_own_prop_value(&this, "__default_prevented__")
+                    .map(|v| to_boolean(&v))
+                    .unwrap_or(false);
+                JsValue::Boolean(p)
             }
             ("document", "addEventListener") => {
                 self.register_listener(DOC_NODE, &args);
@@ -2086,8 +2099,20 @@ pub fn page_boot(
 }
 
 /// True when a persistent page context is live.
+///
+/// Uses [`Locked::try_with`]: [`page_dispatch`] holds `JS_PAGE` for the whole
+/// handler, and the JS tick hook pumps `upkeep` → `browser_anim_tick` →
+/// `layout_session` → `page_active`. A blocking `with` there deadlocks with
+/// interrupts off — click a Radix switch, the machine stops. If the lock is
+/// held we are *inside* a live page, so the answer is yes.
 pub fn page_active() -> bool {
-    JS_PAGE.with(|slot| slot.is_some())
+    JS_PAGE.try_with(|slot| slot.is_some()).unwrap_or(true)
+}
+
+/// True when `JS_PAGE` is already held on this core. The animation tick must
+/// not relayout in that window — same deadlock as [`page_active`].
+pub fn page_lock_held() -> bool {
+    JS_PAGE.try_with(|_| ()).is_none()
 }
 
 /// Drop the page context (navigation / reload / tab close). Field order in
@@ -2098,15 +2123,18 @@ pub fn page_close() {
 }
 
 /// Run `f` against the live page DOM (commit/layout/effects reads and writes).
-/// Returns `None` when no page is active.
+/// Returns `None` when no page is active, **or** when the page lock is
+/// already held (a click handler's tick must not re-enter).
 pub fn page_with_dom<R>(f: impl FnOnce(&mut JsDom) -> R) -> Option<R> {
-    JS_PAGE.with(|slot| slot.as_mut().map(|p| f(&mut *p.shared.borrow_mut())))
+    JS_PAGE
+        .try_with(|slot| slot.as_mut().map(|p| f(&mut *p.shared.borrow_mut())))
+        .flatten()
 }
 
 /// Element indices that should be hit-testable: everything with a registered
 /// listener or an inline `on*` attribute.
 pub fn page_interactive_elems() -> alloc::vec::Vec<usize> {
-    JS_PAGE.with(|slot| {
+    JS_PAGE.try_with(|slot| {
         let Some(p) = slot.as_mut() else { return Vec::new() };
         let mut out: Vec<usize> = p
             .listeners
@@ -2125,6 +2153,7 @@ pub fn page_interactive_elems() -> alloc::vec::Vec<usize> {
         out.dedup();
         out
     })
+    .unwrap_or_default()
 }
 
 /// Dispatch UI events into page JS: capture (window → document → ancestors)
@@ -2159,17 +2188,326 @@ pub fn page_dispatch(events: &[PageEvent]) -> alloc::vec::Vec<bool> {
     out
 }
 
+/// Pointer press: the DOM sequence a real click produces, then a native
+/// `data-state` fallback when page JS did not mutate the widget.
+///
+/// Radix Tabs listens on `mousedown` (`event.button === 0`); Switch/Checkbox
+/// and Accordion listen on `click`. React 18 also expects
+/// `isPropagationStopped`. If the engine cannot run that stack, we still
+/// flip `data-state` / `hidden` so the next layout paints the new chrome.
+pub fn page_click(target: usize, x: i32, y: i32) -> bool {
+    let before = page_with_dom(|dom| widget_fingerprint(dom)).unwrap_or_default();
+    let types = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+    let evs: alloc::vec::Vec<PageEvent> = types
+        .iter()
+        .map(|t| PageEvent {
+            target,
+            type_: String::from(*t),
+            x,
+            y,
+        })
+        .collect();
+    let prevented = page_dispatch(&evs);
+    let after = page_with_dom(|dom| widget_fingerprint(dom)).unwrap_or_default();
+    if before == after {
+        let _ = page_with_dom(|dom| page_native_toggle(dom, target));
+    }
+    prevented.last().copied().unwrap_or(false)
+}
+
+fn widget_fingerprint(dom: &super::js::JsDom) -> alloc::vec::Vec<(usize, String, bool, bool)> {
+    dom.elements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let st = e
+                .attrs
+                .get("data-state")
+                .cloned()
+                .or_else(|| e.dataset.get("state").cloned())?;
+            Some((i, st, e.hidden, e.checked))
+        })
+        .collect()
+}
+
+fn attr_of<'a>(e: &'a super::js::ElemRef, name: &str) -> Option<&'a str> {
+    e.attrs.get(name).map(String::as_str).or_else(|| {
+        if name == "data-state" {
+            e.dataset.get("state").map(String::as_str)
+        } else if name == "role" {
+            None
+        } else {
+            None
+        }
+    })
+}
+
+fn role_of(e: &super::js::ElemRef) -> &str {
+    attr_of(e, "role").unwrap_or("")
+}
+
+fn data_state_of(e: &super::js::ElemRef) -> Option<&str> {
+    attr_of(e, "data-state")
+}
+
+fn set_data_state(e: &mut super::js::ElemRef, next: &str) {
+    e.attrs
+        .insert(String::from("data-state"), String::from(next));
+    e.dataset
+        .insert(String::from("state"), String::from(next));
+}
+
+fn set_hidden(e: &mut super::js::ElemRef, hidden: bool) {
+    e.hidden = hidden;
+    if hidden {
+        e.attrs.insert(String::from("hidden"), String::new());
+    } else {
+        e.attrs.remove("hidden");
+    }
+}
+
+fn descendants(dom: &super::js::JsDom, root: usize) -> alloc::vec::Vec<usize> {
+    let mut out = alloc::vec::Vec::new();
+    let mut stack = dom
+        .elements
+        .get(root)
+        .map(|e| e.children.clone())
+        .unwrap_or_default();
+    while let Some(i) = stack.pop() {
+        out.push(i);
+        if let Some(e) = dom.elements.get(i) {
+            stack.extend(e.children.iter().copied());
+        }
+    }
+    out
+}
+
+fn page_native_toggle(dom: &mut super::js::JsDom, target: usize) {
+    let mut chain = alloc::vec::Vec::new();
+    let mut cur = Some(target);
+    while let Some(i) = cur {
+        chain.push(i);
+        cur = dom.elements.get(i).and_then(|e| e.parent);
+        if chain.len() > 32 {
+            break;
+        }
+    }
+    for &i in &chain {
+        let Some(e) = dom.elements.get(i) else {
+            continue;
+        };
+        let role = role_of(e).to_string();
+        let state = data_state_of(e).map(str::to_string);
+        if role == "tab" {
+            activate_tab(dom, i);
+            return;
+        }
+        if role == "switch"
+            || role == "checkbox"
+            || matches!(state.as_deref(), Some("checked" | "unchecked"))
+        {
+            toggle_checked_widget(dom, i);
+            return;
+        }
+        if matches!(state.as_deref(), Some("open" | "closed")) {
+            toggle_accordion(dom, i);
+            return;
+        }
+    }
+}
+
+fn toggle_checked_widget(dom: &mut super::js::JsDom, i: usize) {
+    let cur = data_state_of(&dom.elements[i]).unwrap_or("unchecked");
+    let next = if cur == "checked" {
+        "unchecked"
+    } else {
+        "checked"
+    };
+    let checked = next == "checked";
+    {
+        let e = &mut dom.elements[i];
+        set_data_state(e, next);
+        e.checked = checked;
+        e.attrs.insert(
+            String::from("aria-checked"),
+            String::from(if checked { "true" } else { "false" }),
+        );
+    }
+    let kids = dom.elements[i].children.clone();
+    for k in kids {
+        if matches!(data_state_of(&dom.elements[k]), Some("checked" | "unchecked")) {
+            set_data_state(&mut dom.elements[k], next);
+        }
+    }
+}
+
+fn apply_open_closed(e: &mut super::js::ElemRef, open: bool) {
+    set_data_state(e, if open { "open" } else { "closed" });
+    e.attrs.insert(
+        String::from("aria-expanded"),
+        String::from(if open { "true" } else { "false" }),
+    );
+}
+
+fn toggle_accordion(dom: &mut super::js::JsDom, trigger: usize) {
+    let was_open = data_state_of(&dom.elements[trigger])
+        .map(|s| s == "open")
+        .unwrap_or(false);
+    let now_open = !was_open;
+    apply_open_closed(&mut dom.elements[trigger], now_open);
+
+    let mut item = trigger;
+    let mut cur = dom.elements[trigger].parent;
+    while let Some(p) = cur {
+        if matches!(data_state_of(&dom.elements[p]), Some("open" | "closed")) {
+            item = p;
+            break;
+        }
+        cur = dom.elements[p].parent;
+    }
+    if item != trigger {
+        apply_open_closed(&mut dom.elements[item], now_open);
+    }
+
+    let desc = descendants(dom, item);
+    for d in desc {
+        if d == trigger {
+            continue;
+        }
+        let role = role_of(&dom.elements[d]).to_string();
+        let st = data_state_of(&dom.elements[d]).map(str::to_string);
+        if role == "region" || matches!(st.as_deref(), Some("open" | "closed")) {
+            apply_open_closed(&mut dom.elements[d], now_open);
+            set_hidden(&mut dom.elements[d], !now_open);
+        }
+    }
+
+    if now_open {
+        if let Some(root) = dom.elements[item].parent {
+            let sibs = dom.elements[root].children.clone();
+            for s in sibs {
+                if s != item {
+                    close_accordion_item(dom, s);
+                }
+            }
+        }
+    }
+}
+
+fn close_accordion_item(dom: &mut super::js::JsDom, item: usize) {
+    if !matches!(data_state_of(&dom.elements[item]), Some("open" | "closed")) {
+        return;
+    }
+    apply_open_closed(&mut dom.elements[item], false);
+    let desc = descendants(dom, item);
+    for d in desc {
+        let region = role_of(&dom.elements[d]) == "region";
+        let stated = matches!(data_state_of(&dom.elements[d]), Some("open" | "closed"));
+        if region || stated {
+            apply_open_closed(&mut dom.elements[d], false);
+            if region {
+                set_hidden(&mut dom.elements[d], true);
+            }
+        }
+    }
+}
+
+fn apply_tab(e: &mut super::js::ElemRef, active: bool) {
+    set_data_state(e, if active { "active" } else { "inactive" });
+    e.attrs.insert(
+        String::from("aria-selected"),
+        String::from(if active { "true" } else { "false" }),
+    );
+    e.attrs.insert(
+        String::from("tabindex"),
+        String::from(if active { "0" } else { "-1" }),
+    );
+}
+
+fn apply_panel(e: &mut super::js::ElemRef, active: bool) {
+    set_data_state(e, if active { "active" } else { "inactive" });
+    set_hidden(e, !active);
+}
+
+fn activate_tab(dom: &mut super::js::JsDom, tab: usize) {
+    let controls = attr_of(&dom.elements[tab], "aria-controls").map(str::to_string);
+    let list = dom.elements[tab].parent;
+    if let Some(list) = list {
+        let kids = dom.elements[list].children.clone();
+        for k in kids {
+            if role_of(&dom.elements[k]) == "tab" {
+                apply_tab(&mut dom.elements[k], k == tab);
+            }
+        }
+    } else {
+        apply_tab(&mut dom.elements[tab], true);
+    }
+    let panels: alloc::vec::Vec<usize> = (0..dom.elements.len())
+        .filter(|&i| role_of(&dom.elements[i]) == "tabpanel")
+        .collect();
+    if let Some(ref c) = controls {
+        for p in panels {
+            let id = dom.elements[p].id.clone();
+            let active = id.as_deref() == Some(c.as_str());
+            apply_panel(&mut dom.elements[p], active);
+        }
+    } else {
+        let tabs: alloc::vec::Vec<usize> = if let Some(list) = list {
+            dom.elements[list]
+                .children
+                .iter()
+                .copied()
+                .filter(|&k| role_of(&dom.elements[k]) == "tab")
+                .collect()
+        } else {
+            alloc::vec![tab]
+        };
+        let idx = tabs.iter().position(|&t| t == tab).unwrap_or(0);
+        for (i, p) in panels.into_iter().enumerate() {
+            apply_panel(&mut dom.elements[p], i == idx);
+        }
+    }
+}
+
 fn dispatch_one(page: &mut JsPage, ev: &PageEvent) -> bool {
     // Event object: preventDefault/stopPropagation route through the
     // DomResolver's ("Event", …) method arms and set marker props.
+    //
+    // Radix Tabs gates on `event.button === 0 && !event.ctrlKey`; without
+    // `button` the handler preventDefaults and the tab never changes.
+    // React 18 also calls `event.isPropagationStopped()` as a method.
     let eobj = make_object(vec![]);
     set_own_prop(&eobj, "__builtin_name__", s("Event"), false);
     set_own_prop(&eobj, "type", s(&ev.type_), true);
     set_own_prop(&eobj, "clientX", num(ev.x as i64), true);
     set_own_prop(&eobj, "clientY", num(ev.y as i64), true);
+    set_own_prop(&eobj, "pageX", num(ev.x as i64), true);
+    set_own_prop(&eobj, "pageY", num(ev.y as i64), true);
+    set_own_prop(&eobj, "button", num(0), true);
+    set_own_prop(
+        &eobj,
+        "buttons",
+        num(if ev.type_.ends_with("down") { 1 } else { 0 }),
+        true,
+    );
+    set_own_prop(&eobj, "which", num(1), true);
+    set_own_prop(
+        &eobj,
+        "detail",
+        num(if ev.type_ == "click" { 1 } else { 0 }),
+        true,
+    );
+    set_own_prop(&eobj, "bubbles", JsValue::Boolean(true), true);
+    set_own_prop(&eobj, "cancelable", JsValue::Boolean(true), true);
+    set_own_prop(&eobj, "ctrlKey", JsValue::Boolean(false), true);
+    set_own_prop(&eobj, "metaKey", JsValue::Boolean(false), true);
+    set_own_prop(&eobj, "shiftKey", JsValue::Boolean(false), true);
+    set_own_prop(&eobj, "altKey", JsValue::Boolean(false), true);
+    set_own_prop(&eobj, "defaultPrevented", JsValue::Boolean(false), true);
     let target_w = elem_wrapper(ev.target);
     set_own_prop(&eobj, "target", target_w.clone(), true);
     set_own_prop(&eobj, "currentTarget", target_w.clone(), true);
+    set_own_prop(&eobj, "srcElement", target_w.clone(), true);
 
     // Propagation path root→target: window, document, ancestors, target.
     // Snapshot it (and everything else we need) BEFORE running JS — handler
@@ -2921,6 +3259,222 @@ mod tests {
             .first()
             .copied()
             .unwrap_or(false)
+    }
+
+    #[test_case]
+    fn page_accessors_do_not_block_when_the_page_lock_is_held() {
+        // Click → page_dispatch holds JS_PAGE → host tick → anim tick →
+        // layout_session → these accessors. A blocking `with` there is the
+        // Switch/Checkbox freeze (interrupts off, no Ctrl+C).
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><button id="b">go</button></body></html>"#);
+        page_boot(&doc, "https://t.example/", 640, 400, &[]);
+        let (held, active, inner, hits) = JS_PAGE.with(|_| {
+            (
+                page_lock_held(),
+                page_active(),
+                page_with_dom(|_| 1),
+                page_interactive_elems(),
+            )
+        });
+        assert!(held, "try_with fails while the lock is held");
+        assert!(active, "inside a live page, so page_active is yes");
+        assert!(inner.is_none(), "page_with_dom must skip, not re-enter");
+        assert!(hits.is_empty(), "interactive set is empty rather than blocking");
+        page_close();
+    }
+
+    #[test_case]
+    fn a_click_that_sets_data_state_reaches_the_next_layout() {
+        // Radix Switch: click → setAttribute('data-state','checked') →
+        // browser_repaint → layout_session. The attribute has to be on the
+        // layout tree or `[data-state=checked]{background:#0f172a}` never
+        // matches and the switch looks stuck.
+        use crate::browser::html;
+        use crate::browser::{layout_session, SessionAssets};
+        use alloc::collections::BTreeMap;
+        let src = r#"<html><head><style>
+            button{display:flex;width:36px;height:20px;background:#e2e8f0;border-radius:9999px}
+            button[data-state=checked]{background:#0f172a}
+        </style></head><body>
+            <button id="sw" data-state="unchecked"
+                onclick="this.setAttribute('data-state','checked')">x</button>
+        </body></html>"#;
+        let doc = html::parse(src);
+        page_boot(&doc, "https://t.example/", 640, 400, &[]);
+        let sw = idx_of("sw");
+        click(sw);
+        let empty_css: BTreeMap<String, String> = BTreeMap::new();
+        let empty_bg: BTreeMap<String, (alloc::vec::Vec<u32>, usize, usize)> = BTreeMap::new();
+        let assets = SessionAssets {
+            css_external: &empty_css,
+            bg_pixels: &empty_bg,
+        };
+        let (_d, lay, _) = layout_session(src, 640, 400, "https://t.example/", &assets);
+        assert!(
+            lay.rects.iter().any(|r| r.color == 0x0f172a && r.w >= 20),
+            "checked track must paint primary, rects={:?}",
+            lay.rects.iter().map(|r| (r.color, r.w, r.h)).collect::<alloc::vec::Vec<_>>()
+        );
+        page_close();
+    }
+
+    #[test_case]
+    fn a_click_event_has_button_zero_and_is_propagation_stopped() {
+        use crate::browser::html;
+        let doc = html::parse(r#"<html><body><button id="b">go</button></body></html>"#);
+        page_boot(
+            &doc,
+            "https://t.example/",
+            640,
+            400,
+            &[String::from(
+                "document.getElementById('b').addEventListener('mousedown', function (e) {\
+                     console.log('md' + e.button);\
+                     console.log(e.isPropagationStopped());\
+                 });",
+            )],
+        );
+        let b = idx_of("b");
+        page_click(b, 1, 1);
+        let logs = page_with_dom(|d| d.log.clone()).unwrap_or_default();
+        assert!(
+            logs.iter().any(|l| l.contains("md0")),
+            "mousedown must carry button=0 (Radix Tabs), logs={logs:?}"
+        );
+        assert!(
+            logs.iter().any(|l| l.contains("false")),
+            "isPropagationStopped() must be callable, logs={logs:?}"
+        );
+        page_close();
+    }
+
+    #[test_case]
+    fn native_fallback_toggles_a_switch_without_page_js() {
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><body>
+                <button id="sw" role="switch" data-state="unchecked">
+                    <span data-state="unchecked"></span>
+                </button>
+            </body></html>"#,
+        );
+        page_boot(&doc, "https://t.example/", 640, 400, &[]);
+        let sw = idx_of("sw");
+        page_click(sw, 1, 1);
+        let (state, thumb, checked) = page_with_dom(|dom| {
+            let e = &dom.elements[sw];
+            let st = e.attrs.get("data-state").cloned();
+            let thumb = e
+                .children
+                .first()
+                .and_then(|&c| dom.elements.get(c))
+                .and_then(|c| c.attrs.get("data-state").cloned());
+            (st, thumb, e.checked)
+        })
+        .expect("page");
+        assert_eq!(state.as_deref(), Some("checked"));
+        assert_eq!(thumb.as_deref(), Some("checked"));
+        assert!(checked);
+        page_click(sw, 1, 1);
+        let state2 = page_with_dom(|dom| {
+            dom.elements[sw].attrs.get("data-state").cloned()
+        })
+        .flatten();
+        assert_eq!(state2.as_deref(), Some("unchecked"));
+        page_close();
+    }
+
+    #[test_case]
+    fn native_fallback_opens_an_accordion_item() {
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><body>
+                <div>
+                  <div id="item" data-state="closed">
+                    <button id="t" data-state="closed">Q</button>
+                    <div id="c" role="region" data-state="closed" hidden>A</div>
+                  </div>
+                </div>
+            </body></html>"#,
+        );
+        page_boot(&doc, "https://t.example/", 640, 400, &[]);
+        let t = idx_of("t");
+        page_click(t, 1, 1);
+        let (item, trigger, content, hidden) = page_with_dom(|dom| {
+            let item = dom
+                .elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("item"))
+                .and_then(|e| e.attrs.get("data-state").cloned());
+            let trigger = dom.elements[t].attrs.get("data-state").cloned();
+            let c = dom
+                .elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("c"))
+                .unwrap();
+            (item, trigger, c.attrs.get("data-state").cloned(), c.hidden)
+        })
+        .expect("page");
+        assert_eq!(item.as_deref(), Some("open"));
+        assert_eq!(trigger.as_deref(), Some("open"));
+        assert_eq!(content.as_deref(), Some("open"));
+        assert!(!hidden, "open panel must drop hidden");
+        page_close();
+    }
+
+    #[test_case]
+    fn native_fallback_activates_a_tab() {
+        use crate::browser::html;
+        let doc = html::parse(
+            r#"<html><body>
+                <div role="tablist">
+                  <button id="a" role="tab" data-state="active" aria-controls="pa">A</button>
+                  <button id="b" role="tab" data-state="inactive" aria-controls="pb">B</button>
+                </div>
+                <div id="pa" role="tabpanel" data-state="active">one</div>
+                <div id="pb" role="tabpanel" data-state="inactive" hidden>two</div>
+            </body></html>"#,
+        );
+        page_boot(&doc, "https://t.example/", 640, 400, &[]);
+        let b = idx_of("b");
+        page_click(b, 1, 1);
+        let (a_st, b_st, pa_hidden, pb_hidden, pb_st) = page_with_dom(|dom| {
+            let a = dom
+                .elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("a"))
+                .unwrap();
+            let b = dom
+                .elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("b"))
+                .unwrap();
+            let pa = dom
+                .elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("pa"))
+                .unwrap();
+            let pb = dom
+                .elements
+                .iter()
+                .find(|e| e.id.as_deref() == Some("pb"))
+                .unwrap();
+            (
+                a.attrs.get("data-state").cloned(),
+                b.attrs.get("data-state").cloned(),
+                pa.hidden,
+                pb.hidden,
+                pb.attrs.get("data-state").cloned(),
+            )
+        })
+        .expect("page");
+        assert_eq!(a_st.as_deref(), Some("inactive"));
+        assert_eq!(b_st.as_deref(), Some("active"));
+        assert!(pa_hidden, "previous panel hides");
+        assert!(!pb_hidden, "selected panel shows");
+        assert_eq!(pb_st.as_deref(), Some("active"));
+        page_close();
     }
 
     #[test_case]
