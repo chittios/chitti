@@ -168,11 +168,28 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         manifest_json: include_str!("../../../agents/doom/manifest.json"),
         skill_id: SkillId(SYSTEM_SKILL_BASE + 48),
         agent_id: AgentId(SYSTEM_AGENT_BASE + 48),
+        // The IWAD ships with the OS. Freedoom is 3-clause BSD, so redistribution
+        // is permitted **provided the licence and credits travel with it** — which
+        // is why those two files are assets and not just a note in the SOUL.
         assets: &[],
-        binary_assets: &[(
-            "tools.wasm",
-            include_bytes!("../../../agents/doom/assets/tools.wasm"),
-        )],
+        binary_assets: &[
+            (
+                "tools.wasm",
+                include_bytes!("../../../agents/doom/assets/tools.wasm"),
+            ),
+            (
+                "freedoom1.wad",
+                include_bytes!("../../../agents/doom/assets/freedoom1.wad"),
+            ),
+            (
+                "FREEDOOM-COPYING.txt",
+                include_bytes!("../../../agents/doom/assets/FREEDOOM-COPYING.txt"),
+            ),
+            (
+                "FREEDOOM-CREDITS.txt",
+                include_bytes!("../../../agents/doom/assets/FREEDOOM-CREDITS.txt"),
+            ),
+        ],
     },
     SystemAgentDef {
         name: "snake",

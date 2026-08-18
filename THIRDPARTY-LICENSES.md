@@ -546,3 +546,50 @@ Themes keep their own names. Both projects ship a `nord` and the palettes are
 not identical, so the import replaced this project's earlier hand-tuned one.
 The six themes that did not come from omarchy are `dark`, `light`,
 `solarized-dark`, `dracula` and `ubuntu` (and `nord`, now omarchy's).
+
+## doomgeneric + Freedoom — `third_party/doomgeneric/`, `agents/doom/assets/`
+
+The Doom app package (`/agents start doom`) ships two third-party works, and they
+are under **different licences with different obligations**.
+
+### doomgeneric — `third_party/doomgeneric/` (GPL-2.0)
+
+id Software's Doom source release plus ozkl's platform-abstraction layer.
+Upstream <https://github.com/ozkl/doomgeneric>, commit
+`dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284`; the full licence is at
+`third_party/doomgeneric/LICENSE` and provenance at
+`third_party/doomgeneric/VENDORING.md`.
+
+**Vendored unmodified.** Nothing upstream is edited — everything ChittiOS-specific
+is a *substitution*: `tools/doom-wasm/src/platform.c` replaces the
+`doomgeneric_*.c` platform ports, and `tools/doombench/src/w_file_memory.c`
+defines `stdc_wad_file` over a memory buffer in place of `w_file_stdc.c`. That is
+the same rule the ring-3 image tenant follows (one implementation, so porting
+cannot regress it), and it also keeps the GPL boundary clean and legible.
+
+The compiled artifact is `agents/doom/assets/tools.wasm`, a **separate wasm
+module** loaded at runtime — the same arrangement as
+`assets/wasm/javy-plugin.wasm` and `assets/wasm/pdfrender.wasm`. It is not linked
+into the kernel binary.
+
+### Freedoom — `agents/doom/assets/freedoom1.wad` (3-clause BSD)
+
+Freedoom Phase 1 v0.13.0, <https://freedoom.github.io/>. Game data, not code: a
+complete free replacement for the original Doom IWAD, so the app needs no
+proprietary asset to run.
+
+Bundled rather than fetched, because the BSD licence **permits redistribution**
+outright. Note the obligation that comes with it: the licence and credits must
+travel with the data, which is why `FREEDOOM-COPYING.txt` and
+`FREEDOOM-CREDITS.txt` are shipped as assets beside the WAD and written into the
+agent's home at install — not merely linked from a document.
+
+This is deliberately a different call from the `/samples/` corpus, which is
+*fetched, never committed*. That rule exists to avoid taking a redistribution
+decision on files whose licences do not clearly permit one. Freedoom's does, so
+the decision is simply made.
+
+**Size, stated plainly:** the WAD is ~27.5 MB. It is committed to this repository
+and `include_bytes!`d into every kernel image built with the Doom agent, so both
+the git history and the image carry it. That is the cost of the game working on a
+fresh boot with no network.

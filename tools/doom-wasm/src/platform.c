@@ -23,6 +23,7 @@ IMPORT("host_keys_held")   extern int32_t host_keys_held(void *out, int32_t len)
 IMPORT("host_now_ms")      extern int64_t host_now_ms(void);
 IMPORT("host_fs_read")     extern int32_t host_fs_read(const char *p, int32_t pl, void *out, int32_t cap);
 IMPORT("host_fs_exists")   extern int32_t host_fs_exists(const char *p, int32_t pl);
+IMPORT("host_home")        extern int32_t host_home(void *out, int32_t cap);
 IMPORT("host_log")         extern void    host_log(const char *p, int32_t l);
 IMPORT("host_audio_submit") extern int32_t host_audio_submit(const void *pcm, int32_t frames, int32_t rate, int32_t ch);
 IMPORT("host_audio_free")  extern int32_t host_audio_free(void);
@@ -192,14 +193,43 @@ static int64_t reply(const char *s) {
     return ((int64_t)(uint32_t)(uintptr_t)argheap << 32) | n;
 }
 
-/* Where the WAD is looked for, in order. `/samples` is not among them: Freedoom
- * is ~29 MB and the sample corpus is embedded in the kernel image, so the WAD is
- * fetched on the running OS with `/http -O` instead. */
-static const char *const WAD_PATHS[] = {
-    "/downloads/freedoom1.wad",
-    "/downloads/doom1.wad",
-    "/downloads/doom.wad",
-};
+/* Where the WAD is looked for, in order.
+ *
+ * The bundled Freedoom in this agent's own `assets/` comes first, so the game
+ * works on a fresh boot with no network and nothing to fetch. `/downloads` is
+ * searched after it so someone who owns the original game data can drop
+ * `doom1.wad` or `doom.wad` there and have it win over the bundled one — a real
+ * IWAD should take precedence over the replacement. */
+static char wad_paths[4][160];
+static int wad_path_count;
+
+static void build_wad_paths(void) {
+    char home[96];
+    int hn = host_home(home, (int32_t)sizeof home - 1);
+    if (hn < 0) hn = 0;
+    home[hn] = 0;
+
+    wad_path_count = 0;
+    /* Owned game data first, then the bundled replacement. */
+    static const char *const downloads[] = {
+        "/downloads/doom.wad", "/downloads/doom1.wad", "/downloads/freedoom1.wad",
+    };
+    for (unsigned i = 0; i < sizeof downloads / sizeof *downloads; i++) {
+        unsigned n = (unsigned)strlen(downloads[i]);
+        if (n >= sizeof wad_paths[0]) continue;
+        memcpy(wad_paths[wad_path_count], downloads[i], n + 1);
+        wad_path_count++;
+    }
+    if (hn > 0 && wad_path_count < 4) {
+        char *d = wad_paths[wad_path_count];
+        unsigned n = 0;
+        for (int i = 0; i < hn && n < sizeof wad_paths[0] - 24; i++) d[n++] = home[i];
+        const char *tail = "/assets/freedoom1.wad";
+        for (unsigned i = 0; tail[i]; i++) d[n++] = tail[i];
+        d[n] = 0;
+        wad_path_count++;
+    }
+}
 
 /* Doom needs the WAD resident: `w_file_memory.c` serves every lump from this
  * buffer via `wad_file_t::mapped`, so nothing streams across the boundary. */
@@ -214,10 +244,11 @@ int64_t doom_start(int32_t p, int32_t n) {
     (void)p; (void)n;
     if (started) return reply("ok");
 
+    build_wad_paths();
     const char *found = 0;
     int32_t got = 0;
-    for (unsigned i = 0; i < sizeof WAD_PATHS / sizeof *WAD_PATHS; i++) {
-        const char *path = WAD_PATHS[i];
+    for (int i = 0; i < wad_path_count; i++) {
+        const char *path = wad_paths[i];
         int32_t pl = (int32_t)strlen(path);
         if (!host_fs_exists(path, pl)) continue;
         got = host_fs_read(path, pl, wad, (int32_t)sizeof wad);
@@ -231,12 +262,15 @@ int64_t doom_start(int32_t p, int32_t n) {
         if (got > 0) { found = path; break; }
     }
     if (!found) {
-        logs("doom: no WAD found in /downloads");
+        /* The bundled WAD is written into this agent's home at install, so this
+         * should be unreachable. It means the asset did not land — worth saying
+         * plainly rather than blaming the user for not fetching something that
+         * ships with the OS. */
+        logs("doom: no WAD found, including the bundled one in my own assets");
         return reply(
-            "ask:There is no Doom WAD on this machine. Tell the user to fetch Freedoom "
-            "(3-clause BSD, freely redistributable) with:  "
-            "/http -O https://github.com/freedoom/freedoom/releases/latest  "
-            "and unzip freedoom1.wad into /downloads/.");
+            "ask:I could not find a WAD, not even the Freedoom one bundled in my own "
+            "assets folder — so my install may be incomplete. Tell the user they can "
+            "also drop doom.wad or doom1.wad into /downloads/.");
     }
 
     dg_set_wad(wad, (unsigned)got);

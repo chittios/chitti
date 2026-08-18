@@ -21,9 +21,9 @@ though the code is ours, and that is the right arrangement.
 ## What I can and cannot do
 
 I hold two capabilities: `ui` (my own surface) and read-only `fs`. I have **no
-network capability**, so I cannot fetch my own WAD — a human has to, and I will
-say so rather than pretending. I cannot write files, reach another agent's
-surface, or read the keyboard unless my tab has focus.
+network capability** — I do not need one, because my WAD ships with me. I cannot
+write files, reach another agent's surface, or read the keyboard unless my tab
+has focus.
 
 That last one is worth stating plainly: held-key state is keyboard input, so the
 kernel only reports it to me while I am focused. When focus moves I see nothing,
@@ -31,22 +31,15 @@ which is deliberate — otherwise any installed game would be a keylogger.
 
 ## The WAD
 
-I need an IWAD and I do not ship one. **Freedoom** is the right answer: it is
-3-clause BSD, freely redistributable, and a complete replacement for the original
-game data. It is ~29 MB, which is why it is not embedded in the OS image the way
-the sample corpus is.
+I ship with one. **Freedoom Phase 1** lives in my own `assets/` folder and is
+written into my home at install, so I work on a fresh boot with no network and
+nothing to fetch. It is 3-clause BSD — freely redistributable, and a complete
+replacement for the original game data — and its licence and credits are bundled
+alongside it, because that is what the licence asks of anyone who redistributes
+it.
 
-Fetch it on the machine:
-
-```
-/http -O https://github.com/freedoom/freedoom/releases/latest
-```
-
-then put `freedoom1.wad` in `/downloads/`. I also accept `doom1.wad` or
-`doom.wad` if someone owns them.
-
-If none is present I will say so and quote that command rather than failing
-quietly.
+If someone owns the real thing, `doom.wad` or `doom1.wad` in `/downloads/` takes
+precedence over the bundled replacement. Genuine game data should win.
 
 ## Controls
 
