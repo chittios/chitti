@@ -987,6 +987,9 @@ fn forward_key(key: &str) -> bool {
 
 /// Forward an arrow key (CSI final byte) to the focused package app.
 pub fn nav(fin: u8) -> bool {
+    if focused_app_polls_input() {
+        return true;
+    }
     match nav_key_name(fin) {
         Some(key) => forward_key(key),
         None => false,
@@ -994,7 +997,42 @@ pub fn nav(fin: u8) -> bool {
 }
 
 /// Forward a printable / Enter / Esc key to the focused package app.
+/// Whether the focused app reads input by **polling** rather than by `on_key`.
+///
+/// A realtime app (one that declared `wasm.frame_ms`) reads `host_keys_held`
+/// once per frame, so it exports no `on_key` and the push path would find
+/// nothing to call — leaving every keystroke to fall through to the shell. That
+/// is not merely untidy: with a chat agent behind the prompt, typing `w` to walk
+/// forward sends `w` to a language model. It cost a 16-second remote inference
+/// to discover.
+///
+/// So a focused realtime app consumes **everything** the shell would otherwise
+/// take as chat. Partial consumption is the wrong shape here — the composer gets
+/// the remainder, which is how an image tab once turned a typed URL into
+/// `http://1..2.2:81/ogo.png` by eating only `0` and `l`.
+///
+/// The escapes are unaffected because they are handled **before** this: Ctrl+Tab
+/// moves focus, Ctrl+C interrupts, Ctrl+W closes the tab. Without one of those
+/// this would be a keyboard trap, which is why it is worth naming them here.
+fn focused_app_polls_input() -> bool {
+    let Some(surface) = input_target_surface() else {
+        return false;
+    };
+    APPS.with(|m| {
+        m.get(&surface)
+            .is_some_and(|r| r.frame_ms != HOUSEKEEPING_MS)
+    })
+}
+
 pub fn key(c: u8) -> bool {
+    if focused_app_polls_input() {
+        // Printable ASCII, Enter and Esc — what a game binds. **Not** the other
+        // control bytes: Ctrl+C (0x03), Ctrl+W (0x17) and friends are the OS
+        // escapes, and swallowing them here would turn a focused game into a
+        // keyboard trap with no way out. Modifiers like Ctrl-to-fire never arrive
+        // as bytes at all; the guest reads those from the held-key bitmap.
+        return matches!(c, 0x20..=0x7e | b'\r' | b'\n' | 0x1b);
+    }
     let key: String = match c {
         b'\r' | b'\n' => "enter".to_string(),
         b' ' => "space".to_string(),

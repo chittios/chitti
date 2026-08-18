@@ -186,29 +186,14 @@ fn draw_surface_hud(id: u32, hud: &str, barh: u64) {
 ///
 /// Pure — unit-tested.
 pub fn present_fit(sw: u64, sh: u64, pw: u64, ph: u64) -> (u64, u64) {
-    if sw == 0 || sh == 0 || pw == 0 || ph == 0 {
-        return (0, 0);
-    }
-    // Free aspect-fit ("contain").
-    let fit_w = pw;
-    let fit_h = sh.saturating_mul(pw).saturating_div(sw).max(1);
-    let (free_w, free_h) = if fit_h <= ph {
-        (fit_w, fit_h)
-    } else {
-        let fit_h = ph;
-        let fit_w = sw.saturating_mul(ph).saturating_div(sh).max(1);
-        (fit_w.min(pw), fit_h)
-    };
-    // Integer upscale when the free fit would grow the image.
-    if free_w >= sw && free_h >= sh {
-        let s = (pw / sw).min(ph / sh).max(1);
-        let iw = sw.saturating_mul(s);
-        let ih = sh.saturating_mul(s);
-        if iw <= pw && ih <= ph && s >= 1 {
-            return (iw, ih);
-        }
-    }
-    (free_w, free_h)
+    crate::panes_layout::present_fit_mode(sw, sh, pw, ph, true)
+}
+
+/// Re-export: the arithmetic lives in [`crate::panes_layout`] because
+/// `framebuffer/` is `#[cfg(not(test))]` and a test written here would never be
+/// compiled, let alone run.
+pub fn present_fit_mode(sw: u64, sh: u64, pw: u64, ph: u64, integer: bool) -> (u64, u64) {
+    crate::panes_layout::present_fit_mode(sw, sh, pw, ph, integer)
 }
 
 /// Like [`present_surface`], but leaves `reserve_bottom` px at the bottom of the

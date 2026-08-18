@@ -127,6 +127,13 @@ struct Surface {
     back: Vec<u32>,
     /// Deferred `text` ops (see [`TextLabel`]).
     labels: Vec<TextLabel>,
+    /// Set once this surface has been filled by `ui_present` rather than by draw
+    /// ops. It selects the presentation fit: a frame has no labels to keep crisp,
+    /// so it takes the free aspect-fit and fills the pane, while a canvas keeps
+    /// the integer upscale its text depends on. Sticky rather than per-update
+    /// because a renderer that presents every frame would otherwise flip fit mode
+    /// the instant it also drew a HUD label, resizing the picture mid-play.
+    presented: bool,
     /// Input events the compositor routed to this surface (mouse/keys), drained
     /// by `ui_event_poll`. Empty headless.
     events: VecDeque<UiEvent>,
@@ -235,6 +242,7 @@ fn request_exact(owner: TaskId, kind: SurfaceKind, w: usize, h: usize) -> u32 {
                 kind,
                 w,
                 h,
+                presented: false,
                 back: vec![0u32; w * h],
                 labels: Vec::new(),
                 events: VecDeque::new(),
@@ -520,9 +528,11 @@ fn present(id: u32) {
 fn present_forced(id: u32) {
     let snap = SURFACES.with(|m| {
         m.get(&id)
-            .map(|s| (s.back.clone(), s.labels.clone(), s.hud.clone(), s.w, s.h))
+            .map(|s| {
+                (s.back.clone(), s.labels.clone(), s.hud.clone(), s.w, s.h, s.presented)
+            })
     });
-    let Some((back, labels, hud, sw, sh)) = snap else {
+    let Some((back, labels, hud, sw, sh, presented)) = snap else {
         return;
     };
     // Usable pane (minus HUD strip) so fit matches what present_surface_reserve
@@ -533,7 +543,8 @@ fn present_forced(id: u32) {
         .unwrap_or((sw as u64, sh as u64));
     let reserve = crate::framebuffer::surface_hud_reserve(&hud);
     let ph = ph_full.saturating_sub(reserve);
-    let (dw, dh) = crate::framebuffer::present_fit(sw as u64, sh as u64, pw, ph);
+    let (dw, dh) =
+        crate::framebuffer::present_fit_mode(sw as u64, sh as u64, pw, ph, !presented);
     if dw == 0 || dh == 0 {
         return;
     }
@@ -853,6 +864,60 @@ mod tests {
         }
     }
 
+    /// A presented surface takes the free fit; a drawn one keeps the integer
+    /// upscale its labels depend on. This is what decides how much of the pane a
+    /// game fills, and getting it backwards is invisible in a unit test that only
+    /// checks the flag — so assert the *geometry* both ways.
+    #[test_case]
+    fn a_presented_frame_fills_the_pane_and_a_canvas_does_not() {
+        // Doom's 320x200 in a pane that is not an exact multiple.
+        let (pw, ph) = (1080u64, 1000u64);
+        let integer = crate::panes_layout::present_fit_mode(320, 200, pw, ph, true);
+        let free = crate::panes_layout::present_fit_mode(320, 200, pw, ph, false);
+        // Integer lands on a whole multiple and leaves the remainder unused.
+        assert_eq!(integer.0 % 320, 0, "integer fit must be a whole multiple: {integer:?}");
+        assert!(free.0 > integer.0 && free.1 > integer.1, "free must be larger: {free:?}");
+        assert!(free.0 <= pw && free.1 <= ph, "free must still fit: {free:?}");
+        let want_h = free.0 * 200 / 320;
+        assert!(free.1.abs_diff(want_h) <= 1, "aspect drifted: {free:?}");
+
+        // The case where the integer rule really costs: a pane just under 2x.
+        // Integer is stuck at 1x and uses a third of the width; free nearly
+        // doubles it. This is the shape a narrow action column actually has.
+        let (nw, nh) = (630u64, 400u64);
+        let i2 = crate::panes_layout::present_fit_mode(320, 200, nw, nh, true);
+        let f2 = crate::panes_layout::present_fit_mode(320, 200, nw, nh, false);
+        assert_eq!(i2, (320, 200), "integer cannot scale at all here");
+        assert!(f2.0 >= 620, "free should fill the width: {f2:?}");
+
+        // Shrinking is unaffected by the flag — the integer rule only ever
+        // applied to growth, and a surface larger than its pane must still fit.
+        let big = (2000u64, 1200u64);
+        for integer in [true, false] {
+            let r = crate::panes_layout::present_fit_mode(big.0, big.1, 640, 480, integer);
+            assert!(r.0 <= 640 && r.1 <= 480, "shrink must fit ({integer}): {r:?}");
+        }
+    }
+
+    /// The flag is sticky, and that is deliberate: a renderer that presents every
+    /// frame *and* draws an occasional HUD label must not flip fit mode mid-play,
+    /// which would resize the picture under the player.
+    #[test_case]
+    fn presented_is_sticky_across_a_later_draw() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request_sized(owner, SurfaceKind::Canvas, 32, 16);
+        assert!(SURFACES.with(|m| !m.get(&id).unwrap().presented));
+        stage_pixels(owner, 32, 16, vec![0u32; 32 * 16]);
+        present_pixels(owner, id, 32, 16).unwrap();
+        assert!(SURFACES.with(|m| m.get(&id).unwrap().presented));
+        draw(owner, id, "text 1 1 12 ffffff hud").unwrap();
+        assert!(
+            SURFACES.with(|m| m.get(&id).unwrap().presented),
+            "a later draw must not revert a presented surface to integer fit"
+        );
+    }
+
     // --- ui_present -------------------------------------------------------
 
     #[test_case]
@@ -1164,6 +1229,7 @@ pub fn present_pixels(task: TaskId, id: u32, w: usize, h: usize) -> Result<usize
             return Err(DrawErr::BadOp("frame size does not match the surface"));
         }
         s.back.copy_from_slice(&px);
+        s.presented = true;
         // A presented frame replaces the whole surface, so any deferred labels
         // from an earlier `ui_draw` are stale — the same reason `Clear` drops
         // them. Leaving them would float last frame's text over a live game.

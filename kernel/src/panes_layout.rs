@@ -1426,3 +1426,43 @@ mod tests {
         assert_eq!(shadow_geom(0).blur, shadow_geom(1).blur);
     }
 }
+
+/// [`present_fit`], with the integer-upscale rule made optional.
+///
+/// Integer upscaling exists to keep **package-UI text** crisp: a canvas carries
+/// deferred labels re-rasterized at presentation scale, and a fractional factor
+/// makes those shimmer. A surface that was filled by `ui_present` has no labels
+/// at all — presenting a frame clears them — so the rule is protecting nothing
+/// there and only costs screen area. At 320x200 in a ~1080x1000 pane the integer
+/// factor is 2, using 640x400 of it and leaving most of the pane empty; the free
+/// fit is 3.4x.
+///
+/// The trade is honest: a fractional nearest-neighbour upscale gives pixel
+/// columns of uneven width. For a photo or a video frame that is invisible, and
+/// for a game it is the same thing every source port does in a non-integer
+/// window. Filling the pane is worth more than uniform pixels here.
+pub fn present_fit_mode(sw: u64, sh: u64, pw: u64, ph: u64, integer: bool) -> (u64, u64) {
+    if sw == 0 || sh == 0 || pw == 0 || ph == 0 {
+        return (0, 0);
+    }
+    // Free aspect-fit ("contain").
+    let fit_w = pw;
+    let fit_h = sh.saturating_mul(pw).saturating_div(sw).max(1);
+    let (free_w, free_h) = if fit_h <= ph {
+        (fit_w, fit_h)
+    } else {
+        let fit_h = ph;
+        let fit_w = sw.saturating_mul(ph).saturating_div(sh).max(1);
+        (fit_w.min(pw), fit_h)
+    };
+    // Integer upscale when the free fit would grow the image.
+    if integer && free_w >= sw && free_h >= sh {
+        let s = (pw / sw).min(ph / sh).max(1);
+        let iw = sw.saturating_mul(s);
+        let ih = sh.saturating_mul(s);
+        if iw <= pw && ih <= ph && s >= 1 {
+            return (iw, ih);
+        }
+    }
+    (free_w, free_h)
+}
