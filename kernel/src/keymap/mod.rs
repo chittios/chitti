@@ -844,6 +844,11 @@ pub fn feed_event(ev: KeyEvent) {
     // `translate` as characters, so tracking here rather than lower down is what
     // makes *every* key observable — including the ones a byte stream cannot
     // express.
+    // `usage: 0` is "no key" — a modifier-only report refreshing the derivation
+    // above. It has no held bit and no character, so it stops here.
+    if ev.usage == 0 {
+        return;
+    }
     held_set(ev.usage, ev.pressed);
 
     // Caps Lock is a toggle whose state must outlive any one driver, so it is
@@ -1020,7 +1025,14 @@ mod held_tests {
     #[test_case]
     fn every_usage_gets_its_own_bit() {
         clear_held();
-        for u in 0..=255u16 {
+        // Usage 0 is "no key": a modifier-only report uses it to refresh the
+        // derivation, so it must claim **no** held bit. Asserted rather than
+        // skipped, because a stray bit there would be permanently stuck on.
+        clear_held();
+        feed_event(ev(0, true));
+        assert_eq!(held_snapshot(), [0; 8], "usage 0 must never take a held bit");
+
+        for u in 1..=255u16 {
             let u = u as Usage;
             feed_event(ev(u, true));
             assert!(is_held(u), "usage {u:#04x} did not set");

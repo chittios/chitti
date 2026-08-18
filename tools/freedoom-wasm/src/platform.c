@@ -119,16 +119,10 @@ static unsigned char doom_key_for(int usage) {
         case 0x2c: return KEY_USE;          /* space */
         case 0xe0: case 0xe4: return KEY_FIRE;   /* ctrl */
         case 0xe1: case 0xe5: return KEY_RSHIFT; /* shift = run */
-        case 0x28: return KEY_ENTER;
-        case 0x29: return KEY_ESCAPE;
+        /* Esc, Enter and the digits are deliberately **absent**: they are taps,
+         * not holds, and the byte path delivers them (see `on_key`). Listing them
+         * here too is what made Esc open the menu and immediately close it. */
         case 0x2b: return KEY_TAB;
-        case 0x1e: return '1';
-        case 0x1f: return '2';
-        case 0x20: return '3';
-        case 0x21: return '4';
-        case 0x22: return '5';
-        case 0x23: return '6';
-        case 0x24: return '7';
         default:   return 0;
     }
 }
@@ -323,6 +317,23 @@ int64_t on_key(int32_t p, int32_t n) {
     char name[24];
     if (json_key((const char *)(uintptr_t)p, (unsigned)(n < 0 ? 0 : n), name, sizeof name) <= 0) {
         return reply("ok");
+    }
+    /* **The two input paths must not overlap.** Anything `poll_input` already
+     * derives from held-key state is ignored here, or the key arrives twice:
+     * Esc opened the menu and instantly closed it, because it was in both. Held
+     * state owns the keys where *holding* is the point (movement, fire, run) —
+     * it is the only path that can express several at once — and the byte path
+     * owns everything else, because only it knows what character a layout
+     * produces. */
+    if (!strcmp(name, "up") || !strcmp(name, "down") || !strcmp(name, "left")
+        || !strcmp(name, "right") || !strcmp(name, "space")) {
+        return reply("used");
+    }
+    if (name[1] == 0) {
+        char c0 = name[0] | 0x20;
+        if (c0 == 'w' || c0 == 'a' || c0 == 's' || c0 == 'd') {
+            return reply("used");
+        }
     }
     unsigned char k = 0;
     if (name[1] == 0) {
