@@ -76,6 +76,12 @@ static FOCUS_SURFACE: AtomicU32 = AtomicU32::new(0);
 /// a ring-3 crossing, an audit entry and a full pane-scale present per app per
 /// tick for no benefit. A **realtime** app opts out via `wasm.frame_ms`.
 const HOUSEKEEPING_MS: u64 = 180;
+
+/// Which surface last had keyboard focus, so a change can be noticed.
+///
+/// `u32::MAX` means "not yet observed" — 0 is a real value here (nothing
+/// focused), and starting there would report a spurious change on the first pump.
+static LAST_INPUT_TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
 /// True while any guest export is running (prevents re-entrant map take-out).
 static IN_GUEST: AtomicBool = AtomicBool::new(false);
 /// Global gate: only one model ask at a time (ui_agent_reply is shell-global).
@@ -843,6 +849,17 @@ pub fn tick() {
         }
     }
 
+    // A key held at the moment focus moved would otherwise stay down forever from
+    // a game's point of view, and Doom would walk into a wall until that key
+    // happened to be pressed and released again. Same reason a windowing system
+    // synthesises key-up on deactivate. Done here rather than at the focus call
+    // sites because there are several of them and `framebuffer/` is
+    // `#[cfg(not(test))]`, so logic placed there cannot be covered.
+    let target = input_target_surface().unwrap_or(0);
+    if LAST_INPUT_TARGET.swap(target, Ordering::Relaxed) != target {
+        crate::keymap::clear_held();
+    }
+
     let now = crate::arch::now_ms();
 
     // Re-read after click handling (map may have changed). Each app carries its
@@ -885,6 +902,17 @@ pub fn tick() {
 
 /// Surface that should receive keyboard input: the focused action-pane package
 /// tab, if any.
+/// Whether `surface` is the one keyboard input is currently going to.
+///
+/// The gate on [`crate::keymap::held_snapshot`] reaching a guest. Held-key state
+/// **is** keyboard input, so an unfocused app that could read it would be a
+/// keylogger — it would see everything typed at the shell prompt, in the editor,
+/// and into the password modal. Focus is the same boundary `forward_key` already
+/// uses; this just makes the pull-based reader honour it too.
+pub fn is_input_target(surface: u32) -> bool {
+    input_target_surface() == Some(surface)
+}
+
 fn input_target_surface() -> Option<u32> {
     #[cfg(not(test))]
     {

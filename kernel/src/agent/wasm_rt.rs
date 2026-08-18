@@ -1113,6 +1113,54 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
     linker
         .func_wrap(
             "chitti",
+            "host_keys_held",
+            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                // Writes the 8-word (32-byte) physical held-key bitmap, indexed
+                // by HID usage: word `usage / 32`, bit `usage % 32`, LSB-first.
+                // Returns the bytes written, or negative on refusal.
+                //
+                // **Gated on focus, and that is the whole security story.** Held-key
+                // state is keyboard input: an unfocused app that could read it
+                // would see everything typed at the shell prompt, in the editor and
+                // into the password modal — a keylogger reachable from any
+                // installed package. Focus is the same boundary `forward_key`
+                // already enforces for pushed keys; this makes the pull-based
+                // reader honour it too. An unfocused caller gets **zeros rather
+                // than an error**, because "nothing is held" is the truth from its
+                // point of view and an error would only tell it that someone else
+                // is typing.
+                let bind = caller.data().bind;
+                if bind.task == 0 || bind.surface == 0 {
+                    return -2;
+                }
+                const BYTES: usize = 32;
+                if len < BYTES as i32 {
+                    return -3;
+                }
+                let focused = crate::service::package_ui::is_input_target(bind.surface);
+                let words = if focused {
+                    crate::keymap::held_snapshot()
+                } else {
+                    [0u32; 8]
+                };
+                let mut buf = [0u8; BYTES];
+                for (i, w) in words.iter().enumerate() {
+                    buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -1;
+                };
+                match mem.write(&mut caller, ptr as usize, &buf) {
+                    Ok(()) => BYTES as i32,
+                    Err(_) => -3,
+                }
+            },
+        )
+        .map_err(|_| "define host_keys_held")?;
+
+    linker
+        .func_wrap(
+            "chitti",
             "host_surface_size",
             |caller: Caller<'_, HostState>| -> i64 {
                 // (w << 32) | h, or 0 if this binding owns no surface. Inert: it
