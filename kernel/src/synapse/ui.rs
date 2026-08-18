@@ -596,7 +596,7 @@ fn present_forced(id: u32) {
         );
     }
     // Buffer is presentation-sized; hit-testing still uses logical 256×192.
-    crate::framebuffer::present_surface_hud_ex(
+    crate::framebuffer::present_surface_hud_ex_fit(
         id,
         sw,
         sh,
@@ -604,6 +604,9 @@ fn present_forced(id: u32) {
         dh_u,
         &full,
         &hud,
+        // A presented frame fills the pane; a drawn canvas keeps the integer
+        // upscale its labels depend on.
+        !presented,
     );
 }
 

@@ -47,6 +47,27 @@ pub fn present_surface_hud_ex(
     buf: &[u32],
     hud: &str,
 ) {
+    present_surface_hud_ex_fit(id, logical_sw, logical_sh, buf_w, buf_h, buf, hud, true)
+}
+
+/// [`present_surface_hud_ex`] with the fit rule chosen by the caller.
+///
+/// `integer_fit: false` gives the free aspect-fit, for a surface holding a
+/// **presented frame**: it has no deferred labels to keep crisp (presenting
+/// clears them), so the integer rule protects nothing and only leaves the pane
+/// part-empty. Everything else keeps `true` and is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn present_surface_hud_ex_fit(
+    id: u32,
+    logical_sw: usize,
+    logical_sh: usize,
+    buf_w: usize,
+    buf_h: usize,
+    buf: &[u32],
+    hud: &str,
+    integer_fit: bool,
+) {
+    remember_surf_fit(id, integer_fit);
     if hud.trim().is_empty() {
         present_surface_reserve_ex(id, logical_sw, logical_sh, buf_w, buf_h, buf, 0);
         return;
@@ -258,7 +279,13 @@ pub fn present_surface_reserve_ex(
         // Destination frame follows the **logical** aspect-fit (matches
         // surface_hit). When the buffer is already that size, the sample loop
         // is 1:1; otherwise nearest-neighbour from buf into the frame.
-        let (dw, dh) = present_fit(logical_sw as u64, logical_sh as u64, pw, ph);
+        //
+        // This is the authoritative rect: a caller that pre-scales its buffer
+        // does not get to choose the rectangle, so the fit mode has to be known
+        // here too. It was not, which is why a presented frame stayed at the
+        // integer 2x however the pre-scale was computed.
+        let (dw, dh) =
+            present_fit_mode(logical_sw as u64, logical_sh as u64, pw, ph, surf_integer_fit(id));
         let ox = px + (pw.saturating_sub(dw)) / 2;
         let oy = py + (ph.saturating_sub(dh)) / 2;
         // **No full-pane clear.** Clearing the whole surface with fill_rect
@@ -337,6 +364,22 @@ pub fn pane_bg() -> Option<u32> {
     })
 }
 
+/// Record whether surface `id` uses the integer fit. Default is `true`, so any
+/// surface never passed through the `_fit` entry point behaves exactly as before.
+fn remember_surf_fit(id: u32, integer: bool) {
+    LAST_SURF_FREE_FIT.with(|m| {
+        if integer {
+            m.remove(&id);
+        } else {
+            m.insert(id);
+        }
+    });
+}
+
+fn surf_integer_fit(id: u32) -> bool {
+    !LAST_SURF_FREE_FIT.with(|m| m.contains(&id))
+}
+
 fn remember_surf_dim(id: u32, sw: usize, sh: usize) {
     LAST_SURF_DIM.with(|m| {
         m.insert(id, (sw, sh));
@@ -391,8 +434,9 @@ pub fn surface_hit(mx: u64, my: u64) -> Option<(u32, u16, u16)> {
         if sw == 0 || sh == 0 {
             return None;
         }
-        // Same fit as present_surface_reserve (integer upscale when growing).
-        let (dw, dh) = present_fit(sw, sh, pw, ph);
+        // Same fit as present_surface_reserve — including the mode, or the hit
+        // map describes a different rectangle from the one on screen.
+        let (dw, dh) = present_fit_mode(sw, sh, pw, ph, surf_integer_fit(id));
         let ox = px + (pw.saturating_sub(dw)) / 2;
         let oy = py + (ph.saturating_sub(dh)) / 2;
         if mx < ox || my < oy || mx >= ox + dw || my >= oy + dh {
