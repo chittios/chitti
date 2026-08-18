@@ -1000,6 +1000,19 @@ fn run_primitive(
                 Err(e) => format!("error:{e:?}"),
             }
         }
+        registry::UI_PRESENT => {
+            let surface = arg_uint(args, 0) as u32;
+            let w = arg_uint(args, 1) as usize;
+            let h = arg_uint(args, 2) as usize;
+            match super::ui::present_pixels(caller, surface, w, h) {
+                Ok(n) => format!("ok:presented={n}"),
+                Err(super::ui::DrawErr::NotOwner) => {
+                    cap::record_denial(caller, "ui_present (not surface owner)");
+                    "error:not_surface_owner".to_string()
+                }
+                Err(e) => format!("error:{e:?}"),
+            }
+        }
         other => format!("error:unimplemented primitive id {other}"),
     }
 }

@@ -1019,6 +1019,71 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_ui_draw")?;
 
+    // host_ui_present(ptr, len, w, h) -> 0 ok | -1 refused | -2 no binding |
+    //                                    -3 the numbers do not describe a frame
+    //
+    // The pixel counterpart of `host_ui_draw`, for a renderer that produces a
+    // frame rather than draw ops. Pixels are 0xRRGGBB in the low 24 bits of a
+    // little-endian u32, `w * h` of them, row-major.
+    //
+    // Pixels do **not** cross the ring-3 boundary: a tenant cannot reach guest
+    // linear memory and the call block is 1920 bytes, so a frame could never fit.
+    // Instead the frame is read here — where wasmi bounds-checks the read against
+    // live linear memory — parked against the calling task, and then the ordinary
+    // gated call carries only `{surface, w, h}`. Reading is not an effect;
+    // *applying* is, and only the gate can cause that. A refused frame is dropped,
+    // so a denial costs a copy and changes nothing on screen.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_ui_present",
+            |caller: Caller<'_, HostState>, ptr: i32, len: i32, w: i32, h: i32| -> i32 {
+                let bind = caller.data().bind;
+                if bind.task == 0 || bind.surface == 0 {
+                    return -2;
+                }
+                // Every number is checked before it is used to size anything —
+                // "a caller's claimed length must never size a buffer".
+                if w <= 0 || h <= 0 || len <= 0 {
+                    return -3;
+                }
+                let (w, h, len) = (w as usize, h as usize, len as usize);
+                let Some(px_count) = w.checked_mul(h) else {
+                    return -3;
+                };
+                if px_count > crate::synapse::ui::MAX_SURF_PIXELS
+                    || len != px_count.saturating_mul(4)
+                {
+                    return -3;
+                }
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -1;
+                };
+                let data = mem.data(&caller);
+                let start = ptr as usize;
+                let Some(end) = start.checked_add(len) else {
+                    return -3;
+                };
+                if end > data.len() {
+                    return -3;
+                }
+                let px: alloc::vec::Vec<u32> = data[start..end]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) & 0x00ff_ffff)
+                    .collect();
+                crate::synapse::ui::stage_pixels(bind.task, w, h, px);
+                if syn_ui_present(bind.task, bind.surface, w, h) {
+                    0
+                } else {
+                    // The gate refused, or userspace never ran it. Either way the
+                    // stage must not survive to be picked up by a later call.
+                    crate::synapse::ui::discard_staged(bind.task);
+                    -1
+                }
+            },
+        )
+        .map_err(|_| "define host_ui_present")?;
+
     linker
         .func_wrap(
             "chitti",
@@ -2025,6 +2090,13 @@ fn syn_ui_draw(task: TaskId, surface: u32, ops: &str) -> Result<(), UiDrawErr> {
     } else {
         Err(UiDrawErr::Refused)
     }
+}
+
+fn syn_ui_present(task: TaskId, surface: u32, w: usize, h: usize) -> bool {
+    let raw = format!(
+        r#"{{"name":"ui_present","arguments":{{"surface":{surface},"w":{w},"h":{h}}}}}"#
+    );
+    syn_in_userspace(task, &raw)
 }
 
 fn map_trap(err: wasmi::Error) -> &'static str {

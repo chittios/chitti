@@ -108,6 +108,18 @@ pub const BOARD_MARK: PrimitiveId = 24;
 /// compositor in a reserved pane-space strip. Ownership-gated like ui_draw.
 pub const UI_HUD: PrimitiveId = 25;
 
+/// Present a whole frame of pixels a guest produced, onto a surface it owns.
+///
+/// A separate primitive from `ui_draw` rather than an extra op, for the reason
+/// `board_set`/`board_mark` are separate: a differently-shaped UI payload gets its
+/// own gated, audited id. It also keeps pixels out of the op grammar, which is
+/// what makes it usable at all — an op program crosses into ring 3 through a
+/// 1920-byte block, and a frame is megabytes.
+///
+/// The pixels do **not** travel in the arguments; see `ui::stage_pixels`. The call
+/// carries only the size, and the executor consumes the frame the caller staged.
+pub const UI_PRESENT: PrimitiveId = 26;
+
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
 
@@ -294,6 +306,17 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "ui_hud",
         params: &[Param { key: "surface", ty: UINT }, Param { key: "text", ty: STR }],
         description: "Set a surface's HUD (status + wrapped hint lines, '\\n'-separated), shown in a reserved strip below the surface. Empty clears it.",
+        effect: Effect::INERT,
+    },
+    PrimitiveSpec {
+        id: UI_PRESENT,
+        name: "ui_present",
+        params: &[
+            Param { key: "surface", ty: UINT },
+            Param { key: "w", ty: UINT },
+            Param { key: "h", ty: UINT },
+        ],
+        description: "Present a whole frame (w*h 0xRRGGBB pixels, staged by the caller) onto a surface you own. For renderers that produce pixels rather than draw ops.",
         effect: Effect::INERT,
     },
 ];
