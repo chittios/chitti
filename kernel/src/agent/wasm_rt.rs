@@ -1113,6 +1113,90 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
     linker
         .func_wrap(
             "chitti",
+            "host_audio_submit",
+            |caller: Caller<'_, HostState>, ptr: i32, frames: i32, rate: i32, channels: i32| -> i32 {
+                // Signed 16-bit PCM, `frames * channels` samples, interleaved.
+                // 0 ok | -1 refused | -2 no binding | -3 the numbers do not
+                // describe a block.
+                //
+                // There is deliberately no `host_audio_rate`: the guest names its
+                // rate here and every driver takes it per call, so there is no
+                // single device rate to report and a function that returned one
+                // would be inventing it.
+                //
+                // The audio counterpart of `host_ui_present`, and the same
+                // staging contract for the same reason: samples cannot cross the
+                // 1920-byte ring-3 call block, so they are read here (bounds-
+                // checked by wasmi), parked against the task, and the gated call
+                // carries only their shape. Reading is not an effect; playing is.
+                //
+                // This replaces `host_sound_play(hz, ms)` for anything real. That
+                // one is a tone generator sharing a 32-call *lifetime* budget with
+                // logging and notifications, which `synth.rs` exhausts after 32
+                // key presses — fine for a jingle, useless for game audio.
+                let bind = caller.data().bind;
+                if bind.task == 0 {
+                    return -2;
+                }
+                if frames <= 0 || channels <= 0 || channels > 2 || rate <= 0 {
+                    return -3;
+                }
+                let (frames, channels) = (frames as usize, channels as usize);
+                let Some(samples) = frames.checked_mul(channels) else {
+                    return -3;
+                };
+                if samples > crate::sound::MAX_SUBMIT_SAMPLES {
+                    return -3;
+                }
+                let Some(bytes) = samples.checked_mul(2) else {
+                    return -3;
+                };
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -1;
+                };
+                let data = mem.data(&caller);
+                let start = ptr as usize;
+                let Some(end) = start.checked_add(bytes) else {
+                    return -3;
+                };
+                if end > data.len() {
+                    return -3;
+                }
+                let pcm: alloc::vec::Vec<i16> = data[start..end]
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                crate::sound::stage_pcm(bind.task, pcm);
+                if syn_audio_submit(bind.task, frames, rate as u32, channels as u8) {
+                    0
+                } else {
+                    crate::sound::discard_staged_pcm(bind.task);
+                    -1
+                }
+            },
+        )
+        .map_err(|_| "define host_audio_submit")?;
+
+    linker
+        .func_wrap(
+            "chitti",
+            "host_audio_free",
+            |_: Caller<'_, HostState>| -> i32 {
+                // Room in the output queue, in samples. Inert and un-gated for the
+                // same reason `host_now_ms` is: it observes our own device state
+                // and reveals only queue depth. It must stay a plain import rather
+                // than a primitive — a game polls it every frame, and an audited
+                // call there would double the audit and ktrace volume the frame
+                // pump already has to keep down.
+                crate::sound::out_free_samples().min(i32::MAX as usize) as i32
+            },
+        )
+        .map_err(|_| "define host_audio_free")?;
+
+
+    linker
+        .func_wrap(
+            "chitti",
             "host_keys_held",
             |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
                 // Writes the 8-word (32-byte) physical held-key bitmap, indexed
@@ -2161,6 +2245,13 @@ fn syn_ui_draw(task: TaskId, surface: u32, ops: &str) -> Result<(), UiDrawErr> {
 fn syn_ui_present(task: TaskId, surface: u32, w: usize, h: usize) -> bool {
     let raw = format!(
         r#"{{"name":"ui_present","arguments":{{"surface":{surface},"w":{w},"h":{h}}}}}"#
+    );
+    syn_in_userspace(task, &raw)
+}
+
+fn syn_audio_submit(task: TaskId, frames: usize, rate: u32, channels: u8) -> bool {
+    let raw = format!(
+        r#"{{"name":"audio_submit","arguments":{{"frames":{frames},"rate":{rate},"channels":{channels}}}}}"#
     );
     syn_in_userspace(task, &raw)
 }

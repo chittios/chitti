@@ -1013,6 +1013,15 @@ fn run_primitive(
                 Err(e) => format!("error:{e:?}"),
             }
         }
+        registry::AUDIO_SUBMIT => {
+            let frames = arg_uint(args, 0) as usize;
+            let rate = arg_uint(args, 1) as u32;
+            let channels = arg_uint(args, 2) as u8;
+            match crate::sound::submit_staged(caller, frames, rate, channels) {
+                Ok(n) => format!("ok:played={n}"),
+                Err(e) => format!("error:{e}"),
+            }
+        }
         other => format!("error:unimplemented primitive id {other}"),
     }
 }

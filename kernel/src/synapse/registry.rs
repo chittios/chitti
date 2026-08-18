@@ -120,6 +120,19 @@ pub const UI_HUD: PrimitiveId = 25;
 /// carries only the size, and the executor consumes the frame the caller staged.
 pub const UI_PRESENT: PrimitiveId = 26;
 
+/// Submit a block of mixed PCM for playback.
+///
+/// **The guest mixes; the kernel does not.** A game already mixes its own
+/// channels into one buffer (Doom mixes ~8), already owns its sample data, and
+/// already knows the output rate — so a kernel-side mixer would be a second
+/// implementation of something the caller has done anyway, plus sample-bank
+/// lifetimes to manage. This takes the finished stream, exactly as `speech_pump`
+/// and the video player already feed `sound::play_ch`.
+///
+/// Like [`UI_PRESENT`], the samples do not travel in the arguments; the caller
+/// stages them and this call carries only their shape.
+pub const AUDIO_SUBMIT: PrimitiveId = 27;
+
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
 
@@ -317,6 +330,17 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
             Param { key: "h", ty: UINT },
         ],
         description: "Present a whole frame (w*h 0xRRGGBB pixels, staged by the caller) onto a surface you own. For renderers that produce pixels rather than draw ops.",
+        effect: Effect::INERT,
+    },
+    PrimitiveSpec {
+        id: AUDIO_SUBMIT,
+        name: "audio_submit",
+        params: &[
+            Param { key: "frames", ty: UINT },
+            Param { key: "rate", ty: UINT },
+            Param { key: "channels", ty: UINT },
+        ],
+        description: "Play a block of signed 16-bit PCM the caller staged. For an app that mixes its own audio (game sound effects).",
         effect: Effect::INERT,
     },
 ];
