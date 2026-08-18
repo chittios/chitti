@@ -1,0 +1,38 @@
+{
+  "name": "doom",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Doom, rendered in software and presented a frame at a time.",
+  "package_ui": true,
+  "toolset": [
+    "doom_start"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "list"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "surface_w": 320,
+    "surface_h": 200,
+    "frame_ms": 28,
+    "memory_pages": 1024,
+    "fuel": 200000000
+  },
+  "autostart": false
+}

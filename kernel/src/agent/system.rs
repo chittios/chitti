@@ -163,6 +163,18 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         )],
     },
     SystemAgentDef {
+        name: "doom",
+        soul: include_str!("../../../agents/doom/SOUL.md"),
+        manifest_json: include_str!("../../../agents/doom/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 48),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 48),
+        assets: &[],
+        binary_assets: &[(
+            "tools.wasm",
+            include_bytes!("../../../agents/doom/assets/tools.wasm"),
+        )],
+    },
+    SystemAgentDef {
         name: "snake",
         soul: include_str!("../../../agents/snake/SOUL.md"),
         manifest_json: include_str!("../../../agents/snake/manifest.json"),
@@ -1522,12 +1534,13 @@ mod tests {
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
         // SOUL + package agents (no network/http plumbing as agents).
-        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git.
-        assert_eq!(SYSTEM_AGENTS.len(), 47);
+        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git + doom.
+        assert_eq!(SYSTEM_AGENTS.len(), 48);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "browser"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "notes"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "doom"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "snake"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "todo"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "download"));
