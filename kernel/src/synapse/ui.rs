@@ -21,10 +21,52 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Fixed logical surface size. The compositor scales/letterboxes this into the
-/// action pane; keeping it fixed makes rasterization deterministic (testable).
+/// Default logical surface size, and the one every existing app gets.
+///
+/// A surface *may* now name its own size at request time ([`request_sized`]) —
+/// a game has a native resolution and 256x192 is not it (Doom's is 320x200) —
+/// but the default is unchanged so nothing that does not ask is affected.
 pub const SURF_W: usize = 256;
 pub const SURF_H: usize = 192;
+
+/// Bounds on a requested surface size.
+///
+/// The lower bound keeps the letterbox arithmetic and the click inverse from
+/// dividing by something degenerate; the upper bound is what stops a guest
+/// asking for a buffer that cannot be allocated. `MAX_SURF_PIXELS` is the one
+/// that actually binds — a 4096x4096 request is 64 MiB of `u32` and would be
+/// refused by a first-fit allocator in a way that reads as a hang.
+pub const MIN_SURF_DIM: usize = 16;
+pub const MAX_SURF_DIM: usize = 4096;
+pub const MAX_SURF_PIXELS: usize = 1920 * 1080;
+
+/// Clamp a requested surface size into something allocatable.
+///
+/// Pure and total: a request is **clamped rather than refused** because the
+/// caller is asking for a canvas, not naming a file — there is no wrong answer
+/// to give back, and refusing would leave an app with no surface at all. The
+/// aspect ratio is preserved when the pixel budget binds, so an oversized
+/// request is scaled down rather than cropped to a different shape.
+pub fn clamp_surface_dims(w: usize, h: usize) -> (usize, usize) {
+    let mut w = w.clamp(MIN_SURF_DIM, MAX_SURF_DIM);
+    let mut h = h.clamp(MIN_SURF_DIM, MAX_SURF_DIM);
+    if w * h > MAX_SURF_PIXELS {
+        // Scale both axes by the same factor so the shape survives. Integer
+        // sqrt of the ratio, rounded up, then re-clamped to the floor.
+        let mut num = 1usize;
+        while (w / (num + 1)).max(MIN_SURF_DIM) * (h / (num + 1)).max(MIN_SURF_DIM)
+            > MAX_SURF_PIXELS
+        {
+            num += 1;
+            if num > MAX_SURF_DIM {
+                break;
+            }
+        }
+        w = (w / (num + 1)).max(MIN_SURF_DIM);
+        h = (h / (num + 1)).max(MIN_SURF_DIM);
+    }
+    (w, h)
+}
 
 /// Longest string a single `text` op may carry (bounded so labels stay `Copy`
 /// and a hostile program can't allocate unboundedly).
@@ -73,13 +115,25 @@ const LABEL_CAP: usize = 96;
 
 struct Surface {
     owner: TaskId,
+    /// This surface's logical size. Was a global constant; a surface now carries
+    /// its own so a game can render at its native resolution instead of being
+    /// letterboxed twice (once into 256x192, again into the pane).
+    w: usize,
+    h: usize,
     #[allow(dead_code)] // recorded for the compositor / future kind-specific layout
     kind: SurfaceKind,
-    /// 0xRRGGBB pixels, row-major, `SURF_W * SURF_H`. Geometry only — text is
+    /// 0xRRGGBB pixels, row-major, `w * h`. Geometry only — text is
     /// in [`Self::labels`] and painted at present scale.
     back: Vec<u32>,
     /// Deferred `text` ops (see [`TextLabel`]).
     labels: Vec<TextLabel>,
+    /// Set once this surface has been filled by `ui_present` rather than by draw
+    /// ops. It selects the presentation fit: a frame has no labels to keep crisp,
+    /// so it takes the free aspect-fit and fills the pane, while a canvas keeps
+    /// the integer upscale its text depends on. Sticky rather than per-update
+    /// because a renderer that presents every frame would otherwise flip fit mode
+    /// the instant it also drew a HUD label, resizing the picture mid-play.
+    presented: bool,
     /// Input events the compositor routed to this surface (mouse/keys), drained
     /// by `ui_event_poll`. Empty headless.
     events: VecDeque<UiEvent>,
@@ -164,6 +218,21 @@ pub enum DrawErr {
 /// Request a new surface owned by `owner`. Returns its id (used as the `surface`
 /// arg in later draw calls; ownership — not the id — is the gate).
 pub fn request(owner: TaskId, kind: SurfaceKind) -> u32 {
+    request_sized(owner, kind, SURF_W, SURF_H)
+}
+
+/// Request a surface of a given logical size (clamped by [`clamp_surface_dims`]).
+///
+/// Exists because a game has a native resolution: Doom renders 320x200, and
+/// forcing that through a 256x192 surface would letterbox it twice — once into
+/// the surface, again into the pane — losing pixels to no purpose. Callers that
+/// do not care keep [`request`] and the historical 256x192.
+pub fn request_sized(owner: TaskId, kind: SurfaceKind, w: usize, h: usize) -> u32 {
+    let (w, h) = clamp_surface_dims(w, h);
+    request_exact(owner, kind, w, h)
+}
+
+fn request_exact(owner: TaskId, kind: SurfaceKind, w: usize, h: usize) -> u32 {
     let id = NEXT_SURFACE.fetch_add(1, Ordering::SeqCst);
     SURFACES.with(|m| {
         m.insert(
@@ -171,7 +240,10 @@ pub fn request(owner: TaskId, kind: SurfaceKind) -> u32 {
             Surface {
                 owner,
                 kind,
-                back: vec![0u32; SURF_W * SURF_H],
+                w,
+                h,
+                presented: false,
+                back: vec![0u32; w * h],
                 labels: Vec::new(),
                 events: VecDeque::new(),
                 hud: alloc::string::String::new(),
@@ -346,13 +418,15 @@ fn parse_ops(program: &str) -> Result<Vec<DrawOp>, DrawErr> {
     Ok(out)
 }
 
-fn put(back: &mut [u32], x: i32, y: i32, color: u32) {
-    if x >= 0 && y >= 0 && (x as usize) < SURF_W && (y as usize) < SURF_H {
-        back[y as usize * SURF_W + x as usize] = color;
+fn put(back: &mut [u32], w: usize, h: usize, x: i32, y: i32, color: u32) {
+    if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+        back[y as usize * w + x as usize] = color;
     }
 }
 
 fn apply_surface(s: &mut Surface, op: DrawOp) {
+    // Read once: `s` is borrowed mutably through `s.back` below.
+    let (sw, sh) = (s.w, s.h);
     match op {
         DrawOp::Clear(c) => {
             s.back.iter_mut().for_each(|p| *p = c);
@@ -361,7 +435,7 @@ fn apply_surface(s: &mut Surface, op: DrawOp) {
         DrawOp::Rect { x, y, w, h, color } => {
             for dy in 0..h.max(0) {
                 for dx in 0..w.max(0) {
-                    put(&mut s.back, x + dx, y + dy, color);
+                    put(&mut s.back, sw, sh, x + dx, y + dy, color);
                 }
             }
         }
@@ -374,7 +448,7 @@ fn apply_surface(s: &mut Surface, op: DrawOp) {
             let sy = if y0 < y1 { 1 } else { -1 };
             let mut err = dx + dy;
             loop {
-                put(&mut s.back, x, y, color);
+                put(&mut s.back, sw, sh, x, y, color);
                 if x == x1 && y == y1 {
                     break;
                 }
@@ -389,7 +463,7 @@ fn apply_surface(s: &mut Surface, op: DrawOp) {
                 }
             }
         }
-        DrawOp::Pixel { x, y, color } => put(&mut s.back, x, y, color),
+        DrawOp::Pixel { x, y, color } => put(&mut s.back, sw, sh, x, y, color),
         DrawOp::Text {
             x,
             y,
@@ -412,15 +486,15 @@ fn apply_surface(s: &mut Surface, op: DrawOp) {
             }
             #[cfg(test)]
             if let Ok(txt) = core::str::from_utf8(&buf[..len as usize]) {
-                draw_text_lo(&mut s.back, x, y, size, color, txt);
+                draw_text_lo(&mut s.back, s.w, s.h, x, y, size, color, txt);
             }
         }
     }
 }
 
 /// 1× logical-surface raster (tests / fallback). Display path uses [`present`].
-fn draw_text_lo(back: &mut [u32], x: i32, y: i32, size: i32, color: u32, s: &str) {
-    let _ = crate::font_ttf::blit_run(back, SURF_W, SURF_H, x, y, s, size as f32, color);
+fn draw_text_lo(back: &mut [u32], w: usize, h: usize, x: i32, y: i32, size: i32, color: u32, s: &str) {
+    let _ = crate::font_ttf::blit_run(back, w, h, x, y, s, size as f32, color);
 }
 
 #[inline]
@@ -454,9 +528,11 @@ fn present(id: u32) {
 fn present_forced(id: u32) {
     let snap = SURFACES.with(|m| {
         m.get(&id)
-            .map(|s| (s.back.clone(), s.labels.clone(), s.hud.clone()))
+            .map(|s| {
+                (s.back.clone(), s.labels.clone(), s.hud.clone(), s.w, s.h, s.presented)
+            })
     });
-    let Some((back, labels, hud)) = snap else {
+    let Some((back, labels, hud, sw, sh, presented)) = snap else {
         return;
     };
     // Usable pane (minus HUD strip) so fit matches what present_surface_reserve
@@ -464,15 +540,16 @@ fn present_forced(id: u32) {
     // Fit to the column this surface's tab actually lives in — a package-UI app
     // dragged to another column must re-scale to that column, not the focused one.
     let (pw, ph_full) = crate::framebuffer::surface_dims_px(id)
-        .unwrap_or((SURF_W as u64, SURF_H as u64));
+        .unwrap_or((sw as u64, sh as u64));
     let reserve = crate::framebuffer::surface_hud_reserve(&hud);
     let ph = ph_full.saturating_sub(reserve);
-    let (dw, dh) = crate::framebuffer::present_fit(SURF_W as u64, SURF_H as u64, pw, ph);
+    let (dw, dh) =
+        crate::framebuffer::present_fit_mode(sw as u64, sh as u64, pw, ph, !presented);
     if dw == 0 || dh == 0 {
         return;
     }
-    let scale_x = dw as f32 / SURF_W as f32;
-    let scale_y = dh as f32 / SURF_H as f32;
+    let scale_x = dw as f32 / sw as f32;
+    let scale_y = dh as f32 / sh as f32;
     // Uniform text scale (min axis) so glyphs aren't stretched.
     let scale_t = if scale_x < scale_y { scale_x } else { scale_y };
     // Nearest-neighbour upscale of geometry into a presentation buffer, then
@@ -481,11 +558,11 @@ fn present_forced(id: u32) {
     let dw_u = dw as usize;
     let dh_u = dh as usize;
     for dy in 0..dh_u {
-        let sy = (dy as u64 * SURF_H as u64 / dh) as usize;
-        let srow = sy * SURF_W;
+        let sy = (dy as u64 * sh as u64 / dh) as usize;
+        let srow = sy * sw;
         let drow = dy * dw_u;
         for dx in 0..dw_u {
-            let sx = (dx as u64 * SURF_W as u64 / dw) as usize;
+            let sx = (dx as u64 * sw as u64 / dw) as usize;
             full[drow + dx] = back[srow + sx];
         }
     }
@@ -519,14 +596,17 @@ fn present_forced(id: u32) {
         );
     }
     // Buffer is presentation-sized; hit-testing still uses logical 256×192.
-    crate::framebuffer::present_surface_hud_ex(
+    crate::framebuffer::present_surface_hud_ex_fit(
         id,
-        SURF_W,
-        SURF_H,
+        sw,
+        sh,
         dw_u,
         dh_u,
         &full,
         &hud,
+        // A presented frame fills the pane; a drawn canvas keeps the integer
+        // upscale its labels depend on.
+        !presented,
     );
 }
 
@@ -733,6 +813,216 @@ pub fn reset() {
 mod tests {
     use super::*;
 
+    // --- per-surface dimensions ------------------------------------------
+
+    /// The default must be byte-identical to the old fixed constant, or every
+    /// existing app silently changes shape.
+    #[test_case]
+    fn an_unsized_request_is_still_256x192() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request(owner, SurfaceKind::Canvas);
+        assert_eq!(surface_dims(id), Some((SURF_W, SURF_H)));
+    }
+
+    #[test_case]
+    fn a_sized_request_gets_its_own_geometry() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        // Doom's native resolution, which is the reason this exists.
+        let id = request_sized(owner, SurfaceKind::Canvas, 320, 200);
+        assert_eq!(surface_dims(id), Some((320, 200)));
+        // Drawing must respect the *surface's* bounds, not the old constant:
+        // x=300 is inside a 320-wide surface and outside a 256-wide one.
+        draw(owner, id, "clear 000000; pixel 300 10 00ff00").unwrap();
+        let px = SURFACES.with(|m| m.get(&id).unwrap().back[10 * 320 + 300]);
+        assert_eq!(px, 0x00ff00, "a pixel inside a wider surface must land");
+    }
+
+    /// Clamping is total and shape-preserving. An out-of-range request is a
+    /// canvas request, not a filename — there is no wrong answer to return, and
+    /// refusing would leave the app with no surface at all.
+    #[test_case]
+    fn surface_dims_are_clamped_not_refused() {
+        // Too small in each axis.
+        assert_eq!(clamp_surface_dims(0, 0), (MIN_SURF_DIM, MIN_SURF_DIM));
+        assert_eq!(clamp_surface_dims(1, 10_000).0, MIN_SURF_DIM);
+        // Ordinary sizes pass through untouched.
+        assert_eq!(clamp_surface_dims(320, 200), (320, 200));
+        assert_eq!(clamp_surface_dims(SURF_W, SURF_H), (SURF_W, SURF_H));
+        // The pixel budget binds before the per-axis one, and both axes shrink
+        // together so an oversized request keeps its aspect rather than being
+        // cropped to a different picture.
+        let (w, h) = clamp_surface_dims(MAX_SURF_DIM, MAX_SURF_DIM);
+        assert!(w * h <= MAX_SURF_PIXELS, "{w}x{h} is over the pixel budget");
+        assert_eq!(w, h, "a square request must stay square");
+        let (w, h) = clamp_surface_dims(4000, 2000);
+        assert!(w * h <= MAX_SURF_PIXELS, "{w}x{h} is over the pixel budget");
+        assert!(w > h, "a wide request must stay wide");
+        // Every clamped result is allocatable and non-degenerate.
+        for (rw, rh) in [(0, 0), (1, 1), (99999, 3), (4096, 4096), (1920, 1080)] {
+            let (w, h) = clamp_surface_dims(rw, rh);
+            assert!(w >= MIN_SURF_DIM && h >= MIN_SURF_DIM, "{rw}x{rh} -> {w}x{h}");
+            assert!(w * h <= MAX_SURF_PIXELS, "{rw}x{rh} -> {w}x{h}");
+        }
+    }
+
+    /// A presented surface takes the free fit; a drawn one keeps the integer
+    /// upscale its labels depend on. This is what decides how much of the pane a
+    /// game fills, and getting it backwards is invisible in a unit test that only
+    /// checks the flag — so assert the *geometry* both ways.
+    #[test_case]
+    fn a_presented_frame_fills_the_pane_and_a_canvas_does_not() {
+        // Doom's 320x200 in a pane that is not an exact multiple.
+        let (pw, ph) = (1080u64, 1000u64);
+        let integer = crate::panes_layout::present_fit_mode(320, 200, pw, ph, true);
+        let free = crate::panes_layout::present_fit_mode(320, 200, pw, ph, false);
+        // Integer lands on a whole multiple and leaves the remainder unused.
+        assert_eq!(integer.0 % 320, 0, "integer fit must be a whole multiple: {integer:?}");
+        assert!(free.0 > integer.0 && free.1 > integer.1, "free must be larger: {free:?}");
+        assert!(free.0 <= pw && free.1 <= ph, "free must still fit: {free:?}");
+        let want_h = free.0 * 200 / 320;
+        assert!(free.1.abs_diff(want_h) <= 1, "aspect drifted: {free:?}");
+
+        // The case where the integer rule really costs: a pane just under 2x.
+        // Integer is stuck at 1x and uses a third of the width; free nearly
+        // doubles it. This is the shape a narrow action column actually has.
+        let (nw, nh) = (630u64, 400u64);
+        let i2 = crate::panes_layout::present_fit_mode(320, 200, nw, nh, true);
+        let f2 = crate::panes_layout::present_fit_mode(320, 200, nw, nh, false);
+        assert_eq!(i2, (320, 200), "integer cannot scale at all here");
+        assert!(f2.0 >= 620, "free should fill the width: {f2:?}");
+
+        // Shrinking is unaffected by the flag — the integer rule only ever
+        // applied to growth, and a surface larger than its pane must still fit.
+        let big = (2000u64, 1200u64);
+        for integer in [true, false] {
+            let r = crate::panes_layout::present_fit_mode(big.0, big.1, 640, 480, integer);
+            assert!(r.0 <= 640 && r.1 <= 480, "shrink must fit ({integer}): {r:?}");
+        }
+    }
+
+    /// The flag is sticky, and that is deliberate: a renderer that presents every
+    /// frame *and* draws an occasional HUD label must not flip fit mode mid-play,
+    /// which would resize the picture under the player.
+    #[test_case]
+    fn presented_is_sticky_across_a_later_draw() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request_sized(owner, SurfaceKind::Canvas, 32, 16);
+        assert!(SURFACES.with(|m| !m.get(&id).unwrap().presented));
+        stage_pixels(owner, 32, 16, vec![0u32; 32 * 16]);
+        present_pixels(owner, id, 32, 16).unwrap();
+        assert!(SURFACES.with(|m| m.get(&id).unwrap().presented));
+        draw(owner, id, "text 1 1 12 ffffff hud").unwrap();
+        assert!(
+            SURFACES.with(|m| m.get(&id).unwrap().presented),
+            "a later draw must not revert a presented surface to integer fit"
+        );
+    }
+
+    // --- ui_present -------------------------------------------------------
+
+    #[test_case]
+    fn a_staged_frame_presents_onto_an_owned_surface() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request_sized(owner, SurfaceKind::Canvas, 32, 16);
+        let px: Vec<u32> = (0..32 * 16).map(|i| i as u32).collect();
+        stage_pixels(owner, 32, 16, px.clone());
+        assert_eq!(present_pixels(owner, id, 32, 16).unwrap(), 32 * 16);
+        let back = SURFACES.with(|m| m.get(&id).unwrap().back.clone());
+        assert_eq!(back, px, "the presented frame must land verbatim");
+    }
+
+    /// Presenting consumes the stage. A second present with nothing staged is an
+    /// error rather than a silent repaint of the previous frame — "the guest sent
+    /// nothing" and "the guest sent the same thing" are different facts.
+    #[test_case]
+    fn a_frame_is_consumed_and_cannot_be_presented_twice() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request_sized(owner, SurfaceKind::Canvas, 16, 16);
+        stage_pixels(owner, 16, 16, vec![1u32; 16 * 16]);
+        assert!(present_pixels(owner, id, 16, 16).is_ok());
+        assert!(
+            present_pixels(owner, id, 16, 16).is_err(),
+            "the stage must not survive a present"
+        );
+    }
+
+    /// Every number is re-checked against what was actually staged. A frame
+    /// written with the wrong stride is not a slightly-wrong picture, it is a
+    /// diagonal smear that reads as a bug somewhere else entirely.
+    #[test_case]
+    fn a_size_mismatch_is_refused_not_blitted() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request_sized(owner, SurfaceKind::Canvas, 32, 16);
+
+        // Staged dims disagree with the call.
+        stage_pixels(owner, 16, 32, vec![7u32; 32 * 16]);
+        assert!(present_pixels(owner, id, 32, 16).is_err());
+
+        // Call agrees with the stage but not with the surface.
+        stage_pixels(owner, 8, 8, vec![7u32; 64]);
+        assert!(present_pixels(owner, id, 8, 8).is_err());
+
+        // Buffer length disagrees with the dims it claims.
+        stage_pixels(owner, 32, 16, vec![7u32; 10]);
+        assert!(present_pixels(owner, id, 32, 16).is_err());
+
+        // Nothing was written by any of the refusals.
+        let back = SURFACES.with(|m| m.get(&id).unwrap().back.clone());
+        assert!(back.iter().all(|&p| p == 0), "a refused frame must not blit");
+    }
+
+    /// Ownership, the same gate `ui_draw` has: a surface id is a small global
+    /// integer, so naming someone else's must be denied.
+    #[test_case]
+    fn present_requires_ownership() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request_sized(owner, SurfaceKind::Canvas, 16, 16);
+        let other = owner + 1;
+        stage_pixels(other, 16, 16, vec![9u32; 256]);
+        assert_eq!(present_pixels(other, id, 16, 16), Err(DrawErr::NotOwner));
+    }
+
+    /// A stage is per-task, so one guest cannot present another's pixels — the
+    /// same reason capability slots are per-task rather than global.
+    #[test_case]
+    fn stages_do_not_leak_between_tasks() {
+        reset();
+        let a = crate::sched::current_task_id();
+        let b = a + 1;
+        stage_pixels(a, 16, 16, vec![1u32; 256]);
+        // `b` staged nothing, so `b` has no frame — even though `a` does.
+        let id_b = request_sized(b, SurfaceKind::Canvas, 16, 16);
+        assert!(present_pixels(b, id_b, 16, 16).is_err());
+        // `a`'s frame is untouched by `b`'s failed attempt.
+        let id_a = request_sized(a, SurfaceKind::Canvas, 16, 16);
+        assert!(present_pixels(a, id_a, 16, 16).is_ok());
+    }
+
+    /// A presented frame replaces the whole surface, so stale labels from an
+    /// earlier `ui_draw` must go — otherwise last frame's text floats over a live
+    /// game. Same reason `Clear` drops them.
+    #[test_case]
+    fn presenting_clears_deferred_labels() {
+        reset();
+        let owner = crate::sched::current_task_id();
+        let id = request_sized(owner, SurfaceKind::Canvas, 32, 32);
+        draw(owner, id, "text 1 1 12 ffffff hello").unwrap();
+        assert!(SURFACES.with(|m| !m.get(&id).unwrap().labels.is_empty()));
+        stage_pixels(owner, 32, 32, vec![0u32; 32 * 32]);
+        present_pixels(owner, id, 32, 32).unwrap();
+        assert!(
+            SURFACES.with(|m| m.get(&id).unwrap().labels.is_empty()),
+            "a presented frame must not keep the previous frame's labels"
+        );
+    }
+
     #[test_case]
     fn rasterizes_clear_rect_pixel_deterministically() {
         reset();
@@ -874,4 +1164,114 @@ mod tests {
         assert_ne!(checksum(id).unwrap(), h1);
         close(owner, id).unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pixel present (UI_PRESENT)
+// ---------------------------------------------------------------------------
+
+/// A frame a guest has produced but the gate has not yet approved.
+///
+/// **Why pixels are staged rather than passed as arguments.** The primitive is
+/// executed in ring 3 (the standing rule), and a tenant cannot reach a wasm
+/// guest's linear memory; the startup block that carries the call text is 1920
+/// bytes, so a frame cannot travel through it either. So the kernel-side host
+/// import reads the pixels out of guest memory *first* — where wasmi bounds-checks
+/// the read — parks them here keyed by the calling task, and then makes the
+/// ordinary gated call carrying only `{surface, w, h}`. The executor consumes the
+/// stage only if the gate approved.
+///
+/// The ordering matters: reading is not an effect, and **applying** is. A staged
+/// frame that is refused is dropped, so a denial costs a copy and changes nothing
+/// on screen. Keying by `TaskId` is what stops one guest presenting another's
+/// pixels — the same reason `Cap` slots are per-task rather than global.
+static STAGED: Locked<BTreeMap<TaskId, (usize, usize, Vec<u32>)>> =
+    Locked::new(BTreeMap::new());
+
+/// Park a frame for `task`, replacing any previous one.
+///
+/// Replacing rather than queueing is deliberate: a game that renders faster than
+/// it presents should drop the stale frame, not build a backlog that grows without
+/// bound and shows the player the past.
+pub fn stage_pixels(task: TaskId, w: usize, h: usize, px: Vec<u32>) {
+    STAGED.with(|m| {
+        m.insert(task, (w, h, px));
+    });
+}
+
+/// Drop a task's staged frame, if any. Called when a guest goes away so a dead
+/// task's last frame does not hold a megabyte of heap for the life of the boot.
+pub fn discard_staged(task: TaskId) {
+    STAGED.with(|m| {
+        m.remove(&task);
+    });
+}
+
+/// Apply the frame `task` staged to a surface it owns.
+///
+/// Every number is re-checked against what was actually staged rather than
+/// trusted from the call — the image tenant's rule, and it holds even though both
+/// sides are our own code, because the guest is the untrusted side by
+/// construction. A mismatch is an error, never a partial blit: a frame written
+/// with the wrong stride is not a slightly-wrong picture, it is a diagonal smear
+/// that reads as a decoder bug somewhere else entirely.
+pub fn present_pixels(task: TaskId, id: u32, w: usize, h: usize) -> Result<usize, DrawErr> {
+    let staged = STAGED.with(|m| m.remove(&task));
+    let Some((sw, sh, px)) = staged else {
+        return Err(DrawErr::BadOp("no frame staged for this task"));
+    };
+    if sw != w || sh != h || px.len() != w * h {
+        return Err(DrawErr::BadOp("staged frame does not match the presented size"));
+    }
+    SURFACES.with(|m| {
+        let s = m.get_mut(&id).ok_or(DrawErr::NoSuchSurface)?;
+        if s.owner != task {
+            return Err(DrawErr::NotOwner);
+        }
+        if s.w != w || s.h != h {
+            return Err(DrawErr::BadOp("frame size does not match the surface"));
+        }
+        s.back.copy_from_slice(&px);
+        s.presented = true;
+        // A presented frame replaces the whole surface, so any deferred labels
+        // from an earlier `ui_draw` are stale — the same reason `Clear` drops
+        // them. Leaving them would float last frame's text over a live game.
+        s.labels.clear();
+        Ok(())
+    })?;
+    maybe_present(id);
+    Ok(w * h)
+}
+
+/// The logical size of a surface, for a caller that needs to match it.
+pub fn surface_dims(id: u32) -> Option<(usize, usize)> {
+    SURFACES.with(|m| m.get(&id).map(|s| (s.w, s.h)))
+}
+
+/// Resize a surface, from the **kernel** side.
+///
+/// Deliberately not a primitive and not reachable from a guest. A package UI's
+/// resolution is a property of its signed manifest, fixed at install time and
+/// approved by the human then — not something the running guest asks for. So this
+/// widens no authority: `ui_surface_request` still takes only a `kind`, the
+/// grammar is unchanged, and the primitive count is unaffected.
+///
+/// The contents are dropped rather than rescaled. A resize happens once, at
+/// startup, before anything has been drawn; scaling an empty buffer would only be
+/// a slower way to clear it, and scaling a *drawn* one would invent pixels.
+pub fn resize(owner: TaskId, id: u32, w: usize, h: usize) -> Result<(usize, usize), DrawErr> {
+    let (w, h) = clamp_surface_dims(w, h);
+    SURFACES.with(|m| {
+        let s = m.get_mut(&id).ok_or(DrawErr::NoSuchSurface)?;
+        if s.owner != owner {
+            return Err(DrawErr::NotOwner);
+        }
+        if s.w != w || s.h != h {
+            s.w = w;
+            s.h = h;
+            s.back = vec![0u32; w * h];
+            s.labels.clear();
+        }
+        Ok((w, h))
+    })
 }

@@ -50,6 +50,13 @@ struct Running {
     fuel: u64,
     /// Model ask in flight for this app: surface input is dropped.
     asking: bool,
+    /// Target frame interval. `HOUSEKEEPING_MS` for an ordinary event-driven app;
+    /// a smaller value for a **realtime** one that declared `wasm.frame_ms`.
+    frame_ms: u64,
+    /// When this app last ticked. Per-app, not global: one shared timestamp meant
+    /// the first app to tick set it for everyone, so N apps each ticked at 1/N of
+    /// the intended rate — invisible with one app open, which is the usual case.
+    last_tick_ms: u64,
 }
 
 /// All live package-UI apps, keyed by surface id.
@@ -63,7 +70,18 @@ static TITLES: Locked<BTreeMap<u32, String>> = Locked::new(BTreeMap::new());
 static STOP_PENDING: Locked<alloc::vec::Vec<u32>> = Locked::new(alloc::vec::Vec::new());
 /// Most recently started / focused package surface (for stop() without a tab).
 static FOCUS_SURFACE: AtomicU32 = AtomicU32::new(0);
-static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+/// Housekeeping cadence for an ordinary, event-driven package UI.
+///
+/// Unchanged at 180 ms: these apps redraw on input, and a faster poll would cost
+/// a ring-3 crossing, an audit entry and a full pane-scale present per app per
+/// tick for no benefit. A **realtime** app opts out via `wasm.frame_ms`.
+const HOUSEKEEPING_MS: u64 = 180;
+
+/// Which surface last had keyboard focus, so a change can be noticed.
+///
+/// `u32::MAX` means "not yet observed" — 0 is a real value here (nothing
+/// focused), and starting there would report a spurious change on the first pump.
+static LAST_INPUT_TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
 /// True while any guest export is running (prevents re-entrant map take-out).
 static IN_GUEST: AtomicBool = AtomicBool::new(false);
 /// Global gate: only one model ask at a time (ui_agent_reply is shell-global).
@@ -670,12 +688,35 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
         task,
         surface,
     };
+    // Per-call fuel from the manifest. This was hardcoded to `CALL_FUEL`, so
+    // `wasm.fuel` was read for chat tool calls and **silently ignored for the app
+    // itself** — a package could declare a budget, appear to be granted it, and
+    // still trap at 2 M. It is a ceiling, not a cost: an app that finishes in
+    // 50 k is unaffected by a large number here.
+    let call_fuel = crate::agent::system::manifest_fuel(agent_id).unwrap_or(CALL_FUEL);
     let limits = Limits::default()
-        .with_fuel(CALL_FUEL)
+        .with_fuel(call_fuel)
         // 64 pages (4 MiB) unless the manifest asks for more — every existing app
         // declares none and so keeps exactly its old ceiling.
-        .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64));
-    let session = Session::instantiate(&wasm, limits, bind).map_err(|e| {
+        .with_pages(crate::agent::system::manifest_pages(agent_id).unwrap_or(64))
+        // A libc-built guest is full of function pointers; the default 256 is far
+        // too tight (the PDF renderer needed 693). Raised only for `wasm.native`
+        // packages so every existing guest keeps exactly its old bound.
+        .with_table_elems(if crate::agent::system::manifest_native(agent_id) {
+            4096
+        } else {
+            crate::agent::wasm_rt::DEFAULT_MAX_TABLE_ELEMS
+        });
+    // A libc-built guest (`wasm.native`) imports WASI whether or not it uses it,
+    // so it needs the wider import set or it fails at instantiation with
+    // `missing imports` — a message that names nothing. Opt-in per package: an
+    // app that does not need a filesystem view is not handed one.
+    let instantiate = if crate::agent::system::manifest_native(agent_id) {
+        Session::instantiate_native
+    } else {
+        Session::instantiate
+    };
+    let session = instantiate(&wasm, limits, bind).map_err(|e| {
         crate::serial_println!("package_ui> {name}: wasm instantiate failed: {e}");
         let raw = format!(
             r#"{{"name":"ui_surface_close","arguments":{{"surface":{surface}}}}}"#
@@ -685,6 +726,31 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
         clear_title(surface);
         e
     })?;
+    // A package UI's native resolution and frame budget come from its **signed
+    // manifest**, not from the running guest — so the kernel applies both here
+    // and `ui_surface_request` keeps taking only a `kind`. That is why neither
+    // needed a grammar change or a new primitive: the guest's authority is
+    // exactly what it was.
+    if let Some((mw, mh)) = crate::agent::system::manifest_surface(agent_id) {
+        match crate::synapse::ui::resize(task, surface, mw as usize, mh as usize) {
+            Ok((w, h)) => {
+                crate::serial_println!("package_ui> {name}: surface {surface} sized {w}x{h}")
+            }
+            Err(e) => crate::serial_println!(
+                "package_ui> {name}: surface resize to {mw}x{mh} refused ({e:?}) — keeping default"
+            ),
+        }
+    }
+    let frame_ms = crate::agent::system::manifest_frame_ms(agent_id)
+        .map(|v| v as u64)
+        .unwrap_or(HOUSEKEEPING_MS);
+    if frame_ms != HOUSEKEEPING_MS {
+        crate::serial_println!(
+            "package_ui> {name}: realtime, {frame_ms} ms/frame ({} fps target)",
+            1000 / frame_ms.max(1)
+        );
+    }
+
     let start_owned = start_export_name(name);
     crate::serial_println!("package_ui> {name}: wasm ready, calling {start_owned}…");
 
@@ -697,8 +763,12 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
                 task,
                 surface,
                 session,
-                fuel: CALL_FUEL,
+                fuel: call_fuel,
                 asking: false,
+                frame_ms,
+                // Zero, not `now`, so the first frame runs on the very next pump
+                // rather than after a full frame of nothing.
+                last_tick_ms: 0,
             },
         );
     });
@@ -708,8 +778,22 @@ pub fn start(name: &str) -> Result<u32, &'static str> {
     let init_args = format!(r#"{{"app":"{name}","surface":{surface},"model":{model}}}"#);
     let mut init_result: Result<String, &'static str> = Err("init not run");
     crate::synapse::ui::with_deferred_present(|| {
-        init_result = call_surface(surface, &start_owned, &init_args)
-            .or_else(|_| call_surface(surface, "app_start", &init_args));
+        init_result = match call_surface(surface, &start_owned, &init_args) {
+            Ok(v) => Ok(v),
+            Err(primary) => {
+                // `app_start` is the older convention; try it, but **report the
+                // primary export's error** if both fail. Returning the fallback's
+                // told you "export missing or wrong type" about a name the package
+                // never claimed, while the real failure — a fuel trap inside
+                // `doom_start` — went unmentioned. A diagnostic that names the
+                // wrong symbol is worse than none: it sends you to look at the ABI
+                // when the ABI was fine.
+                match call_surface(surface, "app_start", &init_args) {
+                    Ok(v) => Ok(v),
+                    Err(_) => Err(primary),
+                }
+            }
+        };
     });
     match init_result {
         Ok(s) if s.starts_with("ask:") => {
@@ -802,23 +886,50 @@ pub fn tick() {
         }
     }
 
-    let now = crate::arch::now_ms();
-    if now.saturating_sub(LAST_TICK_MS.load(Ordering::Relaxed)) < 180 {
-        return;
+    // A key held at the moment focus moved would otherwise stay down forever from
+    // a game's point of view, and Doom would walk into a wall until that key
+    // happened to be pressed and released again. Same reason a windowing system
+    // synthesises key-up on deactivate. Done here rather than at the focus call
+    // sites because there are several of them and `framebuffer/` is
+    // `#[cfg(not(test))]`, so logic placed there cannot be covered.
+    let target = input_target_surface().unwrap_or(0);
+    if LAST_INPUT_TARGET.swap(target, Ordering::Relaxed) != target {
+        crate::keymap::clear_held();
     }
-    LAST_TICK_MS.store(now, Ordering::Relaxed);
 
-    // Re-read after click handling (map may have changed).
-    let apps: Vec<(String, u32, bool)> = APPS.with(|m| {
+    let now = crate::arch::now_ms();
+
+    // Re-read after click handling (map may have changed). Each app carries its
+    // own cadence and its own last-tick stamp, so a realtime game runs at its
+    // frame rate without dragging every other app up to it — and, more to the
+    // point, without every other app dragging *it* down.
+    let apps: Vec<(String, u32, bool, u64)> = APPS.with(|m| {
         m.values()
-            .map(|x| (x.name.clone(), x.surface, x.asking))
+            .filter(|x| now.saturating_sub(x.last_tick_ms) >= x.frame_ms)
+            .map(|x| (x.name.clone(), x.surface, x.asking, x.frame_ms))
             .collect()
     });
-    for (name, surface, asking) in apps {
+    for (name, surface, asking, frame_ms) in apps {
         if is_stop_pending(surface) {
             continue;
         }
-        if let Ok(out) = call_surface(surface, "tick", &format!(r#"{{"app":"{name}"}}"#)) {
+        // Stamp *before* the call, not after. A frame that takes longer than its
+        // budget would otherwise schedule the next one immediately on return, so
+        // a heavy app would monopolise `upkeep` and starve the clock, the mouse
+        // and the net stack — the cooperative-scheduler failure this whole file
+        // is careful about.
+        APPS.with(|m| {
+            if let Some(r) = m.get_mut(&surface) {
+                r.last_tick_ms = now;
+            }
+        });
+        // The guest is handed the elapsed time so it can advance its own
+        // simulation honestly. `dt` rather than a frame counter because the pump
+        // is driven by `upkeep()`, whose cadence is opportunistic — a fixed step
+        // would drift against the wall clock whenever the machine is busy.
+        let dt = frame_ms;
+        let args = format!(r#"{{"app":"{name}","dt":{dt}}}"#);
+        if let Ok(out) = call_surface(surface, "tick", &args) {
             if !asking {
                 let _ = handle_result(surface, out);
             }
@@ -828,6 +939,17 @@ pub fn tick() {
 
 /// Surface that should receive keyboard input: the focused action-pane package
 /// tab, if any.
+/// Whether `surface` is the one keyboard input is currently going to.
+///
+/// The gate on [`crate::keymap::held_snapshot`] reaching a guest. Held-key state
+/// **is** keyboard input, so an unfocused app that could read it would be a
+/// keylogger — it would see everything typed at the shell prompt, in the editor,
+/// and into the password modal. Focus is the same boundary `forward_key` already
+/// uses; this just makes the pull-based reader honour it too.
+pub fn is_input_target(surface: u32) -> bool {
+    input_target_surface() == Some(surface)
+}
+
 fn input_target_surface() -> Option<u32> {
     #[cfg(not(test))]
     {
@@ -865,14 +987,56 @@ fn forward_key(key: &str) -> bool {
 
 /// Forward an arrow key (CSI final byte) to the focused package app.
 pub fn nav(fin: u8) -> bool {
+    let polls = focused_app_polls_input();
     match nav_key_name(fin) {
-        Some(key) => forward_key(key),
+        Some(key) => forward_key(key) || polls,
         None => false,
     }
 }
 
 /// Forward a printable / Enter / Esc key to the focused package app.
+/// Whether the focused app reads input by **polling** rather than by `on_key`.
+///
+/// A realtime app (one that declared `wasm.frame_ms`) reads `host_keys_held`
+/// once per frame, so it exports no `on_key` and the push path would find
+/// nothing to call — leaving every keystroke to fall through to the shell. That
+/// is not merely untidy: with a chat agent behind the prompt, typing `w` to walk
+/// forward sends `w` to a language model. It cost a 16-second remote inference
+/// to discover.
+///
+/// So a focused realtime app consumes **everything** the shell would otherwise
+/// take as chat. Partial consumption is the wrong shape here — the composer gets
+/// the remainder, which is how an image tab once turned a typed URL into
+/// `http://1..2.2:81/ogo.png` by eating only `0` and `l`.
+///
+/// The escapes are unaffected because they are handled **before** this: Ctrl+Tab
+/// moves focus, Ctrl+C interrupts, Ctrl+W closes the tab. Without one of those
+/// this would be a keyboard trap, which is why it is worth naming them here.
+fn focused_app_polls_input() -> bool {
+    let Some(surface) = input_target_surface() else {
+        return false;
+    };
+    APPS.with(|m| {
+        m.get(&surface)
+            .is_some_and(|r| r.frame_ms != HOUSEKEEPING_MS)
+    })
+}
+
 pub fn key(c: u8) -> bool {
+    // A polling app still gets the key *forwarded*, it just also consumes it
+    // unconditionally. Both halves matter and I had only the second:
+    //
+    // Held-key state answers "is W down", which is movement. It cannot answer
+    // "what character did the user type", because that is layout-dependent and
+    // `keymap` has already done that work — a guest re-deriving it from physical
+    // usages would be a second, worse layout table. So text entry (Doom's save
+    // menu) needs the *byte*, and discarding it made the menu unusable.
+    //
+    // Consuming regardless is what keeps a keystroke out of the chat agent even
+    // when the guest ignores it. **Not** the other control bytes: Ctrl+C (0x03),
+    // Ctrl+W (0x17) and Ctrl+Tab are the OS escapes, and swallowing them would
+    // turn a focused game into a keyboard trap with no way out.
+    let polls = focused_app_polls_input();
     let key: String = match c {
         b'\r' | b'\n' => "enter".to_string(),
         b' ' => "space".to_string(),
@@ -880,7 +1044,7 @@ pub fn key(c: u8) -> bool {
         0x21..=0x7e => (c as char).to_string(),
         _ => return false,
     };
-    forward_key(&key)
+    forward_key(&key) || polls
 }
 
 #[cfg(test)]

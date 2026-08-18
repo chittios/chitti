@@ -627,6 +627,17 @@ static TABS_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// Last presented surface dimensions (logical sw×sh) so hit-testing matches
 /// the aspect-fit used by [`present_surface_reserve`] (browser is 640×400,
 /// chess/ui is 256×192, etc.).
+/// Surfaces whose destination rect uses the **free** aspect-fit rather than the
+/// integer upscale — i.e. those filled by `ui_present`.
+///
+/// Remembered rather than recomputed because the click inverse (`surface_hit`)
+/// must use the *same* fit as the blit. Two fits that disagree put the picture in
+/// one rectangle and the hit map in another, so a click lands somewhere the user
+/// did not press — and the drift grows with the scale factor, which makes it look
+/// like a mouse calibration problem rather than a mismatch.
+static LAST_SURF_FREE_FIT: crate::mm::Locked<alloc::collections::BTreeSet<u32>> =
+    crate::mm::Locked::new(alloc::collections::BTreeSet::new());
+
 static LAST_SURF_DIM: crate::mm::Locked<alloc::collections::BTreeMap<u32, (usize, usize)>> =
     crate::mm::Locked::new(alloc::collections::BTreeMap::new());
 

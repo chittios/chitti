@@ -108,6 +108,31 @@ pub const BOARD_MARK: PrimitiveId = 24;
 /// compositor in a reserved pane-space strip. Ownership-gated like ui_draw.
 pub const UI_HUD: PrimitiveId = 25;
 
+/// Present a whole frame of pixels a guest produced, onto a surface it owns.
+///
+/// A separate primitive from `ui_draw` rather than an extra op, for the reason
+/// `board_set`/`board_mark` are separate: a differently-shaped UI payload gets its
+/// own gated, audited id. It also keeps pixels out of the op grammar, which is
+/// what makes it usable at all — an op program crosses into ring 3 through a
+/// 1920-byte block, and a frame is megabytes.
+///
+/// The pixels do **not** travel in the arguments; see `ui::stage_pixels`. The call
+/// carries only the size, and the executor consumes the frame the caller staged.
+pub const UI_PRESENT: PrimitiveId = 26;
+
+/// Submit a block of mixed PCM for playback.
+///
+/// **The guest mixes; the kernel does not.** A game already mixes its own
+/// channels into one buffer (Doom mixes ~8), already owns its sample data, and
+/// already knows the output rate — so a kernel-side mixer would be a second
+/// implementation of something the caller has done anyway, plus sample-bank
+/// lifetimes to manage. This takes the finished stream, exactly as `speech_pump`
+/// and the video player already feed `sound::play_ch`.
+///
+/// Like [`UI_PRESENT`], the samples do not travel in the arguments; the caller
+/// stages them and this call carries only their shape.
+pub const AUDIO_SUBMIT: PrimitiveId = 27;
+
 const STR: ArgType = ArgType::Str;
 const UINT: ArgType = ArgType::Uint;
 
@@ -294,6 +319,28 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "ui_hud",
         params: &[Param { key: "surface", ty: UINT }, Param { key: "text", ty: STR }],
         description: "Set a surface's HUD (status + wrapped hint lines, '\\n'-separated), shown in a reserved strip below the surface. Empty clears it.",
+        effect: Effect::INERT,
+    },
+    PrimitiveSpec {
+        id: UI_PRESENT,
+        name: "ui_present",
+        params: &[
+            Param { key: "surface", ty: UINT },
+            Param { key: "w", ty: UINT },
+            Param { key: "h", ty: UINT },
+        ],
+        description: "Present a whole frame (w*h 0xRRGGBB pixels, staged by the caller) onto a surface you own. For renderers that produce pixels rather than draw ops.",
+        effect: Effect::INERT,
+    },
+    PrimitiveSpec {
+        id: AUDIO_SUBMIT,
+        name: "audio_submit",
+        params: &[
+            Param { key: "frames", ty: UINT },
+            Param { key: "rate", ty: UINT },
+            Param { key: "channels", ty: UINT },
+        ],
+        description: "Play a block of signed 16-bit PCM the caller staged. For an app that mixes its own audio (game sound effects).",
         effect: Effect::INERT,
     },
 ];

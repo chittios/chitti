@@ -703,6 +703,106 @@ pub fn test_tone(hz_tone: u32, ms: u32, rate: u32) -> Vec<i16> {
 }
 
 #[cfg(test)]
+mod submit_tests {
+    use super::*;
+    use alloc::vec;
+
+    /// A staged block is consumed by its submission, so a second call with
+    /// nothing staged is an error rather than a silent replay of the previous
+    /// block — "the guest sent nothing" and "the guest sent the same thing" are
+    /// different facts, and replaying would stutter rather than go quiet.
+    #[test_case]
+    fn pcm_is_consumed_by_its_submission() {
+        let t = crate::sched::current_task_id();
+        discard_staged_pcm(t);
+        stage_pcm(t, vec![0i16; 64]);
+        // Whether playback itself succeeds depends on a device being up, which a
+        // test guest has not got; what is under test is the validation and the
+        // consume. Either way the stage must be gone.
+        let _ = submit_staged(t, 64, 16_000, 1);
+        assert!(
+            submit_staged(t, 64, 16_000, 1).is_err(),
+            "the stage must not survive a submission"
+        );
+    }
+
+    /// Every number is re-checked against what was actually staged. A block
+    /// played at the wrong rate or channel count is not slightly wrong — it is a
+    /// different pitch and duration, which reads as a broken decoder rather than
+    /// a bad argument.
+    #[test_case]
+    fn a_shape_mismatch_is_refused() {
+        let t = crate::sched::current_task_id();
+
+        // Sample count disagrees with frames x channels.
+        discard_staged_pcm(t);
+        stage_pcm(t, vec![0i16; 64]);
+        assert!(submit_staged(t, 64, 16_000, 2).is_err(), "64 frames stereo needs 128");
+
+        discard_staged_pcm(t);
+        stage_pcm(t, vec![0i16; 10]);
+        assert!(submit_staged(t, 64, 16_000, 1).is_err());
+
+        // Channel counts we cannot mix.
+        discard_staged_pcm(t);
+        stage_pcm(t, vec![0i16; 64]);
+        assert!(submit_staged(t, 64, 16_000, 0).is_err());
+        discard_staged_pcm(t);
+        stage_pcm(t, vec![0i16; 64]);
+        assert!(submit_staged(t, 8, 16_000, 8).is_err());
+
+        // Rates outside anything a device accepts. A plausible-but-wrong rate
+        // would play, at the wrong pitch.
+        for bad in [0u32, 100, 1_000_000] {
+            discard_staged_pcm(t);
+            stage_pcm(t, vec![0i16; 64]);
+            assert!(submit_staged(t, 64, bad, 1).is_err(), "rate {bad} must be refused");
+        }
+        discard_staged_pcm(t);
+    }
+
+    /// A submission with nothing staged must not play whatever was left behind.
+    #[test_case]
+    fn submitting_without_staging_is_an_error() {
+        let t = crate::sched::current_task_id();
+        discard_staged_pcm(t);
+        assert!(submit_staged(t, 64, 16_000, 1).is_err());
+    }
+
+    /// The block bound is what stops one call handing over an unbounded
+    /// allocation; a game submits about a frame of audio, far below it.
+    #[test_case]
+    fn an_oversized_block_is_refused() {
+        let t = crate::sched::current_task_id();
+        discard_staged_pcm(t);
+        let n = MAX_SUBMIT_SAMPLES + 2;
+        stage_pcm(t, vec![0i16; n]);
+        assert!(submit_staged(t, n, 44_100, 1).is_err());
+        discard_staged_pcm(t);
+    }
+
+    /// Stages are per-task, so one guest cannot play another's audio — the same
+    /// reason capability slots and frame stages are per-task.
+    #[test_case]
+    fn stages_do_not_leak_between_tasks() {
+        let a = crate::sched::current_task_id();
+        let b = a + 1;
+        discard_staged_pcm(a);
+        discard_staged_pcm(b);
+        stage_pcm(a, vec![0i16; 64]);
+        assert!(submit_staged(b, 64, 16_000, 1).is_err(), "b staged nothing");
+        discard_staged_pcm(a);
+    }
+
+    /// Free space is reported in samples, not bytes — a guest mixes samples, and
+    /// bytes would make every one of them divide by two and get it wrong once.
+    #[test_case]
+    fn free_space_is_in_samples() {
+        assert_eq!(out_free_samples(), out_free_bytes() / 2);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -845,4 +945,83 @@ mod tests {
         // discovery out forever — saturating, so it simply waits.
         assert!(!should_reprobe(false, 10_000, 5));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Guest-submitted PCM (AUDIO_SUBMIT)
+// ---------------------------------------------------------------------------
+
+/// PCM a guest has produced but the gate has not yet approved.
+///
+/// Same shape and same reason as `synapse::ui`'s frame staging: the primitive
+/// executes in ring 3 and a tenant cannot reach a wasm guest's linear memory,
+/// while the call block that carries the arguments is 1920 bytes. So the samples
+/// are read on the kernel side — where wasmi bounds-checks the read — parked
+/// against the calling task, and the gated call carries only their shape.
+/// Reading is not an effect; **playing** is.
+static STAGED_PCM: crate::mm::Locked<alloc::collections::BTreeMap<crate::sched::TaskId, alloc::vec::Vec<i16>>> =
+    crate::mm::Locked::new(alloc::collections::BTreeMap::new());
+
+/// Longest block a single submission may carry.
+///
+/// One second at 44.1 kHz stereo. The point is not the duration but that a guest
+/// cannot hand over an unbounded allocation in one call; a game submits ~1 frame
+/// of audio at a time, three orders of magnitude below this.
+pub const MAX_SUBMIT_SAMPLES: usize = 88_200;
+
+/// Park a block of PCM for `task`, replacing any previous one.
+pub fn stage_pcm(task: crate::sched::TaskId, pcm: alloc::vec::Vec<i16>) {
+    STAGED_PCM.with(|m| {
+        m.insert(task, pcm);
+    });
+}
+
+/// Drop a task's staged PCM, if any.
+pub fn discard_staged_pcm(task: crate::sched::TaskId) {
+    STAGED_PCM.with(|m| {
+        m.remove(&task);
+    });
+}
+
+/// Play the PCM `task` staged.
+///
+/// Every number is re-checked against what was actually staged rather than
+/// trusted from the call — the image tenant's rule. A mismatch is refused rather
+/// than played at the wrong rate: audio at the wrong sample rate is not slightly
+/// wrong, it is a different pitch and duration, which reads as a broken decoder.
+pub fn submit_staged(
+    task: crate::sched::TaskId,
+    frames: usize,
+    rate: u32,
+    channels: u8,
+) -> Result<usize, &'static str> {
+    let staged = STAGED_PCM.with(|m| m.remove(&task));
+    let Some(pcm) = staged else {
+        return Err("no pcm staged for this task");
+    };
+    if channels == 0 || channels > 2 {
+        return Err("channels must be 1 or 2");
+    }
+    // A plausible-but-wrong rate is worse than a refusal: it plays, at the wrong
+    // pitch, and sounds like a decoder bug rather than a bad argument.
+    if !(4_000..=192_000).contains(&rate) {
+        return Err("rate out of range");
+    }
+    if pcm.len() != frames.saturating_mul(channels as usize) {
+        return Err("staged pcm does not match the submitted shape");
+    }
+    if pcm.len() > MAX_SUBMIT_SAMPLES {
+        return Err("block too large");
+    }
+    play_ch(&pcm, rate, channels).map(|()| frames)
+}
+
+/// How much room the output queue has, in **samples** (not bytes).
+///
+/// The pacing signal a guest needs, and the same one `speech_pump` and the video
+/// player use: query, drain that much, submit. Reported in samples because that
+/// is what the caller mixes in; bytes would make every guest divide by two and
+/// get it wrong once.
+pub fn out_free_samples() -> usize {
+    out_free_bytes() / 2
 }

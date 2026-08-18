@@ -1,0 +1,39 @@
+{
+  "name": "freedoom",
+  "version": "1.0.0",
+  "kind": "skill_agent",
+  "description": "Freedoom, rendered in software and presented a frame at a time.",
+  "package_ui": true,
+  "toolset": [
+    "freedoom_start"
+  ],
+  "capabilities": [
+    {
+      "domain": "ui",
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
+      "scope": "any"
+    },
+    {
+      "domain": "fs",
+      "rights": [
+        "read",
+        "list"
+      ],
+      "scope": "any"
+    }
+  ],
+  "wasm": {
+    "module": "assets/tools.wasm",
+    "surface_w": 320,
+    "surface_h": 200,
+    "frame_ms": 28,
+    "memory_pages": 2048,
+    "fuel": 200000000,
+    "native": true
+  },
+  "autostart": false
+}

@@ -163,6 +163,35 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
         )],
     },
     SystemAgentDef {
+        name: "freedoom",
+        soul: include_str!("../../../agents/freedoom/SOUL.md"),
+        manifest_json: include_str!("../../../agents/freedoom/manifest.json"),
+        skill_id: SkillId(SYSTEM_SKILL_BASE + 48),
+        agent_id: AgentId(SYSTEM_AGENT_BASE + 48),
+        // The IWAD ships with the OS. Freedoom is 3-clause BSD, so redistribution
+        // is permitted **provided the licence and credits travel with it** — which
+        // is why those two files are assets and not just a note in the SOUL.
+        assets: &[],
+        binary_assets: &[
+            (
+                "tools.wasm",
+                include_bytes!("../../../agents/freedoom/assets/tools.wasm"),
+            ),
+            (
+                "freedoom1.wad",
+                include_bytes!("../../../agents/freedoom/assets/freedoom1.wad"),
+            ),
+            (
+                "FREEDOOM-COPYING.txt",
+                include_bytes!("../../../agents/freedoom/assets/FREEDOOM-COPYING.txt"),
+            ),
+            (
+                "FREEDOOM-CREDITS.txt",
+                include_bytes!("../../../agents/freedoom/assets/FREEDOOM-CREDITS.txt"),
+            ),
+        ],
+    },
+    SystemAgentDef {
         name: "snake",
         soul: include_str!("../../../agents/snake/SOUL.md"),
         manifest_json: include_str!("../../../agents/snake/manifest.json"),
@@ -621,6 +650,49 @@ pub fn manifest_fuel(id: u64) -> Option<u64> {
 /// two are not interchangeable. The default 2 MiB suits a tool that digests one
 /// small argument, and is well under what a guest handling a whole *document*
 /// needs — the git agent's clone holds a packfile plus every object it unpacks.
+/// A package UI's native surface size, from `wasm.surface_w` / `wasm.surface_h`.
+///
+/// Both must be present; a half-specified size is ignored rather than mixed with
+/// the default, because 320x192 is a shape nobody asked for and the symptom would
+/// be a subtly squashed picture rather than an error.
+pub fn manifest_surface(id: u64) -> Option<(u32, u32)> {
+    let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
+    let j = Json::parse(def.manifest_json)?;
+    let w = j.get("wasm")?.get("surface_w")?.as_i64()?;
+    let h = j.get("wasm")?.get("surface_h")?.as_i64()?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some((w as u32, h as u32))
+}
+
+/// Target frame interval in ms for a **realtime** package UI (`wasm.frame_ms`).
+///
+/// Presence is what marks an app realtime: an ordinary app is event-driven and
+/// keeps the shared 180 ms housekeeping tick, while a game needs a frame budget.
+/// Clamped to a sane band — 0 would spin and anything over the housekeeping tick
+/// is just an ordinary app with extra steps.
+pub fn manifest_frame_ms(id: u64) -> Option<u32> {
+    let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
+    let j = Json::parse(def.manifest_json)?;
+    let v = j.get("wasm")?.get("frame_ms")?.as_i64()?;
+    Some(v.clamp(8, 180) as u32)
+}
+
+/// Whether this package's module is built against a libc (`wasm.native`).
+///
+/// Opt-in because the extra imports are a (read-only) filesystem view, and an app
+/// that does not need one should not be handed it. A Rust `no_std` guest imports
+/// nothing from WASI and must stay on the narrower surface.
+pub fn manifest_native(id: u64) -> bool {
+    SYSTEM_AGENTS
+        .iter()
+        .find(|d| d.agent_id.0 == id)
+        .and_then(|def| Json::parse(def.manifest_json))
+        .and_then(|j| j.get("wasm").and_then(|w| w.get("native")).and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
 pub fn manifest_pages(id: u64) -> Option<u32> {
     let def = SYSTEM_AGENTS.iter().find(|d| d.agent_id.0 == id)?;
     let j = Json::parse(def.manifest_json)?;
@@ -1493,12 +1565,13 @@ mod tests {
             assert!(!m.capabilities.is_empty(), "{} declares capabilities", def.name);
         }
         // SOUL + package agents (no network/http plumbing as agents).
-        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git.
-        assert_eq!(SYSTEM_AGENTS.len(), 47);
+        // 14 original + 16 UI + 10 chat + 6 more (breakout/tetris/console/maps/radio/sandbox-lab) + git + freedoom.
+        assert_eq!(SYSTEM_AGENTS.len(), 48);
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "browser"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "chess"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "media"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "notes"));
+        assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "freedoom"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "snake"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "todo"));
         assert!(SYSTEM_AGENTS.iter().any(|d| d.name == "download"));

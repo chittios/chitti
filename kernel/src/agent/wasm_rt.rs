@@ -145,6 +145,13 @@ pub struct HostState {
     /// arrives on fd 0, the result leaves on fd 1). Empty and untouched for
     /// every other guest.
     fds: Fds,
+    /// The one file a WASI guest may have open, if this surface grants any.
+    ///
+    /// One slot rather than a table because the only guest on this surface opens
+    /// exactly one file, once, to check it exists — see [`register_wasi_fs_imports`].
+    /// A table would be more general and would need an eviction policy for a case
+    /// that does not arise.
+    wasi_file: Option<(String, u64)>,
 }
 
 /// fd 0/1/2 backing for a WASI guest, held host-side.
@@ -285,6 +292,7 @@ pub fn js_store(
         last_error: None,
         log_count: 0,
         fds: Fds::default(),
+        wasi_file: None,
     };
     let mut store = Store::new(&engine, host);
     store.limiter(|s| &mut s.limiter);
@@ -394,6 +402,20 @@ impl Session {
         Self::instantiate_with(wasm, limits, bind, HostImportSet::Js)
     }
 
+    /// Instantiate a guest built against a libc — [`HostImportSet::Native`].
+    ///
+    /// The `chitti.*` half is identical to [`Self::instantiate`]; the addition is
+    /// the WASI surface a libc imports whether or not the program uses it. Opt-in
+    /// per package (`wasm.native`) rather than always-on, so an app that does not
+    /// need a filesystem view does not get one.
+    pub fn instantiate_native(
+        wasm: &[u8],
+        limits: Limits,
+        bind: HostBindings,
+    ) -> Result<Self, &'static str> {
+        Self::instantiate_with(wasm, limits, bind, HostImportSet::Native)
+    }
+
     /// Present `bytes` as the guest's stdin, from the start. A WASI guest reads
     /// its arguments here; rewindable because a Javy plugin consumes one stream
     /// during `initialize-runtime` and the tool's arguments must follow as a new
@@ -425,6 +447,7 @@ impl Session {
             last_error: None,
             log_count: 0,
             fds: Fds::default(),
+            wasi_file: None,
         };
         let mut store = Store::new(&engine, host);
         store.limiter(|s| &mut s.limiter);
@@ -444,6 +467,11 @@ impl Session {
             HostImportSet::Js => {
                 register_host_imports(&mut linker)?;
                 register_wasi_imports(&mut linker)?;
+            }
+            HostImportSet::Native => {
+                register_host_imports(&mut linker)?;
+                register_wasi_imports(&mut linker)?;
+                register_wasi_fs_imports(&mut linker)?;
             }
         }
         // wasmi 1.x runs the start function as part of instantiation.
@@ -630,6 +658,15 @@ enum HostImportSet {
     Agent,
     /// Browser page surface: `env` + WASI stubs only (no agent effects).
     Page,
+    /// A native guest built against a libc: the agent surface, WASI stdio, and a
+    /// **read-only** WASI file view of the store.
+    ///
+    /// This exists for ported C programs, which reach a file through `fopen`
+    /// whatever else they are given. Doom is the case in hand: its WAD arrives in
+    /// linear memory via `host_fs_read` and its lumps never touch WASI at all, but
+    /// `D_FindWADByName` still checks the file *exists* before opening it, and
+    /// without that it reports "Game mode indeterminate" and refuses to start.
+    Native,
     /// A JavaScript guest: the **whole** agent surface plus WASI stdio, because
     /// a QuickJS module reads its arguments from fd 0 and writes its result to
     /// fd 1. The `chitti.*` half is the identical, already-gated set a wasm
@@ -1019,6 +1056,71 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define host_ui_draw")?;
 
+    // host_ui_present(ptr, len, w, h) -> 0 ok | -1 refused | -2 no binding |
+    //                                    -3 the numbers do not describe a frame
+    //
+    // The pixel counterpart of `host_ui_draw`, for a renderer that produces a
+    // frame rather than draw ops. Pixels are 0xRRGGBB in the low 24 bits of a
+    // little-endian u32, `w * h` of them, row-major.
+    //
+    // Pixels do **not** cross the ring-3 boundary: a tenant cannot reach guest
+    // linear memory and the call block is 1920 bytes, so a frame could never fit.
+    // Instead the frame is read here — where wasmi bounds-checks the read against
+    // live linear memory — parked against the calling task, and then the ordinary
+    // gated call carries only `{surface, w, h}`. Reading is not an effect;
+    // *applying* is, and only the gate can cause that. A refused frame is dropped,
+    // so a denial costs a copy and changes nothing on screen.
+    linker
+        .func_wrap(
+            "chitti",
+            "host_ui_present",
+            |caller: Caller<'_, HostState>, ptr: i32, len: i32, w: i32, h: i32| -> i32 {
+                let bind = caller.data().bind;
+                if bind.task == 0 || bind.surface == 0 {
+                    return -2;
+                }
+                // Every number is checked before it is used to size anything —
+                // "a caller's claimed length must never size a buffer".
+                if w <= 0 || h <= 0 || len <= 0 {
+                    return -3;
+                }
+                let (w, h, len) = (w as usize, h as usize, len as usize);
+                let Some(px_count) = w.checked_mul(h) else {
+                    return -3;
+                };
+                if px_count > crate::synapse::ui::MAX_SURF_PIXELS
+                    || len != px_count.saturating_mul(4)
+                {
+                    return -3;
+                }
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -1;
+                };
+                let data = mem.data(&caller);
+                let start = ptr as usize;
+                let Some(end) = start.checked_add(len) else {
+                    return -3;
+                };
+                if end > data.len() {
+                    return -3;
+                }
+                let px: alloc::vec::Vec<u32> = data[start..end]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) & 0x00ff_ffff)
+                    .collect();
+                crate::synapse::ui::stage_pixels(bind.task, w, h, px);
+                if syn_ui_present(bind.task, bind.surface, w, h) {
+                    0
+                } else {
+                    // The gate refused, or userspace never ran it. Either way the
+                    // stage must not survive to be picked up by a later call.
+                    crate::synapse::ui::discard_staged(bind.task);
+                    -1
+                }
+            },
+        )
+        .map_err(|_| "define host_ui_present")?;
+
     linker
         .func_wrap(
             "chitti",
@@ -1044,6 +1146,156 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
             },
         )
         .map_err(|_| "define host_hud_set")?;
+
+    linker
+        .func_wrap(
+            "chitti",
+            "host_audio_submit",
+            |caller: Caller<'_, HostState>, ptr: i32, frames: i32, rate: i32, channels: i32| -> i32 {
+                // Signed 16-bit PCM, `frames * channels` samples, interleaved.
+                // 0 ok | -1 refused | -2 no binding | -3 the numbers do not
+                // describe a block.
+                //
+                // There is deliberately no `host_audio_rate`: the guest names its
+                // rate here and every driver takes it per call, so there is no
+                // single device rate to report and a function that returned one
+                // would be inventing it.
+                //
+                // The audio counterpart of `host_ui_present`, and the same
+                // staging contract for the same reason: samples cannot cross the
+                // 1920-byte ring-3 call block, so they are read here (bounds-
+                // checked by wasmi), parked against the task, and the gated call
+                // carries only their shape. Reading is not an effect; playing is.
+                //
+                // This replaces `host_sound_play(hz, ms)` for anything real. That
+                // one is a tone generator sharing a 32-call *lifetime* budget with
+                // logging and notifications, which `synth.rs` exhausts after 32
+                // key presses — fine for a jingle, useless for game audio.
+                let bind = caller.data().bind;
+                if bind.task == 0 {
+                    return -2;
+                }
+                if frames <= 0 || channels <= 0 || channels > 2 || rate <= 0 {
+                    return -3;
+                }
+                let (frames, channels) = (frames as usize, channels as usize);
+                let Some(samples) = frames.checked_mul(channels) else {
+                    return -3;
+                };
+                if samples > crate::sound::MAX_SUBMIT_SAMPLES {
+                    return -3;
+                }
+                let Some(bytes) = samples.checked_mul(2) else {
+                    return -3;
+                };
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -1;
+                };
+                let data = mem.data(&caller);
+                let start = ptr as usize;
+                let Some(end) = start.checked_add(bytes) else {
+                    return -3;
+                };
+                if end > data.len() {
+                    return -3;
+                }
+                let pcm: alloc::vec::Vec<i16> = data[start..end]
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                crate::sound::stage_pcm(bind.task, pcm);
+                if syn_audio_submit(bind.task, frames, rate as u32, channels as u8) {
+                    0
+                } else {
+                    crate::sound::discard_staged_pcm(bind.task);
+                    -1
+                }
+            },
+        )
+        .map_err(|_| "define host_audio_submit")?;
+
+    linker
+        .func_wrap(
+            "chitti",
+            "host_audio_free",
+            |_: Caller<'_, HostState>| -> i32 {
+                // Room in the output queue, in samples. Inert and un-gated for the
+                // same reason `host_now_ms` is: it observes our own device state
+                // and reveals only queue depth. It must stay a plain import rather
+                // than a primitive — a game polls it every frame, and an audited
+                // call there would double the audit and ktrace volume the frame
+                // pump already has to keep down.
+                crate::sound::out_free_samples().min(i32::MAX as usize) as i32
+            },
+        )
+        .map_err(|_| "define host_audio_free")?;
+
+
+    linker
+        .func_wrap(
+            "chitti",
+            "host_keys_held",
+            |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                // Writes the 8-word (32-byte) physical held-key bitmap, indexed
+                // by HID usage: word `usage / 32`, bit `usage % 32`, LSB-first.
+                // Returns the bytes written, or negative on refusal.
+                //
+                // **Gated on focus, and that is the whole security story.** Held-key
+                // state is keyboard input: an unfocused app that could read it
+                // would see everything typed at the shell prompt, in the editor and
+                // into the password modal — a keylogger reachable from any
+                // installed package. Focus is the same boundary `forward_key`
+                // already enforces for pushed keys; this makes the pull-based
+                // reader honour it too. An unfocused caller gets **zeros rather
+                // than an error**, because "nothing is held" is the truth from its
+                // point of view and an error would only tell it that someone else
+                // is typing.
+                let bind = caller.data().bind;
+                if bind.task == 0 || bind.surface == 0 {
+                    return -2;
+                }
+                const BYTES: usize = 32;
+                if len < BYTES as i32 {
+                    return -3;
+                }
+                let focused = crate::service::package_ui::is_input_target(bind.surface);
+                let words = if focused {
+                    crate::keymap::held_snapshot()
+                } else {
+                    [0u32; 8]
+                };
+                let mut buf = [0u8; BYTES];
+                for (i, w) in words.iter().enumerate() {
+                    buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return -1;
+                };
+                match mem.write(&mut caller, ptr as usize, &buf) {
+                    Ok(()) => BYTES as i32,
+                    Err(_) => -3,
+                }
+            },
+        )
+        .map_err(|_| "define host_keys_held")?;
+
+    linker
+        .func_wrap(
+            "chitti",
+            "host_surface_size",
+            |caller: Caller<'_, HostState>| -> i64 {
+                // (w << 32) | h, or 0 if this binding owns no surface. Inert: it
+                // reports the geometry the kernel already chose for this guest
+                // from its own manifest, so there is nothing to gate — the same
+                // reason `host_surface_id` and `host_now_ms` are plain imports.
+                let sid = caller.data().bind.surface;
+                match crate::synapse::ui::surface_dims(sid) {
+                    Some((w, h)) => ((w as i64) << 32) | (h as i64 & 0xffff_ffff),
+                    None => 0,
+                }
+            },
+        )
+        .map_err(|_| "define host_surface_size")?;
 
     linker
         .func_wrap(
@@ -2027,6 +2279,191 @@ fn syn_ui_draw(task: TaskId, surface: u32, ops: &str) -> Result<(), UiDrawErr> {
     }
 }
 
+fn syn_ui_present(task: TaskId, surface: u32, w: usize, h: usize) -> bool {
+    let raw = format!(
+        r#"{{"name":"ui_present","arguments":{{"surface":{surface},"w":{w},"h":{h}}}}}"#
+    );
+    syn_in_userspace(task, &raw)
+}
+
+fn syn_audio_submit(task: TaskId, frames: usize, rate: u32, channels: u8) -> bool {
+    let raw = format!(
+        r#"{{"name":"audio_submit","arguments":{{"frames":{frames},"rate":{rate},"channels":{channels}}}}}"#
+    );
+    syn_in_userspace(task, &raw)
+}
+
+/// The WASI file surface a ported C program needs, **read-only** and backed by
+/// the Synapse store.
+///
+/// `register_wasi_imports` covers stdio; this adds the eight preview1 functions a
+/// libc reaches for `fopen`. Together they are exactly the 14 imports a
+/// doomgeneric build emits — a list obtained by parsing the module's import
+/// section rather than by guessing, because wasmi resolves an import by name
+/// **and `FuncType`** and a single wrong arity makes the whole module fail with
+/// `missing imports`, a message that names nothing.
+///
+/// **Read-only, and every mutator fails honestly.** `path_rename`,
+/// `path_unlink_file`, `path_create_directory` and `path_remove_directory` return
+/// `NOENT`. A guest that needs to write has `host_fs_write`, which is home-scoped;
+/// routing writes through a second, unscoped path would widen authority by way of
+/// a compatibility shim. A C program treats a failed config write as "no config"
+/// and carries on, which is the behaviour wanted here.
+///
+/// **One open file, one offset.** The guest this exists for opens one file once.
+/// A descriptor table would need an eviction policy for a case that does not
+/// arise.
+///
+/// **`path_open` succeeds but reading through it does not.** `fd_read`/`fd_seek`/
+/// `fd_close` belong to the stdio set and answer `BADF` for any descriptor they do
+/// not own, so this surface answers *"does this file exist"* and nothing more.
+/// That is the whole requirement — a ported program gets its actual bytes through
+/// `host_fs_read` into linear memory, where it can address them directly, rather
+/// than streaming them a `fread` at a time across the boundary. Stated because the
+/// asymmetry is surprising: an `fopen` that works followed by an `fread` that
+/// returns nothing. If a guest ever genuinely needs to stream a file, give this
+/// its own `fd_read` arm keyed on `FILE_FD` and serve it from `synapse::fs`;
+/// do not widen the stdio one.
+fn register_wasi_fs_imports(linker: &mut Linker<HostState>) -> Result<(), &'static str> {
+    const W: &str = "wasi_snapshot_preview1";
+    const NOENT: i32 = 44;
+    const BADF: i32 = 8;
+    /// The preopened directory. A libc will not resolve any path — absolute or
+    /// relative — without at least one preopen; it fails inside its own path
+    /// resolution before ever calling `path_open`.
+    const PREOPEN_FD: i32 = 3;
+    /// The single file descriptor this surface can hand out. Above stdio and the
+    /// preopen so it cannot collide with either.
+    const FILE_FD: i32 = 4;
+
+    fn read_path(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
+        let mem = caller.get_export("memory").and_then(|e| e.into_memory())?;
+        let data = mem.data(caller);
+        let start = ptr.max(0) as usize;
+        let end = start.checked_add(len.max(0) as usize)?;
+        if end > data.len() {
+            return None;
+        }
+        core::str::from_utf8(&data[start..end]).ok().map(String::from)
+    }
+
+    /// Resolve a guest path against the store.
+    ///
+    /// A guest path arrives relative to the preopen, so a leading `/` is stripped
+    /// and one added back: the store is rooted, and a path that kept the guest's
+    /// own notion of `/` would name a different file on every libc.
+    fn store_path(p: &str) -> String {
+        let t = p.trim_start_matches('/');
+        format!("/{t}")
+    }
+
+    linker
+        .func_wrap(
+            W,
+            "fd_prestat_get",
+            |mut caller: Caller<'_, HostState>, fd: i32, out: i32| -> i32 {
+                if fd != PREOPEN_FD {
+                    return BADF;
+                }
+                // { u8 tag = dir, pad[3], u32 name_len }. The padding is real:
+                // name_len is at offset 4, not 1.
+                if let Some(m) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let mut buf = [0u8; 8];
+                    buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+                    let _ = m.write(&mut caller, out as usize, &buf);
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.fd_prestat_get")?;
+
+    linker
+        .func_wrap(
+            W,
+            "fd_prestat_dir_name",
+            |mut caller: Caller<'_, HostState>, fd: i32, path: i32, len: i32| -> i32 {
+                if fd != PREOPEN_FD || len < 1 {
+                    return BADF;
+                }
+                if let Some(m) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let _ = m.write(&mut caller, path as usize, b"/");
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.fd_prestat_dir_name")?;
+
+    linker
+        .func_wrap(
+            W,
+            "path_open",
+            |mut caller: Caller<'_, HostState>,
+             _dirfd: i32,
+             _dirflags: i32,
+             path: i32,
+             path_len: i32,
+             oflags: i32,
+             _base: i64,
+             _inherit: i64,
+             _fdflags: i32,
+             out_fd: i32|
+             -> i32 {
+                // OFLAGS_CREAT (1) | OFLAGS_TRUNC (8) mean the guest intends to
+                // write. Refused rather than silently opened read-only, which
+                // would look like success and then lose the data.
+                if oflags & 0b1001 != 0 {
+                    return NOENT;
+                }
+                let Some(p) = read_path(&caller, path, path_len) else {
+                    return NOENT;
+                };
+                let full = store_path(&p);
+                if !crate::synapse::fs::exists(&full) {
+                    return NOENT;
+                }
+                caller.data_mut().wasi_file = Some((full, 0));
+                if let Some(m) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    let _ = m.write(&mut caller, out_fd as usize, &FILE_FD.to_le_bytes());
+                }
+                0
+            },
+        )
+        .map_err(|_| "define wasi.path_open")?;
+
+    linker
+        .func_wrap(
+            W,
+            "fd_fdstat_set_flags",
+            |_: Caller<'_, HostState>, _: i32, _: i32| -> i32 { 0 },
+        )
+        .map_err(|_| "define wasi.fd_fdstat_set_flags")?;
+
+    // Every mutator: refused. See the function doc — writes go through the
+    // home-scoped `host_fs_write`, not through a compatibility shim.
+    for name in [
+        "path_create_directory",
+        "path_remove_directory",
+        "path_unlink_file",
+    ] {
+        linker
+            .func_wrap(W, name, |_: Caller<'_, HostState>, _: i32, _: i32, _: i32| -> i32 {
+                NOENT
+            })
+            .map_err(|_| "define wasi path mutator")?;
+    }
+    linker
+        .func_wrap(
+            W,
+            "path_rename",
+            |_: Caller<'_, HostState>, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32| -> i32 {
+                NOENT
+            },
+        )
+        .map_err(|_| "define wasi.path_rename")?;
+
+    Ok(())
+}
+
 fn map_trap(err: wasmi::Error) -> &'static str {
     let msg = format!("{err}");
     if msg.contains("fuel") || msg.contains("Fuel") {
@@ -2252,6 +2689,45 @@ mod tests {
     #[test_case]
     fn a_capacity_below_the_envelope_is_none() {
         assert!(split_ops(1, "clear 000000", 4).is_none());
+    }
+
+    /// The Freedoom package's real module must instantiate against the real import
+    /// set. This is the test that would otherwise not exist until someone booted
+    /// the OS and typed `/agents start doom`.
+    ///
+    /// It is worth its cost because the failure mode is uniquely unhelpful: wasmi
+    /// resolves an import by name **and** `FuncType`, so one missing function or
+    /// one wrong arity fails the whole module with `missing imports/limits?` —
+    /// naming neither the function nor the type. A libc-built guest imports ~14
+    /// WASI functions it may never call, and every one of them has to be present.
+    #[test_case]
+    fn the_freedoom_module_instantiates_against_the_native_import_set() {
+        const DOOM: &[u8] = include_bytes!("../../../agents/freedoom/assets/tools.wasm");
+        // Same limits the package manifest declares, so this fails here rather
+        // than at `/agents start` if a limit is too tight — the table-elems trap
+        // the PDF renderer hit at 693 against a hardcoded 256.
+        // 2048 pages = the module's own `--initial-memory` of 128 MiB. A limit
+        // below a module's *initial* memory is refused at instantiation, and the
+        // message says `missing imports/limits?` without saying which — this test
+        // caught exactly that at 1024.
+        let limits = Limits::default()
+            .with_fuel(200_000_000)
+            .with_pages(2048)
+            .with_table_elems(4096);
+        let s = Session::instantiate_native(DOOM, limits, HostBindings::default())
+            .expect("freedoom module must instantiate against HostImportSet::Native");
+        drop(s);
+
+        // And it must *not* instantiate on the narrow set — otherwise `wasm.native`
+        // is decorative and a future guest would silently lose its WASI imports.
+        let limits = Limits::default()
+            .with_fuel(200_000_000)
+            .with_pages(2048)
+            .with_table_elems(4096);
+        assert!(
+            Session::instantiate(DOOM, limits, HostBindings::default()).is_err(),
+            "a libc guest must need the native set; if this passes, the opt-in is meaningless"
+        );
     }
 
     #[test_case]
