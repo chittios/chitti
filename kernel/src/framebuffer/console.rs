@@ -276,6 +276,11 @@ impl Screen {
         // would land in the wrong place entirely. Forgotten here rather than at
         // the eight call sites, so a ninth cannot get it wrong.
         self.toast_forget();
+        // Interiors that skip a full clear (audio live-update, unchanged
+        // surface HUDs) must rebuild after a redraw — the pixels they were
+        // preserving are about to be painted over.
+        super::views::invalidate_audio_paint();
+        super::invalidate_surface_hud();
         // Same reason, for the same kind of state: the panes below are about to
         // be repainted, so the shadows on them are gone and may be painted
         // afresh. Without this every pane would keep the elevation it was drawn

@@ -126,7 +126,7 @@ impl Default for UiConfig {
             status_left: alloc::format!("{NAME} v${{version}}"),
             // Compact macOS-style clock by default (`Tue Aug 4  19:45`); full
             // form stays available as `${datetime}` / `${tz}` if a user wants it.
-            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${recording}  ${datetime_short}".to_string(),
+            status_right: "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${recording}  ${nowplaying}  ${datetime_short}".to_string(),
             status_pos: crate::panes_layout::StatusPos::default().as_str().to_string(),
             tz_offset: 0,
             tz_name: String::new(),
@@ -238,6 +238,10 @@ impl UiConfig {
             // Pre-${recording}: adopt the current default so a saved ui.json
             // gains the chip without a hand edit.
             t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${datetime_short}" => {
+                d.status_right.clone()
+            }
+            // Pre-${nowplaying}.
+            t if t == "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${notifications}  ${recording}  ${datetime_short}" => {
                 d.status_right.clone()
             }
             t => t,
@@ -668,6 +672,9 @@ fn resolve_var(var: &str) -> String {
         // Empty when idle — expand swallows the separator, so the bar is
         // byte-identical to before until a take starts.
         "recording" => crate::shell::record::chip_text(),
+        // Empty when nothing is loaded — same empty-chip rule. The clickable
+        // chip is painted from this same value (`shell::now_playing_chip`).
+        "nowplaying" => crate::shell::now_playing_chip(),
         other => alloc::format!("${{{}}}", other),
     }
 }
@@ -837,6 +844,11 @@ mod tests {
         assert!(
             d.status_right.contains("${datetime_short}"),
             "default status_right should use compact clock: {}",
+            d.status_right
+        );
+        assert!(
+            d.status_right.contains("  ${nowplaying}  "),
+            "default status_right should surround nowplaying with two-space runs: {}",
             d.status_right
         );
         // Not the full `${datetime}` token (would also match datetime_short).

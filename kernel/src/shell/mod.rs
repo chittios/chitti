@@ -49,7 +49,7 @@ pub(crate) use voice::*;
 use agents::*;
 use install::*;
 use keyboard::*;
-use media::*;
+pub(crate) use media::*;
 pub(crate) use notify::*;
 use pdf::*;
 use record::*;
@@ -7154,6 +7154,22 @@ fn media_key(c: u8) -> bool {
                 audio_seek(5000);
                 true
             }
+            b'n' | b']' => {
+                audio_step(true);
+                true
+            }
+            b'p' | b'[' => {
+                audio_step(false);
+                true
+            }
+            b'r' | b'R' => {
+                audio_cycle_repeat();
+                true
+            }
+            b's' | b'S' => {
+                audio_toggle_shuffle();
+                true
+            }
             b'm' | b'M' => {
                 media_toggle_mute();
                 true
@@ -8225,6 +8241,9 @@ fn ui_tick() {
                     StatusChip::Recording => {
                         crate::shell::record::stop_and_save();
                     }
+                    StatusChip::NowPlaying => {
+                        audio_toggle_pause();
+                    }
                     other => crate::modal::status_menu(other),
                 }
             } else if let Some(which) = crate::framebuffer::divider_hit(t.x, t.y) {
@@ -8516,7 +8535,10 @@ fn repaint_tab(mode: crate::framebuffer::RightMode) {
     match mode {
         crate::framebuffer::RightMode::Top => refresh_top(),
         crate::framebuffer::RightMode::Todos => {}
-        crate::framebuffer::RightMode::Audio => repaint_audio(),
+        crate::framebuffer::RightMode::Audio => {
+            crate::framebuffer::invalidate_audio_paint();
+            repaint_audio();
+        }
         crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => {
             present_video_frame()
         }

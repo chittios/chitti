@@ -301,22 +301,53 @@ pub fn draw_top(v: &TopView) {
 /// A snapshot of the background audio player, for [`draw_audio`].
 pub struct AudioView<'a> {
     pub name: &'a str,
+    /// Full path (for the SRC line and playlist matching).
+    pub path: &'a str,
     pub pos_ms: u64,
     pub total_ms: u64,
     pub rate: u32,
     pub playing: bool,
     pub paused: bool,
-    /// Peak envelope `0..=255` for the wave visualizer (see `audio::waveform_peaks`).
+    /// Peak envelope `0..=255` for the whole-track silhouette.
     pub peaks: &'a [u8],
+    /// Live octave-band spectrum, bass → treble, `0..=255` per bar.
+    pub spectrum: &'a [u8],
     /// Software volume percent (`0..=100`) and mute (from `sound::volume`/`muted`).
     pub volume: u32,
     pub muted: bool,
+    pub playlist: &'a [String],
+    pub playlist_idx: usize,
+    pub repeat: crate::audio::hud::Repeat,
+    pub shuffle: bool,
 }
 
-/// Paint the audio-player tab in the **same HUD layout as the video player**:
-/// a centre **wave visualizer** (played = accent, remaining = dim) plus a
-/// bottom control strip (status line, scrubber, shortcut hints). No-op unless
-/// the audio tab is active. Called ~4 Hz from the shell while the tab is on top.
+/// Last full chrome paint. A 4 Hz tick with the same signature only updates
+/// the spectrum + HUD status/scrubber, so the single-buffered FB never
+/// flashes the whole pane to background (the CLIAMP flicker).
+struct AudioPaintState {
+    sig: u64,
+    pw: u64,
+    ph: u64,
+}
+static AUDIO_PAINT: crate::mm::Locked<Option<AudioPaintState>> = crate::mm::Locked::new(None);
+
+/// Forget the last audio paint so the next [`draw_audio`] rebuilds chrome
+/// (tab switch, theme, relayout — the pixels underneath are gone).
+pub fn invalidate_audio_paint() {
+    AUDIO_PAINT.with(|s| *s = None);
+    VIDEO_KEYS.with(|s| *s = None);
+}
+
+/// Same reserved strip as the video player: status, scrubber, key chips.
+pub fn audio_hud_height() -> u64 {
+    video_hud_height()
+}
+
+/// Paint the audio-player tab as a CLIAMP-style TUI: header + live spectrum +
+/// playlist in the content band, and a **reserved bottom HUD** (status,
+/// scrubber, keys) matching the video / browser players. No-op unless the
+/// audio tab is active. Called ~4 Hz from the shell while the tab is on top;
+/// only the live band is refreshed on those ticks.
 pub fn draw_audio(v: &AudioView) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
@@ -330,131 +361,236 @@ pub fn draw_audio(v: &AudioView) {
         let (px, py) = (d.ix, d.iy);
         let (pw, ph) = (d.iw, d.ih);
         let bg = d.bg;
-        // Same HUD height as the video player so the two tabs feel identical.
         let barh = ch * 4 + ch / 2;
         let by = py + ph.saturating_sub(barh);
-
-        // --- centre: waveform visualizer ---------------------------------
-        // Compact band (about 1/3 of the content height, capped) centred in
-        // the area above the HUD — not full-pane tall.
         let content_h = by.saturating_sub(py);
-        let wave_h = (content_h / 3).clamp(ch * 2, ch * 5);
-        let wave_top = py + content_h.saturating_sub(wave_h) / 2;
-        let wave_x = px + cw * 2;
-        let wave_w = pw.saturating_sub(4 * cw).max(1);
-        // Clear the full content band once so a taller previous paint (or
-        // leftover glyphs) never sticks around when the wave shrinks —
-        // wallpaper-aware so the translucent desktop shows behind it.
-        sc.paint_surface(px, py, pw, content_h.saturating_sub(1), bg);
-        let mid = wave_top + wave_h / 2;
-        let n_peaks = v.peaks.len().max(1);
-        let play_x = if v.total_ms > 0 {
-            (wave_w * v.pos_ms.min(v.total_ms) / v.total_ms).min(wave_w.saturating_sub(1))
-        } else {
-            0
-        };
-        for col in 0..wave_w {
-            let pi = ((col as usize) * n_peaks) / (wave_w as usize).max(1);
-            let peak = v.peaks.get(pi).copied().unwrap_or(0) as u64;
-            // Half-height bar (mirrored above/below centre); min 1px when energy.
-            let half = if peak == 0 {
-                0
-            } else {
-                ((wave_h / 2 - 1) * peak / 255).max(1)
-            };
-            let color = if col <= play_x { sc.theme.accent } else { sc.theme.title_dim };
-            // Clear the column then draw the bar.
-            sc.fill_rect(wave_x + col, wave_top, 1, wave_h, bg);
-            if half > 0 {
-                sc.fill_rect(wave_x + col, mid.saturating_sub(half), 1, half * 2, color);
-            } else {
-                // Quiet: a 1px centre tick so the track silhouette stays visible.
-                sc.fill_rect(wave_x + col, mid, 1, 1, sc.theme.sep_dim);
-            }
-        }
-        // Playhead: thin bright line at the current position.
-        sc.fill_rect(wave_x + play_x, wave_top, 2.max(sc.scale), wave_h, sc.theme.chat_fg);
-
-        // --- bottom HUD (mirrors `draw_video_status`) --------------------
-        sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
+        let pad = cw;
+        let x0 = px + pad;
+        let x1 = px + pw.saturating_sub(pad);
+        let inner_w = x1.saturating_sub(x0).max(1);
         let cols = (pw / cw).saturating_sub(2).max(4) as usize;
-        let fit = |s: &str| crate::textsel::fit_width(s, cols);
-        let mmss = |ms: u64| alloc::format!("{}:{:02}", ms / 60000, ms % 60000 / 1000);
-        let state = if v.paused {
-            "||"
-        } else if v.playing {
-            ">"
-        } else {
-            "="
-        };
-        let time = alloc::format!("{} / {}", mmss(v.pos_ms), mmss(v.total_ms));
-        let vol = if v.muted {
-            String::from("muted")
-        } else {
-            alloc::format!("vol {}%", v.volume.min(100))
-        };
-        // Drop less-critical fields as the pane narrows so the line always fits.
-        let candidates = [
-            alloc::format!("{} {}  {}  {}", state, v.name, time, vol),
-            alloc::format!("{} {}  {}", state, v.name, time),
-            alloc::format!("{} {}", state, v.name),
-            alloc::format!("{} {}", state, crate::textsel::ellipsize(v.name, cols.saturating_sub(3).max(1))),
-        ];
-        let line1 = candidates
-            .into_iter()
-            .find(|s| s.chars().count() <= cols)
-            .unwrap_or_else(|| crate::textsel::ellipsize(&alloc::format!("{} {}", state, v.name), cols));
-        let mut y = by + ch / 3;
-        sc.draw_str_bg(px + cw, y, &fit(&line1), sc.theme.accent, bg);
-        y += ch + ch / 4;
-        // Scrubber in the control strip (video-style), not the main area.
-        let track_x = px + cw;
-        let track_w = pw.saturating_sub(2 * cw);
-        let filled = if v.total_ms > 0 {
-            (track_w * v.pos_ms.min(v.total_ms) / v.total_ms).min(track_w)
-        } else {
-            0
-        };
-        sc.fill_rect(track_x, y + ch / 3, track_w, ch / 4, sc.theme.title_dim);
-        sc.fill_rect(track_x, y + ch / 3, filled, ch / 4, sc.theme.accent);
-        y += ch + ch / 4;
-        // Shortcut hints: wrap; drop tokens that can't fit even alone.
-        let hints = [
-            "space play/pause",
-            "<-/-> seek",
-            "up/dn volume",
-            "0 restart",
-            "m mute",
-            "Ctrl+C stop",
-        ];
-        let sep = "   ";
-        let mut linebuf = String::new();
-        let hud_bottom = py + ph;
-        for h in hints {
-            if h.chars().count() > cols {
-                continue; // too wide even alone — hide
-            }
-            let cand = if linebuf.is_empty() {
-                String::from(h)
-            } else {
-                alloc::format!("{}{}{}", linebuf, sep, h)
-            };
-            if cand.chars().count() > cols && !linebuf.is_empty() {
-                if y + ch > hud_bottom {
-                    break; // no room for another hint row
-                }
-                sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
-                y += ch;
-                linebuf = String::from(h);
-            } else {
-                linebuf = cand;
-            }
+
+        let sig = crate::audio::hud::chrome_sig(
+            v.path,
+            v.playlist_idx,
+            v.playlist.len(),
+            v.repeat,
+            v.shuffle,
+        );
+        let reuse = AUDIO_PAINT.with(|s| {
+            matches!(
+                s.as_ref(),
+                Some(st) if st.sig == sig && st.pw == pw && st.ph == ph
+            )
+        });
+
+        if !reuse {
+            // Content only — never the HUD strip. A full-pane clear here is
+            // what flashed the analyser on every tick.
+            sc.paint_surface(px, py, pw, content_h, bg);
+            draw_audio_chrome(sc, v, x0, x1, py, content_h, ch, cw, cols, bg);
+            // Full HUD once (keys included). Later ticks leave the chips.
+            sc.fill_rect(px, by, pw, barh, bg);
+            sc.fill_rect(px, by, pw, 1, sc.theme.accent);
+            let hints_y = by + ch / 3 + ch + ch / 4 + ch + ch / 4;
+            let items = crate::hud_keys::from_pairs(&[
+                ("Space", "Play/Pause"),
+                ("n/p", "Next/Prev"),
+                ("<-/->", "Seek"),
+                ("r", "Repeat"),
+                ("s", "Shuffle"),
+                ("m", "Mute"),
+            ]);
+            draw_hint_rows(sc, x0, x1, hints_y, py + ph, &items, bg);
+            AUDIO_PAINT.with(|s| {
+                *s = Some(AudioPaintState { sig, pw, ph });
+            });
         }
-        if !linebuf.is_empty() && y + ch <= hud_bottom + ch {
-            sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
-        }
+
+        draw_audio_live(sc, v, px, pw, x0, x1, inner_w, py, by, ch, cw, cols, bg);
         sc.cursor_overlay();
     });
+}
+
+fn draw_audio_chrome(
+    sc: &Screen,
+    v: &AudioView,
+    x0: u64,
+    x1: u64,
+    py: u64,
+    content_h: u64,
+    ch: u64,
+    cw: u64,
+    cols: usize,
+    bg: Rgb,
+) {
+    let fit = |s: &str| crate::textsel::fit_width(s, cols);
+    let bottom = py + content_h;
+    let mut y = py + ch / 3;
+    if y + ch <= bottom {
+        sc.draw_str_bg(x0, y, "A U D I O", sc.theme.title_dim, bg);
+        let tag = "[Playlist]";
+        let tx = x1.saturating_sub(tag.len() as u64 * cw);
+        if tx > x0 + 10 * cw {
+            sc.draw_str_bg(tx, y, tag, sc.theme.title_dim, bg);
+        }
+        y += ch;
+    }
+    if y + ch <= bottom {
+        let note = alloc::format!(
+            "{} {}",
+            crate::icons::fa::MUSIC,
+            crate::audio::hud::display_title(v.name)
+        );
+        sc.draw_str_bg(x0, y, &fit(&note), sc.theme.chat_fg, bg);
+        y += ch + ch / 4;
+    }
+    let spec_h = ch * 5;
+    if y + spec_h + ch <= bottom {
+        y += spec_h + ch / 4;
+    }
+    if y + ch <= bottom {
+        let src_dir = crate::audio::hud::parent_dir(v.path);
+        let n = v.playlist.len().max(1);
+        let i = v.playlist_idx.saturating_add(1).min(n);
+        let src = alloc::format!("SRC [{src_dir}] {i}/{n}  {} Hz", v.rate);
+        sc.draw_str_bg(x0, y, &fit(&src), sc.theme.title_dim, bg);
+        y += ch + ch / 5;
+    }
+    if y + ch * 2 <= bottom && !v.playlist.is_empty() {
+        let shuf = if v.shuffle { "[Shuffle]" } else { "[No shuffle]" };
+        let head = alloc::format!(
+            "Playlist — {shuf} [Repeat: {}] [{}/{}]",
+            v.repeat.label(),
+            v.playlist_idx.saturating_add(1).min(v.playlist.len()),
+            v.playlist.len()
+        );
+        sc.draw_str_bg(x0, y, &fit(&head), sc.theme.accent, bg);
+        y += ch;
+        let rows = ((bottom.saturating_sub(y)) / ch) as usize;
+        let (from, to) = crate::audio::hud::playlist_window(
+            v.playlist_idx,
+            v.playlist.len(),
+            rows.max(1),
+        );
+        for (n, item) in v.playlist[from..to].iter().enumerate() {
+            if y + ch > bottom {
+                break;
+            }
+            let i = from + n;
+            let cur = i == v.playlist_idx;
+            let mark = if cur { ">" } else { " " };
+            let label = crate::audio::hud::display_title(item);
+            let line = alloc::format!("{mark} {:>2}. {label}", i + 1);
+            let ink = if cur { sc.theme.accent } else { sc.theme.chat_fg };
+            sc.draw_str_bg(x0, y, &fit(&line), ink, bg);
+            y += ch;
+        }
+    }
+}
+
+fn draw_audio_live(
+    sc: &Screen,
+    v: &AudioView,
+    px: u64,
+    pw: u64,
+    x0: u64,
+    x1: u64,
+    inner_w: u64,
+    py: u64,
+    by: u64,
+    ch: u64,
+    cw: u64,
+    cols: usize,
+    bg: Rgb,
+) {
+    let spec_y = py + ch / 3 + 2 * ch + ch / 4;
+    let spec_h = ch * 5;
+    if spec_y + spec_h <= by {
+        let spec_src: alloc::vec::Vec<u8> = if v.spectrum.iter().any(|&b| b > 0) {
+            v.spectrum.to_vec()
+        } else {
+            let n = crate::audio::hud::SPECTRUM_BARS;
+            let mut s = alloc::vec![0u8; n];
+            if !v.peaks.is_empty() {
+                for (i, slot) in s.iter_mut().enumerate() {
+                    let pi = i * v.peaks.len() / n;
+                    *slot = v.peaks.get(pi).copied().unwrap_or(0);
+                }
+            }
+            s
+        };
+        let n = spec_src.len().max(1);
+        let gap = (cw / 4).max(1);
+        let slot = (inner_w / n as u64).max(2);
+        let bar_w = slot.saturating_sub(gap).max(1);
+        let bar_col = sc.mix(sc.theme.accent, (96, 186, 220), 0.55);
+        let cap_col = sc.lighten(bar_col, 0.35);
+        for (i, &peak) in spec_src.iter().enumerate() {
+            let bx = x0 + i as u64 * slot;
+            if bx + slot > x1 + gap {
+                break;
+            }
+            // Clear just this slot (not the whole band) so a falling bar
+            // does not leave a taller ghost and the band never flashes empty.
+            sc.fill_rect(bx, spec_y, slot, spec_h, bg);
+            let bh = if peak == 0 {
+                1
+            } else {
+                (spec_h.saturating_sub(2) * peak as u64 / 255).max(2)
+            };
+            let top = spec_y + spec_h.saturating_sub(bh);
+            sc.fill_rect(bx, top, bar_w, bh, bar_col);
+            sc.fill_rect(bx, top, bar_w, 1.max(sc.scale), cap_col);
+        }
+    }
+
+    // HUD status + scrubber only — the key chips below stay put.
+    let live_h = ch / 3 + ch + ch / 4 + ch;
+    sc.fill_rect(px, by, pw, live_h, bg);
+    sc.fill_rect(px, by, pw, 1, sc.theme.accent);
+    let clock = alloc::format!(
+        "{} / {}",
+        crate::audio::hud::format_mmss(v.pos_ms),
+        crate::audio::hud::format_mmss(v.total_ms)
+    );
+    let state = if v.paused {
+        "Paused"
+    } else if v.playing {
+        "Playing"
+    } else {
+        "Stopped"
+    };
+    let icon = if v.playing && !v.paused {
+        crate::icons::fa::PLAY
+    } else {
+        crate::icons::fa::PAUSE
+    };
+    let vol = if v.muted {
+        String::from("muted")
+    } else {
+        alloc::format!("vol {}%", v.volume.min(100))
+    };
+    let line = alloc::format!("{icon} {state}   {clock}   {vol}");
+    let y = by + ch / 3;
+    sc.draw_str_bg(
+        x0,
+        y,
+        &crate::textsel::fit_width(&line, cols),
+        sc.theme.accent,
+        bg,
+    );
+    let track_y = y + ch + ch / 4;
+    let thick = (ch / 5).max(2);
+    let filled = if v.total_ms > 0 {
+        (inner_w * v.pos_ms.min(v.total_ms) / v.total_ms).min(inner_w)
+    } else {
+        0
+    };
+    sc.fill_rect(x0, track_y + ch / 3, inner_w, thick, sc.theme.title_dim);
+    if filled > 0 {
+        sc.fill_rect(x0, track_y + ch / 3, filled, thick, sc.theme.accent);
+    }
 }
 
 /// Overlay the **browser** control/status bar (same layout family as the video
@@ -532,52 +668,25 @@ pub fn draw_browser_status(
         sc.fill_rect(track_x, y + ch / 3, filled, ch / 4, sc.theme.accent);
         y += ch + ch / 4;
 
-        // Shortcut hints — wrap like the video player.
-        let hints = if focused_input {
-            [
-                "type text",
-                "Bksp erase",
-                "Tab next",
-                "Enter submit",
-                "Esc unfocus",
-                "wheel scroll",
-            ]
+        let items = if focused_input {
+            crate::hud_keys::from_pairs(&[
+                ("Bksp", "erase"),
+                ("Tab", "next"),
+                ("Enter", "submit"),
+                ("Esc", "unfocus"),
+                ("Wheel", "scroll"),
+            ])
         } else {
-            [
-                "j/k scroll",
-                "space page",
-                "wheel scroll",
-                "b back",
-                "r reload",
-                "click link/form",
-            ]
+            crate::hud_keys::from_pairs(&[
+                ("j/k", "scroll"),
+                ("Space", "page"),
+                ("Wheel", "scroll"),
+                ("b", "back"),
+                ("r", "reload"),
+                ("Click", "link/form"),
+            ])
         };
-        let sep = "   ";
-        let mut linebuf = String::new();
-        let hud_bottom = py + ph;
-        for h in hints {
-            if h.chars().count() > cols {
-                continue;
-            }
-            let cand = if linebuf.is_empty() {
-                String::from(h)
-            } else {
-                alloc::format!("{}{}{}", linebuf, sep, h)
-            };
-            if cand.chars().count() > cols && !linebuf.is_empty() {
-                if y + ch > hud_bottom {
-                    break;
-                }
-                sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
-                y += ch;
-                linebuf = String::from(h);
-            } else {
-                linebuf = cand;
-            }
-        }
-        if !linebuf.is_empty() && y + ch <= hud_bottom + ch {
-            sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
-        }
+        draw_hint_rows(sc, px + cw, px + pw.saturating_sub(cw), y, py + ph, &items, bg);
         let _ = url; // included in line1 when the pane is wide enough
         sc.cursor_overlay();
     });
@@ -619,13 +728,14 @@ pub fn draw_video_status(
         let cw = sc.cw();
         let (px, py) = (d.ix, d.iy);
         let (pw, ph) = (d.iw, d.ih);
-        // Reserved HUD strip (below the video frame). Fill the whole strip once
-        // so time/fps string length changes never leave glyph trails; the strip
-        // is small (~4 lines) so this is cheap and does not flash the picture.
+        // Reserved HUD strip (below the video frame). Fill status + scrubber
+        // every frame (the clock/fps change); leave the key chips alone so
+        // they do not flash on a single-buffered FB at 30 fps.
         let bg = d.bg;
         let barh = ch * 4 + ch / 2;
         let by = py + ph.saturating_sub(barh);
-        sc.fill_rect(px, by, pw, barh, bg);
+        let live_h = ch / 3 + ch + ch / 4 + ch;
+        sc.fill_rect(px, by, pw, live_h, bg);
         sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
         // Usable text width in whole glyph cells, with a one-cell left margin.
         let cols = (pw / cw).saturating_sub(2).max(4) as usize;
@@ -670,33 +780,26 @@ pub fn draw_video_status(
         sc.fill_rect(track_x, y + ch / 3, track_w, ch / 4, sc.theme.title_dim);
         sc.fill_rect(track_x, y + ch / 3, filled, ch / 4, sc.theme.accent);
         y += ch + ch / 4;
-        // Shortcuts: wrap; hide tokens that don't fit; stop when HUD is full.
-        let hints = ["space play/pause", "<-/-> seek", "up/dn volume", "0 restart", "m mute", "Ctrl+C stop"];
-        let sep = "   ";
-        let mut linebuf = String::new();
-        let hud_bottom = py + ph;
-        for h in hints {
-            if h.chars().count() > cols {
-                continue;
-            }
-            let cand = if linebuf.is_empty() { String::from(h) } else { alloc::format!("{}{}{}", linebuf, sep, h) };
-            if cand.chars().count() > cols && !linebuf.is_empty() {
-                if y + ch > hud_bottom {
-                    break;
-                }
-                sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
-                y += ch;
-                linebuf = String::from(h);
-            } else {
-                linebuf = cand;
-            }
-        }
-        if !linebuf.is_empty() && y + ch <= hud_bottom + ch {
-            sc.draw_str_bg(px + cw, y, &fit(&linebuf), sc.theme.logs_fg, bg);
+        let items = crate::hud_keys::from_pairs(&[
+            ("Space", "Play/Pause"),
+            ("<-/->", "Seek"),
+            ("up/dn", "Volume"),
+            ("0", "Restart"),
+            ("m", "Mute"),
+            ("Ctrl+C", "Stop"),
+        ]);
+        let keys_y = y;
+        let keys_fresh = VIDEO_KEYS.with(|s| !matches!(s.as_ref(), Some((w, h)) if *w == pw && *h == ph));
+        if keys_fresh {
+            sc.fill_rect(px, keys_y, pw, (py + ph).saturating_sub(keys_y), bg);
+            draw_hint_rows(sc, px + cw, px + pw.saturating_sub(cw), keys_y, py + ph, &items, bg);
+            VIDEO_KEYS.with(|s| *s = Some((pw, ph)));
         }
         sc.cursor_overlay();
     });
 }
+
+static VIDEO_KEYS: crate::mm::Locked<Option<(u64, u64)>> = crate::mm::Locked::new(None);
 
 /// The editor pane text-area geometry `(ix, iy, cw, ch, cols, text_rows)` so the
 /// editor can map a click to a (row, col). `None` unless the editor is open.
@@ -769,34 +872,23 @@ pub fn draw_pdf_status(line: &str) {
         let cols = (pw / cw).saturating_sub(2).max(4) as usize;
         let mut y = by + ch / 3;
         let hud_bottom = py + ph;
-        // The first row is the position/zoom group (accent), the rest hints.
-        let mut first = true;
-        let mut linebuf = String::new();
-        let flush = |sc: &mut Screen, y: &mut u64, s: &str, first: bool| {
-            let colour = if first { sc.theme.accent } else { sc.theme.logs_fg };
-            sc.draw_str_bg(px + cw, *y, &crate::textsel::fit_width(s, cols), colour, bg);
-            *y += ch;
+        // `pdfview::hud` puts three spaces between the status groups and the
+        // keys so we can chip the keys without guessing which tokens are which.
+        let (status, hints) = match line.split_once("   ") {
+            Some((s, h)) => (s, h),
+            None => (line, ""),
         };
-        for group in line.split("  ").filter(|s| !s.trim().is_empty()) {
-            let group = group.trim();
-            let cand = if linebuf.is_empty() {
-                String::from(group)
-            } else {
-                alloc::format!("{}  {}", linebuf, group)
-            };
-            if cand.chars().count() > cols && !linebuf.is_empty() {
-                if y + ch > hud_bottom {
-                    return;
-                }
-                flush(sc, &mut y, &linebuf, first);
-                first = false;
-                linebuf = String::from(group);
-            } else {
-                linebuf = cand;
-            }
-        }
-        if !linebuf.is_empty() && y + ch <= hud_bottom {
-            flush(sc, &mut y, &linebuf, first);
+        sc.draw_str_bg(
+            px + cw,
+            y,
+            &crate::textsel::fit_width(status, cols),
+            sc.theme.accent,
+            bg,
+        );
+        y += ch;
+        if !hints.is_empty() && y + ch <= hud_bottom {
+            let items = crate::hud_keys::parse_hints(hints);
+            draw_hint_rows(sc, px + cw, px + pw.saturating_sub(cw), y, hud_bottom, &items, bg);
         }
         sc.cursor_overlay();
     });

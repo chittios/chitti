@@ -117,6 +117,7 @@ pub mod theme;
 pub mod smp;
 pub mod synapse;
 pub mod textfit;
+pub mod hud_keys;
 pub mod textsel;
 pub mod video;
 pub mod xhci;

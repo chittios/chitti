@@ -579,9 +579,13 @@ pub enum StatusChip {
     /// Live screen recording (`crate::shell::record`). Empty when idle.
     /// Click stops the take — the macOS menu-bar stop control.
     Recording = 10,
+    /// Now-playing track (`crate::shell::now_playing_chip`). Empty when idle.
+    /// Click toggles play/pause. Discriminant is the hit-rect index — append
+    /// only, never renumber.
+    NowPlaying = 11,
 }
 
-const STATUS_CHIP_N: usize = 11;
+const STATUS_CHIP_N: usize = 12;
 
 /// Hit rects for [`StatusChip`] (index = `chip as usize`). Zero-size = absent.
 static STATUS_CHIP_RECTS: Locked<[(u64, u64, u64, u64); STATUS_CHIP_N]> =

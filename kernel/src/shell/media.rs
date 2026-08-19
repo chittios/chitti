@@ -161,7 +161,8 @@ pub(super) fn image_cmd(_c: u8) {}
 /// A background audio player: the decoded PCM plus a cursor. Lives in a static
 /// so playback continues while you switch tabs or run other commands — it is
 /// pumped one chunk at a time from `ui_tick` (`pump_audio`), like `/top`
-/// refreshes. `done` latches at end-of-track.
+/// refreshes. `done` latches at end-of-track; auto-advance then consults the
+/// sibling playlist (same folder) and the repeat / shuffle flags.
 #[cfg(not(feature = "server"))]
 pub(super) struct AudioPlayer {
     /// Interleaved when `channels > 1`, so this is `frames * channels` long and
@@ -174,13 +175,22 @@ pub(super) struct AudioPlayer {
     /// it never lands mid-frame. A cursor that drifts off a frame boundary
     /// swaps left and right for the rest of the track.
     at: usize,
+    /// Full store / mount path, used to rebuild the sibling playlist.
+    path: String,
     name: String,
     total_ms: u64,
     done: bool,
     paused: bool,
     finished_announced: bool,
-    /// Peak envelope for the wave visualizer (`audio::waveform_peaks`).
+    /// Peak envelope for the whole-track silhouette (`audio::waveform_peaks`).
     peaks: alloc::vec::Vec<u8>,
+    /// Live octave-band spectrum, peak-held across refreshes.
+    spectrum: alloc::vec::Vec<u8>,
+    /// Sibling audio files in the same folder (always contains `path`).
+    playlist: alloc::vec::Vec<String>,
+    playlist_idx: usize,
+    repeat: crate::audio::hud::Repeat,
+    shuffle: bool,
 }
 #[cfg(not(feature = "server"))]
 pub(super) static AUDIO: crate::mm::Locked<Option<AudioPlayer>> = crate::mm::Locked::new(None);
@@ -227,7 +237,7 @@ pub(super) fn play_audio(path: &str) {
         }
         return;
     }
-    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek up/dn=volume 0=restart m=mute; Ctrl+Tab again returns to shell; Ctrl+C or /close stops");
+    serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek n/p=next/prev r=repeat s=shuffle up/dn=volume 0=restart m=mute; Ctrl+Tab again returns to shell; Ctrl+C or /close stops");
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
     // The waveform is one envelope for the whole track, so it is built from a
     // mono fold rather than from the interleaved buffer — peaks taken straight
@@ -237,25 +247,55 @@ pub(super) fn play_audio(path: &str) {
         &crate::audio::to_mono(&audio.pcm, audio.channels),
         crate::audio::WAVEFORM_BINS,
     );
+    let playlist = audio_siblings(path);
+    let playlist_idx = playlist.iter().position(|p| p == path).unwrap_or(0);
+    if playlist.len() > 1 {
+        serial_println!("open>   playlist {}/{} in {}", playlist_idx + 1, playlist.len(), crate::audio::hud::parent_dir(path));
+    }
     AUDIO.with(|a| {
         *a = Some(AudioPlayer {
             channels: audio.channels,
             pcm: audio.pcm,
             rate: audio.rate,
             at: 0,
+            path: path.to_string(),
             name,
             total_ms,
             done: false,
             paused: false,
             finished_announced: false,
             peaks,
+            spectrum: alloc::vec![0u8; crate::audio::hud::SPECTRUM_BARS],
+            playlist,
+            playlist_idx,
+            repeat: crate::audio::hud::Repeat::Off,
+            shuffle: false,
         })
     });
     #[cfg(not(test))]
     {
         crate::framebuffer::set_right(crate::framebuffer::RightMode::Audio);
         repaint_audio();
+        super::update_status();
     }
+}
+
+/// Sibling `.wav`/`.mp3`/`.aac`/`.m4a` files in the same folder as `path`.
+/// Always contains `path` itself, even when the directory cannot be listed.
+#[cfg(not(feature = "server"))]
+fn audio_siblings(path: &str) -> alloc::vec::Vec<String> {
+    use crate::audio::hud;
+    let parent = hud::parent_dir(path);
+    let names: alloc::vec::Vec<String> = crate::fs::vfs::readdir(parent)
+        .map(|ents| {
+            ents.into_iter()
+                .filter(|e| !e.is_dir && hud::is_audio_filename(&e.name))
+                .map(|e| e.name)
+                .collect()
+        })
+        .unwrap_or_default();
+    let refs: alloc::vec::Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    hud::playlist_from_names(path, &refs)
 }
 
 /// Whether a track is loaded (playing or paused at end).
@@ -264,12 +304,32 @@ pub(super) fn audio_loaded() -> bool {
     AUDIO.with(|a| a.is_some())
 }
 
+/// Status-bar now-playing chip. Empty when idle so the template swallows the
+/// separator (same posture as `${notifications}` / `${recording}`).
+pub(crate) fn now_playing_chip() -> String {
+    #[cfg(all(not(feature = "server"), not(test)))]
+    {
+        AUDIO.with(|a| {
+            let Some(p) = a.as_ref() else {
+                return String::new();
+            };
+            crate::audio::hud::chip_text(true, !p.done && !p.paused, &p.name)
+        })
+    }
+    #[cfg(not(all(not(feature = "server"), not(test))))]
+    {
+        String::new()
+    }
+}
+
 /// Stop + unload the background track (Ctrl+C / closing the audio tab).
 #[cfg(not(feature = "server"))]
 pub(super) fn stop_audio() {
     let was = AUDIO.with(|a| a.take().is_some());
     if was {
         serial_println!("\ropen> audio stopped");
+        #[cfg(not(test))]
+        super::update_status();
     }
 }
 /// Headless build has no `/open` media player; the tab-close path still calls
@@ -277,7 +337,8 @@ pub(super) fn stop_audio() {
 #[cfg(feature = "server")]
 pub(super) fn stop_audio() {}
 
-/// Toggle play/pause on the background track (space key on the audio tab).
+/// Toggle play/pause on the background track (space key on the audio tab,
+/// or a click on the status-bar now-playing chip).
 #[cfg(all(not(feature = "server"), not(test)))]
 pub(super) fn audio_toggle_pause() {
     AUDIO.with(|a| {
@@ -286,7 +347,115 @@ pub(super) fn audio_toggle_pause() {
         }
     });
     repaint_audio();
+    super::update_status();
 }
+
+/// Step to the next / previous sibling. Wraps; shuffle hops.
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(super) fn audio_step(forward: bool) {
+    let next = AUDIO.with(|a| {
+        let p = a.as_ref()?;
+        Some(crate::audio::hud::user_step(
+            p.playlist_idx,
+            p.playlist.len(),
+            p.shuffle,
+            crate::arch::now_ms(),
+            forward,
+        ))
+    });
+    if let Some(i) = next {
+        audio_play_index(i);
+    }
+}
+
+/// Cycle Off → All → One → Off.
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(super) fn audio_cycle_repeat() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.repeat = p.repeat.cycle();
+        }
+    });
+    repaint_audio();
+}
+
+/// Toggle shuffle.
+#[cfg(all(not(feature = "server"), not(test)))]
+pub(super) fn audio_toggle_shuffle() {
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.shuffle = !p.shuffle;
+        }
+    });
+    repaint_audio();
+}
+
+/// Decode and swap in playlist slot `idx`, keeping repeat / shuffle / the
+/// sibling list. No-op when the slot is already the loaded track (rewinds)
+/// or the file cannot be read.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn audio_play_index(idx: usize) {
+    let path = AUDIO.with(|a| a.as_ref().and_then(|p| p.playlist.get(idx).cloned()));
+    let Some(path) = path else { return };
+    let already = AUDIO.with(|a| a.as_ref().map(|p| p.path == path).unwrap_or(false));
+    if already {
+        audio_restart();
+        return;
+    }
+    let Some(bytes) = read_mounted(&path).or_else(|| crate::synapse::fs::read(&path)) else {
+        serial_println!("open> {} not found", path);
+        return;
+    };
+    let audio = match crate::audio::decode(&bytes) {
+        Ok(a) => a,
+        Err(e) => {
+            serial_println!("open> cannot decode {}: {}", path, e);
+            return;
+        }
+    };
+    let total_ms = audio.duration_ms();
+    let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
+    let peaks = crate::audio::waveform_peaks(
+        &crate::audio::to_mono(&audio.pcm, audio.channels),
+        crate::audio::WAVEFORM_BINS,
+    );
+    serial_println!(
+        "open> playing {} — {}:{:02} at {} Hz",
+        path,
+        total_ms / 60000,
+        total_ms % 60000 / 1000,
+        audio.rate
+    );
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.channels = audio.channels;
+            p.pcm = audio.pcm;
+            p.rate = audio.rate;
+            p.at = 0;
+            p.path = path;
+            p.name = name;
+            p.total_ms = total_ms;
+            p.done = false;
+            p.paused = false;
+            p.finished_announced = false;
+            p.peaks = peaks;
+            p.spectrum.fill(0);
+            p.playlist_idx = idx;
+        }
+    });
+    repaint_audio();
+    super::update_status();
+}
+
+#[cfg(not(all(not(feature = "server"), not(test))))]
+#[allow(dead_code)]
+pub(super) fn audio_step(_forward: bool) {}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+#[allow(dead_code)]
+pub(super) fn audio_cycle_repeat() {}
+#[cfg(not(all(not(feature = "server"), not(test))))]
+#[allow(dead_code)]
+pub(super) fn audio_toggle_shuffle() {}
 
 /// Seek the background track by `delta_ms` (negative = rewind), clamped to the
 /// track. Takes effect after the device drains its already-queued ~200 ms.
@@ -351,15 +520,70 @@ pub(super) fn pump_audio() {
     if let Some((slice, rate, ch)) = next {
         let _ = crate::sound::play_ch(&slice, rate, ch);
     }
-    // Announce end-of-track once.
-    let finished = AUDIO.with(|a| a.as_mut().map(|p| p.done && !p.finished_announced && !crate::sound::playing()).unwrap_or(false));
-    if finished {
-        AUDIO.with(|a| {
-            if let Some(p) = a.as_mut() {
-                p.finished_announced = true;
+    // Live spectrum from the window around the playhead, peak-held so a
+    // transient does not vanish in one 4 Hz refresh.
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            if p.paused || p.done {
+                return;
             }
+            let ch = p.channels.max(1) as usize;
+            let frames = p.pcm.len() / ch;
+            if frames == 0 {
+                return;
+            }
+            let at = (p.at / ch).min(frames.saturating_sub(1));
+            let win = 1024.min(frames);
+            let start = at.saturating_sub(win / 8);
+            let end = (start + win).min(frames);
+            let mut mono = alloc::vec![0i16; end.saturating_sub(start)];
+            for (i, slot) in mono.iter_mut().enumerate() {
+                let f = start + i;
+                let mut acc: i32 = 0;
+                for c in 0..ch {
+                    acc += p.pcm[f * ch + c] as i32;
+                }
+                *slot = (acc / ch as i32) as i16;
+            }
+            let now = crate::audio::hud::spectrum_bands(&mono, crate::audio::hud::SPECTRUM_BARS);
+            p.spectrum = crate::audio::hud::decay_spectrum(
+                &p.spectrum,
+                &now,
+                crate::audio::hud::SPECTRUM_DECAY,
+            );
+        }
+    });
+    // Auto-advance (repeat / next sibling) or announce end-of-track once.
+    let advance = AUDIO.with(|a| {
+        let p = a.as_mut()?;
+        if !(p.done && !p.finished_announced && !crate::sound::playing()) {
+            return None;
+        }
+        crate::audio::hud::auto_next(
+            p.playlist_idx,
+            p.playlist.len(),
+            p.repeat,
+            p.shuffle,
+            crate::arch::now_ms(),
+        )
+    });
+    if let Some(i) = advance {
+        audio_play_index(i);
+    } else {
+        let finished = AUDIO.with(|a| {
+            a.as_mut()
+                .map(|p| p.done && !p.finished_announced && !crate::sound::playing())
+                .unwrap_or(false)
         });
-        serial_println!("\ropen> audio finished");
+        if finished {
+            AUDIO.with(|a| {
+                if let Some(p) = a.as_mut() {
+                    p.finished_announced = true;
+                }
+            });
+            serial_println!("\ropen> audio finished");
+            super::update_status();
+        }
     }
 }
 #[cfg(not(all(not(feature = "server"), not(test))))]
@@ -375,14 +599,20 @@ pub(super) fn repaint_audio() {
             let pos_ms = (p.at / p.channels.max(1) as usize) as u64 * 1000 / p.rate.max(1) as u64;
             crate::framebuffer::draw_audio(&crate::framebuffer::AudioView {
                 name: &p.name,
+                path: &p.path,
                 pos_ms: pos_ms.min(p.total_ms),
                 total_ms: p.total_ms,
                 rate: p.rate,
                 playing: !p.done && !p.paused,
                 paused: p.paused,
                 peaks: &p.peaks,
+                spectrum: &p.spectrum,
                 volume: crate::sound::volume(),
                 muted: crate::sound::muted(),
+                playlist: &p.playlist,
+                playlist_idx: p.playlist_idx,
+                repeat: p.repeat,
+                shuffle: p.shuffle,
             });
         }
     });

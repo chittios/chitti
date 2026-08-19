@@ -125,6 +125,12 @@ pub mod fa {
     pub const CAMERA: char = '\u{f030}';
     /// play
     pub const PLAY: char = '\u{f04b}';
+    /// pause — now-playing chip when the track is held
+    pub const PAUSE: char = '\u{f04c}';
+    /// backward / previous track
+    pub const BACKWARD: char = '\u{f04a}';
+    /// forward / next track
+    pub const FORWARD: char = '\u{f04e}';
     /// circle-play
     pub const CIRCLE_PLAY: char = '\u{f144}';
 
@@ -541,6 +547,10 @@ mod tests {
         assert_eq!(volume_icon(false, 100), fa::VOLUME_HIGH);
         assert!(is_icon(fa::VOLUME_HIGH));
         assert!(is_icon(fa::VOLUME_XMARK));
+        assert!(is_icon(fa::PLAY));
+        assert!(is_icon(fa::PAUSE));
+        assert!(is_icon(fa::BACKWARD));
+        assert!(is_icon(fa::FORWARD));
         assert_eq!(
             status_volume(DeviceStatus::Ready, false, 100),
             fa::VOLUME_HIGH.to_string()
