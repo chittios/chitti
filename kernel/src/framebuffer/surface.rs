@@ -409,6 +409,7 @@ pub fn present_surface_reserve_ex(
             }
             sc.blit_rgb32_row(ox, oy + dy, &row);
         }
+        mark_modal_dirty();
         sc.cursor_overlay();
     });
 }

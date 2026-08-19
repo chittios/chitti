@@ -8888,6 +8888,11 @@ pub fn start_pump() {
 /// Lighter upkeep for loops that consume their own mouse events (modals, the
 /// editor): caret blink + status bar + net only — no `mouse::tick()`, which
 /// would steal their clicks.
+///
+/// **The login gate must keep calling this**, not [`background_tick`]: a lock
+/// screen that pumps `msgchan` / `schedule` would run agent turns behind it.
+/// Regular popups (status menu, confirm, About) use [`background_tick`] so
+/// audio/video and service agents keep running.
 pub fn status_tick() {
     #[cfg(not(test))]
     {
@@ -8899,6 +8904,44 @@ pub fn status_tick() {
         }
     }
     crate::net::poll();
+}
+
+/// Keep players and agents alive under a popup that owns the mouse.
+///
+/// Same "no `mouse::tick`" rule as [`status_tick`], plus the pumps `upkeep`
+/// would have run: audio/video chunks, USB isoc, package-UI ticks, service
+/// supervise, background jobs, schedules, messaging. Without this a status-bar
+/// dropdown silenced `/open` audio the moment the last queued chunk drained.
+pub fn background_tick() {
+    status_tick();
+    #[cfg(not(test))]
+    {
+        speech_pump();
+        pump_audio();
+        pump_video();
+        crate::arch::uac_pump();
+        crate::service::package_ui::tick();
+        crate::service::supervise_tick();
+        crate::tools::bg::pump();
+        crate::schedule::tick();
+        crate::msgchan::tick();
+        crate::clipboard::tick();
+        crate::drivers::vbox::clipboard::tick();
+        crate::notify::save_if_dirty();
+        crate::notify::tick_banner();
+        crate::shell::record::tick();
+        crate::kms::flush_damage();
+        if browser_loaded() {
+            browser_anim_tick();
+        }
+        let now = crate::arch::now_ms();
+        if crate::framebuffer::right_mode() == crate::framebuffer::RightMode::Audio
+            && now.saturating_sub(LAST_AUDIO_MS.load(Ordering::Relaxed)) >= 250
+        {
+            LAST_AUDIO_MS.store(now, Ordering::Relaxed);
+            repaint_audio();
+        }
+    }
 }
 
 /// Resolve the status-bar templates (from the UI config, phase 2) against the

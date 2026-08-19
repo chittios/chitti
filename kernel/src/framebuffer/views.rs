@@ -408,6 +408,7 @@ pub fn draw_audio(v: &AudioView) {
         }
 
         draw_audio_live(sc, v, px, pw, x0, x1, inner_w, py, by, ch, cw, cols, bg);
+        mark_modal_dirty();
         sc.cursor_overlay();
     });
 }

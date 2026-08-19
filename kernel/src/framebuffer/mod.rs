@@ -541,6 +541,10 @@ static POPUP_HOVER: Locked<Option<ModalHit>> = Locked::new(None);
 /// compute pumps `shell::upkeep`) must not blink the pane caret into the box.
 static MODAL_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Set when a present paints pane content while a modal is up, so the popup
+/// loop can redraw itself on top (single-buffered FB).
+static MODAL_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// The box [`Screen::drop_shadow`] last painted a shadow for.
 ///
 /// A shadow *darkens the pixels it finds*, so painting the same one twice
