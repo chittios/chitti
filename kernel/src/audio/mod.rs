@@ -21,6 +21,7 @@
 //! as audio at twice the rate.
 
 pub mod aac;
+pub mod hud;
 pub mod mp3;
 pub mod mp3_tables;
 #[cfg(test)]

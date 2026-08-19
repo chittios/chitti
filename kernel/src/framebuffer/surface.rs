@@ -110,33 +110,9 @@ pub(super) fn hud_strip_height(hud: &str, ch: u64, cols: usize) -> u64 {
 }
 
 /// Count how many display lines the HUD's hint text (everything after line 0)
-/// wraps to at `cols` columns. Pure-ish (reads only the passed args).
+/// wraps to at `cols` columns, after keys have been turned into chips.
 pub(super) fn wrapped_hint_lines(hud: &str, cols: usize) -> u64 {
-    let mut it = hud.split('\n');
-    let _status = it.next();
-    let hints: alloc::vec::Vec<&str> = it.collect();
-    if hints.is_empty() {
-        return 0;
-    }
-    // Wrap on word boundaries; a token longer than cols still takes a line.
-    let mut lines = 1u64;
-    let mut col = 0usize;
-    for hint in &hints {
-        for word in hint.split_whitespace() {
-            let wlen = word.chars().count();
-            let need = if col == 0 { wlen } else { col + 1 + wlen };
-            if need > cols && col > 0 {
-                lines += 1;
-                col = wlen;
-            } else {
-                col = need;
-            }
-        }
-        // Each explicit hint line after the first forces a new row.
-        lines += 1;
-        col = 0;
-    }
-    lines.saturating_sub(1).max(1)
+    crate::hud_keys::wrapped_hint_rows(hud, cols)
 }
 
 /// Render a surface's HUD in the reserved bottom strip of its pane (native
@@ -145,6 +121,25 @@ pub(super) fn wrapped_hint_lines(hud: &str, cols: usize) -> u64 {
 /// `barh` must be the same value used for `present_surface_reserve`'s
 /// `reserve_bottom` — precomputed *outside* this critical section so we never
 /// re-enter `SCREEN` (non-reentrant spinlock).
+/// Last surface HUD we actually painted. Animating apps present every tick
+/// with the same hint line; refilling that strip is what flashed the key
+/// chips on a single-buffered framebuffer.
+struct SurfHudPaint {
+    id: u32,
+    barh: u64,
+    px: u64,
+    py: u64,
+    pw: u64,
+    hud: alloc::string::String,
+}
+static LAST_SURF_HUD: crate::mm::Locked<Option<SurfHudPaint>> = crate::mm::Locked::new(None);
+
+/// Forget a cached surface HUD so the next present rebuilds it (theme,
+/// relayout, tab switch — the pixels underneath are gone).
+pub fn invalidate_surface_hud() {
+    LAST_SURF_HUD.with(|s| *s = None);
+}
+
 fn draw_surface_hud(id: u32, hud: &str, barh: u64) {
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
@@ -159,6 +154,21 @@ fn draw_surface_hud(id: u32, hud: &str, barh: u64) {
         let (pw, ph) = (d.iw, d.ih);
         let by = py + ph.saturating_sub(barh);
         let bg = d.bg;
+        let skip = LAST_SURF_HUD.with(|s| {
+            matches!(
+                s.as_ref(),
+                Some(p) if p.id == id
+                    && p.barh == barh
+                    && p.px == px
+                    && p.py == py
+                    && p.pw == pw
+                    && p.hud == hud
+            )
+        });
+        if skip {
+            sc.cursor_overlay();
+            return;
+        }
         sc.fill_rect(px, by, pw, barh, bg);
         sc.fill_rect(px, by, pw, 1, sc.theme.accent); // top hairline
         let cols = (pw / cw).saturating_sub(2).max(4) as usize;
@@ -170,32 +180,111 @@ fn draw_surface_hud(id: u32, hud: &str, barh: u64) {
             sc.draw_str_bg(px + cw, y, &fit(status), sc.theme.accent, bg);
             y += ch;
         }
-        // Hint lines (dim), word-wrapped; stop when the strip is full.
-        let hud_bottom = py + ph;
-        let mut linebuf = String::new();
-        let flush = |sc: &mut Screen, y: &mut u64, s: &str| {
-            if *y + ch <= hud_bottom {
-                sc.draw_str_bg(px + cw, *y, &fit(s), sc.theme.logs_fg, bg);
-                *y += ch;
-            }
-        };
-        for hint in lines {
-            for word in hint.split_whitespace() {
-                let cand = if linebuf.is_empty() { String::from(word) } else { alloc::format!("{linebuf} {word}") };
-                if cand.chars().count() > cols && !linebuf.is_empty() {
-                    flush(sc, &mut y, &linebuf);
-                    linebuf = String::from(word);
-                } else {
-                    linebuf = cand;
-                }
-            }
-            if !linebuf.is_empty() {
-                flush(sc, &mut y, &linebuf);
-                linebuf.clear();
-            }
+        // Hint line(s): each key is a chip, descriptions stay dim.
+        let rest: alloc::vec::Vec<&str> = lines.collect();
+        if !rest.is_empty() {
+            draw_hint_text(sc, px + cw, px + pw.saturating_sub(cw), y, py + ph, &rest.join("\n"), bg);
         }
+        LAST_SURF_HUD.with(|s| {
+            *s = Some(SurfHudPaint {
+                id,
+                barh,
+                px,
+                py,
+                pw,
+                hud: alloc::string::String::from(hud),
+            });
+        });
         sc.cursor_overlay();
     });
+}
+
+/// Paint free-form hint text (newlines stay row breaks).
+pub(super) fn draw_hint_text(
+    sc: &Screen,
+    x0: u64,
+    max_x: u64,
+    mut y: u64,
+    bottom: u64,
+    text: &str,
+    bg: Rgb,
+) -> u64 {
+    let ch = sc.ch();
+    let cw = sc.cw();
+    let cols = (max_x.saturating_sub(x0) / cw).max(1) as usize;
+    for row in crate::hud_keys::hint_rows(text, cols) {
+        if y + ch > bottom {
+            break;
+        }
+        draw_hint_row(sc, x0, y, max_x, &row, bg);
+        y += ch;
+    }
+    y
+}
+
+/// Paint wrapped key-chip rows. Returns the y just past the last row drawn.
+pub(super) fn draw_hint_rows(
+    sc: &Screen,
+    x0: u64,
+    max_x: u64,
+    mut y: u64,
+    bottom: u64,
+    items: &[crate::hud_keys::HintItem],
+    bg: Rgb,
+) -> u64 {
+    let ch = sc.ch();
+    let cw = sc.cw();
+    let cols = (max_x.saturating_sub(x0) / cw).max(1) as usize;
+    for row in crate::hud_keys::wrap_items(items, cols) {
+        if y + ch > bottom {
+            break;
+        }
+        draw_hint_row(sc, x0, y, max_x, &row, bg);
+        y += ch;
+    }
+    y
+}
+
+fn draw_hint_row(
+    sc: &Screen,
+    mut x: u64,
+    y: u64,
+    max_x: u64,
+    row: &[crate::hud_keys::HintItem],
+    bg: Rgb,
+) {
+    use crate::hud_keys::HintItem;
+    let cw = sc.cw();
+    let ch = sc.ch();
+    let chip_bg = sc.mix(bg, sc.theme.accent, 0.22);
+    for item in row {
+        let w = crate::hud_keys::item_cols(item) as u64 * cw;
+        if x + w > max_x + cw {
+            break;
+        }
+        match item {
+            HintItem::Chip { key, desc } => {
+                let key_w = (key.chars().count() as u64 + 1) * cw;
+                sc.fill_rect(x, y, key_w, ch, chip_bg);
+                sc.draw_str_bg(x + cw / 2, y, key, sc.theme.chat_fg, chip_bg);
+                x += key_w + cw / 3;
+                if !desc.is_empty() {
+                    sc.draw_str_bg(x, y, desc, sc.theme.title_dim, bg);
+                    x += desc.chars().count() as u64 * cw + cw;
+                } else {
+                    x += cw / 2;
+                }
+            }
+            HintItem::Sep => {
+                sc.draw_str_bg(x, y, "·", sc.theme.title_dim, bg);
+                x += 2 * cw;
+            }
+            HintItem::Text(s) => {
+                sc.draw_str_bg(x, y, s, sc.theme.title_dim, bg);
+                x += s.chars().count() as u64 * cw + cw;
+            }
+        }
+    }
 }
 
 /// Choose destination size for presenting `sw×sh` into a `pw×ph` pane.
@@ -320,6 +409,7 @@ pub fn present_surface_reserve_ex(
             }
             sc.blit_rgb32_row(ox, oy + dy, &row);
         }
+        mark_modal_dirty();
         sc.cursor_overlay();
     });
 }

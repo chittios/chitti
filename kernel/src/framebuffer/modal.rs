@@ -640,9 +640,22 @@ pub fn modal_is_open() -> bool {
     MODAL_ON.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// A pane present painted over the open popup — the modal loop should redraw.
+pub fn mark_modal_dirty() {
+    if MODAL_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        MODAL_DIRTY.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Take the dirty flag (clears it). True → redraw the popup on top.
+pub fn take_modal_dirty() -> bool {
+    MODAL_DIRTY.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Dismiss any modal and repaint the normal UI.
 pub fn modal_dismiss() {
     MODAL_ON.store(false, core::sync::atomic::Ordering::Relaxed);
+    MODAL_DIRTY.store(false, core::sync::atomic::Ordering::Relaxed);
     MODAL_RECTS.with(|m| *m = [(0, 0, 0, 0); 3]);
     clear_modal_close_rect();
     clear_popup_hover();

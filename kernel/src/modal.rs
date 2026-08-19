@@ -13,6 +13,14 @@
 
 use alloc::string::String;
 
+/// Pump audio/video/agents without stealing this loop's mouse. Returns true
+/// when a present painted over the popup, so the caller must redraw it.
+#[cfg(not(test))]
+fn pump_under_popup() -> bool {
+    crate::shell::background_tick();
+    crate::framebuffer::take_modal_dirty()
+}
+
 /// Ask a yes/no question. Returns `true` only on an explicit yes (default No —
 /// safe for destructive confirmations). Keyboard: **Enter** confirms the
 /// focused button, **Esc** (or Ctrl-C) cancels, **arrows/Tab** move focus
@@ -59,7 +67,9 @@ pub fn confirm(title: &str, msg: &str) -> bool {
                 _ => {}
             }
         }
-        crate::shell::status_tick(); // status bar + net stay alive under the modal
+        if pump_under_popup() {
+            framebuffer::draw_confirm(title, msg, focus_yes);
+        }
         crate::sched::yield_now();
     }
 }
@@ -118,7 +128,9 @@ pub fn input(title: &str, prompt: &str, masked: bool) -> String {
             caret_on = !caret_on;
             framebuffer::draw_input(title, prompt, &buf, masked, caret_on);
         }
-        crate::shell::status_tick(); // status bar + net stay alive under the modal
+        if pump_under_popup() {
+            framebuffer::draw_input(title, prompt, &buf, masked, caret_on);
+        }
         crate::sched::yield_now();
     }
 }
@@ -229,7 +241,9 @@ pub fn about() {
                 _ => {}
             }
         }
-        crate::shell::status_tick();
+        if pump_under_popup() {
+            framebuffer::draw_about();
+        }
         crate::sched::yield_now();
     }
 }
@@ -353,7 +367,9 @@ pub fn status_menu(chip: crate::framebuffer::StatusChip) {
                 }
             }
         }
-        crate::shell::status_tick();
+        if pump_under_popup() {
+            need_repaint = true;
+        }
         crate::sched::yield_now();
     }
 }
@@ -431,7 +447,9 @@ pub fn choose(title: &str, question: &str, options: &[&str]) -> Option<usize> {
                 _ => {}
             }
         }
-        crate::shell::status_tick();
+        if pump_under_popup() {
+            framebuffer::draw_choose(title, question, options, focus);
+        }
         crate::sched::yield_now();
     }
 }
@@ -616,7 +634,9 @@ pub fn browse_commands() -> Option<String> {
             caret_on = !caret_on;
             paint(&query, &rows, sel, scroll, caret_on);
         }
-        crate::shell::status_tick();
+        if pump_under_popup() {
+            paint(&query, &rows, sel, scroll, caret_on);
+        }
         crate::sched::yield_now();
     }
 }
@@ -846,7 +866,9 @@ pub fn browse_agents() -> Option<String> {
             caret_on = !caret_on;
             paint(&query, &rows, sel, scroll, caret_on);
         }
-        crate::shell::status_tick();
+        if pump_under_popup() {
+            paint(&query, &rows, sel, scroll, caret_on);
+        }
         crate::sched::yield_now();
     }
 }

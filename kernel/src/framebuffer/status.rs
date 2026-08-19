@@ -60,9 +60,9 @@ pub fn status_chip_hit(x: u64, y: u64) -> Option<StatusChip> {
                     7 => StatusChip::Volume,
                     8 => StatusChip::Clock,
                     9 => StatusChip::Notifications,
-                    // Recording is last; a future chip must add an arm, not fall
-                    // through here (that used to silently open Notifications).
-                    _ => StatusChip::Recording,
+                    10 => StatusChip::Recording,
+                    11 => StatusChip::NowPlaying,
+                    _ => return None,
                 });
             }
         }
@@ -81,7 +81,12 @@ fn status_str_advance(s: &str, cw: u64, ch: u64) -> u64 {
 }
 
 /// Live right-side status chips (same content the bar paints, in order).
-fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String, crate::icons::DeviceStatus)> {
+///
+/// `vertical` is passed in rather than re-read from `SCREEN`: this is called
+/// from inside `Screen::draw_status`, which already holds that lock.
+fn status_right_chips(
+    vertical: bool,
+) -> alloc::vec::Vec<(StatusChip, alloc::string::String, crate::icons::DeviceStatus)> {
     use crate::icons::DeviceStatus;
     let mut out = alloc::vec::Vec::new();
     let last_k = crate::console::input_activity_ms();
@@ -133,6 +138,15 @@ fn status_right_chips() -> alloc::vec::Vec<(StatusChip, alloc::string::String, c
         crate::icons::status_volume(v_st, crate::sound::muted(), crate::sound::volume()),
         v_st,
     ));
+    // Now-playing: a stack row on a vertical bar. A horizontal bar paints
+    // the same text as a centred pill in `draw_status_horizontal` so it is
+    // not also pushed here (that would draw it twice).
+    if vertical {
+        let np = crate::shell::now_playing_chip();
+        if !np.is_empty() {
+            out.push((StatusChip::NowPlaying, np, DeviceStatus::Ready));
+        }
+    }
     // Only shown when there is something unread — the Battery precedent above.
     // A machine with nothing to say has a byte-identical status bar, and
     // `ui_config::resolve_var` returns the same empty string so the template
@@ -315,7 +329,7 @@ impl Screen {
             self.draw_status_str(tx, top, line, fg, self.theme.status_bg, max_x);
             top += row;
         }
-        for (chip, text, st) in status_right_chips() {
+        for (chip, text, st) in status_right_chips(true) {
             if top + row > last {
                 break;
             }
@@ -373,7 +387,7 @@ impl Screen {
 
         // Right chips painted individually so each has a hit rect.
         // Icons and labels share status_fg so they match the theme text colour.
-        let chips = status_right_chips();
+        let chips = status_right_chips(false);
         let gap1 = cw; // within a tight group
         let gap2 = 2 * cw; // between groups
         let mut total = 0u64;
@@ -391,6 +405,10 @@ impl Screen {
             .max(left_end)
             .min(self.width.saturating_sub(OUTER));
         let max_x = self.width.saturating_sub(OUTER / 2);
+        // Centre pill: play/pause + title. Drawn in the gap between the
+        // wordmark and the right-hand chips so a playing track is obvious
+        // even with the audio tab in the background.
+        self.draw_now_playing_pill(left_end, x, sy_top, bar_h, ty, cw, line_h);
         for (i, (chip, text, st)) in chips.iter().enumerate() {
             if i > 0 {
                 x += if i == 1 { gap1 } else { gap2 };
@@ -413,5 +431,47 @@ impl Screen {
             set_status_chip_rect(*chip, (hx, sy_top, hw, bar_h));
             x = x1;
         }
+    }
+
+    /// Centre now-playing pill on a horizontal status bar. No-op when idle or
+    /// when the gap between the wordmark and the right chips is too tight.
+    fn draw_now_playing_pill(
+        &self,
+        left_end: u64,
+        right_start: u64,
+        sy_top: u64,
+        bar_h: u64,
+        ty: u64,
+        cw: u64,
+        line_h: u64,
+    ) {
+        let text = crate::shell::now_playing_chip();
+        if text.is_empty() {
+            return;
+        }
+        let pad = cw;
+        let tw = status_str_advance(&text, cw, line_h);
+        let pw = tw + pad * 2;
+        let gap = right_start.saturating_sub(left_end);
+        if gap < pw + cw * 2 {
+            // Not enough room to centre it — park it just after the wordmark
+            // so the chip is still visible and clickable.
+            if left_end + pw + cw > right_start {
+                return;
+            }
+        }
+        let x = if gap >= pw + cw * 2 {
+            left_end + (gap - pw) / 2
+        } else {
+            left_end
+        };
+        let y = sy_top + 2;
+        let h = bar_h.saturating_sub(4).max(line_h);
+        let pill_bg = self.mix(self.theme.status_bg, self.theme.accent, 0.22);
+        let ink = self.theme.accent;
+        self.fill_rect(x, y, pw, h, pill_bg);
+        let tx = x + pad;
+        self.draw_status_str(tx, ty, &text, ink, pill_bg, x + pw);
+        set_status_chip_rect(StatusChip::NowPlaying, (x, sy_top, pw, bar_h));
     }
 }

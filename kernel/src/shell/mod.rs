@@ -49,7 +49,7 @@ pub(crate) use voice::*;
 use agents::*;
 use install::*;
 use keyboard::*;
-use media::*;
+pub(crate) use media::*;
 pub(crate) use notify::*;
 use pdf::*;
 use record::*;
@@ -7154,6 +7154,22 @@ fn media_key(c: u8) -> bool {
                 audio_seek(5000);
                 true
             }
+            b'n' | b']' => {
+                audio_step(true);
+                true
+            }
+            b'p' | b'[' => {
+                audio_step(false);
+                true
+            }
+            b'r' | b'R' => {
+                audio_cycle_repeat();
+                true
+            }
+            b's' | b'S' => {
+                audio_toggle_shuffle();
+                true
+            }
             b'm' | b'M' => {
                 media_toggle_mute();
                 true
@@ -8225,6 +8241,9 @@ fn ui_tick() {
                     StatusChip::Recording => {
                         crate::shell::record::stop_and_save();
                     }
+                    StatusChip::NowPlaying => {
+                        audio_toggle_pause();
+                    }
                     other => crate::modal::status_menu(other),
                 }
             } else if let Some(which) = crate::framebuffer::divider_hit(t.x, t.y) {
@@ -8516,7 +8535,10 @@ fn repaint_tab(mode: crate::framebuffer::RightMode) {
     match mode {
         crate::framebuffer::RightMode::Top => refresh_top(),
         crate::framebuffer::RightMode::Todos => {}
-        crate::framebuffer::RightMode::Audio => repaint_audio(),
+        crate::framebuffer::RightMode::Audio => {
+            crate::framebuffer::invalidate_audio_paint();
+            repaint_audio();
+        }
         crate::framebuffer::RightMode::Surface(id) if id == crate::framebuffer::VIDEO_SURFACE => {
             present_video_frame()
         }
@@ -8866,6 +8888,11 @@ pub fn start_pump() {
 /// Lighter upkeep for loops that consume their own mouse events (modals, the
 /// editor): caret blink + status bar + net only — no `mouse::tick()`, which
 /// would steal their clicks.
+///
+/// **The login gate must keep calling this**, not [`background_tick`]: a lock
+/// screen that pumps `msgchan` / `schedule` would run agent turns behind it.
+/// Regular popups (status menu, confirm, About) use [`background_tick`] so
+/// audio/video and service agents keep running.
 pub fn status_tick() {
     #[cfg(not(test))]
     {
@@ -8877,6 +8904,44 @@ pub fn status_tick() {
         }
     }
     crate::net::poll();
+}
+
+/// Keep players and agents alive under a popup that owns the mouse.
+///
+/// Same "no `mouse::tick`" rule as [`status_tick`], plus the pumps `upkeep`
+/// would have run: audio/video chunks, USB isoc, package-UI ticks, service
+/// supervise, background jobs, schedules, messaging. Without this a status-bar
+/// dropdown silenced `/open` audio the moment the last queued chunk drained.
+pub fn background_tick() {
+    status_tick();
+    #[cfg(not(test))]
+    {
+        speech_pump();
+        pump_audio();
+        pump_video();
+        crate::arch::uac_pump();
+        crate::service::package_ui::tick();
+        crate::service::supervise_tick();
+        crate::tools::bg::pump();
+        crate::schedule::tick();
+        crate::msgchan::tick();
+        crate::clipboard::tick();
+        crate::drivers::vbox::clipboard::tick();
+        crate::notify::save_if_dirty();
+        crate::notify::tick_banner();
+        crate::shell::record::tick();
+        crate::kms::flush_damage();
+        if browser_loaded() {
+            browser_anim_tick();
+        }
+        let now = crate::arch::now_ms();
+        if crate::framebuffer::right_mode() == crate::framebuffer::RightMode::Audio
+            && now.saturating_sub(LAST_AUDIO_MS.load(Ordering::Relaxed)) >= 250
+        {
+            LAST_AUDIO_MS.store(now, Ordering::Relaxed);
+            repaint_audio();
+        }
+    }
 }
 
 /// Resolve the status-bar templates (from the UI config, phase 2) against the

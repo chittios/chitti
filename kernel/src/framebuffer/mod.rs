@@ -541,6 +541,10 @@ static POPUP_HOVER: Locked<Option<ModalHit>> = Locked::new(None);
 /// compute pumps `shell::upkeep`) must not blink the pane caret into the box.
 static MODAL_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Set when a present paints pane content while a modal is up, so the popup
+/// loop can redraw itself on top (single-buffered FB).
+static MODAL_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// The box [`Screen::drop_shadow`] last painted a shadow for.
 ///
 /// A shadow *darkens the pixels it finds*, so painting the same one twice
@@ -579,9 +583,13 @@ pub enum StatusChip {
     /// Live screen recording (`crate::shell::record`). Empty when idle.
     /// Click stops the take — the macOS menu-bar stop control.
     Recording = 10,
+    /// Now-playing track (`crate::shell::now_playing_chip`). Empty when idle.
+    /// Click toggles play/pause. Discriminant is the hit-rect index — append
+    /// only, never renumber.
+    NowPlaying = 11,
 }
 
-const STATUS_CHIP_N: usize = 11;
+const STATUS_CHIP_N: usize = 12;
 
 /// Hit rects for [`StatusChip`] (index = `chip as usize`). Zero-size = absent.
 static STATUS_CHIP_RECTS: Locked<[(u64, u64, u64, u64); STATUS_CHIP_N]> =
