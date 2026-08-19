@@ -391,26 +391,34 @@ pub(super) fn audio_toggle_shuffle() {
 }
 
 /// Decode and swap in playlist slot `idx`, keeping repeat / shuffle / the
-/// sibling list. No-op when the slot is already the loaded track (rewinds)
-/// or the file cannot be read.
+/// sibling list. Rewinds when the slot is already the loaded track.
+/// Returns whether a track is now ready to play.
 #[cfg(all(not(feature = "server"), not(test)))]
-fn audio_play_index(idx: usize) {
+fn audio_play_index(idx: usize) -> bool {
     let path = AUDIO.with(|a| a.as_ref().and_then(|p| p.playlist.get(idx).cloned()));
-    let Some(path) = path else { return };
+    let Some(path) = path else { return false };
     let already = AUDIO.with(|a| a.as_ref().map(|p| p.path == path).unwrap_or(false));
     if already {
         audio_restart();
-        return;
+        return true;
     }
+    // Drop the previous PCM *before* decoding the next file so a wrap from
+    // the last track does not hold two whole files at once (trap #3).
+    AUDIO.with(|a| {
+        if let Some(p) = a.as_mut() {
+            p.pcm = alloc::vec::Vec::new();
+            p.peaks = alloc::vec::Vec::new();
+        }
+    });
     let Some(bytes) = read_mounted(&path).or_else(|| crate::synapse::fs::read(&path)) else {
         serial_println!("open> {} not found", path);
-        return;
+        return false;
     };
     let audio = match crate::audio::decode(&bytes) {
         Ok(a) => a,
         Err(e) => {
             serial_println!("open> cannot decode {}: {}", path, e);
-            return;
+            return false;
         }
     };
     let total_ms = audio.duration_ms();
@@ -445,6 +453,7 @@ fn audio_play_index(idx: usize) {
     });
     repaint_audio();
     super::update_status();
+    true
 }
 
 #[cfg(not(all(not(feature = "server"), not(test))))]
@@ -492,12 +501,30 @@ pub(super) fn audio_restart() {
     repaint_audio();
 }
 
+/// Re-entrancy guard: AAC decode pumps `upkeep` every 32 frames, and
+/// `upkeep` calls `pump_audio`. Without this, Repeat wrapping to an AAC
+/// sibling re-entered here, saw the same end-of-track, and started another
+/// decode — stack overflow, the machine goes down.
+#[cfg(all(not(feature = "server"), not(test)))]
+static PUMPING_AUDIO: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Feed the next chunk to the sound device when it has drained the previous
 /// one — the background-player heartbeat, called every idle tick. Copies the
 /// chunk out before playing so the `AUDIO` lock isn't held across the device
 /// enqueue. No-op when nothing is loaded or the device is still draining.
 #[cfg(all(not(feature = "server"), not(test)))]
 pub(super) fn pump_audio() {
+    use core::sync::atomic::Ordering;
+    if PUMPING_AUDIO.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    pump_audio_inner();
+    PUMPING_AUDIO.store(false, Ordering::Release);
+}
+
+#[cfg(all(not(feature = "server"), not(test)))]
+fn pump_audio_inner() {
     if crate::sound::playing() {
         return; // still draining the last chunk
     }
@@ -554,21 +581,28 @@ pub(super) fn pump_audio() {
         }
     });
     // Auto-advance (repeat / next sibling) or announce end-of-track once.
+    // Claim `finished_announced` *before* loading the next file: AAC decode
+    // calls `upkeep` (and so `pump_audio`) and must not start another load.
     let advance = AUDIO.with(|a| {
         let p = a.as_mut()?;
         if !(p.done && !p.finished_announced && !crate::sound::playing()) {
             return None;
         }
-        crate::audio::hud::auto_next(
+        let next = crate::audio::hud::auto_next(
             p.playlist_idx,
             p.playlist.len(),
             p.repeat,
             p.shuffle,
             crate::arch::now_ms(),
-        )
+        )?;
+        p.finished_announced = true;
+        Some(next)
     });
     if let Some(i) = advance {
-        audio_play_index(i);
+        if !audio_play_index(i) {
+            serial_println!("\ropen> audio finished");
+            super::update_status();
+        }
     } else {
         let finished = AUDIO.with(|a| {
             a.as_mut()
