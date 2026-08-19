@@ -28,6 +28,7 @@ IMPORT("host_home")        extern int32_t host_home(void *out, int32_t cap);
 IMPORT("host_log")         extern void    host_log(const char *p, int32_t l);
 IMPORT("host_audio_submit") extern int32_t host_audio_submit(const void *pcm, int32_t frames, int32_t rate, int32_t ch);
 IMPORT("host_audio_free")  extern int32_t host_audio_free(void);
+IMPORT("host_hud_set")     extern int32_t host_hud_set(const char *p, int32_t l);
 
 static void logs(const char *s) { host_log(s, (int32_t)strlen(s)); }
 
@@ -118,6 +119,13 @@ static unsigned char doom_key_for(int usage) {
         case 0x07: return KEY_STRAFE_R;     /* d */
         case 0x2c: return KEY_USE;          /* space */
         case 0xe0: case 0xe4: return KEY_FIRE;   /* ctrl */
+        /* `f` as a second fire button, on the **held** path so it fires
+         * continuously like Ctrl does. Ctrl is the Doom default and stays, but a
+         * host window manager or terminal can swallow it before the guest ever
+         * sees it, and then nothing on screen explains why shooting does
+         * nothing. A plain letter cannot be intercepted. It is excluded from
+         * `on_key` for the usual reason — a key in both paths arrives twice. */
+        case 0x09: return KEY_FIRE;              /* f */
         case 0xe1: case 0xe5: return KEY_RSHIFT; /* shift = run */
         /* Esc, Enter and the digits are deliberately **absent**: they are taps,
          * not holds, and the byte path delivers them (see `on_key`). Listing them
@@ -268,6 +276,16 @@ int64_t freedoom_start(int32_t p, int32_t n) {
             "also drop doom.wad or doom1.wad into /downloads/.");
     }
 
+    /* The controls, in the compositor's HUD strip. A game whose keys are
+     * undiscoverable is a game nobody can play: Ctrl-to-fire is the Doom default
+     * and is invisible, and the pane gives us a place to say so that costs no
+     * pixels of the picture. */
+    static const char hud[] =
+        "Freedoom\n"
+        "move WASD/arrows  .  fire F or Ctrl  .  use Space  .  run Shift\n"
+        "weapons 1-7  .  menu Esc  .  Ctrl+Tab back to the shell";
+    host_hud_set(hud, (int32_t)(sizeof hud - 1));
+
     dg_set_wad(wad, (unsigned)got);
     /* Doom picks its *game mode* from the IWAD's filename, so the path is needed
      * even though the bytes are already in memory. Without it: "Game mode
@@ -331,7 +349,7 @@ int64_t on_key(int32_t p, int32_t n) {
     }
     if (name[1] == 0) {
         char c0 = name[0] | 0x20;
-        if (c0 == 'w' || c0 == 'a' || c0 == 's' || c0 == 'd') {
+        if (c0 == 'w' || c0 == 'a' || c0 == 's' || c0 == 'd' || c0 == 'f') {
             return reply("used");
         }
     }
