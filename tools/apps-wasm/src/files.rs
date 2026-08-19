@@ -10,7 +10,31 @@ use alloc::vec::Vec;
 /// Max path components we keep on the stack (cwd trail).
 const MAX_DEPTH: usize = 12;
 /// Display rows.
-const VIS: usize = 8;
+/// Layout, derived rather than scattered as magic numbers.
+///
+/// The surface was 256x192 with every coordinate written out literally, which is
+/// why the path was cut at 26 characters and names at 12 — there was nowhere for
+/// them to go. `wasm.surface_w/h` in the manifest now asks for 640x400, so the
+/// numbers live here and the rest of the file reads from them.
+///
+/// Text is unaffected by the size: `synapse::ui` defers labels and re-rasterizes
+/// them at the pane's presentation scale, so glyphs stay sharp whatever the
+/// surface is. What a bigger surface buys is *room* — rows, columns and a
+/// preview that can show more than fourteen characters a line.
+const SW: i32 = 640;
+const SH: i32 = 400;
+const HDR_H: i32 = 26;
+const PAD: i32 = 6;
+const ROW_H: i32 = 22;
+/// Left list width; the preview takes the rest.
+const LIST_W: i32 = 300;
+const PREV_X: i32 = LIST_W + PAD * 2;
+const PREV_W: i32 = SW - PREV_X - PAD;
+/// First row's top edge.
+const ROW0_Y: i32 = HDR_H + PAD;
+/// Rows that fit. Kept under `LABEL_CAP` (96 deferred labels per surface) with
+/// room for the header and the preview lines.
+const VIS: usize = 15;
 
 static mut PATH: [[u8; 40]; MAX_DEPTH] = [[0; 40]; MAX_DEPTH];
 static mut PATH_LEN: [u8; MAX_DEPTH] = [0; MAX_DEPTH];
@@ -157,11 +181,17 @@ fn load_preview() {
 fn paint() {
     let cwd = cwd_string();
     let mut ops = String::from("clear 1a1816; ");
-    ops.push_str("rect 0 0 256 16 3a3632; ");
-    // Folder glyph (Font Awesome) + path.
-    let path_show = if cwd.len() > 26 {
-        // keep end of path
-        format!("…{}", &cwd[cwd.len() - 24..])
+    ops.push_str(&format!("rect 0 0 {SW} {HDR_H} 3a3632; "));
+    // Folder glyph (Font Awesome) + path. Truncation keeps the *end* of the
+    // path, because the leaf is what tells you where you are.
+    const PATH_MAX: usize = 62;
+    let path_show = if cwd.len() > PATH_MAX {
+        let cut = cwd.len() - (PATH_MAX - 2);
+        let mut c = cut;
+        while c < cwd.len() && !cwd.is_char_boundary(c) {
+            c += 1;
+        }
+        format!("…{}", &cwd[c..])
     } else {
         cwd.clone()
     };
@@ -173,23 +203,24 @@ fn paint() {
         "e8e4df",
         &format!("{} {}", crate::fa::FOLDER_OPEN, path_show),
     );
-    ops.push_str("rect 0 16 130 160 2c2926; ");
-    ops.push_str("rect 134 16 118 160 2c2926; ");
-    text_op(&mut ops, 138, 20, 10, "a8a4a0", "preview");
+    let body_h = SH - HDR_H;
+    ops.push_str(&format!("rect 0 {HDR_H} {} {body_h} 2c2926; ", LIST_W + PAD * 2));
+    ops.push_str(&format!("rect {PREV_X} {HDR_H} {PREV_W} {body_h} 2c2926; "));
+    text_op(&mut ops, PREV_X + 4, HDR_H + 4, 11, "a8a4a0", "preview");
     unsafe {
         // Parent row when not at root.
         let mut row0 = 0i32;
         let start = SCROLL as usize;
         let mut painted = 0usize;
         if DEPTH > 0 && start == 0 {
-            let y = 20;
+            let y = ROW0_Y;
             let c = if SEL < 0 { "cc785c" } else { "3a3632" };
-            ops.push_str(&format!("rect 4 {y} 122 16 {c}; "));
+            ops.push_str(&format!("rect {PAD} {y} {LIST_W} {} {c}; ", ROW_H - 2));
             text_op(
                 &mut ops,
-                8,
-                y + 2,
-                10,
+                PAD + 6,
+                y + 3,
+                11,
                 "e8e4df",
                 &format!("{} ..", crate::fa::FOLDER),
             );
@@ -208,10 +239,10 @@ fn paint() {
             if idx >= NENTS {
                 break;
             }
-            let y = 20 + (row0 + i as i32) * 18;
+            let y = ROW0_Y + (row0 + i as i32) * ROW_H;
             let hi = idx as i32 == SEL;
             let c = if hi { "cc785c" } else { "5a5652" };
-            ops.push_str(&format!("rect 4 {y} 122 16 {c}; "));
+            ops.push_str(&format!("rect {PAD} {y} {LIST_W} {} {c}; ", ROW_H - 2));
             let name = core::str::from_utf8(&NAMES[idx][..NAME_LEN[idx] as usize]).unwrap_or("?");
             let is_dir = IS_DIR[idx] != 0;
             let icon = if is_dir {
@@ -219,18 +250,29 @@ fn paint() {
             } else {
                 crate::fa::FILE
             };
-            let shown = if name.len() > 12 { &name[..12] } else { name };
+            // Room for a real filename now. Still bounded, and cut on a char
+            // boundary so a multi-byte name cannot panic the slice.
+            const NAME_MAX: usize = 34;
+            let shown = if name.len() > NAME_MAX {
+                let mut e = NAME_MAX;
+                while e > 0 && !name.is_char_boundary(e) {
+                    e -= 1;
+                }
+                &name[..e]
+            } else {
+                name
+            };
             text_op(
                 &mut ops,
-                8,
-                y + 2,
-                10,
+                PAD + 6,
+                y + 3,
+                11,
                 "e8e4df",
                 &format!("{icon} {shown}"),
             );
         }
         if NENTS == 0 && DEPTH == 0 {
-            text_op(&mut ops, 10, 40, 10, "a8a4a0", "(empty store)");
+            text_op(&mut ops, PAD + 6, ROW0_Y + 4, 11, "a8a4a0", "(empty store)");
         }
         if PREVIEW_LEN > 0 {
             let prev = core::str::from_utf8(&PREVIEW[..PREVIEW_LEN.min(200)]).unwrap_or("(binary)");
@@ -245,11 +287,22 @@ fn paint() {
                     }
                 })
                 .collect();
+            // Roughly one character per 6 px at size 10, which the pane's own
+            // scale then sharpens. Was 14 characters over 11 lines — a preview
+            // that could not show a line of code.
+            const PREV_COLS: usize = 46;
+            const PREV_ROWS: i32 = 14;
             let mut row = 0i32;
             let mut col = 0usize;
             let bytes = clean.as_bytes();
-            while col < bytes.len() && row < 11 {
-                let end = (col + 14).min(bytes.len());
+            while col < bytes.len() && row < PREV_ROWS {
+                // Break at the newline if one falls inside this line, so text
+                // files keep their own shape instead of being reflowed.
+                let hard = clean[col..].find('\n').map(|i| col + i);
+                let end = match hard {
+                    Some(h) if h < col + PREV_COLS => h,
+                    _ => (col + PREV_COLS).min(bytes.len()),
+                };
                 // char boundary
                 let mut e = end;
                 while e > col && !clean.is_char_boundary(e) {
@@ -260,18 +313,19 @@ fn paint() {
                 }
                 text_op(
                     &mut ops,
-                    138,
-                    36 + row * 12,
-                    9,
+                    PREV_X + 4,
+                    HDR_H + 22 + row * 15,
+                    10,
                     "e8e4df",
-                    &clean[col..e],
+                    clean[col..e].trim_end_matches('\n'),
                 );
-                col = e;
+                // Skip the newline we broke on, or we emit a blank line for it.
+                col = if e < bytes.len() && bytes[e] == b'\n' { e + 1 } else { e };
                 row += 1;
             }
         } else if selected_is_dir() {
-            text_op(&mut ops, 138, 40, 10, "a8a4a0", "(directory)");
-            text_op(&mut ops, 138, 54, 9, "a8a4a0", "enter to open");
+            text_op(&mut ops, PREV_X + 4, HDR_H + 24, 11, "a8a4a0", "(directory)");
+            text_op(&mut ops, PREV_X + 4, HDR_H + 42, 10, "a8a4a0", "enter or click to open");
         } else if NENTS > 0 {
             text_op(&mut ops, 138, 40, 10, "a8a4a0", "(empty/binary)");
         }
@@ -342,8 +396,10 @@ pub fn start(_: &str) -> String {
 }
 
 pub fn on_click(x: i32, y: i32) -> String {
-    if x < 130 && y >= 16 && y < 176 {
-        let row = (y - 20) / 18;
+    // Must track the paint geometry above: a hit map that disagrees with what is
+    // drawn sends a click to the row above or below the one under the pointer.
+    if x < LIST_W + PAD * 2 && y >= HDR_H && y < SH {
+        let row = (y - ROW0_Y) / ROW_H;
         if row < 0 {
             return status("");
         }
