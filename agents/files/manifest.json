@@ -2,7 +2,7 @@
   "name": "files",
   "version": "1.0.0",
   "kind": "skill_agent",
-  "description": "Synapse FS browser — same store as shell /ls (browse directories and preview files).",
+  "description": "Synapse FS browser \u2014 same store as shell /ls (browse directories and preview files).",
   "package_ui": true,
   "toolset": [
     "files_start",
@@ -17,18 +17,27 @@
   "capabilities": [
     {
       "domain": "ui",
-      "rights": ["exec", "write", "delete"],
+      "rights": [
+        "exec",
+        "write",
+        "delete"
+      ],
       "scope": "any"
     },
     {
       "domain": "fs",
-      "rights": ["read", "list"],
+      "rights": [
+        "read",
+        "list"
+      ],
       "scope": "any"
     }
   ],
   "wasm": {
     "module": "assets/tools.wasm",
-    "fuel": 2000000
+    "fuel": 2000000,
+    "surface_w": 640,
+    "surface_h": 800
   },
   "autostart": false
 }
