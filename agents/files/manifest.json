@@ -37,7 +37,7 @@
     "module": "assets/tools.wasm",
     "fuel": 2000000,
     "surface_w": 640,
-    "surface_h": 400
+    "surface_h": 800
   },
   "autostart": false
 }
