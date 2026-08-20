@@ -349,6 +349,12 @@ pub fn audio_hud_height() -> u64 {
 /// audio tab is active. Called ~4 Hz from the shell while the tab is on top;
 /// only the live band is refreshed on those ticks.
 pub fn draw_audio(v: &AudioView) {
+    // A live analyser blit would paint through a status-bar dropdown
+    // (Keyboard / Net / …). Help/Agents already redraw on top; skip the
+    // visual refresh here so PCM can keep playing without covering the menu.
+    if modal_is_open() {
+        return;
+    }
     SCREEN.with(|slot| {
         let Some(sc) = slot else { return };
         let Some(d) = sc.mode_dims(RightMode::Audio) else {

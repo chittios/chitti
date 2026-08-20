@@ -349,6 +349,12 @@ pub fn present_surface_reserve_ex(
         if sc.actions[pi].active != ti {
             return;
         }
+        // Same reason `draw_audio` bails: a game/video present would draw
+        // through a status-bar dropdown. Guest state still advances; we
+        // just do not touch the framebuffer until the menu is gone.
+        if modal_is_open() {
+            return;
+        }
         if logical_sw == 0 || logical_sh == 0 || buf_w == 0 || buf_h == 0 {
             return;
         }

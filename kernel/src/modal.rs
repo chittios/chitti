@@ -267,12 +267,14 @@ pub fn status_menu(chip: crate::framebuffer::StatusChip) {
     let mut need_repaint = true;
     loop {
         let now = crate::arch::now_ms();
-        // Clock ticks every second; volume repaints after each adjust; others once.
-        let due = match chip {
-            StatusChip::Clock => now.saturating_sub(last_paint) >= 1000,
-            StatusChip::Volume => need_repaint || last_paint == 0,
-            _ => last_paint == 0,
-        };
+        // Clock ticks every second; volume / hover / a present that painted
+        // over us set `need_repaint`. Other chips used to paint only once,
+        // so the audio analyser (and any agent UI) sat on top of Keyboard
+        // / Net / … until the menu was dismissed — Help/Agents already
+        // redrew immediately after `pump_under_popup`.
+        let due = need_repaint
+            || last_paint == 0
+            || (chip == StatusChip::Clock && now.saturating_sub(last_paint) >= 1000);
         if due {
             framebuffer::draw_status_menu(chip);
             last_paint = now;
@@ -368,7 +370,9 @@ pub fn status_menu(chip: crate::framebuffer::StatusChip) {
             }
         }
         if pump_under_popup() {
-            need_repaint = true;
+            framebuffer::draw_status_menu(chip);
+            last_paint = crate::arch::now_ms();
+            need_repaint = false;
         }
         crate::sched::yield_now();
     }

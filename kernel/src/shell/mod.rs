@@ -8937,6 +8937,7 @@ pub fn background_tick() {
         let now = crate::arch::now_ms();
         if crate::framebuffer::right_mode() == crate::framebuffer::RightMode::Audio
             && now.saturating_sub(LAST_AUDIO_MS.load(Ordering::Relaxed)) >= 250
+            && !crate::framebuffer::modal_is_open()
         {
             LAST_AUDIO_MS.store(now, Ordering::Relaxed);
             repaint_audio();
