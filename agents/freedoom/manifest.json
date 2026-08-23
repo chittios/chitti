@@ -21,6 +21,7 @@
       "domain": "fs",
       "rights": [
         "read",
+        "write",
         "list"
       ],
       "scope": "any"
