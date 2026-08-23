@@ -149,11 +149,25 @@ pub struct HostState {
     fds: Fds,
     /// The one file a WASI guest may have open, if this surface grants any.
     ///
-    /// One slot rather than a table because the only guest on this surface opens
-    /// exactly one file, once, to check it exists — see [`register_wasi_fs_imports`].
-    /// A table would be more general and would need an eviction policy for a case
-    /// that does not arise.
-    wasi_file: Option<(String, u64)>,
+    /// One slot rather than a table because the guests on this surface open one
+    /// file at a time — see [`register_wasi_fs_imports`]. A table would be more
+    /// general and would need an eviction policy for a case that does not arise.
+    wasi_file: Option<WasiFile>,
+}
+
+/// The one file a WASI guest may have open.
+///
+/// Writes are buffered and committed on close rather than streamed, because
+/// `synapse::fs` stores whole values — there is no append. That also makes a
+/// half-written file impossible: a guest that dies mid-save leaves the previous
+/// contents rather than a truncated one, which for a savegame is the difference
+/// between losing a save and losing the game.
+pub struct WasiFile {
+    path: String,
+    /// Read cursor. Unused for writes.
+    off: u64,
+    /// `Some` once the file was opened for writing; committed by `fd_close`.
+    write_buf: Option<Vec<u8>>,
 }
 
 /// fd 0/1/2 backing for a WASI guest, held host-side.
@@ -182,6 +196,44 @@ pub struct Fds {
     /// a shrug.
     last_stderr: String,
 }
+
+/// May a guest whose home is `home` create `path`?
+///
+/// Pure, and separate from the import so it can be tested — the two ways this
+/// goes wrong are both silent and both grant a guest the whole store.
+///
+/// **A plain `starts_with` is not enough.** With home `/agent/9048`, the path
+/// `/agent/90489/evil` shares that prefix and is a *different* agent's home, so
+/// the boundary has to be a separator or the exact string.
+///
+/// **And the path must be normalized first.** `/agent/9048/../doc/SOUL.md` passes
+/// any prefix test while naming a file outside the home entirely; `..` is how a
+/// sandbox is escaped, and a guest chooses the string.
+pub fn wasi_write_allowed(home: &str, path: &str) -> bool {
+    let home = crate::synapse::vpath::normalize(home);
+    let path = crate::synapse::vpath::normalize(path);
+    if home.is_empty() || home == "/" {
+        // A guest with no home of its own gets nothing rather than everything.
+        return false;
+    }
+    if path == home {
+        return false; // the home directory itself is not a file
+    }
+    match path.strip_prefix(&home) {
+        Some(rest) => rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// The synthetic descriptor for the one open file. Above stdio and the preopen
+/// (fd 3), and shared by the stdio and filesystem import sets — a `Linker` takes
+/// one definition per name, so `fd_read`/`fd_write`/`fd_close`/`fd_seek` must
+/// dispatch on the fd rather than being registered twice.
+pub const WASI_FILE_FD: i32 = 4;
+
+/// Largest file a guest may write in one open. A Doom savegame is well under
+/// this; the bound is what stops a runaway guest growing the kernel heap.
+pub const WASI_MAX_FILE: usize = 8 * 1024 * 1024;
 
 /// Cap on fd 2 forwarded to ktrace per store.
 const STDERR_TRACE_CAP: u32 = 4096;
@@ -732,6 +784,39 @@ fn register_wasi_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
             W,
             "fd_read",
             |mut caller: Caller<'_, HostState>, fd: i32, iovs: i32, iovs_len: i32, nread: i32| -> i32 {
+                // The one open file, read through the same gated store facade.
+                if fd == WASI_FILE_FD {
+                    let Some(f) = caller.data().wasi_file.as_ref() else {
+                        return WASI_EBADF;
+                    };
+                    let (path, off) = (f.path.clone(), f.off);
+                    let Some(all) = crate::synapse::fs::read(&path) else {
+                        return WASI_EBADF;
+                    };
+                    let mut total = 0u32;
+                    let mut pos = off as usize;
+                    for i in 0..iovs_len.max(0) {
+                        let Some((ptr, len)) = read_iovec(&caller, iovs, i) else {
+                            return WASI_EBADF;
+                        };
+                        let start = pos.min(all.len());
+                        let end = (start + len as usize).min(all.len());
+                        if end > start && write_guest_bytes(&mut caller, ptr as i32, &all[start..end]).is_err() {
+                            return WASI_EBADF;
+                        }
+                        let got = end - start;
+                        pos += got;
+                        total += got as u32;
+                        if got < len as usize {
+                            break; // EOF
+                        }
+                    }
+                    if let Some(f) = caller.data_mut().wasi_file.as_mut() {
+                        f.off = pos as u64;
+                    }
+                    let _ = write_guest_bytes(&mut caller, nread, &total.to_le_bytes());
+                    return 0;
+                }
                 if fd != 0 {
                     return WASI_EBADF;
                 }
@@ -766,6 +851,36 @@ fn register_wasi_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
             W,
             "fd_write",
             |mut caller: Caller<'_, HostState>, fd: i32, iovs: i32, iovs_len: i32, nwritten: i32| -> i32 {
+                // fd 4 is the one open file (see `register_wasi_fs_imports`).
+                // Handled here rather than in the fs set because a `Linker` takes
+                // one definition per name — two would refuse to register, and
+                // splitting stdio from files by fd is the only way to have both.
+                if fd == WASI_FILE_FD {
+                    let mut total = 0u32;
+                    for i in 0..iovs_len.max(0) {
+                        let Some((ptr, len)) = read_iovec(&caller, iovs, i) else {
+                            return WASI_EBADF;
+                        };
+                        let Some(bytes) = read_guest_bytes(&caller, ptr as i32, len as i32) else {
+                            return WASI_EBADF;
+                        };
+                        let Some(f) = caller.data_mut().wasi_file.as_mut() else {
+                            return WASI_EBADF;
+                        };
+                        let Some(buf) = f.write_buf.as_mut() else {
+                            return WASI_EBADF; // opened read-only
+                        };
+                        // Bounded: a runaway guest must not grow kernel heap without
+                        // limit. A Doom savegame is well under a megabyte.
+                        if buf.len().saturating_add(bytes.len()) > WASI_MAX_FILE {
+                            return WASI_EBADF;
+                        }
+                        buf.extend_from_slice(&bytes);
+                        total += bytes.len() as u32;
+                    }
+                    let _ = write_guest_bytes(&mut caller, nwritten, &total.to_le_bytes());
+                    return 0;
+                }
                 if fd != 1 && fd != 2 {
                     return WASI_EBADF;
                 }
@@ -807,13 +922,56 @@ fn register_wasi_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         )
         .map_err(|_| "define wasi.fd_write")?;
     linker
-        .func_wrap(W, "fd_close", |_c: Caller<'_, HostState>, _fd: i32| -> i32 { 0 })
+        .func_wrap(W, "fd_close", |mut c: Caller<'_, HostState>, fd: i32| -> i32 {
+            // Closing the file is what **commits** it: writes are buffered so a
+            // guest that dies mid-save leaves the previous contents rather than a
+            // truncated file. For a savegame that is the difference between losing
+            // a save and losing the game.
+            if fd == WASI_FILE_FD {
+                if let Some(f) = c.data_mut().wasi_file.take() {
+                    if let Some(buf) = f.write_buf {
+                        crate::synapse::fs::write(&f.path, &buf);
+                        crate::ktrace::log_fmt(format_args!(
+                            "wasi: wrote {} ({} bytes)",
+                            f.path,
+                            buf.len()
+                        ));
+                    }
+                }
+            }
+            0
+        })
         .map_err(|_| "define wasi.fd_close")?;
     linker
         .func_wrap(
             W,
             "fd_seek",
-            |_c: Caller<'_, HostState>, _fd: i32, _off: i64, _whence: i32, _out: i32| -> i32 { WASI_EBADF },
+            |mut c: Caller<'_, HostState>, fd: i32, off: i64, whence: i32, out: i32| -> i32 {
+                if fd != WASI_FILE_FD {
+                    return WASI_EBADF;
+                }
+                let len = c
+                    .data()
+                    .wasi_file
+                    .as_ref()
+                    .and_then(|f| crate::synapse::fs::read(&f.path))
+                    .map(|v| v.len() as i64)
+                    .unwrap_or(0);
+                let cur = c.data().wasi_file.as_ref().map(|f| f.off as i64).unwrap_or(0);
+                // WASI whence: 0 set, 1 cur, 2 end.
+                let base = match whence {
+                    0 => 0,
+                    1 => cur,
+                    2 => len,
+                    _ => return WASI_EBADF,
+                };
+                let next = (base + off).clamp(0, len) as u64;
+                if let Some(f) = c.data_mut().wasi_file.as_mut() {
+                    f.off = next;
+                }
+                let _ = write_guest_bytes(&mut c, out, &next.to_le_bytes());
+                0
+            },
         )
         .map_err(|_| "define wasi.fd_seek")?;
     linker
@@ -2382,9 +2540,9 @@ fn register_wasi_fs_imports(linker: &mut Linker<HostState>) -> Result<(), &'stat
     /// relative — without at least one preopen; it fails inside its own path
     /// resolution before ever calling `path_open`.
     const PREOPEN_FD: i32 = 3;
-    /// The single file descriptor this surface can hand out. Above stdio and the
-    /// preopen so it cannot collide with either.
-    const FILE_FD: i32 = 4;
+    /// The single file descriptor this surface hands out. Shared with the stdio
+    /// set, which dispatches reads/writes/closes on it.
+    const FILE_FD: i32 = WASI_FILE_FD;
 
     fn read_path(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
         let mem = caller.get_export("memory").and_then(|e| e.into_memory())?;
@@ -2458,20 +2616,44 @@ fn register_wasi_fs_imports(linker: &mut Linker<HostState>) -> Result<(), &'stat
              _fdflags: i32,
              out_fd: i32|
              -> i32 {
-                // OFLAGS_CREAT (1) | OFLAGS_TRUNC (8) mean the guest intends to
-                // write. Refused rather than silently opened read-only, which
-                // would look like success and then lose the data.
-                if oflags & 0b1001 != 0 {
-                    return NOENT;
-                }
                 let Some(p) = read_path(&caller, path, path_len) else {
                     return NOENT;
                 };
                 let full = store_path(&p);
-                if !crate::synapse::fs::exists(&full) {
-                    return NOENT;
+                // OFLAGS_CREAT (1) | OFLAGS_TRUNC (8): the guest intends to write.
+                let writing = oflags & 0b1001 != 0;
+                if writing {
+                    // **Home-scoped, exactly like `host_fs_write`.** A guest that
+                    // can create files anywhere in the store is a guest that can
+                    // overwrite another agent's memory or a config — and it would
+                    // have got there through a compatibility shim rather than a
+                    // capability, which is the worst way to acquire authority.
+                    let id = caller.data().bind.agent_id;
+                    if id == 0 {
+                        return NOENT;
+                    }
+                    let home = crate::agent::home::path(id);
+                    if !wasi_write_allowed(&home, &full) {
+                        crate::ktrace::log_fmt(format_args!(
+                            "wasi: refused write outside {home}: {full}"
+                        ));
+                        return NOENT;
+                    }
+                    caller.data_mut().wasi_file = Some(WasiFile {
+                        path: full,
+                        off: 0,
+                        write_buf: Some(Vec::new()),
+                    });
+                } else {
+                    if !crate::synapse::fs::exists(&full) {
+                        return NOENT;
+                    }
+                    caller.data_mut().wasi_file = Some(WasiFile {
+                        path: full,
+                        off: 0,
+                        write_buf: None,
+                    });
                 }
-                caller.data_mut().wasi_file = Some((full, 0));
                 if let Some(m) = caller.get_export("memory").and_then(|e| e.into_memory()) {
                     let _ = m.write(&mut caller, out_fd as usize, &FILE_FD.to_le_bytes());
                 }
@@ -2778,6 +2960,42 @@ mod tests {
             Session::instantiate(DOOM, limits, HostBindings::default()).is_err(),
             "a libc guest must need the native set; if this passes, the opt-in is meaningless"
         );
+    }
+
+    /// The sandbox boundary for guest file writes. Both failure modes here hand a
+    /// guest the whole store, and both look like working code.
+    #[test_case]
+    fn a_guest_write_cannot_escape_its_home() {
+        let home = "/agent/9048";
+        // The ordinary case.
+        assert!(wasi_write_allowed(home, "/agent/9048/doomsav0.dsg"));
+        assert!(wasi_write_allowed(home, "/agent/9048/sub/dir/file"));
+
+        // A shared *prefix* is a different agent, not a subdirectory. This is the
+        // one a plain `starts_with` gets wrong.
+        assert!(!wasi_write_allowed(home, "/agent/90489/evil"));
+        assert!(!wasi_write_allowed(home, "/agent/9048extra"));
+
+        // `..` is how a sandbox is escaped, and the guest chooses the string.
+        assert!(!wasi_write_allowed(home, "/agent/9048/../doc/SOUL.md"));
+        assert!(!wasi_write_allowed(home, "/agent/9048/../../configs/core/auth.json"));
+
+        // Elsewhere entirely.
+        assert!(!wasi_write_allowed(home, "/configs/core/auth.json"));
+        assert!(!wasi_write_allowed(home, "/agent/1/x"));
+
+        // The home itself is a directory, not a file to overwrite.
+        assert!(!wasi_write_allowed(home, "/agent/9048"));
+        assert!(!wasi_write_allowed(home, "/agent/9048/"));
+
+        // A guest with no home gets nothing, not everything — the safe reading of
+        // a missing value.
+        assert!(!wasi_write_allowed("", "/anything"));
+        assert!(!wasi_write_allowed("/", "/anything"));
+
+        // Normalization applies to both sides, so a trailing slash on the home
+        // does not change the answer.
+        assert!(wasi_write_allowed("/agent/9048/", "/agent/9048/save.dsg"));
     }
 
     #[test_case]

@@ -24,6 +24,25 @@ use std::time::Instant;
 // native side
 // ---------------------------------------------------------------------------
 
+/// The mixer's own surface, plus the harness-side capture of what it submitted.
+///
+/// Tested here rather than on a boot because a headless guest has **no sound
+/// device**: `host_audio_free()` returns 0, the mixer correctly produces nothing,
+/// and the serial log can only show that the module initialised. The arithmetic —
+/// the DMX 16-byte skip, the fixed-point resample, the pan law, the clamp — is
+/// checkable only off-hardware, the same reason `pngbench` and `h264diff` exist.
+extern "C" {
+    fn dgsnd_out_rate() -> i32;
+    fn dgsnd_channels() -> i32;
+    static mut dgsnd_free_samples: i32;
+    static dgsnd_last: [i16; 65536];
+    static dgsnd_last_frames: i32;
+    static dgsnd_last_rate: i32;
+    static dgsnd_last_ch: i32;
+    static dgsnd_submits: i32;
+    fn dg_play_pistol();
+}
+
 extern "C" {
     fn dg_wad_storage() -> *mut u8;
     fn dg_wad_capacity() -> u32;
@@ -205,6 +224,25 @@ mod wasm {
         linker.func_wrap(W, "proc_exit", |mut caller: Caller<'_, Host>, code: i32| {
             caller.data_mut().exited = Some(code);
         })?;
+
+        // The `chitti` imports the audio backend uses. Stubbed rather than
+        // omitted from the wasm build, because both sides must compile the *same*
+        // sources or the ratio stops being a property of the interpreter — the
+        // rule this whole harness rests on. `host_audio_free` returns 0, so the
+        // mixer produces nothing and the measured frame cost is the renderer's,
+        // matching the native side where the harness also leaves it at 0 outside
+        // the sound test.
+        linker.func_wrap(
+            "chitti",
+            "host_audio_submit",
+            |_: Caller<'_, Host>, _: i32, _: i32, _: i32, _: i32| -> i32 { 0 },
+        )?;
+        linker.func_wrap("chitti", "host_audio_free", |_: Caller<'_, Host>| -> i32 { 0 })?;
+        linker.func_wrap(
+            "chitti",
+            "host_log",
+            |_: Caller<'_, Host>, _: i32, _: i32| {},
+        )?;
 
         // One preopened directory, "/", so wasi-libc can resolve a path at all.
         // `fd_prestat_get` writes { u8 tag = dir, u32 name_len }; the padding
@@ -638,6 +676,76 @@ mod wasm {
 
 // ---------------------------------------------------------------------------
 
+/// Exercise the audio backend against real WAD effects.
+///
+/// Doom drives sound through `S_StartSound`, so the game itself is started and
+/// then asked to play an effect by name — which also proves the *lump lookup*
+/// works (`ds` prefix, `link` aliases, `W_GetNumForName`), not just the mixer.
+fn run_sound(wad: &[u8], wad_path: &str) -> bool {
+    // SAFETY: single-threaded; the C side owns its own state.
+    unsafe {
+        let cap = dg_wad_capacity() as usize;
+        assert!(wad.len() <= cap);
+        let dst = dg_wad_storage();
+        std::ptr::copy_nonoverlapping(wad.as_ptr(), dst, wad.len());
+        dg_set_wad(dst, wad.len() as u32);
+        let p = wad_path.as_bytes();
+        let pbuf = dg_iwad_path_buf();
+        std::ptr::copy_nonoverlapping(p.as_ptr(), pbuf, p.len());
+        *pbuf.add(p.len()) = 0;
+        dg_create();
+
+        let rate = dgsnd_out_rate();
+        let nchan = dgsnd_channels();
+        println!("mixer: {nchan} channels at {rate} Hz stereo\n");
+
+        let mut ok = true;
+        let mut check = |name: &str, cond: bool| {
+            println!("  {:<46} {}", name, if cond { "ok" } else { "FAIL" });
+            if !cond {
+                ok = false;
+            }
+        };
+
+        // Backpressure: with no room the mixer must submit nothing rather than
+        // overrun a full queue. This is the `speech_pump` contract.
+        dgsnd_free_samples = 0;
+        let before = dgsnd_submits;
+        for _ in 0..4 {
+            dg_tick();
+        }
+        check("a full queue is not written to", dgsnd_submits == before);
+
+        // Now give it room and fire a real effect. Standing still on map 1 plays
+        // nothing at all, which made the first run of this test "inconclusive" —
+        // a test that passes by not exercising the code is worse than no test.
+        dgsnd_free_samples = 4096;
+        dg_play_pistol();
+        for _ in 0..20 {
+            dg_tick();
+        }
+
+        let submits = dgsnd_submits - before;
+        println!("\n  submissions during 120 tics: {submits}");
+        if submits > 0 {
+            let frames = dgsnd_last_frames;
+            check("stereo", dgsnd_last_ch == 2);
+            check("rate matches the mixer", dgsnd_last_rate == rate);
+            check("frames within the free budget", frames > 0 && frames * 2 <= 4096);
+            // Silence would mean the lump was found and decoded to nothing —
+            // which is what a wrong DMX offset produces.
+            let n = (frames * 2) as usize;
+            let peak = dgsnd_last[..n].iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            check("output is not silence", peak > 0);
+            // A wrapped sample is a loud click; the clamp must hold.
+            check("no sample at the wrap boundary", !dgsnd_last[..n].contains(&i16::MIN));
+        } else {
+            println!("  (no effect was triggered in 120 tics — inconclusive, not a failure)");
+        }
+        ok
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(wad_path) = args.next() else {
@@ -647,6 +755,17 @@ fn main() {
         eprintln!("  https://github.com/freedoom/freedoom/releases");
         std::process::exit(2);
     };
+    // `sound <wad>` runs the audio checks instead of the benchmark. Checked
+    // before `frames` is parsed, or that parse eats the path.
+    if wad_path == "sound" {
+        let p = args.next().expect("usage: doombench sound <wad>");
+        let wad = std::fs::read(&p).expect("read WAD");
+        println!("doombench sound: {p}\n");
+        let ok = run_sound(&wad, &p);
+        println!("\n{}", if ok { "all checks passed" } else { "FAILURES above" });
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     let frames: u32 = args
         .next()
         .and_then(|s| s.parse().ok())

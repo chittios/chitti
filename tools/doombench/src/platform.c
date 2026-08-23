@@ -34,6 +34,39 @@
 int system(const char *cmd) { (void)cmd; return -1; }
 #endif
 
+/* ---- native stubs for the audio host imports ----------------------------
+ *
+ * The mixer in `tools/freedoom-wasm/src/sound.c` is compiled into this harness
+ * so its arithmetic can be tested at all: a headless guest has no sound device,
+ * `host_audio_free()` returns 0, the mixer correctly does nothing, and a boot can
+ * only prove the module initialised.
+ *
+ * `dgsnd_free` is settable so a test can control backpressure, and the last
+ * submission is captured rather than played.
+ */
+#ifndef __wasm__
+#include <stdio.h>
+int32_t dgsnd_free_samples = 0;
+int16_t dgsnd_last[65536];
+int32_t dgsnd_last_frames = 0, dgsnd_last_rate = 0, dgsnd_last_ch = 0;
+int32_t dgsnd_submits = 0;
+
+int32_t host_audio_free(void) { return dgsnd_free_samples; }
+
+int32_t host_audio_submit(const void *pcm, int32_t frames, int32_t rate, int32_t ch) {
+    int32_t n = frames * ch;
+    if (n > (int32_t)(sizeof dgsnd_last / sizeof *dgsnd_last)) return -3;
+    memcpy(dgsnd_last, pcm, (size_t)n * sizeof(int16_t));
+    dgsnd_last_frames = frames;
+    dgsnd_last_rate = rate;
+    dgsnd_last_ch = ch;
+    dgsnd_submits++;
+    return 0;
+}
+
+void host_log(const char *p, int32_t l) { fprintf(stderr, "%.*s\n", (int)l, p); }
+#endif
+
 /* Virtual clock. A real clock would make the benchmark non-deterministic *and*
  * let Doom's own frame skipping react to how fast the interpreter is, which would
  * silently flatter the slow side: at 30x, wasm would run fewer game tics per frame
@@ -160,6 +193,19 @@ uint64_t dg_frame_hash(void) {
     for (uint32_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
     return h;
 }
+
+/* Play one real effect through Doom's own API.
+ *
+ * `S_StartSound` rather than poking the mixer directly, so the test covers the
+ * whole path the game uses: the `ds` lump-name lookup, `link` aliasing,
+ * `W_GetNumForName`, the channel allocation in `s_sound.c`, and only then the
+ * mixer. Poking `StartSound` would skip everything that actually goes wrong.
+ */
+#ifndef __wasm__
+#include "s_sound.h"
+#include "sounds.h"
+void dg_play_pistol(void) { S_StartSound(NULL, sfx_pistol); }
+#endif
 
 /* The simulation clock. Two builds that agree here agree on the whole game
  * simulation, which is a far stronger claim than agreeing on a frame hash --

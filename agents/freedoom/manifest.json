@@ -21,6 +21,7 @@
       "domain": "fs",
       "rights": [
         "read",
+        "write",
         "list"
       ],
       "scope": "any"
@@ -32,7 +33,7 @@
     "surface_h": 200,
     "frame_ms": 28,
     "memory_pages": 2048,
-    "fuel": 200000000,
+    "fuel": 2000000000,
     "native": true
   },
   "autostart": false

@@ -280,10 +280,15 @@ int64_t freedoom_start(int32_t p, int32_t n) {
      * undiscoverable is a game nobody can play: Ctrl-to-fire is the Doom default
      * and is invisible, and the pane gives us a place to say so that costs no
      * pixels of the picture. */
+    /* The HUD strip parses **`key description`** pairs separated by two or more
+     * spaces and paints each key as a chip. Writing it the other way round —
+     * "move WASD  .  fire F" — made `hud_keys::is_key_char` read the separator
+     * dots as keys (`.` is in its key-character set) and chip *those*, while the
+     * real key names became description text. The keys have to come first. */
     static const char hud[] =
         "Freedoom\n"
-        "move WASD/arrows  .  fire F or Ctrl  .  use Space  .  run Shift\n"
-        "weapons 1-7  .  menu Esc  .  Ctrl+Tab back to the shell";
+        "F fire  WASD move  arrows turn  Space use  Shift run\n"
+        "1-7 weapon  Esc menu  Ctrl+Tab shell";
     host_hud_set(hud, (int32_t)(sizeof hud - 1));
 
     dg_set_wad(wad, (unsigned)got);
@@ -299,6 +304,33 @@ int64_t freedoom_start(int32_t p, int32_t n) {
     static char a1[] = "-iwad";
     char *argv[] = {a0, a1, iwad_path, 0};
     doomgeneric_Create(3, argv);
+
+    /* Point saves at this agent's own home.
+     *
+     * Doom derives `savegamedir` from `configdir`, which `D_DoomMain` sets before
+     * we get control — the log line is "Using . for configuration and saves", so
+     * it tried `./.savegame/temp.dsg` and `/tmp/recovery.dsg`, neither of which
+     * exists or is writable. `I_Error` then reports the failure, and because
+     * saving happens from inside the game loop it retried every tic: the same
+     * message 35 times a second, plus "recursive call to I_Error detected".
+     *
+     * Overriding the global afterwards is the smallest correct fix — the
+     * alternative is patching `M_SetConfigDir`, which is upstream. The trailing
+     * slash matters: Doom builds paths with `M_StringJoin(savegamedir, name)` and
+     * no separator of its own.
+     *
+     * The home is also the only place the guest *may* write: `path_open` refuses a
+     * create outside it, so this is not merely convention.
+     */
+    static char savedir[160];
+    int hn = host_home(savedir, (int32_t)sizeof savedir - 2);
+    if (hn > 0) {
+        if (savedir[hn - 1] != '/') savedir[hn++] = '/';
+        savedir[hn] = 0;
+        extern char *savegamedir;
+        savegamedir = savedir;
+        logs("freedoom: saves in agent home");
+    }
     started = 1;
     logs("freedoom: started");
     return reply("ok");
