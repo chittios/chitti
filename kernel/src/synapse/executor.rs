@@ -180,8 +180,10 @@ pub fn execute_with_justification(caller: TaskId, raw: &str, justification: Just
     // human confirmation at the shell can let it through.
     //
     // Identity-file writes (SOUL.md / MEMORY.md) are treated as destructive
-    // even though mem_fs_write is not: those files re-enter the system prompt
-    // as trusted persona, so an untrusted write is taint-laundering.
+    // even if a future registry edit marked `mem_fs_write` inert again: those
+    // files re-enter the system prompt as trusted persona, so an untrusted
+    // write is taint-laundering. Ordinary writes are irreversible in the
+    // registry too — persisting attacker-chosen bytes is an effect.
     let identity_write = is_identity_file_mutation(spec, &call.args);
     if (spec.effect.is_effectful() || identity_write) && justification.blocks_destructive() {
         crate::ktrace::log_fmt(format_args!(
@@ -595,12 +597,8 @@ fn fs_path(args: &[ArgValue], i: usize) -> String {
     super::vpath::normalize(arg_str(args, i))
 }
 
-/// Paths that re-enter the agent as trusted persona / durable memory. Writing
-/// them under untrusted justification is prompt-injection taint-laundering.
 fn is_identity_path(path: &str) -> bool {
-    let n = super::vpath::normalize(path);
-    let base = n.rsplit('/').next().unwrap_or(n.as_str());
-    base.eq_ignore_ascii_case("SOUL.md") || base.eq_ignore_ascii_case("MEMORY.md")
+    super::fs::is_identity_path(path)
 }
 
 /// Whether this call mutates an identity file (SOUL.md / MEMORY.md).

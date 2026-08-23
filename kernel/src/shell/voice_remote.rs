@@ -131,6 +131,7 @@ fn endpoint_json(e: &Endpoint) -> Json {
 }
 
 pub fn load() -> VoiceConfig {
+    let _secret = crate::synapse::fs::SecretConfigAccess::new();
     crate::synapse::fs::read(VOICE_CFG_PATH).map(|b| parse_config_json(&b)).unwrap_or_default()
 }
 
@@ -142,6 +143,7 @@ pub fn save(cfg: &VoiceConfig) {
     if let Some(s) = &cfg.stt {
         obj.push(("stt".to_string(), endpoint_json(s)));
     }
+    let _secret = crate::synapse::fs::SecretConfigAccess::new();
     crate::synapse::fs::write(VOICE_CFG_PATH, Json::Obj(obj).to_pretty().as_bytes());
 }
 

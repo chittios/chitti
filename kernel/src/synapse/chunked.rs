@@ -26,6 +26,10 @@ pub enum ChunkCmd {
     Continue = 2,
     /// Abandon state; tenant may free its own scratch.
     Cancel = 3,
+    /// Video: decode display frame `max_units` (rewinds the engine if needed).
+    Seek = 4,
+    /// JS: dispatch a DOM event (`meta0` type, `meta1` target, `meta2/3` x/y).
+    Event = 5,
 }
 
 impl ChunkCmd {
@@ -34,6 +38,8 @@ impl ChunkCmd {
             1 => Some(Self::Init),
             2 => Some(Self::Continue),
             3 => Some(Self::Cancel),
+            4 => Some(Self::Seek),
+            5 => Some(Self::Event),
             _ => None,
         }
     }
@@ -68,10 +74,36 @@ impl ChunkStatus {
     }
 }
 
+/// What the tenant is decoding. Written by the tenant on [`ChunkCmd::Init`].
+pub const KIND_AUDIO: u64 = 1;
+pub const KIND_VIDEO: u64 = 2;
+pub const KIND_JS: u64 = 3;
+
+/// Packed-DOM page envelope (`"JDOM"` little-endian) for the jsint tenant.
+pub const JS_DOM_MAGIC: u32 = 0x4D4F_444A;
+/// Mutation log magic (`"JMUT"` little-endian).
+pub const JS_MUT_MAGIC: u32 = 0x5455_4D4A;
+
+pub const JS_OP_TITLE: u8 = 1;
+pub const JS_OP_NAV: u8 = 2;
+pub const JS_OP_TEXT: u8 = 3;
+pub const JS_OP_VALUE: u8 = 4;
+pub const JS_OP_STYLE: u8 = 5;
+pub const JS_OP_HIDDEN: u8 = 6;
+pub const JS_OP_LOG: u8 = 7;
+pub const JS_OP_INTERACTIVE: u8 = 8;
+pub const JS_OP_SCROLL: u8 = 9;
+/// Full element-table snapshot (createElement/appendChild trees).
+pub const JS_OP_SNAPSHOT: u8 = 10;
+
+pub const JS_EV_CLICK: u64 = 1;
+pub const JS_EV_INPUT: u64 = 2;
+pub const JS_EV_KEYDOWN: u64 = 3;
+
 /// Startup / result block shared between kernel and tenant.
 ///
-/// Layout is fixed so a future H.264/AAC/ONNX guest can `#[path]`-mount the
-/// same constants. All multi-byte fields are little-endian `u64` slots.
+/// Layout is fixed so H.264/AAC/JS guests can `#[path]`-mount the same
+/// constants. All multi-byte fields are little-endian `u64` slots.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkBlock {
@@ -81,11 +113,11 @@ pub struct ChunkBlock {
     pub input_ptr: u64,
     /// Input length in bytes.
     pub input_len: u64,
-    /// Max units to process this entry (frames / AAC frames / ONNX nodes).
+    /// Max units to process this entry (frames / AAC frames / JS scripts).
     pub max_units: u64,
     /// Units completed across all entries so far (tenant updates).
     pub units_done: u64,
-    /// Output buffer guest-VA (YUV plane, PCM, etc.) — tenant-reported.
+    /// Output buffer guest-VA (Y plane, PCM, JS log) — tenant-reported.
     pub output_ptr: u64,
     /// Output length in bytes.
     pub output_len: u64,
@@ -93,6 +125,26 @@ pub struct ChunkBlock {
     pub heap_want: u64,
     /// Opaque decoder-state cookie the tenant may stash (must survive Continue).
     pub state_cookie: u64,
+    /// [`KIND_AUDIO`] / [`KIND_VIDEO`] / [`KIND_JS`].
+    pub kind: u64,
+    /// Audio: sample rate. Video: width. JS: host-op code.
+    pub meta0: u64,
+    /// Audio: channels. Video: height. JS: host-op arg.
+    pub meta1: u64,
+    /// Video: Cb plane guest-VA.
+    pub meta2: u64,
+    /// Video: Cr plane guest-VA.
+    pub meta3: u64,
+    /// Video: Y plane length.
+    pub meta4: u64,
+    /// Video: Cb plane length.
+    pub meta5: u64,
+    /// Video: Cr plane length.
+    pub meta6: u64,
+    /// Heap the loader mapped (guest-VA).
+    pub heap_ptr: u64,
+    /// Heap length in bytes.
+    pub heap_len: u64,
 }
 
 impl ChunkBlock {
@@ -109,6 +161,16 @@ impl ChunkBlock {
             output_len: 0,
             heap_want: 0,
             state_cookie: 0,
+            kind: 0,
+            meta0: 0,
+            meta1: 0,
+            meta2: 0,
+            meta3: 0,
+            meta4: 0,
+            meta5: 0,
+            meta6: 0,
+            heap_ptr: 0,
+            heap_len: 0,
         }
     }
 
@@ -136,6 +198,16 @@ impl ChunkBlock {
             self.output_len,
             self.heap_want,
             self.state_cookie,
+            self.kind,
+            self.meta0,
+            self.meta1,
+            self.meta2,
+            self.meta3,
+            self.meta4,
+            self.meta5,
+            self.meta6,
+            self.heap_ptr,
+            self.heap_len,
         ];
         for (i, w) in words.iter().enumerate() {
             out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
@@ -161,6 +233,16 @@ impl ChunkBlock {
             output_len: word(6)?,
             heap_want: word(7)?,
             state_cookie: word(8)?,
+            kind: word(9)?,
+            meta0: word(10)?,
+            meta1: word(11)?,
+            meta2: word(12)?,
+            meta3: word(13)?,
+            meta4: word(14)?,
+            meta5: word(15)?,
+            meta6: word(16)?,
+            heap_ptr: word(17)?,
+            heap_len: word(18)?,
         })
     }
 
@@ -178,6 +260,49 @@ pub fn should_continue(status: ChunkStatus) -> bool {
     matches!(status, ChunkStatus::NeedMore | ChunkStatus::OutOfMemory)
 }
 
+pub fn put_u16(out: &mut alloc::vec::Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+pub fn put_u32(out: &mut alloc::vec::Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+pub fn put_bytes(out: &mut alloc::vec::Vec<u8>, b: &[u8]) {
+    put_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+pub fn put_str(out: &mut alloc::vec::Vec<u8>, s: &str) {
+    put_bytes(out, s.as_bytes());
+}
+pub fn get_u16(src: &[u8], off: &mut usize) -> Option<u16> {
+    let s = *off;
+    if s + 2 > src.len() {
+        return None;
+    }
+    *off = s + 2;
+    Some(u16::from_le_bytes(src[s..s + 2].try_into().ok()?))
+}
+pub fn get_u32(src: &[u8], off: &mut usize) -> Option<u32> {
+    let s = *off;
+    if s + 4 > src.len() {
+        return None;
+    }
+    *off = s + 4;
+    Some(u32::from_le_bytes(src[s..s + 4].try_into().ok()?))
+}
+pub fn get_bytes<'a>(src: &'a [u8], off: &mut usize) -> Option<&'a [u8]> {
+    let n = get_u32(src, off)? as usize;
+    let s = *off;
+    let e = s.checked_add(n)?;
+    if e > src.len() {
+        return None;
+    }
+    *off = e;
+    Some(&src[s..e])
+}
+pub fn get_str<'a>(src: &'a [u8], off: &mut usize) -> Option<&'a str> {
+    core::str::from_utf8(get_bytes(src, off)?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,14 +316,56 @@ mod tests {
         assert_eq!(b.max_units, 16);
         b.state_cookie = 0xdead_beef;
         b.units_done = 8;
+        b.kind = KIND_AUDIO;
+        b.meta0 = 44100;
+        b.meta1 = 2;
         let mut buf = [0u8; ChunkBlock::BYTES];
         b.pack(&mut buf).unwrap();
         let back = ChunkBlock::unpack(&buf).unwrap();
         assert_eq!(back.state_cookie, 0xdead_beef);
         assert_eq!(back.units_done, 8);
+        assert_eq!(back.kind, KIND_AUDIO);
+        assert_eq!(back.meta0, 44100);
         assert_eq!(back.cmd(), Some(ChunkCmd::Continue));
+        b.kind = KIND_VIDEO;
+        b.meta0 = 1920;
+        b.meta1 = 1080;
+        b.meta2 = 0x2000;
+        b.meta3 = 0x3000;
+        b.meta4 = 1920 * 1080;
+        b.meta5 = 1920 * 1080 / 4;
+        b.meta6 = 1920 * 1080 / 4;
+        b.heap_ptr = 0x4000_0000;
+        b.heap_len = 8 << 20;
+        b.pack(&mut buf).unwrap();
+        let back = ChunkBlock::unpack(&buf).unwrap();
+        assert_eq!(back.kind, KIND_VIDEO);
+        assert_eq!(back.meta0, 1920);
+        assert_eq!(back.meta1, 1080);
+        assert_eq!(back.meta2, 0x2000);
+        assert_eq!(back.meta3, 0x3000);
+        assert_eq!(back.meta4, 1920 * 1080);
+        assert_eq!(back.heap_ptr, 0x4000_0000);
+        assert_eq!(back.heap_len, 8 << 20);
         b.as_cancel();
         assert_eq!(b.cmd(), Some(ChunkCmd::Cancel));
+    }
+
+    #[test_case]
+    fn audio_and_video_kind_slots_are_distinct() {
+        assert_eq!(KIND_AUDIO, 1);
+        assert_eq!(KIND_VIDEO, 2);
+        let mut b = ChunkBlock::new_init(0, 0, 32);
+        b.kind = KIND_AUDIO;
+        b.meta0 = 44100;
+        b.meta1 = 2;
+        let mut buf = [0u8; ChunkBlock::BYTES];
+        b.pack(&mut buf).unwrap();
+        let back = ChunkBlock::unpack(&buf).unwrap();
+        assert_eq!(back.kind, KIND_AUDIO);
+        assert_eq!(back.meta0, 44100);
+        assert_eq!(back.meta1, 2);
+        assert_eq!(back.meta2, 0);
     }
 
     #[test_case]

@@ -345,80 +345,20 @@ pub(super) fn browser_dispatch_nav(base: &str) -> Option<alloc::string::String> 
     Some(browser_load(&abs, true))
 }
 
-/// Fetch + register `@font-face` web fonts named in `css` (URLs resolved
-/// against `base_url`). WOFF is unwrapped to SFNT ([`crate::font_woff`]) and
-/// WOFF2 is Brotli-decompressed + glyf/loca-reconstructed
-/// ([`crate::font_woff2`]). Failures log, never abort a load.
+/// `@font-face` from a page is attacker-controlled bytes. WOFF/WOFF2/TTF
+/// parsers and fontdue run in the kernel, so a malformed webfont is a ring-0
+/// parser bug. Bundled faces (Geist, FA, Noto) stay; downloaded faces are
+/// ignored. Failures log, never abort a load.
 pub(super) fn browser_load_fonts(css: &str, base_url: &str) {
+    let _ = base_url;
     let faces = crate::browser::css::scan_font_faces(css);
     if faces.is_empty() {
         return;
     }
-    let mut urls: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    let mut wanted: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
-        alloc::vec::Vec::new();
-    for f in &faces {
-        if f.family.is_empty() || crate::font_ttf::family_loaded(&f.family) {
-            continue;
-        }
-        if wanted.iter().any(|(fam, _)| fam == &f.family) {
-            continue; // first src per family wins
-        }
-        let abs = crate::browser::url::resolve(base_url, &f.url).unwrap_or_else(|| f.url.clone());
-        if !crate::browser::url::is_browse_url(&abs) {
-            continue;
-        }
-        if !urls.contains(&abs) {
-            urls.push(abs.clone());
-        }
-        wanted.push((f.family.clone(), abs));
-    }
-    if urls.is_empty() {
-        return;
-    }
-    let http_urls: alloc::vec::Vec<_> = urls
-        .iter()
-        .filter(|u| crate::browser::url::is_http_url(u))
-        .cloned()
-        .collect();
-    let fetched = if http_urls.is_empty() {
-        alloc::collections::BTreeMap::new()
-    } else {
-        crate::browser::worker::fetch_subresources_cooperative(
-            &http_urls,
-            crate::browser::loader::Destination::Font,
-            1 << 20,
-        )
-    };
-    for (family, abs) in wanted {
-        let owned;
-        let bytes = if crate::browser::url::is_file_url(&abs) {
-            owned = read_file_url(&abs);
-            owned.as_deref()
-        } else {
-            fetched.get(&abs).map(|v| v.as_slice())
-        };
-        let Some(bytes) = bytes else {
-            crate::serial_println!("browser> font: '{}' not fetched ({})", family, abs);
-            continue;
-        };
-        let res = if crate::font_woff::is_woff2(bytes) {
-            // WOFF2: Brotli-decompress + reconstruct the transformed glyf/loca.
-            crate::font_woff2::woff2_to_sfnt(bytes)
-                .and_then(|sfnt| crate::font_ttf::load_family(&family, &sfnt))
-        } else if crate::font_woff::is_woff(bytes) {
-            crate::font_woff::woff_to_sfnt(bytes)
-                .and_then(|sfnt| crate::font_ttf::load_family(&family, &sfnt))
-        } else {
-            crate::font_ttf::load_family(&family, bytes)
-        };
-        match res {
-            Ok(()) => {
-                crate::serial_println!("browser> font: loaded '{}' ({} B)", family, bytes.len())
-            }
-            Err(e) => crate::serial_println!("browser> font: '{}' failed: {}", family, e),
-        }
-    }
+    crate::serial_println!(
+        "browser> font: {} @font-face(s) not installed — untrusted font files are not parsed in the kernel",
+        faces.len()
+    );
 }
 
 /// Fetch + decode CSS `background-image: url(…)` targets named in `css`,
@@ -2231,5 +2171,25 @@ pub(super) fn browser_key(byte: u8) -> bool {
         }
         // PageUp / we only get plain bytes here; Pg keys come as CSI elsewhere.
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod font_policy_tests {
+    use super::*;
+
+    #[test_case]
+    fn page_font_faces_are_not_installed() {
+        // A malformed webfont used to be parsed in ring 0. The load path now
+        // counts the faces and returns; the family must stay unregistered.
+        assert!(!crate::font_ttf::family_loaded("EvilFace"));
+        browser_load_fonts(
+            "@font-face { font-family: 'EvilFace'; src: url(http://evil.example/x.woff2); }",
+            "http://evil.example/",
+        );
+        assert!(
+            !crate::font_ttf::family_loaded("EvilFace"),
+            "untrusted @font-face must not enter the kernel face table"
+        );
     }
 }

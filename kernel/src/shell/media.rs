@@ -203,17 +203,17 @@ pub(super) static AUDIO: crate::mm::Locked<Option<AudioPlayer>> = crate::mm::Loc
 /// commands never interrupts the track. `/close` (or Ctrl+C at the prompt)
 /// stops it.
 #[cfg(not(feature = "server"))]
-pub(super) fn play_audio(path: &str) {
+pub(super) fn play_audio(path: &str) -> Result<(), &'static str> {
     let Some(bytes) = read_mounted(path).or_else(|| crate::synapse::fs::read(path)) else {
         serial_println!("open> {} not found under any mount or in the store (see /mounts)", path);
-        return;
+        return Err("not found");
     };
     let t0 = crate::arch::now_ms();
     let audio = match crate::audio::decode(&bytes) {
         Ok(a) => a,
         Err(e) => {
             serial_println!("open> cannot decode {}: {}", path, e);
-            return;
+            return Err(e);
         }
     };
     let total_ms = audio.duration_ms();
@@ -235,7 +235,7 @@ pub(super) fn play_audio(path: &str) {
         if crate::arch::aarch64::is_apple() {
             serial_println!("open>   built-in speaker did not come up — `/audio dump` then `/audio up` to retry");
         }
-        return;
+        return Err("no sound device");
     }
     serial_println!("open>   switch tabs freely, it keeps playing; Ctrl+Tab to focus then space=pause <-/->=seek n/p=next/prev r=repeat s=shuffle up/dn=volume 0=restart m=mute; Ctrl+Tab again returns to shell; Ctrl+C or /close stops");
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
@@ -278,6 +278,7 @@ pub(super) fn play_audio(path: &str) {
         repaint_audio();
         super::update_status();
     }
+    Ok(())
 }
 
 /// Sibling `.wav`/`.mp3`/`.aac`/`.m4a` files in the same folder as `path`.

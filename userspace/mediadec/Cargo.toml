@@ -1,0 +1,36 @@
+# A **userspace** tenant: compiled for ring 3 / EL0 and loaded by the kernel.
+# Outside the workspace on purpose, exactly as `imgdec` and `kernel/` are.
+[package]
+name = "chitti-mediadec"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[[bin]]
+name = "mediadec"
+path = "src/main.rs"
+
+[dependencies]
+rust_h264 = { path = "../../third_party/rust_h264", default-features = false }
+
+# Named so the mounted `audio/mod.rs` `feature = "tenant-guest"` check is a
+# real feature of this crate (kernel defines the same name; we enable it).
+[features]
+default = ["tenant-guest"]
+tenant-guest = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(chitti_tenant)'] }
+
+[profile.release]
+panic = "abort"
+# Decode is compute-heavy (AAC/H.264); `3` is faster and not larger than `s`
+# for this tree (same finding as pdfrender-wasm).
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"

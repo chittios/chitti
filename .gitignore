@@ -62,6 +62,8 @@ userspace/**/*.bin
 # `include_bytes!`s them, exactly as it does `agents/*/assets/tools.wasm`. Without them the
 # tree does not build for anyone who did not run `cargo xtask imgdec` locally.
 !userspace/imgdec/imgdec-*.bin
+!userspace/mediadec/mediadec-*.bin
+!userspace/jsint/jsint-*.bin
 
 node_modules/
 *.pack

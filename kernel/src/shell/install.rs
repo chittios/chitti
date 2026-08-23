@@ -88,15 +88,17 @@ pub(super) fn plan_carry(
 /// Read the live store into the `(encoded name, bytes)` pairs a fresh data
 /// partition is formatted with, and report what was left behind.
 ///
-/// **Holds [`CredentialAccess`] for the whole walk**, and that is the load-bearing
-/// line here. `synapse::fs::list` filters the login credential record out and
-/// `read` refuses it — deliberately, so no agent can enumerate or exfiltrate the
-/// verifier — which means a migration written the obvious way copies everything
-/// *except* the password and silently produces a machine whose owner cannot log
-/// in. The guard is exactly what it is for: kernel-side code, on a path a human
-/// typed, that legitimately needs the record.
+/// **Holds [`CredentialAccess`] and [`SecretConfigAccess`] for the whole walk**,
+/// and that is the load-bearing line here. `synapse::fs::list` filters the login
+/// credential record and secret configs out and `read` refuses them — deliberately,
+/// so no agent can enumerate or exfiltrate tokens — which means a migration
+/// written the obvious way copies everything *except* the password (and the
+/// Telegram/voice keys) and silently produces a machine whose owner cannot log
+/// in. The guards are exactly what they are for: kernel-side code, on a path a
+/// human typed, that legitimately needs the records.
 fn read_carry() -> (Vec<(String, Vec<u8>)>, Vec<(String, Dropped)>) {
     let _access = crate::synapse::fs::CredentialAccess::new();
+    let _secrets = crate::synapse::fs::SecretConfigAccess::new();
     let keys = crate::synapse::fs::list();
     let mut sized: Vec<(String, usize)> = Vec::with_capacity(keys.len());
     for k in &keys {

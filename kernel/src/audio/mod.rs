@@ -21,6 +21,10 @@
 //! as audio at twice the rate.
 
 pub mod aac;
+/// HUD chrome pulls icons / status-bar helpers the ring-3 tenant must not see.
+/// `userspace/mediadec` passes `--cfg chitti_tenant` (and may enable `tenant-guest`);
+/// the kernel never does either, so the HUD stays in the kernel build.
+#[cfg(not(any(feature = "tenant-guest", chitti_tenant)))]
 pub mod hud;
 pub mod mp3;
 pub mod mp3_tables;
@@ -148,7 +152,44 @@ pub fn waveform_peaks(pcm: &[i16], n: usize) -> Vec<u8> {
 
 /// Decode `bytes` by sniffing the container: RIFF/WAVE, MP3 (ID3 / frame
 /// sync), or ADTS AAC (`.aac`, syncword `0xFFF`).
+/// In-kernel audio parsers (MP3/AAC/WAV) run in ring 0. A size ceiling stops
+/// a crafted file from expanding into a multi-hundred-megabyte PCM buffer
+/// before the decoder can refuse; it is not a sandbox. Full confinement is a
+/// chunked ring-3 tenant (same shape as image decode).
+pub const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Length gate used by [`decode`]. Kept as a function so the unit suite can
+/// pin it without allocating a 32 MiB buffer.
+pub fn decode_too_large(len: usize) -> bool {
+    len > MAX_DECODE_BYTES
+}
+
 pub fn decode(bytes: &[u8]) -> Result<Audio, &'static str> {
+    if decode_too_large(bytes.len()) {
+        return Err("audio: file too large for the in-kernel decoder");
+    }
+    // Host harnesses (`h264diff`) mount this file and have no Synapse. The
+    // mediadec tenant mounts it too (`tenant-guest` / `chitti_tenant`) and has
+    // no `crate::synapse` — its session talks to wav/mp3/aac directly.
+    #[cfg(all(
+        not(feature = "real-audio"),
+        not(feature = "tenant-guest"),
+        not(chitti_tenant)
+    ))]
+    {
+        if crate::synapse::chunked_run::sandboxed_media() {
+            return match crate::synapse::chunked_run::decode_audio(bytes) {
+                Ok(a) => Ok(a),
+                Err(crate::synapse::tenant::LoadError::Declined { .. }) => {
+                    Err("the sandboxed decoder rejected this file (corrupt, or an unsupported variant)")
+                }
+                Err(crate::synapse::tenant::LoadError::Faulted) => {
+                    Err("the sandboxed decoder faulted on this file -- the kernel is unharmed")
+                }
+                Err(_) => Err("the audio decode sandbox could not be started"),
+            };
+        }
+    }
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
         wav::decode(bytes)
     } else if is_adts(bytes) {
@@ -189,6 +230,15 @@ mod tests {
     fn unknown_container_is_an_error() {
         assert!(decode(b"OggS....").is_err());
         assert!(decode(b"").is_err());
+    }
+
+    #[test_case]
+    fn oversized_buffers_are_refused_before_sniff() {
+        assert_eq!(MAX_DECODE_BYTES, 32 * 1024 * 1024);
+        assert!(!decode_too_large(0));
+        assert!(!decode_too_large(MAX_DECODE_BYTES));
+        assert!(decode_too_large(MAX_DECODE_BYTES + 1));
+        assert!(decode(b"OggS....").is_err());
     }
 
     #[test_case]

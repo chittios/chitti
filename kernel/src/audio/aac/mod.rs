@@ -821,6 +821,17 @@ mod tests {
     use super::*;
 
     #[test_case]
+    fn dsp_windows_live_on_the_heap_not_the_stack() {
+        // Pin: inline `[f32; 1024]` windows overflowed the mediadec tenant
+        // (64 KiB stack → data abort in `.rodata` on `/open sample.aac`).
+        assert!(
+            core::mem::size_of::<dsp::Dsp>() < 512,
+            "Dsp is {} bytes; window/IMDCT scratch must be heap Vecs",
+            core::mem::size_of::<dsp::Dsp>()
+        );
+    }
+
+    #[test_case]
     fn parse_asc_44100_stereo() {
         // 0x12 0x10 → AOT=2 LC, freq_idx=4 (44100), chcfg=2, frame 1024
         let a = parse_asc(&[0x12, 0x10]).unwrap();

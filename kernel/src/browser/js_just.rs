@@ -1850,6 +1850,16 @@ impl PluginResolver for DomResolver {
 /// (DOM untouched) if any script fails to parse, so the caller can fall back to
 /// the legacy engine; parse happens before any mutation.
 pub fn run_scripts_via_just(dom: &mut JsDom, scripts: &[String]) -> bool {
+    if crate::synapse::chunked_run::sandboxed_js() {
+        let packed = crate::synapse::chunked_run::pack_js_page(dom, scripts);
+        return match crate::synapse::chunked_run::js_eval_dom(&packed, scripts.len() as u64) {
+            Ok(muts) => {
+                let _ = crate::synapse::chunked_run::apply_js_mutations(dom, &muts);
+                true
+            }
+            Err(_) => false,
+        };
+    }
     let mut asts = Vec::with_capacity(scripts.len());
     for src in scripts {
         match JsParser::parse_to_ast_from_str(src) {
@@ -1949,6 +1959,54 @@ pub struct JsPage {
 /// single-threaded UI loop), and `.with()` serializes access.
 static JS_PAGE: crate::mm::Locked<Option<JsPage>> = crate::mm::Locked::new(None);
 
+struct SandboxPage {
+    shared: Rc<RefCell<JsDom>>,
+    interactive: alloc::vec::Vec<usize>,
+}
+static JS_SANDBOX: crate::mm::Locked<Option<SandboxPage>> = crate::mm::Locked::new(None);
+
+fn page_boot_sandbox(
+    doc: &super::html::Document,
+    location_href: &str,
+    inner_w: i32,
+    inner_h: i32,
+    scripts: &[String],
+) -> usize {
+    page_close();
+    let mut dom = JsDom::from_document(doc);
+    if !location_href.is_empty() {
+        dom.location_href = location_href.to_string();
+    }
+    dom.inner_width = inner_w;
+    dom.inner_height = inner_h;
+    let packed = crate::synapse::chunked_run::pack_js_page(&dom, scripts);
+    match crate::synapse::chunked_run::js_page_open(&packed, scripts.len() as u64) {
+        Ok(muts) => {
+            let interactive = crate::synapse::chunked_run::apply_js_mutations(&mut dom, &muts);
+            let parsed = scripts.len();
+            JS_SANDBOX.with(|s| {
+                *s = Some(SandboxPage {
+                    shared: Rc::new(RefCell::new(dom)),
+                    interactive,
+                })
+            });
+            parsed
+        }
+        Err(_) => {
+            dom.log.push(String::from(
+                "error: the js sandbox could not run this page",
+            ));
+            JS_SANDBOX.with(|s| {
+                *s = Some(SandboxPage {
+                    shared: Rc::new(RefCell::new(dom)),
+                    interactive: Vec::new(),
+                })
+            });
+            0
+        }
+    }
+}
+
 /// A UI event to deliver into page JS.
 pub struct PageEvent {
     /// Element index in `JsDom.elements` (the click target).
@@ -1971,6 +2029,9 @@ pub fn page_boot(
     inner_h: i32,
     scripts: &[String],
 ) -> usize {
+    if crate::synapse::chunked_run::sandboxed_js() {
+        return page_boot_sandbox(doc, location_href, inner_w, inner_h, scripts);
+    }
     page_close();
     let mut dom = JsDom::from_document(doc);
     if !location_href.is_empty() {
@@ -2106,7 +2167,11 @@ pub fn page_boot(
 /// interrupts off — click a Radix switch, the machine stops. If the lock is
 /// held we are *inside* a live page, so the answer is yes.
 pub fn page_active() -> bool {
-    JS_PAGE.try_with(|slot| slot.is_some()).unwrap_or(true)
+    if crate::synapse::chunked_run::js_page_live() {
+        return true;
+    }
+    JS_SANDBOX.try_with(|s| s.is_some()).unwrap_or(true)
+        || JS_PAGE.try_with(|slot| slot.is_some()).unwrap_or(true)
 }
 
 /// True when `JS_PAGE` is already held on this core. The animation tick must
@@ -2119,6 +2184,8 @@ pub fn page_lock_held() -> bool {
 /// [`JsPage`] guarantees closures die before the ASTs they point into.
 pub fn page_close() {
     JS_PAGE.with(|slot| *slot = None);
+    JS_SANDBOX.with(|s| *s = None);
+    crate::synapse::chunked_run::js_page_close();
     reset_elem_wrappers();
 }
 
@@ -2126,6 +2193,11 @@ pub fn page_close() {
 /// Returns `None` when no page is active, **or** when the page lock is
 /// already held (a click handler's tick must not re-enter).
 pub fn page_with_dom<R>(f: impl FnOnce(&mut JsDom) -> R) -> Option<R> {
+    if JS_SANDBOX.try_with(|s| s.is_some()).unwrap_or(false) {
+        return JS_SANDBOX
+            .try_with(|s| s.as_mut().map(|p| f(&mut *p.shared.borrow_mut())))
+            .flatten();
+    }
     JS_PAGE
         .try_with(|slot| slot.as_mut().map(|p| f(&mut *p.shared.borrow_mut())))
         .flatten()
@@ -2134,6 +2206,9 @@ pub fn page_with_dom<R>(f: impl FnOnce(&mut JsDom) -> R) -> Option<R> {
 /// Element indices that should be hit-testable: everything with a registered
 /// listener or an inline `on*` attribute.
 pub fn page_interactive_elems() -> alloc::vec::Vec<usize> {
+    if let Some(v) = JS_SANDBOX.try_with(|s| s.as_ref().map(|p| p.interactive.clone())).flatten() {
+        return v;
+    }
     JS_PAGE.try_with(|slot| {
         let Some(p) = slot.as_mut() else { return Vec::new() };
         let mut out: Vec<usize> = p
@@ -2159,7 +2234,36 @@ pub fn page_interactive_elems() -> alloc::vec::Vec<usize> {
 /// Dispatch UI events into page JS: capture (window → document → ancestors)
 /// → target (inline `on*` attr first, then listeners) → bubble (ancestors →
 /// document → window). Returns one `default_prevented` flag per event.
+fn page_dispatch_sandbox(events: &[PageEvent]) -> alloc::vec::Vec<bool> {
+    let mut out = alloc::vec::Vec::with_capacity(events.len());
+    for ev in events {
+        let ty = match ev.type_.as_str() {
+            "input" => crate::synapse::chunked::JS_EV_INPUT,
+            "keydown" => crate::synapse::chunked::JS_EV_KEYDOWN,
+            _ => crate::synapse::chunked::JS_EV_CLICK,
+        };
+        match crate::synapse::chunked_run::js_page_event(ty, ev.target, ev.x, ev.y) {
+            Ok(muts) => {
+                JS_SANDBOX.with(|s| {
+                    if let Some(p) = s.as_mut() {
+                        p.interactive = crate::synapse::chunked_run::apply_js_mutations(
+                            &mut *p.shared.borrow_mut(),
+                            &muts,
+                        );
+                    }
+                });
+                out.push(false);
+            }
+            Err(_) => out.push(false),
+        }
+    }
+    out
+}
+
 pub fn page_dispatch(events: &[PageEvent]) -> alloc::vec::Vec<bool> {
+    if crate::synapse::chunked_run::js_page_live() {
+        return page_dispatch_sandbox(events);
+    }
     let _ = drain_console_log();
     // A handler is JS too, and a click into an infinite loop is just as fatal
     // as a script that never returns. Re-armed per dispatch so a page that

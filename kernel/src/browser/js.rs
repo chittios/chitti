@@ -42,6 +42,9 @@ use alloc::rc::Rc;
 const MAX_STEPS: u32 = 200_000;
 const MAX_LOOP: u32 = 10_000;
 const MAX_CALL_DEPTH: u32 = 64;
+/// Page `<script>` bodies parse in the kernel. A ceiling stops a multi-megabyte
+/// script from becoming the working set of the interpreter; it is not a sandbox.
+const MAX_SCRIPT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub enum Val {
@@ -494,6 +497,58 @@ pub(crate) fn empty_elem(tag: &str) -> ElemRef {
 /// Run all scripts; returns log lines. Mutates `dom` (title, element text/style).
 /// Tries the bytecode VM (`js_bc`) first for simple scripts, then the AST engine.
 pub fn run_scripts(dom: &mut JsDom, scripts: &[String]) -> Vec<String> {
+    let scripts: alloc::vec::Vec<String> = scripts
+        .iter()
+        .filter(|s| s.len() <= MAX_SCRIPT_BYTES)
+        .cloned()
+        .collect();
+    let uses_dom_early = scripts.iter().any(|s| {
+        s.contains("document")
+            || s.contains("localStorage")
+            || s.contains("sessionStorage")
+            || s.contains("window")
+            || s.contains("location")
+            || s.contains("fetch")
+            || s.contains("postMessage")
+            || s.contains("parent")
+            || s.contains("getContext")
+            || s.contains("canvas")
+            || s.contains("WebAssembly")
+    });
+    // Page scripts parse in ring 3. DOM bindings go through a packed element
+    // table; there is no in-kernel fallback (a sandbox failure is a refused page).
+    if crate::synapse::chunked_run::sandboxed_js() && !scripts.is_empty() {
+        if uses_dom_early {
+            if super::js_just::run_scripts_via_just(dom, &scripts) {
+                return dom.log.clone();
+            }
+            dom.log.push(String::from(
+                "error: the js sandbox could not run this script",
+            ));
+            return dom.log.clone();
+        }
+        match crate::synapse::chunked_run::eval_scripts(&scripts) {
+            Ok(log) => {
+                for line in log.lines() {
+                    if let Some(rest) = line.strip_prefix("title=") {
+                        dom.title = rest.to_string();
+                    } else if line.starts_with("value=") || line.is_empty() {
+                        continue;
+                    } else {
+                        dom.log.push(line.to_string());
+                    }
+                }
+                return dom.log.clone();
+            }
+            Err(_) => {
+                dom.log.push(String::from(
+                    "error: the js sandbox could not run this script",
+                ));
+                return dom.log.clone();
+            }
+        }
+    }
+    let scripts = scripts.as_slice();
     // Seed last inbound message for scripts (`messageData` / `messageOrigin`).
     let (msg_data, msg_origin) = dom
         .inbound_messages
@@ -4145,6 +4200,23 @@ mod tests {
         assert!(logs.iter().any(|l| l.contains("hi") && l.contains("3")), "{logs:?}");
         commit_to_tree(&mut doc.root, &dom);
         let _ = doc;
+    }
+
+    #[test_case]
+    fn oversized_scripts_are_skipped() {
+        // The ceiling is a working-set bound, not a sandbox. A script just over
+        // it must not run (it would have set the title if it did); a later
+        // in-budget script still does.
+        let mut doc = html::parse("<html><head><title>Old</title></head><body></body></html>");
+        let mut dom = JsDom::from_document(&doc);
+        let big = "document.title = \"pwned\";".to_string()
+            + &alloc::string::String::from_utf8(alloc::vec![b' '; MAX_SCRIPT_BYTES]).unwrap();
+        assert!(big.len() > MAX_SCRIPT_BYTES);
+        let _ = run_scripts(
+            &mut dom,
+            &[big, String::from(r#"document.title = "New";"#)],
+        );
+        assert_eq!(dom.title, "New", "the oversized script must not have run");
     }
 
     #[test_case]

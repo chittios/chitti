@@ -77,7 +77,7 @@ fn drop_meta(path: &str) {
 
 /// Metadata for a store key, if recorded.
 pub fn meta(path: &str) -> Option<FileMeta> {
-    if credential_refused(path) {
+    if protected_refused(path) {
         return None;
     }
     let key = vpath::normalize(path);
@@ -86,8 +86,8 @@ pub fn meta(path: &str) -> Option<FileMeta> {
 
 /// Set owner (agent id). Cosmetic — does not grant authority.
 pub fn chown(path: &str, uid: u32) -> Result<(), &'static str> {
-    if credential_refused(path) {
-        return Err(CREDENTIAL_REFUSAL);
+    if protected_refused(path) {
+        return Err(refusal_message(path));
     }
     let key = vpath::normalize(path);
     if !exists(&key) {
@@ -104,8 +104,8 @@ pub fn chown(path: &str, uid: u32) -> Result<(), &'static str> {
 
 /// Set permission bits (low 12). Cosmetic for listings.
 pub fn chmod(path: &str, mode_bits: u16) -> Result<(), &'static str> {
-    if credential_refused(path) {
-        return Err(CREDENTIAL_REFUSAL);
+    if protected_refused(path) {
+        return Err(refusal_message(path));
     }
     let key = vpath::normalize(path);
     if !exists(&key) {
@@ -159,7 +159,7 @@ static TAINT: Locked<BTreeMap<String, crate::security::Provenance>> = Locked::ne
 pub fn write_tagged(path: &str, contents: &[u8], prov: crate::security::Provenance) {
     // `write` would refuse the credential record anyway; returning here as well
     // stops a taint tag being filed for a file that was never created.
-    if credential_refused(path) {
+    if protected_refused(path) {
         return;
     }
     write(path, contents);
@@ -270,9 +270,17 @@ pub fn end_batch() {
 /// `no_shell_file_command_can_read_or_remove_the_credential_record` asserts.
 pub const CREDENTIAL_REFUSAL: &str = "refused: the login credential record is not reachable from the filesystem";
 
+/// What a refused **secret-config** mutation reports (channel tokens, voice keys).
+pub const SECRET_REFUSAL: &str = "refused: this configuration file is not reachable from the filesystem";
+
 /// Set while `auth::store` is legitimately touching the record. The only way
 /// through [`credential_refused`].
 static CREDENTIAL_ACCESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set while kernel code that owns the channel/voice config is reading or
+/// writing it (`msgchan`, `voice_remote`, install carry). The only way through
+/// [`secret_config_refused`].
+static SECRET_ACCESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// RAII permission to touch the credential record, held only by
 /// [`crate::auth::store`]. Restores the previous value on drop rather than
@@ -298,10 +306,71 @@ fn credential_refused(path: &str) -> bool {
     !CREDENTIAL_ACCESS.load(core::sync::atomic::Ordering::Relaxed) && crate::auth::is_credential_path(path)
 }
 
+/// RAII permission to touch secret config (`channels.json`, `voice.json`).
+/// Held by [`crate::msgchan`], [`crate::shell::voice_remote`], and install carry.
+pub(crate) struct SecretConfigAccess(bool);
+
+impl SecretConfigAccess {
+    pub(crate) fn new() -> SecretConfigAccess {
+        SecretConfigAccess(SECRET_ACCESS.swap(true, core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for SecretConfigAccess {
+    fn drop(&mut self) {
+        SECRET_ACCESS.store(self.0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn secret_config_refused(path: &str) -> bool {
+    !SECRET_ACCESS.load(core::sync::atomic::Ordering::Relaxed) && is_secret_config_path(path)
+}
+
+/// Login record **or** secret config, and no matching guard is held.
+fn protected_refused(path: &str) -> bool {
+    credential_refused(path) || secret_config_refused(path)
+}
+
+fn refusal_message(path: &str) -> &'static str {
+    if crate::auth::is_credential_path(path) {
+        CREDENTIAL_REFUSAL
+    } else {
+        SECRET_REFUSAL
+    }
+}
+
+fn visible_in_list(path: &str) -> bool {
+    if crate::auth::is_credential_path(path) {
+        return CREDENTIAL_ACCESS.load(core::sync::atomic::Ordering::Relaxed);
+    }
+    if is_secret_config_path(path) {
+        return SECRET_ACCESS.load(core::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
+/// Paths that re-enter an agent as trusted persona / durable memory.
+/// Writing them under untrusted justification is taint-laundering; the
+/// executor's identity-file gate and wasm `host_fs_write` both consult this.
+pub fn is_identity_path(path: &str) -> bool {
+    let n = vpath::normalize(path);
+    let base = n.rsplit('/').next().unwrap_or(n.as_str());
+    base.eq_ignore_ascii_case("SOUL.md") || base.eq_ignore_ascii_case("MEMORY.md")
+}
+
+/// Store keys that hold credentials an agent must not read through the
+/// filesystem (`/cat`, wasm `host_fs_read`, glob/grep). Telegram bot tokens
+/// and remote-voice API keys. `auth.json` is covered separately by the
+/// credential facade. Kernel owners hold [`SecretConfigAccess`].
+pub fn is_secret_config_path(path: &str) -> bool {
+    let n = vpath::normalize(path);
+    n == "/configs/core/channels.json" || n == "/configs/core/voice.json"
+}
+
 /// Create or replace the file at `path` with `contents`.
 /// Paths are normalised (`..` / `//` collapsed) so keys stay canonical.
 pub fn write(path: &str, contents: &[u8]) {
-    if credential_refused(path) {
+    if protected_refused(path) {
         return;
     }
     let path = vpath::normalize(path);
@@ -316,7 +385,7 @@ pub fn write(path: &str, contents: &[u8]) {
 
 /// Read the file at `path`, or `None` if it does not exist.
 pub fn read(path: &str) -> Option<Vec<u8>> {
-    if credential_refused(path) {
+    if protected_refused(path) {
         return None;
     }
     let path = vpath::normalize(path);
@@ -337,26 +406,23 @@ pub fn exists(path: &str) -> bool {
 
 /// All file paths, sorted, so `list` output is deterministic run-to-run.
 ///
-/// The credential record is filtered out: `list` feeds `glob`, `grep` and the
-/// tool router's `readable_paths`, so leaving it in would let an agent find it
-/// (and, with `grep`, oracle its contents a byte at a time) without ever calling
-/// `read`.
+/// The credential record and secret configs are filtered out: `list` feeds
+/// `glob`, `grep` and the tool router's `readable_paths`, so leaving them in
+/// would let an agent find a token (and, with `grep`, oracle its contents a
+/// byte at a time) without ever calling `read`.
 pub fn list() -> Vec<String> {
     let all: Vec<String> = STORE.with(|b| match b {
         Backend::Memory(s) => s.keys().cloned().collect(),
         Backend::Ext4(s) => s.list(),
     });
-    if CREDENTIAL_ACCESS.load(core::sync::atomic::Ordering::Relaxed) {
-        return all;
-    }
-    all.into_iter().filter(|p| !crate::auth::is_credential_path(p)).collect()
+    all.into_iter().filter(|p| visible_in_list(p)).collect()
 }
 
 /// Delete the file at `path`. Returns whether a file was actually removed.
 /// **Destructive / irreversible** -- the reason `mem_fs_delete` is gated on
 /// provenance by the Synapse taint gate (Phase 6).
 pub fn delete(path: &str) -> bool {
-    if credential_refused(path) {
+    if protected_refused(path) {
         return false;
     }
     let path = vpath::normalize(path);
@@ -373,7 +439,7 @@ pub fn delete(path: &str) -> bool {
 
 /// Byte size of a file key, or `None` if missing.
 pub fn size_of(path: &str) -> Option<usize> {
-    if credential_refused(path) {
+    if protected_refused(path) {
         return None;
     }
     let path = vpath::normalize(path);
@@ -386,10 +452,15 @@ pub fn size_of(path: &str) -> Option<usize> {
 /// All store keys with their sizes (for hierarchical listing).
 fn list_with_sizes() -> Vec<(String, usize)> {
     STORE.with(|b| match b {
-        Backend::Memory(s) => s.iter().map(|(k, v)| (k.clone(), v.len())).collect(),
+        Backend::Memory(s) => s
+            .iter()
+            .filter(|(k, _)| visible_in_list(k))
+            .map(|(k, v)| (k.clone(), v.len()))
+            .collect(),
         Backend::Ext4(s) => s
             .list()
             .into_iter()
+            .filter(|k| visible_in_list(k))
             .map(|k| {
                 let sz = s.read(&k).map(|v| v.len()).unwrap_or(0);
                 (k, sz)
@@ -423,8 +494,8 @@ pub fn is_file(path: &str) -> bool {
 /// Create a directory by writing an empty `.keep` marker (idempotent).
 /// With `parents`, create every missing ancestor the same way.
 pub fn mkdir(path: &str, parents: bool) -> Result<(), &'static str> {
-    if credential_refused(path) {
-        return Err(CREDENTIAL_REFUSAL);
+    if protected_refused(path) {
+        return Err(refusal_message(path));
     }
     let path = vpath::normalize(path);
     if path == "/" {
@@ -471,8 +542,8 @@ pub fn mkdir(path: &str, parents: bool) -> Result<(), &'static str> {
 
 /// Create an empty file (or update mtime-equivalent by rewriting).
 pub fn touch(path: &str) -> Result<(), &'static str> {
-    if credential_refused(path) {
-        return Err(CREDENTIAL_REFUSAL);
+    if protected_refused(path) {
+        return Err(refusal_message(path));
     }
     let path = vpath::normalize(path);
     if path == "/" {
@@ -502,8 +573,11 @@ pub fn touch(path: &str) -> Result<(), &'static str> {
 pub fn copy(src: &str, dst: &str, recursive: bool) -> Result<usize, &'static str> {
     // Both ends: copying *from* the record would duplicate the verifier to a
     // readable path, and copying *onto* it would replace the password.
-    if credential_refused(src) || credential_refused(dst) {
-        return Err(CREDENTIAL_REFUSAL);
+    if protected_refused(src) {
+        return Err(refusal_message(src));
+    }
+    if protected_refused(dst) {
+        return Err(refusal_message(dst));
     }
     let src = vpath::normalize(src);
     let dst_in = vpath::normalize(dst);
@@ -563,8 +637,11 @@ pub fn copy(src: &str, dst: &str, recursive: bool) -> Result<usize, &'static str
 pub fn rename(src: &str, dst: &str) -> Result<usize, &'static str> {
     // Both ends: renaming the record *away* removes the gate as surely as
     // deleting it, and renaming something *onto* it replaces the password.
-    if credential_refused(src) || credential_refused(dst) {
-        return Err(CREDENTIAL_REFUSAL);
+    if protected_refused(src) {
+        return Err(refusal_message(src));
+    }
+    if protected_refused(dst) {
+        return Err(refusal_message(dst));
     }
     let src = vpath::normalize(src);
     let dst_in = vpath::normalize(dst);
@@ -651,8 +728,8 @@ pub fn rename(src: &str, dst: &str) -> Result<usize, &'static str> {
 /// [`list`], which filters the credential record out, and [`delete`] guards it
 /// again anyway.
 pub fn remove(path: &str, recursive: bool) -> Result<usize, &'static str> {
-    if credential_refused(path) {
-        return Err(CREDENTIAL_REFUSAL);
+    if protected_refused(path) {
+        return Err(refusal_message(path));
     }
     let path = vpath::normalize(path);
     if path == "/" {
@@ -697,6 +774,26 @@ mod tests {
         assert_eq!(read("fs_test_a").as_deref(), Some(&b"world"[..]));
         assert!(exists("fs_test_a"));
         assert!(!exists("fs_test_missing"));
+    }
+
+    #[test_case]
+    fn identity_and_secret_paths_are_recognised_through_normalisation() {
+        assert!(is_identity_path("/agent/1/SOUL.md"));
+        assert!(is_identity_path("/agent/1/../1/memory.md"));
+        assert!(!is_identity_path("/agent/1/SOUL.md.bak"));
+        assert!(is_secret_config_path("/configs/core/channels.json"));
+        assert!(is_secret_config_path("/configs/core/../core/voice.json"));
+        assert!(!is_secret_config_path("/configs/core/ui.json"));
+
+        write("/configs/core/channels.json", b"token-should-not-stick");
+        assert!(read("/configs/core/channels.json").is_none());
+        {
+            let _s = SecretConfigAccess::new();
+            write("/configs/core/channels.json", b"{\"token\":\"ok\"}");
+            assert_eq!(read("/configs/core/channels.json").as_deref(), Some(&b"{\"token\":\"ok\"}"[..]));
+            delete("/configs/core/channels.json");
+        }
+        assert!(read("/configs/core/channels.json").is_none());
     }
 
     /// The object-provenance half of the value-granular experiment: a write

@@ -244,18 +244,22 @@ pub fn load_image(b: Blob) -> Result<Loaded, LoadError> {
             }
         }
     }
-    // **Sixteen stack pages, not one.** A single page was enough for hand-written asm that
-    // touched no stack at all, and it silently was not enough for a real decoder: `png::decode`
-    // faulted mid-run (`#GP` at a code address, after an early-rejected input had succeeded on
-    // the same path), which is what a stack running off its page looks like when there is no
-    // guard page under it. Cheap to be generous — this is one mapping per run, and 64 KiB is
-    // still small against the arena.
+    // **2 MiB of stack, plus an unmapped guard under it.** Sixteen pages (64 KiB)
+    // was enough for PNG after in-place unfilter, and 64 pages (256 KiB) was
+    // enough for AAC once `Dsp` windows moved to the heap. It was not enough for
+    // page JS: pest's recursive parse of `/samples/html/shadcn.js` (~222 KiB
+    // React 18 IIFE) ran off the bottom of the stack into the guard. FAR sat
+    // 64 bytes below `stack_page` (ESR 0x92000047, translation fault level 3),
+    // page-boot logged `the js sandbox could not run this page`, and the gallery
+    // froze on "loading shadcn/ui bundle…". 512 pages is the margin for that
+    // descent; the guard still turns overflow into a named fault.
     //
-    // There is no guard page here either, so an overflow past this corrupts the RW image below
-    // it rather than faulting. Worth fixing when a decoder's real depth is known; for now the
-    // margin is the mitigation.
-    const STACK_PAGES: u64 = 16;
-    let stack_page = base + b.rx + b.rw;
+    // The guard is one unmapped page between `.bss` and the stack. Overflow used to
+    // corrupt the RW image (writable, so silent) before hitting RX; an unmapped gap
+    // turns that into a translation fault at the first overflowing store.
+    const STACK_PAGES: u64 = 512;
+    const GUARD_PAGES: u64 = 1;
+    let stack_page = base + b.rx + b.rw + GUARD_PAGES * PAGE;
     for p in 0..STACK_PAGES {
         space.map_new_page(stack_page + p * PAGE, UserPerms::RW).map_err(|_| LoadError::Map)?;
     }
@@ -468,9 +472,9 @@ mod tests {
         //
         // Asserted by contrast so it cannot pass for the wrong reason: the same call, as
         // the same task, differing *only* in the justification the kernel set. Note the
-        // primitive has to be a genuinely destructive one — `mem_fs_write` is
-        // `Effect::INERT` and the taint gate does not touch it, which is what made a
-        // first version of this test pass a tainted write and prove nothing.
+        // primitive has to be a genuinely destructive one. `mem_fs_write` is
+        // irreversible too; this test uses delete so a permitted call is visible
+        // as the file vanishing rather than as bytes that happened to land.
         let tenant = crate::sched::spawn_parked("justification-probe");
         let spec = crate::synapse::registry::by_name("mem_fs_delete").expect("mem_fs_delete is registered");
         crate::cap::grant(tenant, crate::cap::Right::InvokePrimitive(spec.id));

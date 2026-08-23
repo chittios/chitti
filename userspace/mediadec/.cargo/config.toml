@@ -1,0 +1,24 @@
+# Mirrors `userspace/imgdec`: custom target JSON plus `build-std`.
+[build]
+target = "../../targets/x86_64-chitti-user.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
+
+# `--cfg chitti_tenant` gates `audio::hud` (icons) out of the mounted kernel
+# sources. The linker script differs per arch only in USER_BASE.
+[target.x86_64-chitti-user]
+rustflags = [
+    "-C", "link-arg=-T../../userspace/mediadec/link-x86_64.ld",
+    "-C", "link-arg=-no-pie",
+    "--cfg", "chitti_tenant",
+]
+
+[target.aarch64-chitti-user]
+rustflags = [
+    "-C", "link-arg=-T../../userspace/mediadec/link-aarch64.ld",
+    "-C", "link-arg=-no-pie",
+    "--cfg", "chitti_tenant",
+]

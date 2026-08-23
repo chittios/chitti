@@ -25,6 +25,7 @@
 pub mod abi;
 pub mod citation;
 pub mod chunked;
+pub mod chunked_run;
 pub mod tenant;
 pub mod audit;
 pub mod bench;

@@ -1489,6 +1489,45 @@ fn taint_gate_blocks_identity_file_write() {
     let _ = sched::kill(task);
 }
 
+/// Ordinary store writes are irreversible: a tainted turn must not plant a
+/// file that the next turn reads as trusted context.
+#[test_case]
+fn taint_gate_blocks_ordinary_store_write() {
+    use security::taint::{Justification, Provenance as TaintProv};
+
+    let task = sched::spawn_parked("taint-write");
+    let caps = alloc::vec![agent::types::CapabilityRequest::new(
+        agent::types::CapDomain::Fs,
+        agent::types::Rights::WRITE | agent::types::Rights::READ,
+        agent::types::Scope::Any,
+    )];
+    agent::manifest::grant_to_task(task, &caps);
+
+    // A path no other test seeds: `/redteam/planted.txt` is written by the
+    // CapsOnly redteam baseline, and the store is process-global.
+    let raw = r#"{"name":"mem_fs_write","arguments":{"path":"/taint-ordinary/planted.txt","text":"pwned"}}"#;
+    let j = Justification::from_context(TaintProv::UntrustedIngested);
+    let refused = synapse::execute_with_justification(task, raw, j);
+    assert!(
+        matches!(refused, synapse::Invocation::RefusedTainted { .. }),
+        "tainted store write must refuse: {refused:?}"
+    );
+    assert!(synapse::fs::read("/taint-ordinary/planted.txt").is_none(), "the write must not have landed");
+    let ok = synapse::execute(task, raw);
+    assert!(matches!(ok, synapse::Invocation::Executed { .. }), "trusted write: {ok:?}");
+
+    let edit_path = "/taint-ordinary/edit_me.txt";
+    synapse::fs::write(edit_path, b"draft text");
+    let edit = r#"{"name":"mem_fs_edit","arguments":{"path":"/taint-ordinary/edit_me.txt","old":"draft","new":"pwned"}}"#;
+    let refused_edit = synapse::execute_with_justification(task, edit, j);
+    assert!(
+        matches!(refused_edit, synapse::Invocation::RefusedTainted { .. }),
+        "tainted store edit must refuse: {refused_edit:?}"
+    );
+    assert_eq!(synapse::fs::read(edit_path).as_deref(), Some(&b"draft text"[..]));
+    let _ = sched::kill(task);
+}
+
 /// `Scope::Net` coverage (host glob + port range) — the pure attenuation math
 /// the Net scope gate relies on. Narrows, never widens.
 #[test_case]

@@ -1,0 +1,42 @@
+# A **userspace** tenant: compiled for ring 3 / EL0 and loaded by
+# `kernel/src/synapse/tenant.rs`. It shares no code with the kernel and links
+# against nothing but `core` + `alloc` + the vendored just-engine (page JS
+# parser/interpreter — the attacker-facing part).
+#
+# Outside the workspace on purpose, exactly as `kernel/` and `userspace/imgdec/`
+# are: it has its own target, its own linker script, and must not inherit
+# workspace-level settings.
+[package]
+name = "chitti-jsint"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[[bin]]
+name = "jsint"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+# Small and predictable: the blob is copied into mapped pages at load time.
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+
+[profile.dev]
+panic = "abort"
+
+# Same pest stack the kernel builds — otherwise this tenant would measure a
+# different parser than the one that used to run in ring 0.
+[patch.crates-io]
+pest = { path = "../../third_party/pest" }
+pest_derive = { path = "../../third_party/pest_derive" }
+pest_generator = { path = "../../third_party/pest_generator" }
+pest_meta = { path = "../../third_party/pest_meta" }
+pest_consume = { path = "../../third_party/pest_consume" }
+pest_consume_macros = { path = "../../third_party/pest_consume_macros" }
+
+[dependencies]
+just-engine = { path = "../../third_party/just-ref", default-features = false }

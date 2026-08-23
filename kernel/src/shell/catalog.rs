@@ -65,7 +65,14 @@ pub const COMMAND_ALIASES: &[&str] = &[
 // `ssh-keygen` is here because *overwriting* a private key locks the human out
 // of every server that trusts it — so no schedule may fire it and no package may
 // claim the name, exactly as for the login commands.
-pub const RESERVED_HUMAN_ONLY: &[&str] = &["passwd", "password", "lock", "ssh-keygen"];
+//
+// `/mode` sets the kernel approval policy (including Bypass). `/tls insecure`
+// disables certificate verification for every HTTPS client on the machine.
+// `/js` is the in-kernel interpreter + on-machine compiler. `/decoder kernel`
+// puts the image parser back in ring 0. All used to live in `dispatch_system`,
+// so `run_shell_command` — which is in CORE_TOOLS — could reach them.
+pub const RESERVED_HUMAN_ONLY: &[&str] =
+    &["passwd", "password", "lock", "ssh-keygen", "mode", "tls", "js", "decoder"];
 
 /// Whether `name` names a human-only command that automation must not install.
 pub fn is_human_only(name: &str) -> bool {
@@ -175,6 +182,7 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "Network", title: "Generate an SSH Key", name: "ssh-keygen", shortcut: "" },
     Entry { category: "Network", title: "Wi-Fi", name: "wifi", shortcut: "" },
     Entry { category: "Network", title: "HTTP Client", name: "http", shortcut: "" },
+    Entry { category: "Network", title: "TLS certificate verification", name: "tls", shortcut: "" },
     Entry {
         category: "Network",
         title: "Browse URL / file:///samples/html/…",
@@ -209,10 +217,9 @@ pub const ENTRIES: &[Entry] = &[
     Entry { category: "System & UI", title: "Keyboard Layout & IME", name: "keyboard", shortcut: "" },
     Entry { category: "System & UI", title: "Notifications", name: "notify", shortcut: "" },
     Entry { category: "System & UI", title: "Touchscreen", name: "touchscreen", shortcut: "" },
-    // Login. Listed here so `/help` and Tab completion find them — they are
-    // **interactive-only** (matched in the REPL, never in `dispatch_system`), so
-    // being in this catalogue does not make them reachable by an agent. See
-    // `shell::auth` for why that distinction is the whole security property.
+    // Human-only. Listed here so `/help` and Tab completion find them — they
+    // are **interactive-only** (matched in the REPL, never in `dispatch_system`),
+    // so being in this catalogue does not make them reachable by an agent.
     Entry { category: "System & UI", title: "Login Password", name: "passwd", shortcut: "" },
     Entry { category: "System & UI", title: "Lock Console", name: "lock", shortcut: "" },
     Entry { category: "System & UI", title: "Suspend", name: "suspend", shortcut: "" },
