@@ -1063,7 +1063,7 @@ fn decoder_cmd(arg: &str) {
             };
             serial_println!("decoder> images decode in {where_}");
             serial_println!(
-                "decoder>   audio/js/video {}  (H.264/AAC/JS bitstream in mediadec/jsint tenants)",
+                "decoder>   audio/js/video/html {}  (bitstream + HTML tokenize in mediadec/jsint tenants)",
                 if crate::synapse::chunked_run::sandboxed_media()
                     && crate::synapse::chunked_run::sandboxed_js()
                 {
@@ -1081,7 +1081,7 @@ fn decoder_cmd(arg: &str) {
             crate::synapse::tenant::set_sandboxed_decode(true);
             crate::synapse::chunked_run::set_sandboxed_media(true);
             crate::synapse::chunked_run::set_sandboxed_js(true);
-            serial_println!("decoder> images, audio, video bitstream, and page JS now decode in ring 3");
+            serial_println!("decoder> images, audio, video bitstream, HTML, and page JS now decode in ring 3");
         }
         "kernel" | "ring0" | "off" => {
             crate::synapse::tenant::set_sandboxed_decode(false);

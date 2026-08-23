@@ -259,10 +259,24 @@ pub fn run_to_idle(
     max_units: u64,
     mut on_chunk: impl FnMut(&ChunkedTenant, &ChunkBlock) -> Result<(), LoadError>,
 ) -> Result<ChunkBlock, LoadError> {
+    run_to_idle_meta(tenant, input, max_units, 0, on_chunk)
+}
+
+fn run_to_idle_meta(
+    tenant: &mut ChunkedTenant,
+    input: &[u8],
+    max_units: u64,
+    init_meta0: u64,
+    mut on_chunk: impl FnMut(&ChunkedTenant, &ChunkBlock) -> Result<(), LoadError>,
+) -> Result<ChunkBlock, LoadError> {
     tenant.copy_input(input)?;
     let mut cmd = ChunkCmd::Init;
     loop {
-        let blk = tenant.enter(cmd, max_units)?;
+        let blk = if cmd == ChunkCmd::Init {
+            tenant.enter_meta(cmd, max_units, init_meta0, 0, 0, 0)?
+        } else {
+            tenant.enter(cmd, max_units)?
+        };
         let Some(st) = blk.status() else {
             return Err(LoadError::Declined { status: blk.cmd_or_status });
         };
@@ -370,7 +384,7 @@ pub fn decode_audio(bytes: &[u8]) -> Result<crate::audio::Audio, LoadError> {
     let mut pcm: Vec<i16> = Vec::new();
     let mut rate = 0u32;
     let mut channels = 1u8;
-    let result = run_to_idle(&mut tenant, bytes, 32, |t, blk| {
+    let result = run_to_idle_meta(&mut tenant, bytes, 32, chunked::KIND_AUDIO, |t, blk| {
         if blk.kind != chunked::KIND_AUDIO && blk.output_len == 0 {
             return Ok(());
         }
@@ -480,24 +494,32 @@ impl VideoPipe {
     }
 
     fn init_with_oom(tenant: &mut ChunkedTenant) -> Result<ChunkBlock, LoadError> {
-        let blk = tenant.enter(ChunkCmd::Init, 1)?;
-        let st = blk.status().ok_or(LoadError::Declined { status: blk.cmd_or_status })?;
-        if matches!(st, ChunkStatus::Failed | ChunkStatus::Cancelled) {
-            return Err(LoadError::Declined { status: blk.cmd_or_status });
+        loop {
+            let blk = tenant.enter(ChunkCmd::Init, 1)?;
+            let st = blk.status().ok_or(LoadError::Declined { status: blk.cmd_or_status })?;
+            match st {
+                ChunkStatus::Failed | ChunkStatus::Cancelled => {
+                    return Err(LoadError::Declined { status: blk.cmd_or_status });
+                }
+                ChunkStatus::OutOfMemory => {
+                    let want = tenant.wanted_heap().max(tenant.heap_bytes() * 2).min(MAX_HEAP);
+                    if want <= tenant.heap_bytes() || !tenant.grow_heap(want) {
+                        return Err(LoadError::NoAddressSpace);
+                    }
+                }
+                ChunkStatus::NeedMore | ChunkStatus::Done => {
+                    // Init can succeed inside the default 8 MiB while HEAP_WANT
+                    // names the whole-clip bump arena. Honour it *before*
+                    // Continue: an OOM mid-AU leaves CABAC unusable and used
+                    // to surface as `display N failed: Declined { status: 4 }`.
+                    let want = tenant.wanted_heap().min(MAX_HEAP);
+                    if want > tenant.heap_bytes() && !tenant.grow_heap(want) {
+                        return Err(LoadError::NoAddressSpace);
+                    }
+                    return Ok(blk);
+                }
+            }
         }
-        if st != ChunkStatus::OutOfMemory {
-            return Ok(blk);
-        }
-        let want = tenant.wanted_heap().max(tenant.heap_bytes() * 2).min(MAX_HEAP);
-        if !tenant.grow_heap(want) {
-            return Err(LoadError::NoAddressSpace);
-        }
-        let blk = tenant.enter(ChunkCmd::Init, 1)?;
-        let st = blk.status().ok_or(LoadError::Declined { status: blk.cmd_or_status })?;
-        if matches!(st, ChunkStatus::Failed | ChunkStatus::Cancelled) {
-            return Err(LoadError::Declined { status: blk.cmd_or_status });
-        }
-        Ok(blk)
     }
 
     pub fn pts_ms(&self, idx: usize) -> u64 {
@@ -684,6 +706,177 @@ pub fn eval_scripts(scripts: &[alloc::string::String]) -> Result<String, LoadErr
 
 static JS_PAGE: crate::mm::Locked<Option<ChunkedTenant>> = crate::mm::Locked::new(None);
 
+/// Pack raw HTML so the jsint tenant tokenizes it (`JS_HTML_MAGIC`).
+pub fn pack_html_page(src: &str, href: &str, inner_w: i32, inner_h: i32, run_scripts: bool) -> Vec<u8> {
+    use super::chunked::{put_str, put_u32, JS_HTML_MAGIC, JS_HTML_RUN_SCRIPTS};
+    let mut out = Vec::new();
+    put_u32(&mut out, JS_HTML_MAGIC);
+    put_u32(&mut out, if run_scripts { JS_HTML_RUN_SCRIPTS } else { 0 });
+    put_u32(&mut out, inner_w as u32);
+    put_u32(&mut out, inner_h as u32);
+    put_str(&mut out, href);
+    put_str(&mut out, src);
+    out
+}
+
+/// Tokenize HTML in ring 3. Layout still runs in the kernel over the
+/// reconstructed tree; the `htmlparser` walk never happens at EL1.
+pub fn parse_html_sandbox(src: &str) -> Result<crate::browser::html::Document, LoadError> {
+    let packed = pack_html_page(src, "", 640, 400, false);
+    let muts = js_eval_dom(&packed, 1)?;
+    let css = extract_css(&muts);
+    let mut dummy = empty_jsdom();
+    let _ = apply_js_mutations(&mut dummy, &muts);
+    Ok(document_from_jsdom(&dummy, css))
+}
+
+fn extract_css(bytes: &[u8]) -> String {
+    use super::chunked::{get_bytes, get_u32, JS_MUT_MAGIC, JS_OP_CSS};
+    let mut off = 0usize;
+    let Some(mag) = get_u32(bytes, &mut off) else { return String::new() };
+    if mag != JS_MUT_MAGIC {
+        return String::new();
+    }
+    let Some(n) = get_u32(bytes, &mut off) else { return String::new() };
+    let mut css = String::new();
+    for _ in 0..n {
+        let Some(op) = bytes.get(off).copied() else { break };
+        off += 1;
+        let Some(_idx) = get_u32(bytes, &mut off) else { break };
+        let Some(payload) = get_bytes(bytes, &mut off) else { break };
+        if op == JS_OP_CSS {
+            if let Ok(s) = core::str::from_utf8(payload) {
+                css.push_str(s);
+            }
+        }
+    }
+    css
+}
+
+fn empty_jsdom() -> crate::browser::js::JsDom {
+    crate::browser::js::JsDom {
+        title: String::new(),
+        log: Vec::new(),
+        elements: Vec::new(),
+        location_href: String::from("about:blank"),
+        inner_width: 640,
+        inner_height: 400,
+        navigate: None,
+        scroll_to: None,
+        fetch_log: Vec::new(),
+        outbound_messages: Vec::new(),
+        inbound_messages: Vec::new(),
+        is_nested: false,
+        parent_origin: String::new(),
+        canvases: alloc::collections::BTreeMap::new(),
+    }
+}
+
+fn document_from_jsdom(
+    dom: &crate::browser::js::JsDom,
+    css: String,
+) -> crate::browser::html::Document {
+    use crate::browser::html::{Document, Node, NodeKind, StyleSrc};
+    let n = dom.elements.len();
+    let mut seen = alloc::vec![false; n];
+    let mut root = Node {
+        kind: NodeKind::Document,
+        children: Vec::new(),
+        elem_idx: None,
+    };
+    for i in 0..n {
+        if dom.elements[i].parent.is_none() {
+            root.children.push(elem_to_node(i, &dom.elements, &mut seen));
+        }
+    }
+    let styles_ordered = if css.is_empty() {
+        Vec::new()
+    } else {
+        alloc::vec![StyleSrc::Inline(css.clone())]
+    };
+    Document {
+        title: dom.title.clone(),
+        root,
+        node_count: n.saturating_add(1),
+        stylesheets: css,
+        scripts: Vec::new(),
+        script_tags: Vec::new(),
+        styles_ordered,
+    }
+}
+
+fn elem_to_node(
+    i: usize,
+    elems: &[crate::browser::js::ElemRef],
+    seen: &mut [bool],
+) -> crate::browser::html::Node {
+    use crate::browser::html::{Node, NodeKind};
+    if i >= elems.len() {
+        return Node::element("div");
+    }
+    if seen[i] {
+        return Node::element(&elems[i].tag);
+    }
+    seen[i] = true;
+    let e = &elems[i];
+    let mut n = Node::element(&e.tag);
+    n.elem_idx = Some(i);
+    if let NodeKind::Element {
+        id,
+        class,
+        style_attr,
+        href,
+        src,
+        name,
+        value,
+        input_type,
+        placeholder,
+        extra_attrs,
+        ..
+    } = &mut n.kind
+    {
+        *id = e.id.clone();
+        *class = e.class.clone();
+        if !e.style.is_empty() {
+            *style_attr = Some(e.style.clone());
+        }
+        if !e.href.is_empty() {
+            *href = Some(e.href.clone());
+        }
+        if !e.src.is_empty() {
+            *src = Some(e.src.clone());
+        }
+        if !e.name_attr.is_empty() {
+            *name = Some(e.name_attr.clone());
+        }
+        if !e.value.is_empty() {
+            *value = Some(e.value.clone());
+        }
+        if !e.type_attr.is_empty() {
+            *input_type = Some(e.type_attr.clone());
+        }
+        if !e.placeholder.is_empty() {
+            *placeholder = Some(e.placeholder.clone());
+        }
+        for (k, v) in &e.attrs {
+            match k.as_str() {
+                "id" | "class" | "style" | "href" | "src" | "name" | "value" | "type"
+                | "placeholder" => {}
+                _ => extra_attrs.push((k.clone(), v.clone())),
+            }
+        }
+    }
+    let mut kids: Vec<Node> = Vec::new();
+    for &c in &e.children {
+        kids.push(elem_to_node(c, elems, seen));
+    }
+    if !e.text.is_empty() && kids.is_empty() {
+        kids.push(Node::text(e.text.clone()));
+    }
+    n.children = kids;
+    n
+}
+
 /// Pack a live `JsDom` + page scripts as the jsint `JDOM` envelope.
 pub fn pack_js_page(dom: &crate::browser::js::JsDom, scripts: &[String]) -> Vec<u8> {
     use super::chunked::{put_str, put_u16, put_u32, JS_DOM_MAGIC};
@@ -807,6 +1000,9 @@ pub fn apply_js_mutations(dom: &mut crate::browser::js::JsDom, bytes: &[u8]) -> 
                 if let Some(elems) = unpack_elem_snapshot(payload) {
                     dom.elements = elems;
                 }
+            }
+            crate::synapse::chunked::JS_OP_CSS => {
+                // Handled by [`parse_html_sandbox`]; ignore on the live-page path.
             }
             _ => {}
         }
@@ -1109,6 +1305,8 @@ mod tests {
         let mut pipe = VideoPipe::open(clip).expect("h264 tenant must open");
         assert!(pipe.w > 0 && pipe.h > 0, "Init must report geometry");
         assert!(pipe.frame_count > 0, "Init must report a frame count");
+        // Init used to return NeedMore inside the default 8 MiB and leave
+        // HEAP_WANT unread; Continue then OOMed mid-AU and Failed.
         let yuv = pipe
             .decode_display(0)
             .expect("first frame must not fault")
@@ -1224,6 +1422,32 @@ mod tests {
             "F(cb) must run: {:?}",
             dom.log
         );
+        set_sandboxed_js(false);
+    }
+
+    #[test_case]
+    fn jsint_tenant_tokenizes_html_and_extracts_css() {
+        set_sandboxed_js(true);
+        let doc = parse_html_sandbox(
+            "<html><head><style>p{color:red}</style><title>T</title></head>\
+             <body><p id=\"x\">hi</p></body></html>",
+        )
+        .expect("html tenant must not fault");
+        assert_eq!(doc.title, "T", "title comes from the tenant parse");
+        assert!(
+            doc.stylesheets.contains("color:red"),
+            "css text must come back: {:?}",
+            doc.stylesheets
+        );
+        fn find_id<'a>(n: &'a crate::browser::html::Node, want: &str) -> bool {
+            if let crate::browser::html::NodeKind::Element { id, .. } = &n.kind {
+                if id.as_deref() == Some(want) {
+                    return true;
+                }
+            }
+            n.children.iter().any(|c| find_id(c, want))
+        }
+        assert!(find_id(&doc.root, "x"), "p#x must survive reconstruction");
         set_sandboxed_js(false);
     }
 }

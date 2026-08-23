@@ -81,8 +81,12 @@ pub const KIND_JS: u64 = 3;
 
 /// Packed-DOM page envelope (`"JDOM"` little-endian) for the jsint tenant.
 pub const JS_DOM_MAGIC: u32 = 0x4D4F_444A;
+/// Raw-HTML page envelope (`"HTML"` little-endian): the tenant tokenizes.
+pub const JS_HTML_MAGIC: u32 = 0x4C4D_5448;
 /// Mutation log magic (`"JMUT"` little-endian).
 pub const JS_MUT_MAGIC: u32 = 0x5455_4D4A;
+/// `JS_HTML_MAGIC` flags: run extracted `<script>` bodies after parse.
+pub const JS_HTML_RUN_SCRIPTS: u32 = 1;
 
 pub const JS_OP_TITLE: u8 = 1;
 pub const JS_OP_NAV: u8 = 2;
@@ -95,6 +99,8 @@ pub const JS_OP_INTERACTIVE: u8 = 8;
 pub const JS_OP_SCROLL: u8 = 9;
 /// Full element-table snapshot (createElement/appendChild trees).
 pub const JS_OP_SNAPSHOT: u8 = 10;
+/// Concatenated `<style>` text extracted while parsing HTML in the tenant.
+pub const JS_OP_CSS: u8 = 11;
 
 pub const JS_EV_CLICK: u64 = 1;
 pub const JS_EV_INPUT: u64 = 2;

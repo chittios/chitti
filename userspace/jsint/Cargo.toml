@@ -40,3 +40,4 @@ pest_consume_macros = { path = "../../third_party/pest_consume_macros" }
 
 [dependencies]
 just-engine = { path = "../../third_party/just-ref", default-features = false }
+htmlparser = { version = "0.2", default-features = false }

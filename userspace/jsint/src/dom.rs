@@ -23,9 +23,9 @@ use just_engine::runner::plugin::types::{EvalContext, NativeProps};
 
 use crate::chunked::{
     get_str, get_u16, get_u32, put_str, put_u16, put_u32, JS_DOM_MAGIC, JS_EV_CLICK,
-    JS_EV_INPUT, JS_EV_KEYDOWN, JS_MUT_MAGIC, JS_OP_HIDDEN, JS_OP_INTERACTIVE, JS_OP_LOG,
-    JS_OP_NAV, JS_OP_SCROLL, JS_OP_SNAPSHOT, JS_OP_STYLE, JS_OP_TEXT, JS_OP_TITLE,
-    JS_OP_VALUE,
+    JS_EV_INPUT, JS_EV_KEYDOWN, JS_HTML_MAGIC, JS_HTML_RUN_SCRIPTS, JS_MUT_MAGIC,
+    JS_OP_CSS, JS_OP_HIDDEN, JS_OP_INTERACTIVE, JS_OP_LOG, JS_OP_NAV, JS_OP_SCROLL,
+    JS_OP_SNAPSHOT, JS_OP_STYLE, JS_OP_TEXT, JS_OP_TITLE, JS_OP_VALUE,
 };
 
 const DOC_NODE: i64 = -1;
@@ -54,6 +54,9 @@ pub struct World {
     pub navigate: Option<String>,
     pub scroll: Option<i32>,
     pub extra_log: String,
+    /// Concatenated `<style>` text from the HTML parse (kernel layout still
+    /// cascades; the tokenizer is what had to leave ring 0).
+    pub css: String,
     pub listeners: Vec<(usize, String, JsValue)>,
     wrappers: RefCell<alloc::collections::BTreeMap<usize, JsValue>>,
     document: JsValue,
@@ -126,6 +129,52 @@ impl World {
                 navigate: None,
                 scroll: None,
                 extra_log: String::new(),
+                css: String::new(),
+                listeners: Vec::new(),
+                wrappers: RefCell::new(alloc::collections::BTreeMap::new()),
+                document,
+                window,
+                location,
+            },
+            scripts,
+        ))
+    }
+
+    /// Tokenize raw HTML in this tenant. Returns the live world plus inline
+    /// scripts when `JS_HTML_RUN_SCRIPTS` is set.
+    pub fn from_html(input: &[u8]) -> Option<(Self, Vec<String>)> {
+        let mut off = 0usize;
+        let mag = get_u32(input, &mut off)?;
+        if mag != JS_HTML_MAGIC {
+            return None;
+        }
+        let flags = get_u32(input, &mut off)?;
+        let inner_w = get_u32(input, &mut off)? as i32;
+        let inner_h = get_u32(input, &mut off)? as i32;
+        let href = get_str(input, &mut off)?.to_string();
+        let src = get_str(input, &mut off)?;
+        let doc = crate::html::parse(src);
+        let mut elems = Vec::new();
+        collect_html(&doc.root, None, &mut elems);
+        let scripts = if flags & JS_HTML_RUN_SCRIPTS != 0 {
+            doc.scripts.clone()
+        } else {
+            Vec::new()
+        };
+        let document = make_host("document", DOC_NODE);
+        let window = make_host("window", WIN_NODE);
+        let location = make_host("location", LOC_NODE);
+        Some((
+            Self {
+                title: doc.title.clone(),
+                href,
+                inner_w,
+                inner_h,
+                elems,
+                navigate: None,
+                scroll: None,
+                extra_log: String::new(),
+                css: doc.stylesheets.clone(),
                 listeners: Vec::new(),
                 wrappers: RefCell::new(alloc::collections::BTreeMap::new()),
                 document,
@@ -166,6 +215,9 @@ impl World {
             Self::pack_elem(&mut snap, e);
         }
         ops.push((JS_OP_SNAPSHOT, 0, snap));
+        if !self.css.is_empty() {
+            ops.push((JS_OP_CSS, 0, self.css.as_bytes().to_vec()));
+        }
         if !self.title.is_empty() {
             ops.push((JS_OP_TITLE, 0, self.title.as_bytes().to_vec()));
         }
@@ -242,6 +294,105 @@ impl World {
             return e.class.split_whitespace().any(|x| x == c);
         }
         e.tag.eq_ignore_ascii_case(sel)
+    }
+}
+
+fn collect_html(n: &crate::html::Node, parent: Option<usize>, out: &mut Vec<Elem>) {
+    use crate::html::NodeKind;
+    let mut mine = parent;
+    if let NodeKind::Element {
+        tag,
+        id,
+        class,
+        style_attr,
+        value,
+        href,
+        src,
+        name,
+        input_type,
+        placeholder,
+        srcdoc,
+        on_attrs,
+        extra_attrs,
+        ..
+    } = &n.kind
+    {
+        if !matches!(tag.as_str(), "script" | "style" | "noscript") {
+            let text = crate::html::collect_text(n);
+            let val = value.clone().unwrap_or_else(|| {
+                if matches!(tag.as_str(), "input" | "textarea" | "button") {
+                    text.clone()
+                } else {
+                    String::new()
+                }
+            });
+            let mut attrs = Vec::new();
+            if let Some(i) = id {
+                attrs.push((String::from("id"), i.clone()));
+            }
+            if let Some(c) = class {
+                attrs.push((String::from("class"), c.clone()));
+            }
+            if let Some(s) = style_attr {
+                attrs.push((String::from("style"), s.clone()));
+            }
+            if let Some(h) = href {
+                if !h.is_empty() {
+                    attrs.push((String::from("href"), h.clone()));
+                }
+            }
+            if let Some(s) = src {
+                if !s.is_empty() {
+                    attrs.push((String::from("src"), s.clone()));
+                }
+            }
+            if let Some(t) = input_type {
+                if !t.is_empty() {
+                    attrs.push((String::from("type"), t.clone()));
+                }
+            }
+            if let Some(nm) = name {
+                if !nm.is_empty() {
+                    attrs.push((String::from("name"), nm.clone()));
+                }
+            }
+            if let Some(p) = placeholder {
+                if !p.is_empty() {
+                    attrs.push((String::from("placeholder"), p.clone()));
+                }
+            }
+            if let Some(sd) = srcdoc {
+                if !sd.is_empty() {
+                    attrs.push((String::from("srcdoc"), sd.clone()));
+                }
+            }
+            for (k, v) in on_attrs {
+                attrs.push((k.clone(), v.clone()));
+            }
+            for (k, v) in extra_attrs {
+                attrs.push((k.clone(), v.clone()));
+            }
+            let i = out.len();
+            if let Some(p) = parent {
+                out[p].children.push(i);
+            }
+            out.push(Elem {
+                tag: tag.clone(),
+                id: id.clone().unwrap_or_default(),
+                class: class.clone().unwrap_or_default(),
+                text,
+                value: val,
+                style: style_attr.clone().unwrap_or_default(),
+                parent,
+                children: Vec::new(),
+                attrs,
+                hidden: false,
+            });
+            mine = Some(i);
+        }
+    }
+    for c in &n.children {
+        collect_html(c, mine, out);
     }
 }
 

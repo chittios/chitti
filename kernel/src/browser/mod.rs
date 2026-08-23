@@ -732,9 +732,37 @@ pub fn set_html_engine(e: HtmlEngine) {
 /// **Every page load must go through here**, never `html::parse` directly, or
 /// the switch silently applies to some paths and not others — which makes an
 /// A/B measure a mixture rather than an engine.
+///
+/// At boot the tokenizer runs in ring 3 (`jsint`). There is no in-kernel
+/// fallback: a tenant fault is an empty document, not a quiet retry at EL1.
 pub fn parse_html(source: &str) -> html::Document {
+    #[cfg(not(test))]
+    {
+        if crate::synapse::chunked_run::sandboxed_js() {
+            return match crate::synapse::chunked_run::parse_html_sandbox(source) {
+                Ok(doc) => doc,
+                Err(_) => html_sandbox_failed(),
+            };
+        }
+    }
     match html_engine() {
         HtmlEngine::Ours => html::parse(source),
         HtmlEngine::Tl => html_tl::parse(source),
+    }
+}
+
+fn html_sandbox_failed() -> html::Document {
+    html::Document {
+        title: String::from("the html sandbox could not parse this page"),
+        root: html::Node {
+            kind: html::NodeKind::Document,
+            children: Vec::new(),
+            elem_idx: None,
+        },
+        node_count: 1,
+        stylesheets: String::new(),
+        scripts: Vec::new(),
+        script_tags: Vec::new(),
+        styles_ordered: Vec::new(),
     }
 }

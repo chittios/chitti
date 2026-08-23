@@ -58,6 +58,14 @@ use just_engine::runner::std_lib::console::drain_console_log;
 #[path = "../../../kernel/src/synapse/chunked.rs"]
 mod chunked;
 
+/// HTML tokenizer — same source as the kernel, so a port cannot regress it.
+#[allow(dead_code)]
+#[path = "../../../kernel/src/browser/elements.rs"]
+mod elements;
+#[allow(dead_code)]
+#[path = "../../../kernel/src/browser/html.rs"]
+mod html;
+
 mod dom;
 
 use chunked::{ChunkBlock, ChunkCmd, ChunkStatus, KIND_JS};
@@ -470,15 +478,22 @@ fn boot_session(sources: Vec<String>) -> Result<Session, String> {
 }
 
 fn boot_from_input(input: &[u8]) -> Result<Session, String> {
+    if let Some((world, sources)) = dom::World::from_html(input) {
+        return boot_world(world, sources);
+    }
     if let Some((world, sources)) = dom::World::unpack(input) {
-        let world = Rc::new(RefCell::new(world));
-        let mut session = boot_session(sources)?;
-        session.ctx.native_props = Some(Rc::new(dom::DomHost { world: world.clone() }));
-        session.ctx.add_resolver(alloc::boxed::Box::new(dom::DomHost { world: world.clone() }));
-        session.world = Some(world);
-        return Ok(session);
+        return boot_world(world, sources);
     }
     parse_scripts(input).and_then(boot_session)
+}
+
+fn boot_world(world: dom::World, sources: Vec<String>) -> Result<Session, String> {
+    let world = Rc::new(RefCell::new(world));
+    let mut session = boot_session(sources)?;
+    session.ctx.native_props = Some(Rc::new(dom::DomHost { world: world.clone() }));
+    session.ctx.add_resolver(alloc::boxed::Box::new(dom::DomHost { world: world.clone() }));
+    session.world = Some(world);
+    Ok(session)
 }
 
 fn fail_text(blk: *mut u8, msg: &str, want: u64) {

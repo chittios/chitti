@@ -25,8 +25,23 @@ pub fn heap_guess(input_len: usize) -> u64 {
     (input_len.saturating_mul(8).saturating_add(8 << 20)) as u64
 }
 
+/// Bump arenas do not reclaim dropped DPB pictures (only the top allocation).
+/// Size for every decoded frame plus scratch, not a high-water mark.
+fn video_arena_bytes(w: u32, h: u32, frames: usize, input_len: usize) -> u64 {
+    let yuv = (w as usize).saturating_mul(h as usize).saturating_mul(2);
+    let pics = frames.max(1);
+    input_len
+        .saturating_add(yuv.saturating_mul(pics))
+        .saturating_add(16 << 20) as u64
+}
+
 pub fn init(input: &[u8], b: &mut ChunkBlock) -> ChunkStatus {
-    match Session::open(input) {
+    // `meta0 == KIND_AUDIO` forces the mp4 AAC path. Autodetect would open
+    // an mp4 as video, and decoding that track *inside* the video session
+    // stranded the full PCM in the bump arena so Continue could not allocate
+    // a DPB picture (`display 2 failed: Declined { status: 4 }`).
+    let force_audio = b.meta0 == KIND_AUDIO;
+    match Session::open(input, force_audio) {
         Ok(sess) => {
             sess.report_geometry(b);
             b.heap_want = sess.heap_want();
@@ -45,7 +60,12 @@ pub fn cont(max_units: u64, b: &mut ChunkBlock) -> ChunkStatus {
     // SAFETY: Continue after a successful Init; single-threaded.
     let sess = unsafe { (*core::ptr::addr_of_mut!(SESSION)).as_mut() };
     match sess {
-        Some(s) => s.step(max_units, b),
+        Some(s) => {
+            if crate::take_oom() {
+                s.recover_oom();
+            }
+            s.step(max_units, b)
+        }
         None => ChunkStatus::Failed,
     }
 }
@@ -53,10 +73,15 @@ pub fn cont(max_units: u64, b: &mut ChunkBlock) -> ChunkStatus {
 pub fn seek(target: u64, b: &mut ChunkBlock) -> ChunkStatus {
     let sess = unsafe { (*core::ptr::addr_of_mut!(SESSION)).as_mut() };
     match sess {
-        Some(s) => match s.as_mut() {
-            Session::Video(v) => v.seek_to(target as usize, b),
-            _ => ChunkStatus::Failed,
-        },
+        Some(s) => {
+            if crate::take_oom() {
+                s.recover_oom();
+            }
+            match s.as_mut() {
+                Session::Video(v) => v.seek_to(target as usize, b),
+                _ => ChunkStatus::Failed,
+            }
+        }
         None => ChunkStatus::Failed,
     }
 }
@@ -67,13 +92,15 @@ enum Session {
 }
 
 impl Session {
-    fn open(input: &[u8]) -> Result<Self, &'static str> {
+    fn open(input: &[u8], force_audio: bool) -> Result<Self, &'static str> {
         if looks_wav(input) {
             Ok(Session::Audio(AudioSess::open_wav(input)?))
         } else if is_adts(input) {
             Ok(Session::Audio(AudioSess::open_aac(input)?))
         } else if looks_mp3(input) {
             Ok(Session::Audio(AudioSess::open_mp3(input)?))
+        } else if force_audio {
+            Ok(Session::Audio(AudioSess::open_mp4(input)?))
         } else {
             Ok(Session::Video(VideoSess::open(input)?))
         }
@@ -101,10 +128,13 @@ impl Session {
     fn heap_want(&self) -> u64 {
         match self {
             Session::Audio(a) => heap_guess(a.input_len()),
-            Session::Video(v) => {
-                let yuv = (v.w as usize).saturating_mul(v.h as usize).saturating_mul(2);
-                (v.bytes.len().saturating_add(yuv.saturating_mul(8)).saturating_add(8 << 20)) as u64
-            }
+            Session::Video(v) => video_arena_bytes(v.w, v.h, v.display.len(), v.bytes.len()),
+        }
+    }
+
+    fn recover_oom(&mut self) {
+        if let Session::Video(v) = self {
+            let _ = v.rebuild_from_shown();
         }
     }
 
@@ -152,6 +182,7 @@ enum AudioSess {
     Wav(WavSess),
     Mp3(Mp3Sess),
     Aac(AacSess),
+    Mp4(Mp4AacSess),
 }
 
 impl AudioSess {
@@ -160,6 +191,7 @@ impl AudioSess {
             AudioSess::Wav(s) => s.rate,
             AudioSess::Mp3(s) => s.rate,
             AudioSess::Aac(s) => s.rate,
+            AudioSess::Mp4(s) => s.rate,
         }
     }
     fn channels(&self) -> u8 {
@@ -167,6 +199,7 @@ impl AudioSess {
             AudioSess::Wav(s) => s.out_ch,
             AudioSess::Mp3(s) => s.channels,
             AudioSess::Aac(_) => 1,
+            AudioSess::Mp4(_) => 1,
         }
     }
     fn input_len(&self) -> usize {
@@ -174,6 +207,7 @@ impl AudioSess {
             AudioSess::Wav(s) => s.bytes.len(),
             AudioSess::Mp3(s) => s.bytes.len(),
             AudioSess::Aac(s) => s.bytes.len(),
+            AudioSess::Mp4(s) => s.pcm.len().saturating_mul(2),
         }
     }
     fn is_exhausted(&self) -> bool {
@@ -181,6 +215,7 @@ impl AudioSess {
             AudioSess::Wav(s) => s.remaining_frames() == 0,
             AudioSess::Mp3(s) => s.at >= s.bytes.len(),
             AudioSess::Aac(s) => s.pos + 7 >= s.bytes.len(),
+            AudioSess::Mp4(s) => s.pos >= s.pcm.len(),
         }
     }
     fn step(&mut self, max_units: u64, b: &mut ChunkBlock) -> ChunkStatus {
@@ -188,6 +223,7 @@ impl AudioSess {
             AudioSess::Wav(s) => s.step(max_units, b),
             AudioSess::Mp3(s) => s.step(max_units, b),
             AudioSess::Aac(s) => s.step(max_units, b),
+            AudioSess::Mp4(s) => s.step(max_units, b),
         }
     }
 
@@ -199,6 +235,9 @@ impl AudioSess {
     }
     fn open_aac(input: &[u8]) -> Result<Self, &'static str> {
         Ok(AudioSess::Aac(AacSess::parse(input)?))
+    }
+    fn open_mp4(input: &[u8]) -> Result<Self, &'static str> {
+        Ok(AudioSess::Mp4(Mp4AacSess::parse(input)?))
     }
 }
 
@@ -552,6 +591,53 @@ impl AacSess {
     }
 }
 
+/// AAC inside mp4/mov. Decoded in a **throwaway audio session**, never inside
+/// the video tenant — that bump arena has to stay free for the DPB.
+struct Mp4AacSess {
+    pcm: Vec<i16>,
+    rate: u32,
+    pos: usize,
+    out: Vec<i16>,
+}
+
+impl Mp4AacSess {
+    fn parse(input: &[u8]) -> Result<Self, &'static str> {
+        let track = video::mp4::parse_audio(input)?.ok_or("aac: no AAC track")?;
+        let pairs: Vec<(usize, usize)> = track.samples.iter().map(|s| (s.offset, s.size)).collect();
+        let a = audio::aac::decode_track(
+            track.sample_rate,
+            track.channels,
+            &track.asc,
+            input,
+            &pairs,
+        )?;
+        Ok(Self {
+            pcm: a.pcm,
+            rate: a.rate,
+            pos: 0,
+            out: Vec::new(),
+        })
+    }
+
+    fn step(&mut self, max_units: u64, b: &mut ChunkBlock) -> ChunkStatus {
+        let want = if max_units == 0 { 4096 } else { max_units as usize };
+        let n = self.pcm.len().saturating_sub(self.pos).min(want);
+        self.out.clear();
+        if n == 0 {
+            report_pcm(b, &self.out, self.rate, 1, 0);
+            return ChunkStatus::Done;
+        }
+        self.out.extend_from_slice(&self.pcm[self.pos..self.pos + n]);
+        self.pos += n;
+        report_pcm(b, &self.out, self.rate, 1, n as u64);
+        if self.pos >= self.pcm.len() {
+            ChunkStatus::Done
+        } else {
+            ChunkStatus::NeedMore
+        }
+    }
+}
+
 fn input_copy(input: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(input.len());
     v.extend_from_slice(input);
@@ -612,6 +698,20 @@ impl VideoSess {
     fn open(input: &[u8]) -> Result<Self, &'static str> {
         if video::hls::looks_like_playlist(input) {
             return Err("video: HLS playlist");
+        }
+        if let Some(refs) = video::hls::unpack_ts_segments(input) {
+            let mut tracks = Vec::new();
+            for r in &refs {
+                let body = input
+                    .get(r.offset..r.offset + r.len)
+                    .ok_or("video: HLS segment out of range")?;
+                let mut track = video::ts::demux_video(body)?;
+                track.discontinuity = r.discontinuity;
+                tracks.push(track);
+            }
+            let (buf, config, samples, ts) = video::ts::assemble_samples(&tracks)?;
+            let duration_ms = ts_duration_ms(&samples, ts);
+            return Self::from_parts(buf, config, samples, ts, duration_ms);
         }
         if is_mpegts(input) {
             let track = video::ts::demux_video(input)?;
@@ -829,6 +929,20 @@ impl VideoSess {
         Ok(())
     }
 
+    /// An OOM abort leaves CABAC mid-AU. Rebuild the engine and catch up to
+    /// the last *shown* display index so the next Continue is the same picture.
+    fn rebuild_from_shown(&mut self) -> Result<(), &'static str> {
+        let shown = self.next_display;
+        self.rewind()?;
+        while self.next_display < shown {
+            if !self.ensure_frame(self.next_display) {
+                return Err("video: recover after OOM");
+            }
+            self.next_display += 1;
+        }
+        Ok(())
+    }
+
     fn report_yuv(&self, b: &mut ChunkBlock) {
         b.kind = KIND_VIDEO;
         b.output_ptr = self.out_y.as_ptr() as u64;
@@ -1014,13 +1128,12 @@ impl VideoSess {
     }
 
     fn decode_one(&mut self) -> Result<(), &'static str> {
-        let s = self.samples[self.next];
-        self.next += 1;
+        let sample_i = self.next;
+        let s = self.samples[sample_i];
         if s.offset + s.size > self.bytes.len() {
             return Err("video: sample out of range");
         }
         let data = &self.bytes[s.offset..s.offset + s.size];
-        let sample_i = self.next - 1;
         match &mut self.engine {
             Engine::RustH264 { dec, pending, open_sample } => {
                 let nals = rust_h264::nal::parse_avcc(data, self.length_size as usize);
@@ -1109,6 +1222,7 @@ impl VideoSess {
                 }
             }
         }
+        self.next = sample_i + 1;
         Ok(())
     }
 }
