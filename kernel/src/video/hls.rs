@@ -21,6 +21,10 @@ use super::m3u8::{self, Playlist, Segment};
 use super::mp4::{self, CodecConfig, Sample};
 use super::ts;
 
+/// Multi-segment MPEG-TS envelope (`"HLSS"` little-endian) handed to the
+/// mediadec tenant so **demux** happens in ring 3. Kernel fetch stays here.
+pub const HLSS_MAGIC: u32 = 0x5353_4C48;
+
 /// Fully resolved VOD playlist ready to download: absolute segment URIs and
 /// optional init map, with total advertised duration.
 #[derive(Clone, Debug)]
@@ -119,16 +123,95 @@ pub fn resolve_vod(
     }
 }
 
-/// Download every segment of a resolved VOD playlist and demux into one
-/// length-prefixed sample table.
-///
-/// `on_progress(i, n)` is invoked before each segment fetch so the shell can
-/// pump the UI and honour Ctrl+C.
-pub fn load_vod(
+/// One downloaded MPEG-TS segment, before demux.
+pub struct FetchedSeg {
+    pub body: Vec<u8>,
+    pub discontinuity: bool,
+    /// Absolute URI used to fetch this body — named in demux errors so a
+    /// 300-segment VOD does not fail as a bare `ts: no PAT/PMT`.
+    pub url: String,
+}
+
+/// Segment bodies fetched for a VOD, not yet demuxed.
+pub struct FetchedVod {
+    pub ts: Vec<FetchedSeg>,
+    pub fmp4: Vec<Vec<u8>>,
+}
+
+/// Byte range of one TS segment inside an [`HLSS_MAGIC`] envelope.
+#[derive(Clone, Copy, Debug)]
+pub struct TsSegRef {
+    pub offset: usize,
+    pub len: usize,
+    pub discontinuity: bool,
+}
+
+/// Pack fetched MPEG-TS segments so the mediadec tenant can demux them
+/// (per-segment, with playlist discontinuity flags). Kernel must not parse
+/// the PES / PAT / PMT on the sandbox path.
+pub fn pack_ts_segments(segs: &[FetchedSeg]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&HLSS_MAGIC.to_le_bytes());
+    out.extend_from_slice(&(segs.len() as u32).to_le_bytes());
+    for s in segs {
+        out.extend_from_slice(&(s.body.len() as u32).to_le_bytes());
+        out.push(if s.discontinuity { 1 } else { 0 });
+        out.extend_from_slice(&[0, 0, 0]);
+    }
+    for s in segs {
+        out.extend_from_slice(&s.body);
+    }
+    out
+}
+
+/// Inverse of [`pack_ts_segments`]. `None` if the buffer is not an envelope
+/// (a plain `.ts` / `.mp4` is handed to the tenant as-is).
+pub fn unpack_ts_segments(bytes: &[u8]) -> Option<Vec<TsSegRef>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let mag = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    if mag != HLSS_MAGIC {
+        return None;
+    }
+    let n = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    if n == 0 || n > 4096 {
+        return None;
+    }
+    let hdr = 8usize.checked_add(n.checked_mul(8)?)?;
+    if bytes.len() < hdr {
+        return None;
+    }
+    let mut segs = Vec::with_capacity(n);
+    let mut payload = hdr;
+    for i in 0..n {
+        let o = 8 + i * 8;
+        let len = u32::from_le_bytes(bytes[o..o + 4].try_into().ok()?) as usize;
+        let disc = bytes.get(o + 4).copied()? != 0;
+        let end = payload.checked_add(len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        segs.push(TsSegRef {
+            offset: payload,
+            len,
+            discontinuity: disc,
+        });
+        payload = end;
+    }
+    if payload != bytes.len() {
+        return None;
+    }
+    Some(segs)
+}
+
+/// Download every segment. Does **not** demux — that is the tenant's job on
+/// the sandbox path, and [`load_vod`]'s job on the in-kernel A/B path.
+pub fn fetch_vod(
     vod: &ResolvedVod,
     mut fetch: impl FnMut(&str) -> Result<Vec<u8>, String>,
     mut on_progress: impl FnMut(usize, usize) -> Result<(), String>,
-) -> Result<LoadedHls, String> {
+) -> Result<FetchedVod, String> {
     let n = vod.segments.len() + if vod.map.is_some() { 1 } else { 0 };
     let mut step = 0usize;
 
@@ -153,7 +236,6 @@ pub fn load_vod(
             slice_byterange(body, len, offset)
         };
 
-    // Optional fMP4 init.
     let mut init_bytes: Option<Vec<u8>> = None;
     if let Some(map) = &vod.map {
         on_progress(step, n)?;
@@ -162,20 +244,16 @@ pub fn load_vod(
         init_bytes = Some(fetch_range(&url, map.byterange_len, map.byterange_offset)?);
     }
 
-    let mut ts_tracks: Vec<ts::TsTrack> = Vec::new();
-    let mut fmp4_parts: Vec<Vec<u8>> = Vec::new();
+    let mut ts: Vec<FetchedSeg> = Vec::new();
+    let mut fmp4: Vec<Vec<u8>> = Vec::new();
     if let Some(init) = init_bytes {
-        fmp4_parts.push(init);
+        fmp4.push(init);
     }
 
     for (i, seg) in vod.segments.iter().enumerate() {
         on_progress(step, n)?;
         step += 1;
         let url = m3u8::resolve_uri(&vod.base, &seg.uri);
-        // Every failure below names the segment it came from. A VOD is hundreds
-        // of segments and any one of them can be the bad one, so a bare
-        // "ts: no PAT/PMT" is not a diagnosis — it does not even say whether
-        // the download or the demux failed.
         let blame = |e: &str| {
             alloc::format!(
                 "hls: segment {}/{} ({}): {}",
@@ -189,21 +267,73 @@ pub fn load_vod(
             .map_err(|e| blame(&e))?;
 
         if is_iso_bmff(&body) {
-            fmp4_parts.push(body);
+            fmp4.push(body);
         } else if body.first() == Some(&0x47) {
-            if !fmp4_parts.is_empty() {
+            if !fmp4.is_empty() {
                 return Err(blame("mixed fMP4 and MPEG-TS segments in one playlist"));
             }
-            let mut track = ts::demux_video(&body).map_err(blame)?;
-            // The playlist, not the bytes, is what knows the clock was spliced.
-            track.discontinuity = seg.discontinuity;
-            ts_tracks.push(track);
+            ts.push(FetchedSeg {
+                body,
+                discontinuity: seg.discontinuity,
+                url,
+            });
         } else {
             return Err(blame("neither MPEG-TS nor fMP4"));
         }
     }
+    Ok(FetchedVod { ts, fmp4 })
+}
 
-    if !ts_tracks.is_empty() {
+/// Fetch + pack for the ring-3 tenant: an [`HLSS_MAGIC`] envelope of MPEG-TS
+/// segments, or a single non-fragmented mp4. Does not demux.
+pub fn load_vod_for_tenant(
+    vod: &ResolvedVod,
+    fetch: impl FnMut(&str) -> Result<Vec<u8>, String>,
+    on_progress: impl FnMut(usize, usize) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    let fetched = fetch_vod(vod, fetch, on_progress)?;
+    if !fetched.ts.is_empty() {
+        return Ok(pack_ts_segments(&fetched.ts));
+    }
+    if fetched.fmp4.len() == 1 {
+        let bytes = fetched.fmp4.into_iter().next().unwrap();
+        if has_fragment_box(&bytes) {
+            return Err(alloc::format!("hls: {FMP4_UNSUPPORTED}"));
+        }
+        return Ok(bytes);
+    }
+    Err(alloc::format!(
+        "hls: multi-fragment fMP4/CMAF ({} fragments): {FMP4_UNSUPPORTED}",
+        fetched.fmp4.len()
+    ))
+}
+
+/// Download every segment of a resolved VOD playlist and demux into one
+/// length-prefixed sample table.
+///
+/// `on_progress(i, n)` is invoked before each segment fetch so the shell can
+/// pump the UI and honour Ctrl+C.
+pub fn load_vod(
+    vod: &ResolvedVod,
+    fetch: impl FnMut(&str) -> Result<Vec<u8>, String>,
+    on_progress: impl FnMut(usize, usize) -> Result<(), String>,
+) -> Result<LoadedHls, String> {
+    let fetched = fetch_vod(vod, fetch, on_progress)?;
+    if !fetched.ts.is_empty() {
+        let mut ts_tracks: Vec<ts::TsTrack> = Vec::new();
+        for (i, seg) in fetched.ts.iter().enumerate() {
+            let mut track = ts::demux_video(&seg.body).map_err(|e| {
+                alloc::format!(
+                    "hls: segment {}/{} ({}): {}",
+                    i + 1,
+                    fetched.ts.len(),
+                    seg.url,
+                    e
+                )
+            })?;
+            track.discontinuity = seg.discontinuity;
+            ts_tracks.push(track);
+        }
         let (bytes, config, samples, timescale) =
             ts::assemble_samples(&ts_tracks).map_err(|e| e.to_string())?;
         return Ok(LoadedHls {
@@ -215,6 +345,7 @@ pub fn load_vod(
             container: "hls/mpegts",
         });
     }
+    let mut fmp4_parts = fetched.fmp4;
 
     // fMP4. Concatenating an init segment and its media fragments is **not** a
     // file `mp4::parse` can read: it expects one `moov` with a sample table,
@@ -322,6 +453,32 @@ pub fn looks_like_playlist(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
+
+    #[test_case]
+    fn hlss_envelope_round_trips_segment_boundaries() {
+        let segs = [
+            FetchedSeg {
+                body: alloc::vec![0x47, 1, 2, 3],
+                discontinuity: false,
+                url: String::from("a.ts"),
+            },
+            FetchedSeg {
+                body: alloc::vec![0x47, 9, 8, 7, 6],
+                discontinuity: true,
+                url: String::from("b.ts"),
+            },
+        ];
+        let packed = pack_ts_segments(&segs);
+        assert_eq!(&packed[0..4], &HLSS_MAGIC.to_le_bytes());
+        let refs = unpack_ts_segments(&packed).expect("envelope");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(&packed[refs[0].offset..refs[0].offset + refs[0].len], &[0x47, 1, 2, 3]);
+        assert!(!refs[0].discontinuity);
+        assert_eq!(&packed[refs[1].offset..refs[1].offset + refs[1].len], &[0x47, 9, 8, 7, 6]);
+        assert!(refs[1].discontinuity);
+        assert!(unpack_ts_segments(b"not an envelope").is_none());
+        assert!(unpack_ts_segments(&[0x47; 188]).is_none());
+    }
 
     #[test_case]
     fn resolve_vod_follows_master_to_media() {

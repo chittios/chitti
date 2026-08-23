@@ -206,12 +206,24 @@ unsafe impl core::alloc::GlobalAlloc for Bump {
 #[global_allocator]
 static ALLOC: Bump = Bump;
 
+/// Whether the last allocation failed. Continue/Seek must rebuild decoder
+/// state: an OOM abort leaves CABAC mid-AU.
+pub(crate) fn take_oom() -> bool {
+    unsafe {
+        let v = OOM;
+        OOM = false;
+        v
+    }
+}
+
 #[alloc_error_handler]
 fn on_alloc_failure(_layout: core::alloc::Layout) -> ! {
     // SAFETY: single-threaded; BLOCK is the loader page or null.
     unsafe {
         if !BLOCK.is_null() {
-            write_status(BLOCK, ChunkStatus::OutOfMemory, LAST_HEAP_WANT);
+            let want = (HEAP_LEN as u64).saturating_mul(2).max(LAST_HEAP_WANT);
+            LAST_HEAP_WANT = want;
+            write_status(BLOCK, ChunkStatus::OutOfMemory, want);
         }
     }
     exit()

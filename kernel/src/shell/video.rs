@@ -313,7 +313,7 @@ pub(super) fn play_hls_with(
         vod.segments.len(),
         vod.duration_ms
     );
-    let loaded = crate::video::hls::load_vod(&vod, &mut pumped, |i, n| {
+    let progress = |i: usize, n: usize| {
         crate::shell::upkeep();
         if crate::shell::poll_interrupt() {
             return Err(alloc::string::String::from("cancelled"));
@@ -322,7 +322,17 @@ pub(super) fn play_hls_with(
             serial_println!("open>   segment {}/{}", i + 1, n);
         }
         Ok(())
-    })?;
+    };
+    if crate::synapse::chunked_run::sandboxed_media() {
+        let packed = crate::video::hls::load_vod_for_tenant(&vod, &mut pumped, progress)?;
+        serial_println!(
+            "open>   fetched {} byte(s) for ring-3 demux",
+            packed.len()
+        );
+        let t0 = crate::arch::now_ms();
+        return play_video_sandboxed(base, packed, t0);
+    }
+    let loaded = crate::video::hls::load_vod(&vod, &mut pumped, progress)?;
     serial_println!(
         "open>   demuxed {} sample(s) ({})",
         loaded.samples.len(),
@@ -358,6 +368,9 @@ pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result
         return play_hls(name, &bytes);
     }
     let t0 = crate::arch::now_ms();
+    if crate::synapse::chunked_run::sandboxed_media() {
+        return play_video_sandboxed(name, bytes, t0);
+    }
     // Probe first so we can report clearly and handle unsupported streams.
     match crate::video::probe(&bytes) {
         Ok(info) => {
@@ -409,9 +422,6 @@ pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result
         }
         None => (false, None, 0),
     };
-    if crate::synapse::chunked_run::sandboxed_media() {
-        return play_video_sandboxed(name, bytes, t0, has_audio, audio_pcm, audio_rate);
-    }
     match crate::video::StreamDecoder::open(bytes) {
         Ok(mut dec) => {
             let frame_count = dec.frame_count();
@@ -440,10 +450,22 @@ fn play_video_sandboxed(
     name: &str,
     bytes: alloc::vec::Vec<u8>,
     t0: u64,
-    has_audio: bool,
-    audio_pcm: Option<alloc::vec::Vec<i16>>,
-    audio_rate: u32,
 ) -> Result<(), alloc::string::String> {
+    // AAC is a *separate* tenant run. Decoding it inside the video session
+    // left megabytes of PCM in the bump arena, so Continue could not allocate
+    // the next DPB picture and every later frame returned Failed (status 4).
+    let (has_audio, audio_pcm, audio_rate) =
+        match crate::synapse::chunked_run::decode_audio(&bytes) {
+            Ok(a) if !a.pcm.is_empty() => {
+                serial_println!(
+                    "open>   audio ready: {} KiB PCM @ {} Hz (ring-3 AAC track)",
+                    a.pcm.len() * 2 / 1024,
+                    a.rate
+                );
+                (true, Some(a.pcm), a.rate)
+            }
+            _ => (false, None, 0),
+        };
     match crate::synapse::chunked_run::VideoPipe::open(&bytes) {
         Ok(pipe) => {
             let frame_count = pipe.frame_count;
