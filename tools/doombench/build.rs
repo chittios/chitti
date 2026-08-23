@@ -95,6 +95,8 @@ fn defines() -> Vec<String> {
         // Doom is 1993 C. These are not defects worth patching upstream sources
         // over -- see VENDORING.md's "no source file is modified" rule.
         "-Wno-everything".into(),
+        // Selects the sound module, exactly as the shipped build does.
+        "-DFEATURE_SOUND".into(),
     ]
 }
 
@@ -115,7 +117,13 @@ fn main() {
     // Plain `cc`: whatever the host toolchain is, since this side is only the
     // denominator and must simply be a fair native build.
     let mut objs = Vec::new();
-    let ours = [PathBuf::from("src/platform.c"), PathBuf::from("src/w_file_memory.c")];
+    let ours = [
+        PathBuf::from("src/platform.c"),
+        PathBuf::from("src/w_file_memory.c"),
+        // The real audio backend, so the mixer is exercised natively. A headless
+        // guest has no sound device, so a boot cannot reach this code at all.
+        PathBuf::from("../freedoom-wasm/src/sound.c"),
+    ];
     for s in srcs.iter().chain(ours.iter()) {
         let o = out.join(format!(
             "native-{}.o",
@@ -126,6 +134,8 @@ fn main() {
             .args(defines())
             .arg("-I")
             .arg(&dg)
+            .arg("-I")
+            .arg(root.join("tools/freedoom-wasm/include"))
             .arg("-o")
             .arg(&o)
             .arg(s)
@@ -176,6 +186,8 @@ fn main() {
         .args(defines())
         .arg("-I")
         .arg(&dg)
+        .arg("-I")
+        .arg(root.join("tools/freedoom-wasm/include"))
         // No `main`: the harness drives `dg_*` exports itself.
         .args(["-nostartfiles", "-Wl,--no-entry", "-Wl,--export-dynamic"])
         // Doom's zone allocator wants one big block up front; the default 1 MB

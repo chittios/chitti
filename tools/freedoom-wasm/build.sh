@@ -43,11 +43,13 @@ mkdir -p "$(dirname "$OUT")"
   --sysroot="$SYSROOT" -resource-dir="$RESDIR" \
   -O3 -msimd128 -fno-strict-aliasing -Wno-everything \
   -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 \
-  -I "$DG" \
+  -DFEATURE_SOUND \
+  -I "$DG" -I "$ROOT/tools/freedoom-wasm/include" \
   -nostartfiles -Wl,--no-entry -Wl,--export-dynamic \
   -Wl,-z,stack-size=1048576 -Wl,--initial-memory=134217728 \
   -o "$OUT" \
   $SRCS "$ROOT/tools/freedoom-wasm/src/platform.c" \
+  "$ROOT/tools/freedoom-wasm/src/sound.c" \
   "$ROOT/tools/doombench/src/w_file_memory.c"
 
 echo "built $OUT ($(wc -c < "$OUT") bytes)"
