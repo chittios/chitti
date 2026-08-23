@@ -443,21 +443,44 @@ fn fit_display(w: usize, h: usize, max_edge: usize) -> (usize, usize) {
     (dw, dh)
 }
 
+/// Convert 4:2:0 8-bit planes to display RGB. Presentation stays in the kernel
+/// (SMP YUV→RGB); the ring-3 tenant only produces YUV.
+pub fn rgb_from_i420(y: &[u8], cb: &[u8], cr: &[u8], w: usize, h: usize, pts_ms: u64) -> Frame {
+    frame_from_planes(y, cb, cr, w, h, pts_ms, DISPLAY_MAX_EDGE)
+}
+
+#[cfg(test)]
+pub fn sandbox_test_clip() -> &'static [u8] {
+    decode_fixture_test::pclip_bytes()
+}
+
 /// Convert a decoded YUV frame to RGB for presentation. Large sources are
 /// nearest-neighbour downscaled to `max_edge`. Uses **NEON SIMD** via [`yuv`];
 /// on aarch64 with online APs, **multi-core row split** ([`mt`]).
 fn frame_from_yuv(df: &h264::decoder::DecodedFrame, pts_ms: u64, max_edge: usize) -> Frame {
-    let (sw, sh, scw) = (df.w, df.h, df.w / 2);
+    frame_from_planes(&df.y, &df.cb, &df.cr, df.w, df.h, pts_ms, max_edge)
+}
+
+fn frame_from_planes(
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    w: usize,
+    h: usize,
+    pts_ms: u64,
+    max_edge: usize,
+) -> Frame {
+    let (sw, sh, scw) = (w, h, w / 2);
     let (dw, dh) = fit_display(sw, sh, max_edge);
     let mut pixels = alloc::vec![0u32; dw * dh];
     let mut ctx = yuv::ConvertCtx {
-        y: df.y.as_ptr(),
-        cb: df.cb.as_ptr(),
-        cr: df.cr.as_ptr(),
+        y: y.as_ptr(),
+        cb: cb.as_ptr(),
+        cr: cr.as_ptr(),
         out: pixels.as_mut_ptr(),
-        y_len: df.y.len(),
-        cb_len: df.cb.len(),
-        cr_len: df.cr.len(),
+        y_len: y.len(),
+        cb_len: cb.len(),
+        cr_len: cr.len(),
         out_len: pixels.len(),
         sw,
         sh,
@@ -694,7 +717,21 @@ fn hevc_frame_to_8bit(f: &hevc::decoder::DecodedFrame) -> h264::decoder::Decoded
 impl StreamDecoder {
     /// Demux the container and parse the decoder configuration, ready to decode
     /// on demand.
+    /// In-kernel video parsers (H.264/HEVC/VP9) run in ring 0. A size ceiling
+    /// bounds the working set; it is not a sandbox. Bitstream→YUV in ring 3
+    /// is the designed next tenant.
+    pub const MAX_OPEN_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Length gate used by [`Self::open`]. Kept as a function so the unit
+    /// suite can pin it without allocating a 64 MiB buffer.
+    pub fn open_too_large(len: usize) -> bool {
+        len > Self::MAX_OPEN_BYTES
+    }
+
     pub fn open(bytes: Vec<u8>) -> Result<StreamDecoder, &'static str> {
+        if Self::open_too_large(bytes.len()) {
+            return Err("video: file too large for the in-kernel decoder");
+        }
         match sniff(&bytes) {
             Container::HlsPlaylist => {
                 return Err(
@@ -1691,6 +1728,14 @@ mod tests {
     }
 
     #[test_case]
+    fn oversized_containers_are_refused_before_demux() {
+        assert_eq!(StreamDecoder::MAX_OPEN_BYTES, 64 * 1024 * 1024);
+        assert!(!StreamDecoder::open_too_large(0));
+        assert!(!StreamDecoder::open_too_large(StreamDecoder::MAX_OPEN_BYTES));
+        assert!(StreamDecoder::open_too_large(StreamDecoder::MAX_OPEN_BYTES + 1));
+    }
+
+    #[test_case]
     fn sniff_recognises_containers() {
         let mut mp4 = alloc::vec![0u8; 12];
         mp4[4..8].copy_from_slice(b"ftyp");
@@ -2068,6 +2113,10 @@ mod decode_fixture_test {
     ];
     const PEXPECT_HASH: u32 = 1978314551;
     const PEXPECT_FRAMES: usize = 4;
+
+    pub(super) fn pclip_bytes() -> &'static [u8] {
+        &PCLIP_MP4
+    }
 
     #[test_case]
     fn decodes_embedded_i_and_p_frames_matching_pyav() {

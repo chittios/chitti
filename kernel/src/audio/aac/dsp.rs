@@ -5,29 +5,38 @@
 use super::imdct::Imdct;
 use super::tables::*;
 use super::window::{generate_window, WindowType};
+use alloc::vec::Vec;
 
 const SHORT_WIN_POINT0: usize = 512 - 64;
 const SHORT_WIN_POINT1: usize = 512 + 64;
 
+/// Windows and IMDCT scratch. **Heap, not inline arrays:** `Dsp::new` used to
+/// materialise ~22 KiB of `[f32; N]` plus another ~20 KiB of stack temporaries,
+/// which overflowed the ring-3 tenant's 64 KiB stack (`/open sample.aac`
+/// instruction-adjacent data abort into `.rodata`, kernel unharmed).
 pub struct Dsp {
-    kbd_long_win: [f32; 1024],
-    kbd_short_win: [f32; 128],
-    sine_long_win: [f32; 1024],
-    sine_short_win: [f32; 128],
+    kbd_long_win: Vec<f32>,
+    kbd_short_win: Vec<f32>,
+    sine_long_win: Vec<f32>,
+    sine_short_win: Vec<f32>,
     imdct_long: Imdct,
     imdct_short: Imdct,
-    pcm_long: [f32; 2048],
-    pcm_short: [f32; 1152],
+    pcm_long: Vec<f32>,
+    pcm_short: Vec<f32>,
+}
+
+fn zeros(n: usize) -> Vec<f32> {
+    alloc::vec![0.0f32; n]
 }
 
 impl Dsp {
     pub fn new() -> Self {
-        let mut kbd_long_win = [0.0f32; 1024];
-        let mut kbd_short_win = [0.0f32; 128];
+        let mut kbd_long_win = zeros(1024);
+        let mut kbd_short_win = zeros(128);
         generate_window(WindowType::KaiserBessel(4.0), 1.0, 1024, true, &mut kbd_long_win);
         generate_window(WindowType::KaiserBessel(6.0), 1.0, 128, true, &mut kbd_short_win);
-        let mut sine_long_win = [0.0f32; 1024];
-        let mut sine_short_win = [0.0f32; 128];
+        let mut sine_long_win = zeros(1024);
+        let mut sine_short_win = zeros(128);
         generate_window(WindowType::Sine, 1.0, 1024, true, &mut sine_long_win);
         generate_window(WindowType::Sine, 1.0, 128, true, &mut sine_short_win);
 
@@ -38,8 +47,8 @@ impl Dsp {
             sine_short_win,
             imdct_long: Imdct::new_scaled(1024, 1.0 / 2048.0),
             imdct_short: Imdct::new_scaled(128, 1.0 / 256.0),
-            pcm_long: [0.0; 2048],
-            pcm_short: [0.0; 1152],
+            pcm_long: zeros(2048),
+            pcm_short: zeros(1152),
         }
     }
 

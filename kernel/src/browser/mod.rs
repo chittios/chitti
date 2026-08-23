@@ -329,14 +329,30 @@ pub fn fill_video_slot(fr: &mut layout::FrameBox, bytes: alloc::vec::Vec<u8>) {
     if fr.kind != layout::EmbedKind::Video {
         return;
     }
-    let Ok(mut dec) = crate::video::StreamDecoder::open(bytes) else {
-        return;
-    };
-    if !dec.seek_decode(0) {
-        return;
-    }
-    let Some(frame) = dec.cur_frame() else {
-        return;
+    let frame = if crate::synapse::chunked_run::sandboxed_media() {
+        let Ok(mut pipe) = crate::synapse::chunked_run::VideoPipe::open(&bytes) else {
+            return;
+        };
+        let Ok(Some(yuv)) = pipe.seek_yuv(0) else {
+            return;
+        };
+        yuv.to_rgb(0)
+    } else {
+        let Ok(mut dec) = crate::video::StreamDecoder::open(bytes) else {
+            return;
+        };
+        if !dec.seek_decode(0) {
+            return;
+        }
+        let Some(frame) = dec.cur_frame() else {
+            return;
+        };
+        crate::video::Frame {
+            w: frame.w,
+            h: frame.h,
+            pixels: frame.pixels.clone(),
+            pts_ms: frame.pts_ms,
+        }
     };
     let tw = fr.w.max(1) as usize;
     let th = fr.h.max(1) as usize;

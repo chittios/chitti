@@ -18,9 +18,133 @@ pub(super) const VIDEO_SURFACE: u32 = u32::MAX - 1;
 /// keeps playing/advancing across tab switches like the audio player. Baseline
 /// H.264 decodes every frame (I keyframes + P inter frames), so playback is
 /// full-motion, not keyframe-only.
+/// Bitstream→YUV lives in the mediadec tenant when sandboxing is on; YUV→RGB
+/// and the playback clock stay in the kernel. Tenants are pinned to the boot
+/// CPU, so decode-ahead on an SMP worker is kernel-decoder only.
+#[cfg(not(feature = "server"))]
+enum VideoDec {
+    Kernel(crate::video::StreamDecoder),
+    Sandbox(SandboxVideo),
+    /// Pipe is out of `VIDEO` for a tenant entry. `Locked::with` disables
+    /// interrupts and is not reentrant: decoding under it froze `/open flower.mp4`.
+    Loaned,
+}
+
+#[cfg(not(feature = "server"))]
+struct SandboxVideo {
+    pipe: crate::synapse::chunked_run::VideoPipe,
+    cur: Option<crate::video::Frame>,
+}
+
+#[cfg(not(feature = "server"))]
+impl VideoDec {
+    fn pts_ms(&self, idx: usize) -> u64 {
+        match self {
+            VideoDec::Kernel(d) => d.pts_ms(idx),
+            VideoDec::Sandbox(s) => s.pipe.pts_ms(idx),
+            VideoDec::Loaned => 0,
+        }
+    }
+    fn cur_frame(&self) -> Option<&crate::video::Frame> {
+        match self {
+            VideoDec::Kernel(d) => d.cur_frame(),
+            VideoDec::Sandbox(s) => s.cur.as_ref(),
+            VideoDec::Loaned => None,
+        }
+    }
+    fn seek_decode(&mut self, idx: usize) -> bool {
+        match self {
+            VideoDec::Kernel(d) => d.seek_decode(idx),
+            VideoDec::Sandbox(s) => sandbox_run(s, idx),
+            VideoDec::Loaned => false,
+        }
+    }
+    fn seek_decode_hurry(&mut self, idx: usize, hurry: bool) -> bool {
+        match self {
+            VideoDec::Kernel(d) => d.seek_decode_hurry(idx, hurry),
+            VideoDec::Sandbox(s) => sandbox_run(s, idx),
+            VideoDec::Loaned => false,
+        }
+    }
+    fn src_w(&self) -> u32 {
+        match self {
+            VideoDec::Kernel(d) => d.src_w,
+            VideoDec::Sandbox(s) => s.pipe.w,
+            VideoDec::Loaned => 0,
+        }
+    }
+    fn src_h(&self) -> u32 {
+        match self {
+            VideoDec::Kernel(d) => d.src_h,
+            VideoDec::Sandbox(s) => s.pipe.h,
+            VideoDec::Loaned => 0,
+        }
+    }
+    fn backend(&self) -> &'static str {
+        match self {
+            VideoDec::Kernel(d) => d.backend,
+            VideoDec::Sandbox(_) => "mediadec",
+            VideoDec::Loaned => "mediadec",
+        }
+    }
+    fn as_kernel_mut(&mut self) -> Option<&mut crate::video::StreamDecoder> {
+        match self {
+            VideoDec::Kernel(d) => Some(d),
+            VideoDec::Sandbox(_) | VideoDec::Loaned => None,
+        }
+    }
+}
+
+#[cfg(not(feature = "server"))]
+fn sandbox_run(s: &mut SandboxVideo, idx: usize) -> bool {
+    match s.pipe.decode_display(idx) {
+        Ok(Some(yuv)) => {
+            let pts = s.pipe.pts_ms(idx);
+            s.cur = Some(yuv.to_rgb(pts));
+            true
+        }
+        Ok(None) => {
+            crate::ktrace::log_fmt(format_args!("video: mediadec display {idx} produced no planes"));
+            false
+        }
+        Err(e) => {
+            crate::ktrace::log_fmt(format_args!("video: mediadec display {idx} failed: {e:?}"));
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "server"))]
+fn take_sandbox(p: &mut VideoPlayer) -> Option<SandboxVideo> {
+    match core::mem::replace(&mut p.dec, VideoDec::Loaned) {
+        VideoDec::Sandbox(s) => Some(s),
+        other => {
+            p.dec = other;
+            None
+        }
+    }
+}
+
+/// Tenant enter with `VIDEO` not held. Callers that already hold the lock
+/// must `take_sandbox` themselves.
+#[cfg(all(not(feature = "server"), not(test)))]
+fn sandbox_seek_unlocked(goal: usize) -> bool {
+    let taken = VIDEO.with(|v| v.as_mut().and_then(take_sandbox));
+    let Some(mut s) = taken else {
+        return false;
+    };
+    let changed = sandbox_run(&mut s, goal);
+    VIDEO.with(|v| {
+        if let Some(p) = v.as_mut() {
+            p.dec = VideoDec::Sandbox(s);
+        }
+    });
+    changed
+}
+
 #[cfg(not(feature = "server"))]
 pub(super) struct VideoPlayer {
-    dec: crate::video::StreamDecoder,
+    dec: VideoDec,
     frame_count: usize,
     idx: usize,
     playing: bool,
@@ -218,7 +342,7 @@ pub(super) fn play_hls_with(
                 dec.backend,
                 crate::arch::now_ms().saturating_sub(t0)
             );
-            install_player(base, dec, frame_count, total_ms, false, None, 0)
+            install_player(base, VideoDec::Kernel(dec), frame_count, total_ms, false, None, 0)
         }
         Err(e) => {
             serial_println!("open> HLS decode failed: {}", e);
@@ -285,6 +409,9 @@ pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result
         }
         None => (false, None, 0),
     };
+    if crate::synapse::chunked_run::sandboxed_media() {
+        return play_video_sandboxed(name, bytes, t0, has_audio, audio_pcm, audio_rate);
+    }
     match crate::video::StreamDecoder::open(bytes) {
         Ok(mut dec) => {
             let frame_count = dec.frame_count();
@@ -299,7 +426,7 @@ pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result
                 dec.backend,
                 crate::arch::now_ms().saturating_sub(t0)
             );
-            install_player(name, dec, frame_count, total_ms, has_audio, audio_pcm, audio_rate)
+            install_player(name, VideoDec::Kernel(dec), frame_count, total_ms, has_audio, audio_pcm, audio_rate)
         }
         Err(e) => {
             serial_println!("open> decode failed: {}", e);
@@ -309,9 +436,54 @@ pub(super) fn play_video_bytes(name: &str, bytes: alloc::vec::Vec<u8>) -> Result
 }
 
 #[cfg(not(feature = "server"))]
+fn play_video_sandboxed(
+    name: &str,
+    bytes: alloc::vec::Vec<u8>,
+    t0: u64,
+    has_audio: bool,
+    audio_pcm: Option<alloc::vec::Vec<i16>>,
+    audio_rate: u32,
+) -> Result<(), alloc::string::String> {
+    match crate::synapse::chunked_run::VideoPipe::open(&bytes) {
+        Ok(pipe) => {
+            let frame_count = pipe.frame_count;
+            let total_ms = pipe.duration_ms;
+            let mut dec = VideoDec::Sandbox(SandboxVideo { pipe, cur: None });
+            if !dec.seek_decode(0) {
+                serial_println!("open> sandboxed decoder produced no frames");
+                return Err(alloc::string::String::from(
+                    "the sandboxed decoder produced no frames",
+                ));
+            }
+            serial_println!(
+                "open>   {}x{}  {} frame(s)  decoder={}  ready in {} ms (ring-3 bitstream) — Ctrl+Tab cycles focus, space=pause",
+                dec.src_w(),
+                dec.src_h(),
+                frame_count,
+                dec.backend(),
+                crate::arch::now_ms().saturating_sub(t0)
+            );
+            install_player(name, dec, frame_count, total_ms, has_audio, audio_pcm, audio_rate)
+        }
+        Err(crate::synapse::tenant::LoadError::Faulted) => {
+            serial_println!("open> the sandboxed decoder faulted on this file -- the kernel is unharmed");
+            Err(alloc::string::String::from(
+                "the sandboxed decoder faulted on this file -- the kernel is unharmed",
+            ))
+        }
+        Err(_) => {
+            serial_println!("open> the sandboxed decoder rejected this file (corrupt, or an unsupported variant)");
+            Err(alloc::string::String::from(
+                "the sandboxed decoder rejected this file (corrupt, or an unsupported variant)",
+            ))
+        }
+    }
+}
+
+#[cfg(not(feature = "server"))]
 fn install_player(
     name: &str,
-    dec: crate::video::StreamDecoder,
+    dec: VideoDec,
     frame_count: usize,
     total_ms: u64,
     has_audio: bool,
@@ -359,9 +531,9 @@ pub(super) fn present_video_frame() {
     let now = crate::arch::now_ms();
     VIDEO.with(|v| {
         if let Some(p) = v.as_mut() {
-            if p.pending_job {
-                // `dec` (including `cur`) is on loan to the decode worker;
-                // the pump presents this frame when it collects the job.
+            if p.pending_job || matches!(p.dec, VideoDec::Loaned) {
+                // `dec` (including `cur`) is on loan to the decode worker
+                // or out of this lock for a ring-3 tenant entry.
                 return;
             }
             if let Some(f) = p.dec.cur_frame() {
@@ -401,6 +573,22 @@ pub(super) fn video_loaded() -> bool {
 /// Stop + unload the video (Ctrl+C / closing the video tab).
 #[cfg(not(feature = "server"))]
 pub(super) fn stop_video() {
+    #[cfg(not(test))]
+    {
+        // A ring-3 decode may be outside this lock; wait so we don't drop the
+        // player out from under the pipe.
+        for _ in 0..1_000_000 {
+            let loaned = VIDEO.with(|v| {
+                v.as_ref()
+                    .map(|p| matches!(p.dec, VideoDec::Loaned))
+                    .unwrap_or(false)
+            });
+            if !loaned {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
     let stopped = VIDEO.with(|v| {
         // Reclaim `dec` from any decode-ahead worker before dropping it.
         #[cfg(not(test))]
@@ -556,43 +744,63 @@ pub(super) fn pump_video_inner() {
     // next goal and put `dec` back on loan. Decoding runs one frame AHEAD of
     // its due time, so the ~30 ms 1080p decode overlaps the current frame's
     // display.
-    let finished = VIDEO.with(|v| {
-        let Some(p) = v.as_mut() else { return false };
+    //
+    // Ring-3 bitstream decode MUST NOT run under `VIDEO.with`: that lock
+    // disables interrupts and is not reentrant, and `seek_yuv` used to call
+    // `upkeep()` from inside it (`/open flower.mp4` hung the machine).
+    enum Work {
+        None,
+        Finished,
+        Sandbox { goal: usize, sb: SandboxVideo, finished: bool },
+    }
+    let work = VIDEO.with(|v| {
+        let Some(p) = v.as_mut() else { return Work::None };
         if p.pending_job || p.ahead.is_some() || !p.playing || p.frame_count == 0 {
-            return false;
+            return Work::None;
+        }
+        if matches!(p.dec, VideoDec::Loaned) {
+            return Work::None;
         }
         let t = now.saturating_sub(p.base_ms);
         let mut target = p.idx;
         while target + 1 < p.frame_count && p.dec.pts_ms(target + 1) <= t {
             target += 1;
         }
-        // End of clip: stop on the last frame.
-        if t >= p.total_ms && target + 1 >= p.frame_count {
+        // End of clip: stop on the last frame. `total_ms == 0` is "unknown
+        // duration", not "already over" — treating it as over decoded the
+        // whole clip in one tenant entry and never returned.
+        if p.total_ms > 0 && t >= p.total_ms && target + 1 >= p.frame_count {
             p.playing = false;
-            // **Record where we stopped.** Without this `paused_at` keeps whatever the
-            // last manual pause left in it (0 if there never was one), so pressing play
-            // afterwards anchored the clock to a stale time while `idx` sat on the final
-            // frame — and since the goal is forward-only, nothing was ever decoded again.
             p.paused_at = p.total_ms;
             if !p.finished_announced {
                 p.finished_announced = true;
                 p.idx = target;
+                if let Some(sb) = take_sandbox(p) {
+                    return Work::Sandbox { goal: target, sb, finished: true };
+                }
                 p.dec.seek_decode(target);
-                return true;
+                return Work::Finished;
             }
-            return false;
+            return Work::None;
         }
-        // Forward only; when behind, catch up in SMALL steps (the hurry
-        // flag frame-drops non-reference backlog, and the clock re-anchor
-        // absorbs the rest). Small jobs = frequent presents: one giant
-        // jump would decode every backlog reference in one job and starve
-        // presentation (4K went from ~8 to ~3 fps that way).
-        let goal = if target > p.idx { target.min(p.idx + 2) } else { p.idx + 1 };
+        let sandbox = matches!(p.dec, VideoDec::Sandbox(_));
+        // Ring-3: one display picture per tenant entry. Hurry of +2 asked
+        // for frame 2 while the tenant was still on 1; Continue failed, the
+        // pump skipped `idx`, and flower.mp4 logged Failed for every later
+        // frame in 50 ms.
+        let goal = if sandbox {
+            (p.idx + 1).min(p.frame_count.saturating_sub(1))
+        } else if target > p.idx {
+            target.min(p.idx + 2)
+        } else {
+            p.idx + 1
+        };
         let goal = goal.min(p.frame_count.saturating_sub(1));
         if goal > p.idx {
             let hurry = t > p.dec.pts_ms(goal).saturating_add(100);
-            // Prefer an SMP worker (BSP keeps pumping UI/audio); fall back
-            // to synchronous decode-and-hold when none is available.
+            if let Some(sb) = take_sandbox(p) {
+                return Work::Sandbox { goal, sb, finished: false };
+            }
             if video_job_submit(&mut p.dec, goal, hurry) {
                 p.pending_job = true;
             } else {
@@ -606,8 +814,31 @@ pub(super) fn pump_video_inner() {
                 }
             }
         }
-        false
+        Work::None
     });
+    let finished = match work {
+        Work::Sandbox { goal, mut sb, finished } => {
+            let t0 = crate::arch::now_ms();
+            let changed = sandbox_run(&mut sb, goal);
+            VIDEO_DECODE_MS.fetch_add(crate::arch::now_ms().saturating_sub(t0), Ordering::Relaxed);
+            VIDEO.with(|v| {
+                if let Some(p) = v.as_mut() {
+                    p.dec = VideoDec::Sandbox(sb);
+                    if finished {
+                        p.idx = goal;
+                    } else if changed {
+                        p.ahead = Some(goal);
+                    }
+                    // Sandbox miss: leave `idx` so the next tick retries.
+                    // Skipping desynced the tenant (still on next_display=1)
+                    // from the pump (idx racing to 149).
+                }
+            });
+            finished
+        }
+        Work::Finished => true,
+        Work::None => false,
+    };
     if finished {
         let t0 = crate::arch::now_ms();
         present_video_frame();
@@ -684,7 +915,10 @@ mod vjob {
 /// Try to start a decode-ahead job for `goal`. `false` → caller decodes
 /// synchronously (x86, no workers, degraded fleet, or a job already active).
 #[cfg(all(not(feature = "server"), not(test)))]
-pub(super) fn video_job_submit(dec: &mut crate::video::StreamDecoder, goal: usize, hurry: bool) -> bool {
+pub(super) fn video_job_submit(dec: &mut VideoDec, goal: usize, hurry: bool) -> bool {
+    let Some(dec) = dec.as_kernel_mut() else {
+        return false;
+    };
     #[cfg(target_arch = "aarch64")]
     {
         vjob::DEC.store(dec as *mut _ as usize, core::sync::atomic::Ordering::Release);
@@ -747,34 +981,40 @@ pub(super) fn pump_video() {}
 #[cfg(all(not(feature = "server"), not(test)))]
 pub(super) fn video_toggle_pause() {
     let now = crate::arch::now_ms();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            if p.playing {
-                p.paused_at = now.saturating_sub(p.base_ms);
-                p.playing = false;
-            } else {
-                // Never resume the clock behind the picture, and treat play-at-the-end as
-                // a replay — see `video::resume_action` for what each case froze.
-                let frame_pts = p.dec.pts_ms(p.idx);
-                match crate::video::resume_action(p.paused_at, frame_pts, p.total_ms) {
-                    crate::video::Resume::Restart => {
-                        video_job_join(p); // reclaim `dec` before seeking it
-                        p.idx = 0;
-                        p.base_ms = now;
-                        p.paused_at = 0;
-                        p.dec.seek_decode(0);
-                        p.audio_at = 0;
-                    }
-                    crate::video::Resume::At(ms) => {
-                        p.paused_at = ms;
-                        p.base_ms = now.saturating_sub(ms);
-                    }
-                }
-                p.playing = true;
-                p.finished_announced = false;
-            }
+    let restart = VIDEO.with(|v| {
+        let Some(p) = v.as_mut() else { return false };
+        if p.playing {
+            p.paused_at = now.saturating_sub(p.base_ms);
+            p.playing = false;
+            return false;
         }
+        let frame_pts = p.dec.pts_ms(p.idx);
+        let restart = matches!(
+            crate::video::resume_action(p.paused_at, frame_pts, p.total_ms),
+            crate::video::Resume::Restart
+        );
+        if restart {
+            video_job_join(p);
+            p.idx = 0;
+            p.base_ms = now;
+            p.paused_at = 0;
+            p.audio_at = 0;
+            if !matches!(p.dec, VideoDec::Sandbox(_)) {
+                p.dec.seek_decode(0);
+            }
+        } else if let crate::video::Resume::At(ms) =
+            crate::video::resume_action(p.paused_at, frame_pts, p.total_ms)
+        {
+            p.paused_at = ms;
+            p.base_ms = now.saturating_sub(ms);
+        }
+        p.playing = true;
+        p.finished_announced = false;
+        restart && matches!(p.dec, VideoDec::Sandbox(_))
     });
+    if restart {
+        sandbox_seek_unlocked(0);
+    }
     present_video_status();
 }
 
@@ -848,27 +1088,32 @@ pub(super) fn present_video_status() {}
 #[cfg(all(not(feature = "server"), not(test)))]
 pub(super) fn video_seek(delta: i64) {
     let now = crate::arch::now_ms();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            video_job_join(p); // reclaim `dec` from any decode-ahead worker
-            let n = p.frame_count as i64;
-            let ni = (p.idx as i64 + delta).clamp(0, n - 1) as usize;
-            p.idx = ni;
-            // Re-anchor the clock to the sought frame's pts.
-            let pts = p.dec.pts_ms(ni);
-            p.base_ms = now.saturating_sub(pts);
-            p.paused_at = pts;
-            p.finished_announced = false;
-            p.dec.seek_decode(ni);
-            // Keep audio cursor in lockstep with video pts.
-            if p.audio_rate > 0 {
-                p.audio_at = ((pts as u128) * p.audio_rate as u128 / 1000) as usize;
-                if let Some(pcm) = p.audio_pcm.as_ref() {
-                    p.audio_at = p.audio_at.min(pcm.len());
-                }
+    let sandbox_at = VIDEO.with(|v| {
+        let Some(p) = v.as_mut() else { return None };
+        video_job_join(p);
+        let n = p.frame_count as i64;
+        let ni = (p.idx as i64 + delta).clamp(0, n - 1) as usize;
+        p.idx = ni;
+        let pts = p.dec.pts_ms(ni);
+        p.base_ms = now.saturating_sub(pts);
+        p.paused_at = pts;
+        p.finished_announced = false;
+        if p.audio_rate > 0 {
+            p.audio_at = ((pts as u128) * p.audio_rate as u128 / 1000) as usize;
+            if let Some(pcm) = p.audio_pcm.as_ref() {
+                p.audio_at = p.audio_at.min(pcm.len());
             }
         }
+        if matches!(p.dec, VideoDec::Sandbox(_)) {
+            Some(ni)
+        } else {
+            p.dec.seek_decode(ni);
+            None
+        }
     });
+    if let Some(ni) = sandbox_at {
+        sandbox_seek_unlocked(ni);
+    }
     present_video_frame();
 }
 
@@ -876,17 +1121,24 @@ pub(super) fn video_seek(delta: i64) {
 #[cfg(all(not(feature = "server"), not(test)))]
 pub(super) fn video_restart() {
     let now = crate::arch::now_ms();
-    VIDEO.with(|v| {
-        if let Some(p) = v.as_mut() {
-            video_job_join(p); // reclaim `dec` from any decode-ahead worker
-            p.idx = 0;
-            p.base_ms = now;
-            p.paused_at = 0;
-            p.playing = true;
-            p.finished_announced = false;
+    let sandbox = VIDEO.with(|v| {
+        let Some(p) = v.as_mut() else { return false };
+        video_job_join(p);
+        p.idx = 0;
+        p.base_ms = now;
+        p.paused_at = 0;
+        p.playing = true;
+        p.finished_announced = false;
+        p.audio_at = 0;
+        if matches!(p.dec, VideoDec::Sandbox(_)) {
+            true
+        } else {
             p.dec.seek_decode(0);
-            p.audio_at = 0;
+            false
         }
     });
+    if sandbox {
+        sandbox_seek_unlocked(0);
+    }
     present_video_frame();
 }

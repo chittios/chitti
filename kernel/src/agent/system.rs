@@ -601,7 +601,8 @@ static SYSTEM_AGENTS: &[SystemAgentDef] = &[
     },
     // git: version control. All logic ships as tools.wasm (git_command); the
     // `/git` command hook routes the shell to it. Host imports give the wasm
-    // FS (home-scoped), SHA-1, zlib, clock and HTTP (net cap) — see
+    // FS (Scope::Any, never another agent's home / identity files / secret
+    // configs), SHA-1, zlib, clock and HTTP (net cap, taint-gated) — see
     // `wasm_rt::register_host_imports`.
     SystemAgentDef {
         name: "git",

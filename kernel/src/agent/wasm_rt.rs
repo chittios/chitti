@@ -24,13 +24,15 @@
 //! | `host_hud_set` | reserved pane HUD strip |
 //! | `host_surface_id` | active surface for this binding |
 //! | `host_now_ms` / `host_log` | clock + ktrace |
-//! | `host_sys_{get,set}` | shell theme / approval mode / opacity (settings UI) | |
+//! | `host_sys_{get,set}` | shell theme / opacity (settings UI). `mode` is refused. |
 //!
 //! # Security
 //!
 //! * Fuel budget per call (infinite loops trap as fuel exhaustion)
 //! * [`ResourceLimiter`] caps linear memory growth (default 16 pages = 1 MiB)
-//! * No ambient FS/net; draw/storage go through existing gates
+//! * FS is home-scoped (or `Scope::Any` minus other agents, identity files,
+//!   secret configs). HTTP/SSH require a net cap and are taint-gated on the
+//!   tool path. Approval mode is not settable from wasm.
 //! * Modules load at install/start only — never from model output
 
 use crate::agent::storage::{self, Scope as StorageScope};
@@ -1429,8 +1431,9 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         .map_err(|_| "define host_notify")?;
 
     // host_sys_set(key, val) / host_sys_get(key, out) — apply or read OS UI
-    // preferences from the settings package. Keys: theme, mode, opacity.
-    // Requires a real agent binding so unbound page instances cannot flip mode.
+    // preferences from the settings package. Keys: theme, opacity.
+    // `mode` is refused: approval policy is human-only (`/mode` at the shell).
+    // Requires a real agent binding so unbound page instances cannot flip theme.
     linker
         .func_wrap(
             "chitti",
@@ -1555,9 +1558,12 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                     return -1;
                 };
                 let path = if path.is_empty() { "/" } else { path.as_str() };
+                let Ok(path) = guest_may_touch_store(caller.data().bind.agent_id, path, false) else {
+                    return -2;
+                };
                 let mut s = alloc::string::String::new();
                 use core::fmt::Write;
-                for e in crate::synapse::fs::list_dir(path) {
+                for e in crate::synapse::fs::list_dir(&path) {
                     let kind = if e.is_dir { 'd' } else { 'f' };
                     let name = e.name.as_str();
                     // Skip empty / weird names.
@@ -1599,6 +1605,9 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                 let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
                     return -1;
                 };
+                let Ok(path) = guest_may_touch_store(caller.data().bind.agent_id, &path, false) else {
+                    return -2;
+                };
                 let Some(data) = crate::synapse::fs::read(&path) else {
                     return -2;
                 };
@@ -1633,7 +1642,7 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
 
     // host_home(out_ptr, out_cap) -> i32 — the calling agent's install folder
     // (`/agent/<id>`), so a wasm tool can build absolute store paths for the
-    // unscoped `host_fs_read`/`host_fs_list` and home-scoped `host_fs_write`.
+    // scoped `host_fs_read`/`host_fs_list` and home-scoped `host_fs_write`.
     linker
         .func_wrap(
             "chitti",
@@ -1655,10 +1664,11 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
         .map_err(|_| "define host_home")?;
 
     // host_fs_write(path, data_ptr, data_len) -> i32  (0 ok; -1 bad args, -2
-    // outside the agent's home, -3 no agent). Unlike the read side, **write is
-    // scoped to the calling agent's own `/agent/<id>/` home** — a wasm tool is
-    // untrusted input and must not scribble over arbitrary store keys. The git
-    // agent's repos live in its home.
+    // refused, -3 no agent). Default is the calling agent's `/agent/<id>/`
+    // home. `Scope::Any` widens that (git's working tree) but never into
+    // another agent's folder, never onto SOUL.md/MEMORY.md, and never onto
+    // secret configs. The git agent's repos live in the user home under
+    // that full-fs grant.
     linker
         .func_wrap(
             "chitti",
@@ -1679,20 +1689,9 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                 let Some(data) = read_guest_bytes(&caller, data_ptr, data_len) else {
                     return -1;
                 };
-                let home = crate::agent::home::path(id);
-                let p = crate::synapse::vpath::normalize(&path);
-                let in_home = p == home || p.starts_with(&alloc::format!("{home}/"));
-                if !in_home {
-                    // Only agents whose manifest grants `Scope::Any` fs may
-                    // write outside their home — and never into another
-                    // agent's private `/agent/<n>/` folder (SOULs, storage).
-                    if !crate::agent::system::fs_any_scope(id) {
-                        return -2;
-                    }
-                    if p.starts_with("/agent/") {
-                        return -2;
-                    }
-                }
+                let Ok(p) = guest_may_touch_store(id, &path, true) else {
+                    return -2;
+                };
                 crate::synapse::fs::write(&p, &data);
                 0
             },
@@ -1718,17 +1717,9 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                 let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
                     return -1;
                 };
-                let home = crate::agent::home::path(id);
-                let p = crate::synapse::vpath::normalize(&path);
-                let in_home = p == home || p.starts_with(&alloc::format!("{home}/"));
-                if !in_home {
-                    if !crate::agent::system::fs_any_scope(id) {
-                        return -2;
-                    }
-                    if p.starts_with("/agent/") {
-                        return -2;
-                    }
-                }
+                let Ok(p) = guest_may_touch_store(id, &path, true) else {
+                    return -2;
+                };
                 crate::synapse::fs::delete(&p);
                 0
             },
@@ -1741,10 +1732,17 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
             "chitti",
             "host_fs_exists",
             |caller: Caller<'_, HostState>, path_ptr: i32, path_len: i32| -> i32 {
+                let id = caller.data().bind.agent_id;
+                if id == 0 {
+                    return -3;
+                }
                 let Some(path) = read_guest_str(&caller, path_ptr, path_len) else {
                     return -1;
                 };
-                i32::from(crate::synapse::fs::exists(&path))
+                let Ok(p) = guest_may_touch_store(id, &path, false) else {
+                    return 0;
+                };
+                i32::from(crate::synapse::fs::exists(&p))
             },
         )
         .map_err(|_| "define host_fs_exists")?;
@@ -1840,7 +1838,8 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
     // bits of the return are the body's **full** length (so `len > out_cap` means
     // "retry with a buffer this big" — see `fill_guest`), the high bits the HTTP
     // status. Gated: the calling agent must declare a `net` capability in its
-    // manifest.
+    // manifest, and a tainted tool-call justification is refused (this import
+    // skips the Synapse executor, so the taint gate has to live here).
     linker
         .func_wrap(
             "chitti",
@@ -1853,6 +1852,9 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
              -> i64 {
                 if !crate::agent::system::has_net_cap(caller.data().bind.agent_id) {
                     return -1;
+                }
+                if host_net_refused_by_taint() {
+                    return -6;
                 }
                 let Some(req) = read_guest_str(&caller, req_ptr, req_len) else {
                     return -2;
@@ -1928,6 +1930,10 @@ fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), &'static 
                 let agent_id = caller.data().bind.agent_id;
                 if !crate::agent::system::has_net_cap(agent_id) {
                     return -1;
+                }
+                if host_net_refused_by_taint() {
+                    let _ = fill_guest(&mut caller, out_ptr, out_cap, b"refused: untrusted justification");
+                    return -6;
                 }
                 let Some(req) = read_guest_str(&caller, req_ptr, req_len) else {
                     return -2;
@@ -2022,6 +2028,56 @@ fn zlib_deflate_stored(data: &[u8]) -> alloc::vec::Vec<u8> {
     crate::image::deflate::zlib_stored(data)
 }
 
+/// Whether a wasm guest may touch `path` in the store.
+///
+/// Default is the agent's own `/agent/<id>/` home. A compiled-in `Scope::Any`
+/// fs grant (the consent screen's "FULL filesystem") widens that, but never
+/// into another agent's tree, never onto identity files on write, and never
+/// onto secret configs (channel tokens, voice keys). Those last two are the
+/// wasm equivalent of the executor's identity-file taint gate and the store's
+/// credential facade: a guest must not persist an injection into `SOUL.md` or
+/// read a bot token.
+///
+/// `write == true` also refuses identity files (read of the agent's own SOUL
+/// is allowed). Returns the normalised path, or `-3` (no agent) / `-2` (refused)
+/// / `-1` (empty).
+pub(crate) fn guest_may_touch_store(agent_id: u64, path: &str, write: bool) -> Result<alloc::string::String, i32> {
+    if agent_id == 0 {
+        return Err(-3);
+    }
+    let p = crate::synapse::vpath::normalize(path);
+    if p.is_empty() {
+        return Err(-1);
+    }
+    if crate::auth::is_credential_path(&p) || crate::synapse::fs::is_secret_config_path(&p) {
+        return Err(-2);
+    }
+    if write && crate::synapse::fs::is_identity_path(&p) {
+        return Err(-2);
+    }
+    let home = crate::agent::home::path(agent_id);
+    if p == home || p.starts_with(&alloc::format!("{home}/")) {
+        return Ok(p);
+    }
+    // The directory that lists every agent, or anyone else's home.
+    if p == "/agent" || p.starts_with("/agent/") {
+        return Err(-2);
+    }
+    if crate::agent::system::fs_any_scope(agent_id) {
+        return Ok(p);
+    }
+    Err(-2)
+}
+
+/// Wasm `host_http` / `host_ssh` skip the Synapse executor, so they must
+/// apply the taint gate themselves. Only while a model chose the call
+/// (`in_tool_call`): a human typing `/git clone` is not tainted just because
+/// the default resident snapshot is `UntrustedIngested`.
+pub(crate) fn host_net_refused_by_taint() -> bool {
+    crate::shell::in_tool_call()
+        && crate::security::Justification::from_context(crate::shell::resident_taint()).blocks_destructive()
+}
+
 /// Apply a settings-app preference to live shell/UI state.
 fn apply_sys_pref(key: &str, val: &str) -> Result<(), &'static str> {
     match key {
@@ -2032,13 +2088,7 @@ fn apply_sys_pref(key: &str, val: &str) -> Result<(), &'static str> {
             }
             crate::theme::apply(name).map_err(|_| "theme apply failed")
         }
-        "mode" => {
-            if crate::shell::set_approval_mode_name(val) {
-                Ok(())
-            } else {
-                Err("unknown mode")
-            }
-        }
+        "mode" => Err("mode is human-only; type /mode at the shell"),
         "opacity" => {
             let parsed: u64 = val.trim().parse().map_err(|_| "bad opacity")?;
             let o = parsed.min(255);
@@ -2946,5 +2996,78 @@ mod tests {
         .expect("mod");
         let code = s.call_i32("try").expect("try");
         assert_eq!(code, -2, "no task/surface must return -2");
+    }
+
+    #[test_case]
+    fn host_sys_set_cannot_change_approval_mode() {
+        // The kernel approval policy is human-only (`/mode` at the shell). A
+        // wasm guest that could set Bypass would be deciding how much it gets
+        // asked about its own actions.
+        let before = crate::shell::approval_mode_name();
+        assert!(super::apply_sys_pref("mode", "bypass").is_err());
+        assert!(super::apply_sys_pref("mode", "manual").is_err());
+        assert_eq!(crate::shell::approval_mode_name(), before);
+    }
+
+    #[test_case]
+    fn wasm_fs_is_home_scoped_and_refuses_identity_and_secrets() {
+        let id = 42u64;
+        let home = crate::agent::home::path(id);
+        assert!(super::guest_may_touch_store(id, &home, false).is_ok());
+        assert!(super::guest_may_touch_store(id, &alloc::format!("{home}/notes.md"), true).is_ok());
+        // Default is not the whole store.
+        assert_eq!(super::guest_may_touch_store(id, "/home/chitti/x", false), Err(-2));
+        assert_eq!(super::guest_may_touch_store(id, "/", false), Err(-2));
+        // Another agent's tree, including the listing of every agent.
+        assert_eq!(super::guest_may_touch_store(id, "/agent", false), Err(-2));
+        assert_eq!(super::guest_may_touch_store(id, "/agent/1/SOUL.md", false), Err(-2));
+        // Own SOUL may be read, never written — that is taint-laundering.
+        assert!(super::guest_may_touch_store(id, &alloc::format!("{home}/SOUL.md"), false).is_ok());
+        assert_eq!(
+            super::guest_may_touch_store(id, &alloc::format!("{home}/SOUL.md"), true),
+            Err(-2)
+        );
+        assert_eq!(
+            super::guest_may_touch_store(id, &alloc::format!("{home}/MEMORY.md"), true),
+            Err(-2)
+        );
+        // Channel tokens / voice keys, even through `..`.
+        assert_eq!(
+            super::guest_may_touch_store(id, "/configs/core/channels.json", false),
+            Err(-2)
+        );
+        assert_eq!(
+            super::guest_may_touch_store(id, "/configs/core/../core/voice.json", false),
+            Err(-2)
+        );
+        assert_eq!(super::guest_may_touch_store(0, &home, false), Err(-3));
+
+        // Git declares Scope::Any, so the user home is in reach — but secrets
+        // and other agents' folders are not.
+        let git = 9000u64 + 47;
+        assert!(crate::agent::system::fs_any_scope(git), "git must still be the Any-fs fixture");
+        assert!(super::guest_may_touch_store(git, "/home/chitti/repo", true).is_ok());
+        assert_eq!(
+            super::guest_may_touch_store(git, "/configs/core/channels.json", false),
+            Err(-2)
+        );
+        assert_eq!(super::guest_may_touch_store(git, "/agent/1/SOUL.md", true), Err(-2));
+    }
+
+    #[test_case]
+    fn wasm_net_is_taint_gated_only_on_the_tool_path() {
+        // A human `/git clone` is not inside `in_tool_call`, so the default
+        // UntrustedIngested snapshot must not refuse it.
+        assert!(!crate::shell::in_tool_call());
+        assert!(!super::host_net_refused_by_taint());
+
+        crate::shell::enter_tool_call();
+        crate::shell::set_resident_taint(crate::security::taint::Provenance::UntrustedIngested);
+        assert!(super::host_net_refused_by_taint());
+        crate::shell::set_resident_taint(crate::security::taint::Provenance::UserTyped);
+        assert!(!super::host_net_refused_by_taint());
+        crate::shell::leave_tool_call();
+        crate::shell::set_resident_taint(crate::security::taint::Provenance::UntrustedIngested);
+        assert!(!crate::shell::in_tool_call());
     }
 }

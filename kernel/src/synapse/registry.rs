@@ -158,7 +158,11 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         name: "mem_fs_write",
         params: &[Param { key: "path", ty: STR }, Param { key: "text", ty: STR }],
         description: "Write text to a file in the in-memory store, creating or replacing it.",
-        effect: Effect::INERT,
+        // Persists attacker-chosen bytes. Identity files (SOUL.md / MEMORY.md)
+        // are additionally special-cased in the executor; marking the primitive
+        // itself irreversible is what stops a tainted turn from planting a
+        // payload in an ordinary path and reading it back clean next turn.
+        effect: Effect::IRREVERSIBLE,
     },
     PrimitiveSpec {
         id: LIST,
@@ -199,8 +203,8 @@ pub static REGISTRY: &[PrimitiveSpec] = &[
         id: MEM_FS_EDIT,
         name: "mem_fs_edit",
         params: &[Param { key: "path", ty: STR }, Param { key: "old", ty: STR }, Param { key: "new", ty: STR }],
-        description: "Replace the first occurrence of `old` with `new` in a file. Not destructive (reversible edit).",
-        effect: Effect::INERT,
+        description: "Replace the first occurrence of `old` with `new` in a file.",
+        effect: Effect::IRREVERSIBLE,
     },
     PrimitiveSpec {
         id: MEM_FS_SEARCH,
@@ -394,6 +398,8 @@ mod tests {
     /// deliberate edit here.
     #[test_case]
     fn irreversible_primitives_are_exactly_the_known_set() {
+        // A store write persists attacker-chosen bytes that the next turn can
+        // read; an edit is the same mutation with a find/replace costume.
         // `mem_fs_delete` destroys a stored object; `channel_grant` moves
         // authority to another principal (not undoable by the granter);
         // `net_listen` binds an externally-visible port; `net_http_post`
@@ -404,7 +410,14 @@ mod tests {
             REGISTRY.iter().filter(|p| p.effect.irreversible).map(|p| p.name).collect();
         assert_eq!(
             irreversible,
-            alloc::vec!["mem_fs_delete", "channel_grant", "net_listen", "net_http_post"]
+            alloc::vec![
+                "mem_fs_write",
+                "mem_fs_delete",
+                "mem_fs_edit",
+                "channel_grant",
+                "net_listen",
+                "net_http_post"
+            ]
         );
     }
 
@@ -422,17 +435,17 @@ mod tests {
     }
 
     #[test_case]
-    fn the_effectful_set_is_unchanged_by_the_split() {
-        // The split must not quietly change which calls the gate looks at. This
-        // is the list the single `destructive` bool used to produce; if a future
-        // edit adds an axis to a primitive, this is the test that says the gate's
-        // reach grew.
+    fn the_effectful_set_is_the_union_of_the_two_axes() {
+        // The taint gate keys off `is_effectful`. Growing this list is a
+        // deliberate policy change (ordinary writes used to be inert).
         let effectful: alloc::vec::Vec<_> =
             REGISTRY.iter().filter(|p| p.effect.is_effectful()).map(|p| p.name).collect();
         assert_eq!(
             effectful,
             alloc::vec![
+                "mem_fs_write",
                 "mem_fs_delete",
+                "mem_fs_edit",
                 "channel_grant",
                 "net_listen",
                 "net_http_get",

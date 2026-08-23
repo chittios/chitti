@@ -516,6 +516,17 @@ pub fn run() -> ! {
                 // construction rather than by a guard somebody can forget.
                 "passwd" | "password" => auth::run_passwd(arg),
                 "lock" => auth::run_lock(arg),
+                // Approval policy and TLS verification are kernel-wide. An
+                // agent that could set `/mode bypass` or `/tls insecure on`
+                // would be deciding how much it gets asked, and whether
+                // HTTPS is actually HTTPS. Same structure as `/passwd`.
+                "mode" => run_mode(arg),
+                "tls" => tls_cmd(arg),
+                // `/js` runs the in-kernel interpreter and can compile/call
+                // wasm; `/decoder kernel` puts PNG/JPEG parsing back in ring 0.
+                // An agent must not be able to opt the machine into either.
+                "js" => run_js(arg),
+                "decoder" => decoder_cmd(arg),
                 "todos" | "todo" => run_todos(arg, &orch.session),
                 // Sticky declassification is authority a human handed out, so it
                 // has to be visible and revocable -- a standing grant nobody can
@@ -839,13 +850,11 @@ pub fn dispatch_system(name: &str, arg: &str) -> bool {
         "ping" => net_ping(arg),
         "wifi" => wifi_cmd(arg),
         "audio" => audio_cmd(arg),
-        "tls" => tls_cmd(arg),
-        "decoder" => decoder_cmd(arg),
         "heap" => heap_cmd(arg),
         "html" => html_cmd(arg),
-        "js" => run_js(arg),
+        // `/mode`, `/tls`, `/js`, `/decoder` are interactive-only — see the
+        // match above `dispatch_system`. Do not add them here.
         "think" => run_think(arg),
-        "mode" => run_mode(arg),
         "effort" => run_effort(arg),
         "context" => run_context(arg),
         "view-plan" | "show-plan" | "plan-view" => run_view_plan(arg),
@@ -1054,17 +1063,31 @@ fn decoder_cmd(arg: &str) {
             };
             serial_println!("decoder> images decode in {where_}");
             serial_println!(
+                "decoder>   audio/js/video {}  (H.264/AAC/JS bitstream in mediadec/jsint tenants)",
+                if crate::synapse::chunked_run::sandboxed_media()
+                    && crate::synapse::chunked_run::sandboxed_js()
+                {
+                    "ring 3"
+                } else {
+                    "mixed"
+                }
+            );
+            serial_println!(
                 "decoder>   {decodes} decode(s), {builds} tenant build(s), {grows} arena growth(s) -- a reused tenant stops building"
             );
             serial_println!("decoder>   /decoder ring3|kernel");
         }
         "ring3" | "ring-3" | "sandbox" | "on" => {
             crate::synapse::tenant::set_sandboxed_decode(true);
-            serial_println!("decoder> images now decode in ring 3");
+            crate::synapse::chunked_run::set_sandboxed_media(true);
+            crate::synapse::chunked_run::set_sandboxed_js(true);
+            serial_println!("decoder> images, audio, video bitstream, and page JS now decode in ring 3");
         }
         "kernel" | "ring0" | "off" => {
             crate::synapse::tenant::set_sandboxed_decode(false);
-            serial_println!("decoder> images now decode IN THE KERNEL -- a malformed file is a kernel parser bug away from halting the machine");
+            crate::synapse::chunked_run::set_sandboxed_media(false);
+            crate::synapse::chunked_run::set_sandboxed_js(false);
+            serial_println!("decoder> parsers now run IN THE KERNEL -- a malformed file is a kernel parser bug away from halting the machine");
         }
         _ => serial_println!("decoder> usage: /decoder [status] | /decoder ring3|kernel"),
     }
@@ -2428,10 +2451,12 @@ pub fn chat_busy() -> bool {
 ///
 /// This exists because `dispatch_system` is reached from both, and one of its
 /// commands — `/schedule` — records **who authorised** a standing intent. A
-/// Telegram DM enters the session as `Provenance::UserTyped`, so inferring
-/// "human" from session taint would let a DM-authored schedule act with
-/// typed-human authority forever. The distinction has to come from the call
-/// site, and this is the call site.
+/// A Telegram DM is tagged `UntrustedIngested` (see `drain_channel_inbound`),
+/// but a *console* turn is `UserTyped` even while a model is calling tools.
+/// Inferring "human authored this schedule" from session taint would still
+/// let an injected console turn install a standing job with typed-human
+/// authority. The distinction has to come from the call site, and this is
+/// the call site.
 ///
 /// **A depth counter, not a flag.** Nested `run_tool_command` really happens:
 /// `tools::bg::pump` calls it, `pump` is driven from `shell::upkeep`, and
@@ -2492,7 +2517,7 @@ pub fn resident_taint() -> crate::security::taint::Provenance {
 }
 
 /// Whether the current work is running with **no human at the console** — set
-/// around a scheduled fire.
+/// around a scheduled fire and around a messaging-channel (Telegram/…) turn.
 ///
 /// The one thing it changes: an approval-requiring tool call must not block on
 /// `modal::confirm`, which spins on `console::read_byte()` waiting for somebody
@@ -3380,8 +3405,7 @@ pub fn approval_mode_name() -> &'static str {
 }
 
 /// Set approval mode by name (same vocabulary as `/mode`). Returns false on
-/// unknown names. Used by the settings package-UI host import so a human click
-/// in the settings app applies the same state as the shell command.
+/// unknown names. **Human-only:** wasm `host_sys_set` must not call this.
 pub fn set_approval_mode_name(name: &str) -> bool {
     use core::sync::atomic::Ordering;
     let slot = match name.trim() {
@@ -3861,7 +3885,10 @@ fn execute_chat_tool_inner(
         rule_ask
             || match approval_mode() {
                 ApprovalMode::Manual => true,
-                ApprovalMode::Auto => destructive || is_mcp,
+                // GET `/http` is egress even though it destroys nothing. Auto
+                // used to skip it, so a tool call could POST off-box without a
+                // prompt. Same classifier the router uses (`egress_effect`).
+                ApprovalMode::Auto => destructive || is_mcp || egress_effect,
                 ApprovalMode::Bypass | ApprovalMode::Plan => false,
             }
     };
@@ -4505,6 +4532,21 @@ impl ChatSession {
     /// `max_tool_calls` (with a small interactive ceiling so a runaway model
     /// can't burn the whole session budget on one user message).
     fn turn(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
+        self.turn_tagged(msg, session, crate::agent::types::Provenance::UserTyped)
+    }
+
+    /// A chat turn whose user message is tagged with `provenance`.
+    ///
+    /// Console typing is [`Provenance::UserTyped`]. A Telegram/Discord/Slack DM
+    /// is [`Provenance::UntrustedIngested`]: it is not a human at this console,
+    /// and tagging it typed-human would let the taint gate treat a remote
+    /// stranger as the operator.
+    pub(super) fn turn_tagged(
+        &mut self,
+        msg: &str,
+        session: &mut crate::agent::types::Session,
+        provenance: crate::agent::types::Provenance,
+    ) -> alloc::string::String {
         // **The chat loop runs on its own task**, not on whichever stack called it.
         //
         // This was the last thing in the system still borrowing its caller's stack for
@@ -4520,7 +4562,7 @@ impl ChatSession {
         // `yield_now` gives up the *remainder* of a slice rather than taking a turn's
         // worth of work — and on a cooperative boot (no GIC) the chat task simply runs
         // until it yields of its own accord.
-        let mut body = || self.turn_inner(msg, session);
+        let mut body = || self.turn_inner(msg, session, provenance);
         crate::sched::run_on_new_task("chat-turn", CHAT_TURN_STACK, &mut body).unwrap_or_else(|| {
             // The task died without answering. Surfaced to the user rather than
             // panicking: a turn dying is an operational event and the REPL must survive.
@@ -4529,7 +4571,12 @@ impl ChatSession {
         })
     }
 
-    fn turn_inner(&mut self, msg: &str, session: &mut crate::agent::types::Session) -> alloc::string::String {
+    fn turn_inner(
+        &mut self,
+        msg: &str,
+        session: &mut crate::agent::types::Session,
+        provenance: crate::agent::types::Provenance,
+    ) -> alloc::string::String {
         use crate::agent::orchestrator::now;
         use crate::agent::types::{Provenance, Role, ToolCall};
         // Per-message tool-call ceiling. The shell is a human-driven REPL, not a
@@ -4548,7 +4595,7 @@ impl ChatSession {
         let limits = session.budget.limits;
         session.budget.tool_calls_used = 0;
         session.budget.turns_used = 0;
-        session.push_message(Role::User, msg.into(), Provenance::UserTyped, now());
+        session.push_message(Role::User, msg.into(), provenance, now());
         session.budget.turns_used = session.budget.turns_used.saturating_add(1);
 
         if self.history.is_empty() {
@@ -9337,8 +9384,10 @@ pub(crate) fn run_media_tool(name: &str, args_json: &str) -> alloc::string::Stri
                 if path.is_empty() {
                     return alloc::string::String::from("error: missing path");
                 }
-                play_audio(&path);
-                alloc::format!("ok:audio playing {path}")
+                match play_audio(&path) {
+                    Ok(()) => alloc::format!("ok:audio playing {path}"),
+                    Err(e) => alloc::format!("error: cannot play {path}: {e}"),
+                }
             }
             "audio_control" => {
                 let ms = json_str(args_json, "ms")
@@ -11962,7 +12011,15 @@ mod login_reachability_tests {
 
     #[test_case]
     fn passwd_and_lock_are_unreachable_from_the_tool_surface() {
-        for (name, arg) in [("passwd", "status"), ("password", "status"), ("lock", "")] {
+        for (name, arg) in [
+            ("passwd", "status"),
+            ("password", "status"),
+            ("lock", ""),
+            ("mode", "bypass"),
+            ("tls", "insecure on"),
+            ("js", "-e 1"),
+            ("decoder", "kernel"),
+        ] {
             assert!(
                 !dispatch_system(name, arg),
                 "'/{name}' is reachable from dispatch_system, so every agent holding \
@@ -11973,14 +12030,14 @@ mod login_reachability_tests {
         // No `ToolDef` either, so `search_tools` cannot discover them and
         // `for_agent` yields nothing — not even for a `"*"` toolset, which grants
         // the entire registry.
-        for name in ["passwd", "password", "lock"] {
+        for name in ["passwd", "password", "lock", "mode", "tls", "js", "decoder"] {
             assert!(
                 crate::tools::registry::get(name).is_none(),
                 "'{name}' is a registered tool"
             );
         }
         let everything = crate::tools::registry::for_agent(&[alloc::string::String::from("*")]);
-        for name in ["passwd", "password", "lock"] {
+        for name in ["passwd", "password", "lock", "mode", "tls", "js", "decoder"] {
             assert!(
                 !everything.iter().any(|t| t.name == name),
                 "'{name}' reached an agent through a '*' toolset"
@@ -11993,18 +12050,38 @@ mod login_reachability_tests {
             out.contains("not available as a tool"),
             "run_tool_command ran /passwd instead of refusing: {out}"
         );
+        let out = run_tool_command("mode", "bypass");
+        assert!(
+            out.contains("not available as a tool"),
+            "run_tool_command ran /mode instead of refusing: {out}"
+        );
+        let out = run_tool_command("tls", "insecure on");
+        assert!(
+            out.contains("not available as a tool"),
+            "run_tool_command ran /tls instead of refusing: {out}"
+        );
+        let out = run_tool_command("js", "-e 1+1");
+        assert!(
+            out.contains("not available as a tool"),
+            "run_tool_command ran /js instead of refusing: {out}"
+        );
+        let out = run_tool_command("decoder", "kernel");
+        assert!(
+            out.contains("not available as a tool"),
+            "run_tool_command ran /decoder instead of refusing: {out}"
+        );
 
         // Still discoverable by the human: `/help`, Tab completion and the
         // suggestion popup all read the catalogue, so making them agent-unreachable
         // must not have made them invisible.
-        for name in ["passwd", "lock"] {
+        for name in ["passwd", "lock", "mode", "tls", "js", "decoder"] {
             assert!(
                 crate::shell::catalog::is_command_name(name),
                 "'{name}' vanished from the command catalogue"
             );
         }
         // …but automation may not install them.
-        for name in ["passwd", "password", "lock"] {
+        for name in ["passwd", "password", "lock", "mode", "tls", "js", "decoder"] {
             assert!(crate::shell::catalog::is_human_only(name), "'{name}' is not reserved");
         }
         assert!(!crate::shell::catalog::is_human_only("info"), "an ordinary command was reserved");
@@ -12134,6 +12211,70 @@ mod credential_bypass_tests {
             let _a = crate::synapse::fs::CredentialAccess::new();
             crate::synapse::fs::delete(crate::auth::PATH);
         }
+    }
+
+    /// Channel tokens and remote-voice keys live on the store like any other
+    /// file. Without the same facade as `auth.json`, `/cat` of either is an
+    /// exfil that taint never sees (`cat` is inert).
+    #[test_case]
+    fn no_shell_file_command_can_read_secret_configs() {
+        const CHAN: &str = "/configs/core/channels.json";
+        const VOICE: &str = "/configs/core/voice.json";
+        const TOKEN: &str = "bot-token-cafef00d";
+        const KEY: &str = "sk-voice-deadbeef";
+
+        {
+            let _s = crate::synapse::fs::SecretConfigAccess::new();
+            crate::synapse::fs::write(CHAN, alloc::format!("{{\"token\":\"{TOKEN}\"}}").as_bytes());
+            crate::synapse::fs::write(VOICE, alloc::format!("{{\"key\":\"{KEY}\"}}").as_bytes());
+        }
+
+        for (path, secret) in [(CHAN, TOKEN), (VOICE, KEY)] {
+            for (cmd, arg) in [
+                ("cat", alloc::string::String::from(path)),
+                ("cp", alloc::format!("{path} /tmp/stolen-secret.json")),
+                ("rm", alloc::string::String::from(path)),
+            ] {
+                let out = run_tool_command(cmd, &arg);
+                assert!(
+                    !out.contains(secret),
+                    "'/{cmd} {arg}' leaked secret config: {out}"
+                );
+            }
+        }
+        let out = run_tool_command("cat", "/configs/core/../core/channels.json");
+        assert!(!out.contains(TOKEN), "dot-dot cat leaked a channel token: {out}");
+
+        let enumerating: &[(&str, alloc::string::String)] = &[
+            ("grep", alloc::string::String::from("cafef00d /configs/core")),
+            ("glob", alloc::string::String::from("/configs/core/*")),
+            ("ls", alloc::string::String::from("/configs/core")),
+        ];
+        for (cmd, arg) in enumerating {
+            let out = run_tool_command(cmd, arg);
+            assert!(!out.contains(TOKEN), "'/{cmd} {arg}' leaked a channel token: {out}");
+            assert!(!out.contains(KEY), "'/{cmd} {arg}' leaked a voice key: {out}");
+            assert!(
+                !out.contains("channels.json"),
+                "'/{cmd} {arg}' enumerated channels.json: {out}"
+            );
+            assert!(
+                !out.contains("voice.json"),
+                "'/{cmd} {arg}' enumerated voice.json: {out}"
+            );
+        }
+
+        {
+            let _s = crate::synapse::fs::SecretConfigAccess::new();
+            assert!(crate::synapse::fs::read(CHAN).is_some(), "cat/rm deleted the channel config");
+            assert!(crate::synapse::fs::read(VOICE).is_some(), "cat/rm deleted the voice config");
+            crate::synapse::fs::delete(CHAN);
+            crate::synapse::fs::delete(VOICE);
+        }
+        assert!(
+            !crate::synapse::fs::exists("/tmp/stolen-secret.json"),
+            "a secret config was copied out to a readable path"
+        );
     }
 }
 

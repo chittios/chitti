@@ -151,6 +151,7 @@ fn with_busy<T>(f: impl FnOnce() -> T) -> Option<T> {
 
 /// Load config from the store (call once at boot after the store is mounted).
 pub fn load() {
+    let _secret = crate::synapse::fs::SecretConfigAccess::new();
     let Some(bytes) = store::read(CONFIG_PATH) else {
         return;
     };
@@ -230,6 +231,7 @@ pub fn save() {
             .collect()
     });
     let text = Json::Arr(arr).to_pretty();
+    let _secret = crate::synapse::fs::SecretConfigAccess::new();
     store::write(CONFIG_PATH, text.as_bytes());
 }
 

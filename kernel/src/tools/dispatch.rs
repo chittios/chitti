@@ -183,9 +183,11 @@ impl Router {
         // caller changed what it may do, the ring boundary would be a policy change and
         // not an isolation one.
         //
-        // The orchestrator stays in the kernel: it *is* the shell, it holds root
-        // authority, and it has no meaningful isolation to gain from being confined
-        // relative to the kernel it drives.
+        // Every agent, including the orchestrator, submits the call from ring 3.
+        // The orchestrator still *holds* root capabilities — that is the shell —
+        // but a bug in the call path is a tenant fault, not a kernel wild write.
+        // `dispatch_system` (hardware, `/install`, …) stays kernel; only the
+        // Synapse crossing moves.
         if runs_in_userspace(session) {
             // Classified from the structured outcome, so a ring-3 caller and a ring-0
             // caller are indistinguishable downstream. There is no in-kernel fallback:
@@ -365,7 +367,7 @@ pub fn effect_of(def: &registry::ToolDef, call: &ToolCall) -> Effect {
         ToolBinding::Media => Effect::INERT,             // playback state
         ToolBinding::BgTask => Effect::INERT,            // inspects tasks; spawning is elsewhere
         ToolBinding::AskUser => Effect::INERT,           // asks a human
-        ToolBinding::SearchReplace => Effect::INERT,     // lowers to gated mem_fs_read/write
+        ToolBinding::SearchReplace => Effect::IRREVERSIBLE, // writes the store; executor gates too
     }
 }
 
@@ -681,9 +683,9 @@ impl Router {
             ToolBinding::AgentMemory => {
                 // Lower to `mem_fs_*` through the executor so capability, scope,
                 // and audit apply. The binding stays `AgentMemory` because
-                // `mem_fs_write` is Effect::INERT in the registry (a generic
-                // store write), while agent-memory mutation re-enters the system
-                // prompt and must stay irreversible at the router gate above.
+                // memory mutation re-enters the system prompt and must stay
+                // irreversible at the router gate above, even if a generic
+                // store write were ever classified more narrowly.
                 self.call_agent_memory(session, caller, call)
             }
             ToolBinding::AgentStorage => {
@@ -1582,9 +1584,14 @@ mod tests {
     fn effect_of_classifies_the_conditions_the_scattered_checks_encoded() {
         let cases: &[(&str, &str, bool, bool)] = &[
             ("rm", r#"{"args":"/tmp/x"}"#, true, false),
+            ("cp", r#"{"args":"/a /b"}"#, true, false),
+            ("mv", r#"{"args":"/a /b"}"#, true, false),
             ("ls", r#"{"args":"/"}"#, false, false),
             ("http", r#"{"args":"http://127.0.0.1:9/"}"#, false, true),
             ("delete", r#"{"path":"/x"}"#, true, false),
+            ("write", r#"{"path":"/x","content":"y"}"#, true, false),
+            ("edit", r#"{"path":"/x","old":"a","new":"b"}"#, true, false),
+            ("search_replace", r#"{"path":"/x","old_string":"a","new_string":"b"}"#, true, false),
             ("read", r#"{"path":"/x"}"#, false, false),
             ("download", r#"{"url":"http://127.0.0.1:9/","path":"/x"}"#, true, true),
             ("web_fetch", r#"{"url":"http://127.0.0.1:9/"}"#, false, true),
@@ -1622,16 +1629,31 @@ mod tests {
     }
 }
 
-/// Whether this session's agent performs its effects from **ring 3**.
+/// Whether this session's agent performs its Synapse effects from **ring 3**.
 ///
-/// True for every agent except the orchestrator. The orchestrator is the shell: it holds
-/// root authority, drives the kernel, and confining it relative to the kernel it directs
-/// buys nothing — while everything else is an installed or delegated agent whose code
-/// there is real reason to keep out of kernel memory.
+/// True for every agent, including the orchestrator. The shell still holds root
+/// capabilities; what moved is the *privilege* of the call, not the grant.
+/// Hardware-touching commands stay in ring 0 behind primitives / `dispatch_system`.
 ///
-/// Keyed on the session's manifest rather than on a per-task flag, because "is this the
-/// orchestrator" is a property of *which agent* is running, and a task id is recycled
-/// bookkeeping by comparison.
-pub fn runs_in_userspace(session: &Session) -> bool {
-    session.agent.manifest_id != crate::agent::manifest::ORCHESTRATOR_ID
+/// The session argument is kept so call sites do not have to change if a
+/// future path needs to pin a caller to the kernel (tests of the gate chain
+/// still call the executor directly).
+pub fn runs_in_userspace(_session: &Session) -> bool {
+    true
+}
+
+#[cfg(test)]
+mod ring3_tests {
+    use super::*;
+    use crate::agent::manifest;
+    use crate::agent::types::Session;
+
+    #[test_case]
+    fn even_the_orchestrator_submits_synapse_from_userspace() {
+        let s = Session::new(&manifest::orchestrator_manifest(), 0, alloc::vec::Vec::new(), 0);
+        assert!(
+            runs_in_userspace(&s),
+            "the shell agent's Synapse calls must go through the tenant trap"
+        );
+    }
 }

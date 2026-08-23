@@ -1149,6 +1149,12 @@ pub(super) fn drain_channel_inbound(
     session: &mut crate::agent::types::Session,
 ) {
     // Process a bounded number per loop so the prompt stays responsive.
+    struct UnattendedGuard;
+    impl Drop for UnattendedGuard {
+        fn drop(&mut self) {
+            crate::shell::set_unattended(false);
+        }
+    }
     for _ in 0..3 {
         let Some(msg) = crate::msgchan::take_inbound() else {
             break;
@@ -1186,7 +1192,17 @@ pub(super) fn drain_channel_inbound(
              User message:\n{}",
             msg.from_name, msg.channel, msg.text
         );
-        let reply = sess.turn(&user, session);
+        // A DM is not a human at this console. Tagging it `UserTyped` let the
+        // taint gate treat a remote stranger as the operator — `/http`, `/rm`,
+        // even (previously) `/mode bypass`. Ingested, and unattended so an
+        // approval-requiring call is refused rather than hanging the REPL.
+        crate::shell::set_unattended(true);
+        let _guard = UnattendedGuard;
+        let reply = sess.turn_tagged(
+            &user,
+            session,
+            crate::agent::types::Provenance::UntrustedIngested,
+        );
         let reply = strip_md_light(reply.trim());
         let reply = reply.trim();
         if reply.is_empty() {

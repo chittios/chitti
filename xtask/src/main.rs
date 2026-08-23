@@ -909,7 +909,9 @@ fn main() {
         // boot the real model, run the acceptance checks, exit pass/fail.
         "ref-check" => cmd_ref_check(arch, model),
         "ring-check" => cmd_ring_check(),
-        "imgdec" => cmd_imgdec(),
+        "imgdec" => cmd_user_tenant("imgdec", "imgdec"),
+        "mediadec" => cmd_user_tenant("mediadec", "mediadec"),
+        "jsint" => cmd_user_tenant("jsint", "jsint"),
         // Print host USB vid:pid candidates for BT/camera (used by `make usb-list`).
         "usb-ids" => cmd_usb_ids(&rest),
         // Hidden subcommand: installed as `[target.x86_64-chitti] runner` in
@@ -927,7 +929,7 @@ fn main() {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|sample-files|wifi-assets|usb-ids> [-arch x86_64|aarch64] \
+    "usage: cargo xtask <build|image|run|m1n1|test|ref-check|voice-assets|sample-files|wifi-assets|usb-ids|imgdec|jsint> [-arch x86_64|aarch64] \
      [-model qwen3.5-0.8b|2b|4b|9b|gemma-4-e4b|bonsai-27b|bonsai-27b-ternary] [--release] [--uefi] [-server]\n\
      sample-files [--refresh]: fetch the /samples corpus (images/videos/audios/misc) into \
      assets/samples/; embedded into the image and seeded to /samples/ at boot. \
@@ -937,6 +939,7 @@ fn usage() -> String {
      wifi-assets: extract Apple FullMAC firmware from macOS into assets/wifi/ (for /wifi load).\n\
      iwlwifi-assets: fetch Intel WiFi firmware from linux-firmware into assets/wifi/iwl/.\n\
      usb-ids [bt|cam|all]: grep host USB for Bluetooth/camera vid:pid (see make usb-list / USB_BT=1).\n\
+     imgdec|jsint: rebuild the userspace tenant blobs for both arches (PNG/JPEG decoder, page JS).\n\
      m1n1 (aarch64): package the kernel as a gzip'd arm64 Image and boot it on a \
      tethered Apple Silicon Mac over the m1n1 USB proxy; configure via env \
      CHITTI_M1N1/CHITTI_DTB[/CHITTI_INITRD/CHITTI_BOOTARGS/M1N1DEVICE].\n\
@@ -1509,15 +1512,15 @@ fn detect_host_res() -> Option<(u32, u32)> {
     Some((w.clamp(640, 3840), h.clamp(480, 2400)))
 }
 
-/// `cargo xtask imgdec` — rebuild the userspace tenant blobs for **both** arches.
+/// Rebuild a userspace tenant blob for **both** arches (`imgdec`, `mediadec`, `jsint`).
 ///
 /// The kernel `include_bytes!`s the flat binaries, so they are checked in like
 /// `tools/*-wasm`'s modules. Both arches every time, deliberately: a blob rebuilt for one
 /// is the divergence the dual-arch standing rule exists to prevent, and it would not be
 /// caught by either build.
-fn cmd_imgdec() -> Result<(), String> {
+fn cmd_user_tenant(dir_name: &str, bin_name: &str) -> Result<(), String> {
     let repo = repo_root();
-    let crate_dir = repo.join("userspace/imgdec");
+    let crate_dir = repo.join("userspace").join(dir_name);
     let objcopy = find_objcopy()?;
     // `llvm-nm` ships beside `llvm-objcopy` in the same rustup component, so derive it rather
     // than searching again.
@@ -1528,20 +1531,20 @@ fn cmd_imgdec() -> Result<(), String> {
             .current_dir(&crate_dir)
             .args(["build", "--release", "--target", &target])
             .status()
-            .map_err(|e| format!("imgdec: cargo: {e}"))?;
+            .map_err(|e| format!("{dir_name}: cargo: {e}"))?;
         if !st.success() {
-            return Err(format!("imgdec: build failed for {arch}"));
+            return Err(format!("{dir_name}: build failed for {arch}"));
         }
-        let elf = crate_dir.join(format!("target/{arch}-chitti-user/release/imgdec"));
-        let bin = crate_dir.join(format!("imgdec-{arch}.bin"));
+        let elf = crate_dir.join(format!("target/{arch}-chitti-user/release/{bin_name}"));
+        let bin = crate_dir.join(format!("{bin_name}-{arch}.bin"));
         let st = std::process::Command::new(&objcopy)
             .args(["-O", "binary"])
             .arg(&elf)
             .arg(&bin)
             .status()
-            .map_err(|e| format!("imgdec: objcopy: {e}"))?;
+            .map_err(|e| format!("{dir_name}: objcopy: {e}"))?;
         if !st.success() {
-            return Err(format!("imgdec: objcopy failed for {arch}"));
+            return Err(format!("{dir_name}: objcopy failed for {arch}"));
         }
         // **Record where the entry is, rather than requiring it to be first.** Arranging that in
         // the linker script cost several builds and still failed on x86 (`_start` at
@@ -1554,25 +1557,25 @@ fn cmd_imgdec() -> Result<(), String> {
         let nm_out = std::process::Command::new(&nm)
             .arg(&elf)
             .output()
-            .map_err(|e| format!("imgdec: nm: {e}"))?;
+            .map_err(|e| format!("{dir_name}: nm: {e}"))?;
         let ld = std::fs::read_to_string(crate_dir.join(format!("link-{arch}.ld")))
-            .map_err(|e| format!("imgdec: read linker script: {e}"))?;
+            .map_err(|e| format!("{dir_name}: read linker script: {e}"))?;
         let lay = entry::layout(&String::from_utf8_lossy(&nm_out.stdout), &ld)
-            .ok_or_else(|| format!("imgdec: {arch}: could not read the layout via nm + linker script"))?;
+            .ok_or_else(|| format!("{dir_name}: {arch}: could not read the layout via nm + linker script"))?;
         // A tuple expression, so the kernel can `include!` it straight into a `const`.
         let off_file = crate_dir.join(format!("entry-{arch}.in"));
         std::fs::write(&off_file, format!("({}, {}, {})\n", lay.entry, lay.rx, lay.rw))
-            .map_err(|e| format!("imgdec: write {}: {e}", off_file.display()))?;
+            .map_err(|e| format!("{dir_name}: write {}: {e}", off_file.display()))?;
         let n = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
         println!(
-            "imgdec: {arch} -> {} ({n} bytes; entry +{}, rx {} B, rw {} B)",
+            "{dir_name}: {arch} -> {} ({n} bytes; entry +{}, rx {} B, rw {} B)",
             bin.display(),
             lay.entry,
             lay.rx,
             lay.rw
         );
     }
-    println!("imgdec: both blobs rebuilt -- commit them, the kernel include_bytes! them");
+    println!("{dir_name}: both blobs rebuilt -- commit them, the kernel include_bytes! them");
     Ok(())
 }
 

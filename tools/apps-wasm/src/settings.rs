@@ -112,17 +112,10 @@ fn paint() {
         }
         _ => {
             text_op(&mut ops, 96, 32, 12, "cc785c", "Approval mode");
-            for i in 0..3i32 {
-                let y = 56 + i * 28;
-                let c = if mode as i32 == i {
-                    "cc785c"
-                } else {
-                    "5a5652"
-                };
-                ops.push_str(&format!("rect 96 {y} 120 22 {c}; "));
-                text_op(&mut ops, 108, y + 3, 12, "e8e4df", MODES[i as usize]);
-            }
-            text_op(&mut ops, 96, 148, 9, "a8a4a0", "keys m/a/b");
+            text_op(&mut ops, 96, 56, 12, "e8e4df", MODES[mode as usize]);
+            text_op(&mut ops, 96, 80, 10, "a8a4a0", "read-only here");
+            text_op(&mut ops, 96, 100, 10, "a8a4a0", "type /mode at the");
+            text_op(&mut ops, 96, 116, 10, "a8a4a0", "shell to change");
         }
     }
     ops.push_str("rect 0 176 256 16 3a3632; ");
@@ -143,7 +136,7 @@ fn paint() {
             MODE_NAMES[mode as usize],
             opacity
         ),
-        "1-5 panels  arrows theme  +/- opacity  m/a/b mode",
+        "1-5 panels  arrows theme  +/- opacity",
     );
 }
 
@@ -153,7 +146,6 @@ fn apply() {
     let mode = unsafe { MODE }.min(2) as usize;
     let opacity = unsafe { OPACITY };
     let _ = sys_set("theme", THEMES[theme]);
-    let _ = sys_set("mode", MODE_NAMES[mode]);
     let _ = sys_set("opacity", &format!("{opacity}"));
     let blob = format!(
         "{{\"theme\":{},\"opacity\":{},\"mode\":{},\"panel\":{}}}",
@@ -215,7 +207,7 @@ fn load() {
 pub fn start(_: &str) -> String {
     load();
     paint();
-    String::from("ok:settings (theme applies live; 1-5 panels; m/a/b mode)")
+    String::from("ok:settings (theme applies live; 1-5 panels; /mode at shell)")
 }
 
 pub fn on_click(x: i32, y: i32) -> String {
@@ -237,11 +229,8 @@ pub fn on_click(x: i32, y: i32) -> String {
             }
         }
     }
-    if unsafe { PANEL } == 4 && y >= 56 && x >= 96 {
-        let m = ((y - 56) / 28).clamp(0, 2) as u8;
-        unsafe { MODE = m };
-        apply();
-    }
+    // Panel 4 (approval mode) is read-only: `/mode` at the shell is the only
+    // way to change kernel approval policy. A click must not call sys_set.
     paint();
     status("")
 }
@@ -278,29 +267,13 @@ pub fn on_key(key: &str) -> String {
         "-" | "_" => unsafe {
             OPACITY = OPACITY.saturating_sub(16);
         },
-        "m" => unsafe { MODE = 0 },
-        "a" => unsafe { MODE = 1 },
-        "b" => unsafe { MODE = 2 },
         _ => changed = false,
     }
     if !changed {
         return String::from("ok");
     }
-    // Theme/mode/opacity keys apply immediately; panel-only navigation just paints.
-    if matches!(
-        key,
-        "left"
-            | "h"
-            | "right"
-            | "l"
-            | "+"
-            | "="
-            | "-"
-            | "_"
-            | "m"
-            | "a"
-            | "b"
-    ) {
+    // Theme/opacity keys apply immediately; panel-only navigation just paints.
+    if matches!(key, "left" | "h" | "right" | "l" | "+" | "=" | "-" | "_") {
         apply();
     }
     paint();
@@ -331,19 +304,6 @@ pub fn set(args: &str) -> String {
     }
     if let Some(o) = json_str(args, "opacity") {
         unsafe { OPACITY = o.parse().unwrap_or(OPACITY) };
-    }
-    if let Some(m) = json_str(args, "mode") {
-        if let Ok(i) = m.parse::<u8>() {
-            unsafe { MODE = i.min(2) };
-        } else {
-            unsafe {
-                MODE = match m.as_str() {
-                    "manual" => 0,
-                    "bypass" => 2,
-                    _ => 1,
-                };
-            }
-        }
     }
     apply();
     paint();

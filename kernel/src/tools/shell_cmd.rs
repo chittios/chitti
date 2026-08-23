@@ -197,6 +197,9 @@ mod tests {
         assert!(is_destructive_cmd("rm"));
         assert!(is_destructive_cmd("install"));
         assert!(is_destructive_cmd("mkext4"));
+        assert!(is_destructive_cmd("cp"));
+        assert!(is_destructive_cmd("mv"));
+        assert!(is_destructive_cmd("umount"));
         assert!(!is_destructive_cmd("ls"));
         assert!(!is_destructive_cmd("ping"));
     }
