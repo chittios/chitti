@@ -180,6 +180,18 @@ pub fn online_cpus() -> usize {
     1
 }
 
+/// Publish CPU stores in `[va, va+len)` to other observers of that memory
+/// (a display controller scanning a Normal-mapped framebuffer, a DMA engine).
+///
+/// On aarch64 this is `dc cvac` + `dsb`. On x86 the framebuffer is typically
+/// UC/WC so stores are already visible and this is a no-op.
+#[cfg(target_arch = "aarch64")]
+pub fn dcache_clean(va: usize, len: usize) {
+    aarch64::dcache_clean(va, len)
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dcache_clean(_va: usize, _len: usize) {}
+
 /// Run `f` over `[0, n)`, split across every online core.
 ///
 /// `min_chunk` is the smallest range worth handing to a worker; below roughly

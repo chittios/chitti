@@ -79,9 +79,7 @@ pub fn draw_status_menu(chip: StatusChip) {
         let by = by.min(sc.height.saturating_sub(bh + OUTER)).max(OUTER);
 
         let bg = sc.theme.status_bg;
-        sc.drop_shadow(bx, by, bw, bh);
-        sc.fill_rect(bx, by, bw, bh, bg);
-        sc.rect_outline(bx, by, bw, bh, BORDER, sc.theme.accent);
+        sc.popup_card(bx, by, bw, bh, bg, sc.theme.accent);
 
         let ix = bx + BORDER + PAD;
         let mut y = by + BORDER + PAD;

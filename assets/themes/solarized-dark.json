@@ -4,7 +4,11 @@
   "font_scale": 0,
   "wallpaper": "gradient:#002b36,#00212b",
   "opacity": 236,
-  "cursor": { "fill": "#002b36", "outline": "#93a1a1" },
+  "corner_radius": 8,
+  "cursor": {
+    "fill": "#002b36",
+    "outline": "#93a1a1"
+  },
   "palette": {
     "accent": "#268bd2",
     "logo": "#268bd2",

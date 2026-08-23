@@ -18,7 +18,13 @@ use alloc::string::String;
 #[cfg(not(test))]
 fn pump_under_popup() -> bool {
     crate::shell::background_tick();
-    crate::framebuffer::take_modal_dirty()
+    let dirty = crate::framebuffer::take_modal_dirty();
+    if dirty {
+        // A present painted over the popup; the saved underlay is stale and
+        // the chrome has to be redrawn on top of the new pane pixels.
+        crate::framebuffer::overlay_invalidate();
+    }
+    dirty
 }
 
 /// Ask a yes/no question. Returns `true` only on an explicit yes (default No —

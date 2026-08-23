@@ -127,6 +127,7 @@ omit any key to keep the brand default.
   "status_right": "${kbd} ${mouse}  ${net}  ${mem}  ${cpu} ${cores}  ${battery}  ${datetime_short}",
   "tz_offset": 0,
   "splash": true,
+  "corner_radius": 8,
   "theme": {
     "accent": "#cc785c",
     "logo": "#cc785c",
@@ -154,6 +155,9 @@ omit any key to keep the brand default.
   different set (e.g. `screen_bg`/`chat_bg` = `#faf9f5`/`#f5f0e8`, `*_fg` = ink).
   Status chrome uses `status_bg` / `status_fg`; the Synapse-C mark uses `logo` /
   `logo_node` (default terracotta ring + cream node, independent of `accent`).
+- **`corner_radius`** — CSS-px at font scale 1 (default `8`, `0` = sharp). Applied
+  to every pane, popup, dropdown, composer box and toast; device pixels are
+  `radius × font scale`, clamped to the box. Set live with `/theme radius <0-24>`.
 - **`splash`** — show the boot splash (default `true`).
 - **`status_left` / `status_right`** — templates with `${version}`,
   `${datetime}`, `${datetime_short}`, `${tz}`, `${model}`, `${arch}`,

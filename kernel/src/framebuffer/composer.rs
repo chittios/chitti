@@ -461,13 +461,13 @@ impl Screen {
         }
         let (bx, by, bw, bh, tx, ty, hy) = self.composer_geom();
         // Elevated fill + rounded border (accent when the prompt owns focus).
-        self.paint_surface(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
         let border = if self.composer_active && !self.action_focused() {
             self.theme.accent
         } else {
             self.theme.composer_border
         };
-        let radius = (4 * self.scale).max(4);
+        let radius = self.radius_for(bw, bh);
+        self.paint_surface_rounded(bx, by, bw, bh, radius, self.theme.composer_bg);
         self.rounded_outline(bx, by, bw, bh, radius, border);
         // No under-glow. The gap between the box and the hint line used to carry
         // an accent-tinged band meant to read as the composer "lifting" off the
@@ -628,13 +628,13 @@ impl Screen {
             return;
         }
         let (bx, by, bw, bh, tx, ty, hy) = self.composer_geom();
-        self.paint_surface(bx + 1, by + 1, bw.saturating_sub(2), bh.saturating_sub(2), self.theme.composer_bg);
         let border = if self.composer_active && !self.action_focused() {
             self.theme.accent
         } else {
             self.theme.composer_border
         };
-        let radius = (4 * self.scale).max(4);
+        let radius = self.radius_for(bw, bh);
+        self.paint_surface_rounded(bx, by, bw, bh, radius, self.theme.composer_bg);
         self.rounded_outline(bx, by, bw, bh, radius, border);
         let prompt: &str = if self.composer_prompt.is_empty() {
             "> "
@@ -710,9 +710,9 @@ impl Screen {
         let hpad = 8u64; // left/right inset inside the rounded border
         let bg = self.theme.composer_bg;
         let sel_bg = self.theme.status_bg; // elevated highlight bar
-        // Soft fill + border (matches composer chrome).
-        self.fill_rect(x, y, w, h, bg);
-        let radius = (4 * self.scale).max(4);
+        // Soft fill + border (matches composer chrome). Radius is the theme's.
+        let radius = self.radius_for(w, h);
+        self.fill_round_rect(x, y, w, h, radius, bg);
         self.rounded_outline(x, y, w, h, radius, self.theme.composer_border);
 
         // Usable text columns strictly inside the border + padding.

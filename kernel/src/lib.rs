@@ -89,6 +89,8 @@ pub mod edid;
 pub mod kms;
 /// Pure multi-pane geometry + tab-move helpers (unit-tested).
 pub mod panes_layout;
+/// Rounded-rect coverage / radius math for the compositor (unit-tested).
+pub mod roundrect;
 pub mod pdf;
 pub mod pdfview;
 pub mod qemu;

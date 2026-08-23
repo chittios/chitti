@@ -112,6 +112,9 @@ pub struct UiConfig {
     pub wallpaper: String,
     /// Window opacity over the wallpaper (0..=255; 255 = opaque default).
     pub opacity: u64,
+    /// Corner radius in CSS-px at font scale 1 (0 = sharp, default 8). Applied
+    /// to panes, popups, dropdowns and the composer; see `crate::roundrect`.
+    pub corner_radius: u64,
 }
 
 impl Default for UiConfig {
@@ -141,6 +144,7 @@ impl Default for UiConfig {
             cursor_outline: "#f5f5f8".to_string(),
             wallpaper: String::new(),
             opacity: 255,
+            corner_radius: crate::roundrect::RADIUS_DEFAULT,
         }
     }
 }
@@ -168,6 +172,7 @@ impl UiConfig {
             ("theme_name".to_string(), Json::Str(self.theme_name.clone())),
             ("wallpaper".to_string(), Json::Str(self.wallpaper.clone())),
             ("opacity".to_string(), Json::Num(self.opacity as f64)),
+            ("corner_radius".to_string(), Json::Num(self.corner_radius as f64)),
             ("cursor_fill".to_string(), Json::Str(self.cursor_fill.clone())),
             ("cursor_outline".to_string(), Json::Str(self.cursor_outline.clone())),
             ("theme".to_string(), theme),
@@ -311,6 +316,11 @@ impl UiConfig {
             cursor_outline: s("cursor_outline", &d.cursor_outline),
             wallpaper: s("wallpaper", &d.wallpaper),
             opacity: j.get("opacity").and_then(|v| v.as_i64()).map(|n| n.clamp(0, 255) as u64).unwrap_or(d.opacity),
+            corner_radius: j
+                .get("corner_radius")
+                .and_then(|v| v.as_i64())
+                .map(|n| crate::roundrect::clamp_theme_radius(n.max(0) as u64))
+                .unwrap_or(d.corner_radius),
         }
     }
 
@@ -342,6 +352,7 @@ impl UiConfig {
             fullscreen: 0,
             wallpaper: self.wallpaper.clone(),
             opacity: self.opacity.min(255) as u8,
+            corner_radius: crate::roundrect::clamp_theme_radius(self.corner_radius),
         }
     }
 }
@@ -919,6 +930,7 @@ mod tests {
         assert_eq!(back.opacity, 220);
         assert_eq!(back.cursor_fill, "#abcdef");
         assert_eq!(back.syntax[1].1, "#ff00ff");
+        assert_eq!(back.corner_radius, crate::roundrect::RADIUS_DEFAULT);
         // Untouched syntax + palette keys keep their defaults.
         assert_eq!(back.syntax[4].1, SYNTAX_DEFAULTS[4].1);
     }
@@ -931,5 +943,18 @@ mod tests {
         assert_eq!(d.opacity, 255);
         assert_eq!(d.theme_name, "dark");
         assert_eq!(d.syntax.len(), SYNTAX_DEFAULTS.len());
+        assert_eq!(d.corner_radius, crate::roundrect::RADIUS_DEFAULT);
+    }
+
+    #[test_case]
+    fn corner_radius_clamped_and_defaults() {
+        let back = UiConfig::from_json(&Json::parse(r#"{"corner_radius": 99}"#).unwrap());
+        assert_eq!(back.corner_radius, crate::roundrect::RADIUS_MAX);
+        let sharp = UiConfig::from_json(&Json::parse(r#"{"corner_radius": 0}"#).unwrap());
+        assert_eq!(sharp.corner_radius, 0);
+        // A stale ui.json with no key keeps the house default rather than going
+        // sharp — omitting a new key must not look like a user chose 0.
+        let missing = UiConfig::from_json(&Json::parse(r#"{"opacity": 255}"#).unwrap());
+        assert_eq!(missing.corner_radius, crate::roundrect::RADIUS_DEFAULT);
     }
 }

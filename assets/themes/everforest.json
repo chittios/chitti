@@ -4,6 +4,7 @@
   "font_scale": 0,
   "wallpaper": "gradient:#2d353b,#181d20",
   "opacity": 232,
+  "corner_radius": 8,
   "cursor": {
     "fill": "#2d353b",
     "outline": "#d3c6aa"

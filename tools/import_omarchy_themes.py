@@ -107,6 +107,7 @@ def convert(name, src):
         "font_scale": 0,
         "wallpaper": f"gradient:{bg},{deep}",
         "opacity": 232,
+        "corner_radius": 8,
         "cursor": {
             "fill": bg,
             "outline": pick(src, ("bright_foreground", "foreground")),

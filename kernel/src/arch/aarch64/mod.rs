@@ -196,6 +196,31 @@ pub fn is_apple() -> bool {
     IS_APPLE.load(Ordering::Relaxed)
 }
 
+/// Clean the D-cache for `[va, va+len)` to the Point of Coherency.
+///
+/// The Apple simple-framebuffer is Normal write-back RAM that DCP scans out
+/// of. CPU stores sit in this core's cache until a line evicts, which is
+/// unordered — the display then updates in random tiles and reads as flicker.
+/// `dc cvac` publishes the rows the compositor just painted. A no-op for a
+/// zero length; the range is aligned down to a 64-byte line.
+pub fn dcache_clean(va: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: cache maintenance over a mapped identity-mapped buffer. `dc cvac`
+    // is a clean (not invalidate), so we cannot lose a concurrent write; `dsb`
+    // makes the clean visible to the other observer (DCP) before we return.
+    unsafe {
+        let mut p = (va as u64) & !63;
+        let end = va as u64 + len as u64;
+        while p < end {
+            core::arch::asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags));
+            p += 64;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
 // Recoverable-probe flags for the PL011 MMIO scan (read by the sync handler in
 // `exceptions`), so probing an unbacked candidate address can't crash the boot.
 static UART_PROBING: AtomicBool = AtomicBool::new(false);
