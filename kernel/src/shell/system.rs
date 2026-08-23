@@ -739,7 +739,7 @@ pub(super) fn run_theme_inner(arg: &str) {
                 serial_println!("  {}{}", n, if n == cur { "  *" } else { "" });
             }
             serial_println!("/theme set <name> · current · save <name> · install <url>");
-            serial_println!("/theme wallpaper <none|gradient:#a,#b|/path|https://url> · opacity <0-255>");
+            serial_println!("/theme wallpaper <none|gradient:#a,#b|/path|https://url> · opacity <0-255> · radius <0-24>");
         }
         "current" => serial_println!("theme> current: {}", crate::ui_config::current().theme_name),
         "wallpaper" | "bg" | "wp" => set_wallpaper_cmd(rest),
@@ -752,6 +752,19 @@ pub(super) fn run_theme_inner(arg: &str) {
                 serial_println!("theme> opacity {} (255 = opaque; lower = more see-through)", op);
             }
             Err(_) => serial_println!("usage: /theme opacity <0-255>"),
+        },
+        "radius" => match rest.parse::<u64>() {
+            Ok(n) => {
+                let r = crate::roundrect::clamp_theme_radius(n);
+                let mut cfg = crate::ui_config::current();
+                cfg.corner_radius = r;
+                crate::ui_config::set_config(cfg);
+                serial_println!(
+                    "theme> corner radius {} (0 = sharp; CSS-px at font scale 1, applied to panes/popups/dropdowns)",
+                    r
+                );
+            }
+            Err(_) => serial_println!("usage: /theme radius <0-24>"),
         },
         "set" => {
             if rest.is_empty() {
@@ -786,7 +799,7 @@ pub(super) fn run_theme_inner(arg: &str) {
                 Err(e) => serial_println!("theme> error: {}", e),
             }
         }
-        _ => serial_println!("usage: /theme [list | set <name> | current | save <name> | install <url> | wallpaper <spec> | opacity <n>]"),
+        _ => serial_println!("usage: /theme [list | set <name> | current | save <name> | install <url> | wallpaper <spec> | opacity <n> | radius <n>]"),
     }
 }
 

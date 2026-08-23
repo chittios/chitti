@@ -53,14 +53,15 @@ pub fn toast_show(sev: crate::notify::Severity, head: &str, lines: &[alloc::stri
 
         sc.toast_save(x, y, w, h);
 
-        // The box. `paint_surface`, not a raw `fill_rect` of the background —
-        // under a translucent wallpaper the desktop must show through the banner
-        // exactly as it does through a pane.
+        // The box. `paint_surface_rounded`, not a raw `fill_rect` of the
+        // background — under a translucent wallpaper the desktop must show
+        // through the banner exactly as it does through a pane, including the
+        // rounded corners the theme asked for.
         let bg = sc.theme.composer_bg;
-        sc.paint_surface(x, y, w, h, bg);
-        // Chrome may be faint (it is a border, not a word); text may not.
         let chrome = ink(sc, crate::notify::toast::chrome_ink(sev));
-        sc.rounded_outline(x, y, w, h, (4 * sc.scale).max(4), chrome);
+        let radius = sc.radius_for(w, h);
+        sc.paint_surface_rounded(x, y, w, h, radius, bg);
+        sc.rounded_outline(x, y, w, h, radius, chrome);
         // A severity stripe down the left edge: the one piece of colour that
         // says *what kind* of notification this is before any text is read. Drawn
         // in the *heading* ink rather than the chrome ink, so it is visible even

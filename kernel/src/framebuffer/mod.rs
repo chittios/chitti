@@ -90,6 +90,7 @@ use paint::*;
 // `pub(super)` painters. `/screenshot` needs the read-back, so it is re-exported
 // by name rather than widening `use paint::*` to `pub use`.
 pub use paint::capture;
+pub use paint::publish;
 use pane::*;
 pub use select::*;
 pub use status::*;
@@ -342,6 +343,15 @@ pub struct Screen {
     /// Window opacity over the wallpaper (255 = opaque; only used when
     /// `wallpaper` is `Some`).
     opacity: u8,
+    /// Pixels under the open popup (modal / dropdown), packed `0x00RRGGBB`.
+    /// The toast and the cursor already save what they cover; popups need the
+    /// same on a single-buffered framebuffer, otherwise a blink refill of the
+    /// box flashes the whole screen and a dismiss has to redraw everything.
+    overlay_saved: Vec<u32>,
+    overlay_x: u64,
+    overlay_y: u64,
+    overlay_w: u64,
+    overlay_h: u64,
 }
 
 // Mouse cursor sprites: 0 = transparent, 1 = fill, 2 = outline.
@@ -456,6 +466,10 @@ pub struct LayoutCfg {
     /// Window opacity over the wallpaper (0..=255; 255 = opaque, the default —
     /// identical to the no-wallpaper look). Only meaningful with a wallpaper.
     pub opacity: u8,
+    /// Corner radius in CSS-px at font scale 1 (`ui.json` / theme
+    /// `corner_radius`). Device pixels are `radius * scale`, clamped to the
+    /// box. 0 = sharp (the retro-82 path); default 8.
+    pub corner_radius: u64,
 }
 
 impl Default for LayoutCfg {
@@ -474,6 +488,7 @@ impl Default for LayoutCfg {
             fullscreen: 0,
             wallpaper: String::new(),
             opacity: 255,
+            corner_radius: crate::roundrect::RADIUS_DEFAULT,
         }
     }
 }

@@ -232,9 +232,7 @@ pub fn draw_about() {
         let bx = (sc.width - bw) / 2;
         let by = (sc.height - bh) / 2;
         let bg = sc.theme.status_bg;
-        sc.drop_shadow(bx, by, bw, bh);
-        sc.fill_rect(bx, by, bw, bh, bg);
-        sc.rect_outline(bx, by, bw, bh, BORDER, sc.theme.accent);
+        sc.popup_card(bx, by, bw, bh, bg, sc.theme.accent);
 
         let ix = bx + BORDER + PAD;
         let content_w = cols * cw;
@@ -365,8 +363,9 @@ pub fn draw_input(title: &str, prompt: &str, buf: &str, masked: bool, caret_on: 
             sc.draw_str(ix, iy, prompt, sc.theme.title_dim, sc.theme.status_bg);
             // Input field: a framed row showing the (optionally masked) text.
             let fy = iy + ch + 4;
-            sc.fill_rect(ix, fy, cols * cw, ch, sc.theme.chat_bg);
-            sc.rect_outline(ix, fy, cols * cw, ch, 1, sc.theme.border_dim);
+            let fr = sc.radius_for(cols * cw, ch).min(ch / 2);
+            sc.fill_round_rect(ix, fy, cols * cw, ch, fr, sc.theme.chat_bg);
+            sc.rounded_outline(ix, fy, cols * cw, ch, fr, sc.theme.border_dim);
             let shown: String = if masked { core::iter::repeat('*').take(buf.chars().count()).collect() } else { buf.to_string() };
             let end = sc.draw_str(ix + cw / 2, fy, &shown, sc.theme.chat_fg, sc.theme.chat_bg);
             if caret_on {
@@ -429,10 +428,9 @@ pub fn draw_list_browser(
         let by = (sc.height - bh) / 2;
         // Do **not** full-screen `shade_rect` here: the caret blink repaints this
         // every ~500 ms, and shade multiplies darkness each pass → cascading
-        // black + flicker. Same solid modal box as `/help` (draw_commands_browser).
-        sc.drop_shadow(bx, by, bw, bh);
-        sc.fill_rect(bx, by, bw, bh, bg);
-        sc.rect_outline(bx, by, bw, bh, BORDER, sc.theme.accent);
+        // black + flicker. `popup_card` paints chrome once (saves the underlay)
+        // and skips the fill on later blinks.
+        sc.popup_card(bx, by, bw, bh, bg, sc.theme.accent);
 
         let ix = bx + BORDER + PAD;
         let mut y = by + BORDER + PAD;
@@ -470,8 +468,9 @@ pub fn draw_list_browser(
         let lab_w = ch + 7 * cw;
         let field_x = ix + lab_w + cw / 2;
         let field_w = content_w.saturating_sub(lab_w + cw / 2);
-        sc.fill_rect(field_x, y, field_w, ch, list_bg);
-        sc.rect_outline(field_x, y, field_w, ch, 1, sc.theme.border_dim);
+        let fr = sc.radius_for(field_w, ch).min(ch / 2);
+        sc.fill_round_rect(field_x, y, field_w, ch, fr, list_bg);
+        sc.rounded_outline(field_x, y, field_w, ch, fr, sc.theme.border_dim);
         let qshow = crate::textsel::ellipsize(query, (field_w / cw).saturating_sub(1) as usize);
         let qend = sc.draw_str(field_x + 4, y, &qshow, sc.theme.chat_fg, list_bg);
         if caret_on {
@@ -664,10 +663,27 @@ pub fn modal_dismiss() {
     CHOOSE_RECTS.with(|c| *c = [(0, 0, 0, 0); 9]);
     SCREEN.with(|slot| {
         if let Some(sc) = slot {
-            sc.redraw();
+            if sc.overlay_w != 0 {
+                // Put the panes back in one blit rather than a full-screen
+                // redraw — that redraw is the popup-dismiss flicker.
+                sc.overlay_restore();
+            } else {
+                sc.redraw();
+            }
             sc.cur_vis = false;
         }
     });
+}
+
+/// Forget the popup overlay without restoring (the pixels underneath changed —
+/// a video present painted over the box). The next chrome paint re-saves.
+pub fn overlay_invalidate() {
+    SCREEN.with(|slot| {
+        if let Some(sc) = slot {
+            sc.overlay_forget();
+        }
+    });
+    super::shadow_forget();
 }
 
 impl Screen {
@@ -688,7 +704,7 @@ impl Screen {
         crate::panes_layout::modal_max_rows(self.height, self.ch(), 2 * (BORDER + PAD)) as usize
     }
 
-    fn modal_box(&self, title: &str, rows: u64) -> (u64, u64, u64) {
+    fn modal_box(&mut self, title: &str, rows: u64) -> (u64, u64, u64) {
         let cw = self.cw();
         let ch = self.ch();
         let cols = self.modal_cols();
@@ -703,14 +719,92 @@ impl Screen {
         // ([`modal_max_rows`]); this is the backstop.
         let bx = self.width.saturating_sub(bw) / 2;
         let by = self.height.saturating_sub(bh) / 2;
-        self.drop_shadow(bx, by, bw, bh); // web-style elevation over the panes
-        self.fill_rect(bx, by, bw, bh, self.theme.status_bg);
-        self.rect_outline(bx, by, bw, bh, BORDER, self.theme.accent);
+        self.popup_card(bx, by, bw, bh, self.theme.status_bg, self.theme.accent);
         let ix = bx + BORDER + PAD;
         let iy = by + BORDER + PAD;
         self.draw_str(ix, iy, title, self.theme.accent, self.theme.status_bg);
         self.fill_rect(ix, iy + ch + 2, cols * cw, 1, self.theme.sep_dim);
         (ix, iy + 2 * ch, cols)
+    }
+
+    /// Elevated rounded card used by every popup (confirm, About, list browser,
+    /// status dropdown). Saves the pixels underneath on the first paint so a
+    /// blink / hover can skip the chrome (no fill-flash) and dismiss can put
+    /// the panes back without a full-screen redraw.
+    pub(super) fn popup_card(&mut self, x: u64, y: u64, w: u64, h: u64, bg: Rgb, border: Rgb) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let r = self.radius_for(w, h);
+        let g = crate::panes_layout::shadow_geom(self.scale);
+        let (ox, oy, ow, oh) = crate::roundrect::overlay_rect(
+            x,
+            y,
+            w,
+            h,
+            g.blur,
+            g.offset,
+            self.width,
+            self.height,
+        );
+        let fresh = self.overlay_ensure(ox, oy, ow, oh);
+        if !fresh {
+            return;
+        }
+        self.drop_shadow(x, y, w, h);
+        self.paint_surface_rounded(x, y, w, h, r, bg);
+        self.rounded_frame(x, y, w, h, r, BORDER, border);
+    }
+
+    fn overlay_ensure(&mut self, x: u64, y: u64, w: u64, h: u64) -> bool {
+        if self.overlay_w == w
+            && self.overlay_h == h
+            && self.overlay_x == x
+            && self.overlay_y == y
+            && !self.overlay_saved.is_empty()
+        {
+            return false;
+        }
+        if self.overlay_w != 0 {
+            self.overlay_restore();
+        }
+        self.overlay_save(x, y, w, h);
+        true
+    }
+
+    fn overlay_save(&mut self, x: u64, y: u64, w: u64, h: u64) {
+        let n = (w as usize).saturating_mul(h as usize);
+        let mut buf = alloc::vec![0u32; n];
+        for dy in 0..h {
+            let off = (dy * w) as usize;
+            self.read_rgb32_row(x, y + dy, &mut buf[off..off + w as usize]);
+        }
+        self.overlay_saved = buf;
+        self.overlay_x = x;
+        self.overlay_y = y;
+        self.overlay_w = w;
+        self.overlay_h = h;
+    }
+
+    fn overlay_restore(&mut self) {
+        if self.overlay_w == 0 {
+            return;
+        }
+        let (x, y, w, h) = (self.overlay_x, self.overlay_y, self.overlay_w, self.overlay_h);
+        for dy in 0..h {
+            let off = (dy * w) as usize;
+            let end = (off + w as usize).min(self.overlay_saved.len());
+            if off < end {
+                self.blit_rgb32_row(x, y + dy, &self.overlay_saved[off..end]);
+            }
+        }
+        self.overlay_forget();
+    }
+
+    pub(super) fn overlay_forget(&mut self) {
+        self.overlay_saved.clear();
+        self.overlay_w = 0;
+        self.overlay_h = 0;
     }
 
     /// Draw a labelled button at `(x, y)`, filled when `focused`; record its rect
@@ -720,8 +814,9 @@ impl Screen {
         let ch = self.ch();
         let w = (label.len() as u64 + 2) * cw;
         let (fg, bg) = if focused { (self.theme.status_bg, self.theme.accent) } else { (self.theme.accent, self.theme.status_bg) };
-        self.fill_rect(x, y, w, ch, bg);
-        self.rect_outline(x, y, w, ch, 1, self.theme.accent);
+        let br = self.radius_for(w, ch).min(ch / 2);
+        self.fill_round_rect(x, y, w, ch, br, bg);
+        self.rounded_outline(x, y, w, ch, br, self.theme.accent);
         self.draw_str(x + cw, y, label, fg, bg);
         MODAL_RECTS.with(|m| m[slot] = (x, y, w, ch));
         x + w + cw

@@ -898,8 +898,11 @@ impl Screen {
         // as a doubled border on exactly two sides, and the pane already says it
         // is focused by being drawn in `accent` instead of `border_dim`. The
         // separator under the title stays: it divides title from content, which
-        // is a different job from outlining the pane.
-        self.rect_outline(p.x, p.y, p.w, p.h, BORDER, border);
+        // is a different job from outlining the pane. Radius comes from the
+        // theme so `/theme` re-rounds every pane.
+        let r = self.radius_for(p.w, p.h);
+        self.punch_round_corners(p.x, p.y, p.w, p.h, r);
+        self.rounded_frame(p.x, p.y, p.w, p.h, r, BORDER, border);
         // Title, just inside the top border — ellipsize so a long path never
         // paints into the close button / pane edge.
         let ty = p.y + BORDER + 4;

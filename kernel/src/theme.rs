@@ -1,7 +1,7 @@
 //! **Installable themes** — presets that populate the live UI config
 //! ([`crate::ui_config`]). A theme is pure data (JSON): a chrome `palette`, code
 //! `syntax` colours, `cursor` colours + optional custom sprite bitmaps, a
-//! `wallpaper` + `opacity`, and a `font` + `font_scale`. Because themes carry no
+//! `wallpaper` + `opacity`, a `corner_radius`, and a `font` + `font_scale`. Because themes carry no
 //! code or capabilities they need none of the signed-package machinery — they
 //! mirror the seeded-JSON pattern of `ui_config`.
 //!
@@ -126,6 +126,13 @@ pub fn apply(name: &str) -> Result<(), String> {
     if let Some(v) = j.get("font_scale").and_then(|v| v.as_i64()) {
         cfg.font_scale = v.max(0) as u64;
     }
+    if let Some(v) = j.get("corner_radius").and_then(|v| v.as_i64()) {
+        cfg.corner_radius = crate::roundrect::clamp_theme_radius(v.max(0) as u64);
+    } else {
+        // An older theme file that predates the key keeps the house default,
+        // never 0: omitting a radius is not a request for sharp corners.
+        cfg.corner_radius = crate::roundrect::RADIUS_DEFAULT;
+    }
     cfg.theme_name = name.to_string();
     // Cursor sprites live only in the theme file (never `ui.json`); install them
     // into the framebuffer directly. Absent ⇒ clear to built-ins.
@@ -201,6 +208,7 @@ pub fn save(name: &str) -> Result<String, String> {
         ("font_scale".to_string(), Json::Num(cfg.font_scale as f64)),
         ("wallpaper".to_string(), Json::Str(cfg.wallpaper.clone())),
         ("opacity".to_string(), Json::Num(cfg.opacity as f64)),
+        ("corner_radius".to_string(), Json::Num(cfg.corner_radius as f64)),
         ("cursor".to_string(), cursor),
         ("palette".to_string(), obj(&cfg.theme)),
         ("syntax".to_string(), obj(&cfg.syntax)),
@@ -337,6 +345,17 @@ mod tests {
                     "{name} palette missing {key}"
                 );
             }
+            // Corner radius is a top-level theme token (like opacity). Present
+            // so a switch re-rounds every pane/popup; in 0..=RADIUS_MAX so a
+            // hand-edited file cannot invert a box.
+            let r = j
+                .get("corner_radius")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_else(|| panic!("{name} missing corner_radius"));
+            assert!(
+                r >= 0 && r as u64 <= crate::roundrect::RADIUS_MAX,
+                "{name} corner_radius {r} out of range"
+            );
         }
     }
 

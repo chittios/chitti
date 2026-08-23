@@ -276,6 +276,7 @@ impl Screen {
         // would land in the wrong place entirely. Forgotten here rather than at
         // the eight call sites, so a ninth cannot get it wrong.
         self.toast_forget();
+        self.overlay_forget();
         // Interiors that skip a full clear (audio live-update, unchanged
         // surface HUDs) must rebuild after a redraw — the pixels they were
         // preserving are about to be painted over.
@@ -299,7 +300,8 @@ impl Screen {
         // Drop shadows sit in the gutters (right/bottom bands of each pane).
         if self.chat.w > 0 {
             self.drop_shadow(self.chat.x, self.chat.y, self.chat.w, self.chat.h);
-            self.paint_surface(self.chat.x, self.chat.y, self.chat.w, self.chat.h, self.chat.bg);
+            let cr = self.radius_for(self.chat.w, self.chat.h);
+            self.paint_surface_rounded(self.chat.x, self.chat.y, self.chat.w, self.chat.h, cr, self.chat.bg);
             self.draw_frame(&self.chat, !self.action_focused());
             self.render_view(&self.chat);
             self.draw_composer(); // includes suggest popup when open
@@ -310,7 +312,8 @@ impl Screen {
             }
             let focused = self.focus_action && i == self.focused_action;
             self.drop_shadow(a.pane.x, a.pane.y, a.pane.w, a.pane.h);
-            self.paint_surface(a.pane.x, a.pane.y, a.pane.w, a.pane.h, a.pane.bg);
+            let ar = self.radius_for(a.pane.w, a.pane.h);
+            self.paint_surface_rounded(a.pane.x, a.pane.y, a.pane.w, a.pane.h, ar, a.pane.bg);
             self.draw_frame_titled(&a.pane, focused, "");
             self.draw_tab_bar_for(i);
             self.draw_close_btn_for(i);

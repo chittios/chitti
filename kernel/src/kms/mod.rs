@@ -327,9 +327,13 @@ static DAMAGE: crate::mm::Locked<Option<(u32, u32, u32, u32)>> = crate::mm::Lock
 /// screen in hundreds of small pieces; presenting each one would be a queue round
 /// trip per glyph.
 pub fn damage(x: u32, y: u32, w: u32, h: u32) {
-    if w == 0 || h == 0 || !has_driver() {
+    if w == 0 || h == 0 {
         return;
     }
+    // Always accumulate, even with no KMS driver. Apple's simple-framebuffer is
+    // Normal-mapped RAM that DCP scans out of, so the compositor still needs a
+    // present (D-cache clean) for the writes to become one frame rather than
+    // cache lines evicting at random — which is the Mac Mini flicker.
     DAMAGE.with(|d| {
         let r = (x, y, x + w, y + h);
         *d = Some(match *d {
@@ -351,11 +355,16 @@ pub fn damage_all() {
 /// cost is one flush per tick rather than one per draw call.
 pub fn flush_damage() {
     let Some((x0, y0, x1, y1)) = DAMAGE.with(|d| d.take()) else { return };
+    let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
     DRIVER.with(|d| {
         if let Some(drv) = d.as_mut() {
-            drv.flush(x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0));
+            drv.flush(x0, y0, w, h);
         }
     });
+    // Firmware framebuffer path (Apple simple-framebuffer, GOP, ramfb): publish
+    // the dirty rows so a cached mapping becomes visible in one present.
+    #[cfg(not(test))]
+    crate::framebuffer::publish(x0, y0, w, h);
 }
 
 /// Poll the driver for a display change (resize/hotplug) — DRM's HPD, polled.

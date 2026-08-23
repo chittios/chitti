@@ -279,21 +279,36 @@ impl Screen {
         if w == 0 || h == 0 {
             return;
         }
-        // Fast path: pack once and blast whole scanlines (critical for video
-        // letterbox / status bars — per-pixel put_pixel was multi-ms flashes).
-        let packed = ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | c.2 as u32;
-        if self.bpp_bytes == 4 && self.r_shift == 16 && self.g_shift == 8 && self.b_shift == 0 {
-            let mut row = alloc::vec![packed; w as usize];
-            for dy in 0..h {
-                self.blit_rgb32_row(x, y + dy, &row);
-            }
-            // silence unused mut if n=0 — row is mut for potential reuse
-            let _ = &mut row;
+        let x0 = x.min(self.width);
+        let y0 = y.min(self.height);
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
             return;
         }
-        for dy in 0..h {
-            for dx in 0..w {
-                self.put_pixel(x + dx, y + dy, c);
+        let n = (x1 - x0) as usize;
+        // Blast scanlines in place — the previous path allocated a whole-row
+        // Vec per call (allocator trap #3) and the copy was the flicker on a
+        // 5K Apple panel. Pack once; write_volatile so LLVM cannot delete
+        // stores into a buffer it thinks is unread.
+        let packed = self.pack_rgb(c);
+        if self.bpp_bytes == 4 {
+            for yy in y0..y1 {
+                let offset = self.fb_offset(x0, yy);
+                // SAFETY: clipped to the logical desktop; fb_offset translates
+                // into the kernel-owned framebuffer.
+                unsafe {
+                    let dst = (self.addr as *mut u8).add(offset as usize) as *mut u32;
+                    for i in 0..n {
+                        dst.add(i).write_volatile(packed);
+                    }
+                }
+            }
+            return;
+        }
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                self.put_pixel(xx, yy, c);
             }
         }
     }
@@ -360,6 +375,189 @@ impl Screen {
             let n = w.min(self.width.saturating_sub(x)) as usize;
             if x < self.width && base + n <= wp.len() {
                 self.blit_rgb32_row(x, sy, &wp[base..base + n]);
+            }
+        }
+    }
+
+    /// Theme corner radius in device pixels for a box of size `w`×`h`.
+    pub(super) fn radius_for(&self, w: u64, h: u64) -> u64 {
+        crate::roundrect::radius_px(self.layout.corner_radius, self.scale, w, h)
+    }
+
+    /// Fill a rounded rectangle. Interior is the opaque [`fill_rect`] fast path;
+    /// only the four corner quadrants go through anti-aliased coverage, so a
+    /// pane is not a per-pixel walk. Radius 0 is a plain [`fill_rect`].
+    pub(super) fn fill_round_rect(&self, x: u64, y: u64, w: u64, h: u64, r: u64, c: Rgb) {
+        let r = crate::roundrect::clamp_radius(r, w, h);
+        if r == 0 {
+            self.fill_rect(x, y, w, h, c);
+            return;
+        }
+        crate::kms::damage(
+            (x + self.origin_x) as u32,
+            (y + self.origin_y) as u32,
+            w as u32,
+            h as u32,
+        );
+        // Straight body: full width between the corner bands, plus the two side
+        // slabs that sit between the top and bottom corner rows.
+        self.fill_rect(x + r, y, w.saturating_sub(2 * r), h, c);
+        self.fill_rect(x, y + r, r, h.saturating_sub(2 * r), c);
+        self.fill_rect(x + w.saturating_sub(r), y + r, r, h.saturating_sub(2 * r), c);
+        // Four corner quadrants: AA coverage over whatever is already there
+        // (the gutter / wallpaper), so the desktop shows through the round-off.
+        let r_i = r as i64;
+        for &(ox, oy, sx, sy) in &[
+            (x, y, 1i64, 1i64),                                     // TL
+            (x + w.saturating_sub(1), y, -1i64, 1i64),              // TR
+            (x, y + h.saturating_sub(1), 1i64, -1i64),              // BL
+            (x + w.saturating_sub(1), y + h.saturating_sub(1), -1i64, -1i64), // BR
+        ] {
+            for dy in 0..=r_i {
+                for dx in 0..=r_i {
+                    let px = ox as i64 + sx * dx;
+                    let py = oy as i64 + sy * dy;
+                    if px < 0 || py < 0 {
+                        continue;
+                    }
+                    // Coverage relative to the box origin, so the arc sits on
+                    // the box's own corner rather than a local quadrant origin.
+                    let a = crate::roundrect::coverage(
+                        px - x as i64,
+                        py - y as i64,
+                        w as i64,
+                        h as i64,
+                        r_i,
+                    );
+                    if a == 0 {
+                        continue;
+                    }
+                    if a >= 255 {
+                        self.put_pixel(px as u64, py as u64, c);
+                    } else {
+                        self.blend_pixel(px as u64, py as u64, c, a);
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`paint_surface`] clipped to a rounded rect. Opaque / no-wallpaper falls
+    /// through to [`fill_round_rect`]; a translucent wallpaper blends per pixel
+    /// in the corner bands and uses the existing row blit for the body.
+    pub(super) fn paint_surface_rounded(&self, x: u64, y: u64, w: u64, h: u64, r: u64, color: Rgb) {
+        let r = crate::roundrect::clamp_radius(r, w, h);
+        if r == 0 || self.wallpaper.is_none() || self.opacity >= 255 {
+            self.fill_round_rect(x, y, w, h, r, color);
+            return;
+        }
+        // Translucent: reuse paint_surface for the straight body, then the
+        // corner pixels through bg_at + coverage so the wallpaper shows in the
+        // round-off too.
+        self.paint_surface(x + r, y, w.saturating_sub(2 * r), h, color);
+        self.paint_surface(x, y + r, r, h.saturating_sub(2 * r), color);
+        self.paint_surface(x + w.saturating_sub(r), y + r, r, h.saturating_sub(2 * r), color);
+        let r_i = r as i64;
+        for dy in 0..h {
+            for dx in 0..w {
+                let in_corner = (dx < r && dy < r)
+                    || (dx >= w - r && dy < r)
+                    || (dx < r && dy >= h - r)
+                    || (dx >= w - r && dy >= h - r);
+                if !in_corner {
+                    continue;
+                }
+                let a = crate::roundrect::coverage(dx as i64, dy as i64, w as i64, h as i64, r_i);
+                if a == 0 {
+                    continue;
+                }
+                let px = x + dx;
+                let py = y + dy;
+                let base = self.bg_at(px, py, color);
+                if a >= 255 {
+                    self.put_pixel(px, py, base);
+                } else {
+                    self.blend_pixel(px, py, base, a);
+                }
+            }
+        }
+    }
+
+    /// Restore desktop pixels in the four square-corner wedges a rounded box
+    /// does not own. `draw_frame` on a focus change would otherwise leave the
+    /// previous square fill sticking out past the new arc.
+    pub(super) fn punch_round_corners(&self, x: u64, y: u64, w: u64, h: u64, r: u64) {
+        let r = crate::roundrect::clamp_radius(r, w, h);
+        if r == 0 {
+            return;
+        }
+        let r_i = r as i64;
+        // Only the four r×r corner squares — the rest of the box is the fill.
+        for &(cx, cy) in &[(0u64, 0u64), (w.saturating_sub(r), 0), (0, h.saturating_sub(r)), (w.saturating_sub(r), h.saturating_sub(r))] {
+            for dy in 0..r {
+                for dx in 0..r {
+                    let a = crate::roundrect::coverage(
+                        (cx + dx) as i64,
+                        (cy + dy) as i64,
+                        w as i64,
+                        h as i64,
+                        r_i,
+                    );
+                    if a == 0 {
+                        self.paint_wallpaper(x + cx + dx, y + cy + dy, 1, 1, self.theme.screen_bg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `t`-thick anti-aliased rounded frame (pane / modal / dropdown chrome).
+    /// Radius 0 is [`rect_outline`].
+    pub(super) fn rounded_frame(&self, x: u64, y: u64, w: u64, h: u64, r: u64, t: u64, c: Rgb) {
+        let t = t.max(1);
+        let r = crate::roundrect::clamp_radius(r, w, h);
+        if r == 0 {
+            self.rect_outline(x, y, w, h, t, c);
+            return;
+        }
+        crate::kms::damage(
+            (x + self.origin_x) as u32,
+            (y + self.origin_y) as u32,
+            w as u32,
+            h as u32,
+        );
+        // Straight edges, inset by r so they meet the arcs instead of covering them.
+        let ri = r.min(w / 2).min(h / 2);
+        if w > 2 * ri {
+            self.fill_rect(x + ri, y, w - 2 * ri, t, c);
+            self.fill_rect(x + ri, y + h.saturating_sub(t), w - 2 * ri, t, c);
+        }
+        if h > 2 * ri {
+            self.fill_rect(x, y + ri, t, h - 2 * ri, c);
+            self.fill_rect(x + w.saturating_sub(t), y + ri, t, h - 2 * ri, c);
+        }
+        // Corner arcs: coverage of the stroke (outer minus inner).
+        let (w_i, h_i, r_i, t_i) = (w as i64, h as i64, r as i64, t as i64);
+        let band = ri.max(t) as i64 + 1;
+        for dy in 0..h_i {
+            let on_y = dy < band || dy >= h_i - band;
+            if !on_y {
+                continue;
+            }
+            for dx in 0..w_i {
+                let on_x = dx < band || dx >= w_i - band;
+                if !on_x {
+                    continue;
+                }
+                let a = crate::roundrect::stroke_coverage(dx, dy, w_i, h_i, r_i, t_i);
+                if a == 0 {
+                    continue;
+                }
+                if a >= 255 {
+                    self.put_pixel(x + dx as u64, y + dy as u64, c);
+                } else {
+                    self.blend_pixel(x + dx as u64, y + dy as u64, c, a);
+                }
             }
         }
     }
@@ -566,35 +764,9 @@ impl Screen {
         }
     }
 
-    /// Draw a soft-rounded rectangle outline (bordered input chrome).
+    /// Draw a 1px anti-aliased rounded rectangle outline (composer / toast).
     pub(super) fn rounded_outline(&self, x: u64, y: u64, w: u64, h: u64, r: u64, c: Rgb) {
-        if w < 2 * r || h < 2 * r {
-            self.rect_outline(x, y, w, h, 1, c);
-            return;
-        }
-        // Straight edges.
-        self.fill_rect(x + r, y, w - 2 * r, 1, c);
-        self.fill_rect(x + r, y + h - 1, w - 2 * r, 1, c);
-        self.fill_rect(x, y + r, 1, h - 2 * r, c);
-        self.fill_rect(x + w - 1, y + r, 1, h - 2 * r, c);
-        // Quarter-circle corners (1px arc).
-        let r = r as i64;
-        for &(cx, cy, sx, sy) in &[
-            (x + r as u64, y + r as u64, -1i64, -1i64),
-            (x + w - 1 - r as u64, y + r as u64, 1i64, -1i64),
-            (x + r as u64, y + h - 1 - r as u64, -1i64, 1i64),
-            (x + w - 1 - r as u64, y + h - 1 - r as u64, 1i64, 1i64),
-        ] {
-            for dy in 0..=r {
-                for dx in 0..=r {
-                    let d2 = dx * dx + dy * dy;
-                    // Outer rim only (~1 px thick).
-                    if d2 <= r * r && d2 >= (r - 1) * (r - 1) {
-                        self.put_pixel((cx as i64 + sx * dx) as u64, (cy as i64 + sy * dy) as u64, c);
-                    }
-                }
-            }
-        }
+        self.rounded_frame(x, y, w, h, r, 1, c);
     }
 
     /// Fill an integer-centred disc of radius `r` with `c` (round dots/caps).
@@ -662,6 +834,38 @@ impl Screen {
         let nr = (r * 32 / 100).max(2);
         self.fill_disc(cx, cy, nr, node_c);
     }
+}
+
+/// Publish CPU writes in a **physical** rectangle so a Normal-mapped
+/// framebuffer (Apple simple-framebuffer) becomes visible as one frame.
+///
+/// DCP is not cache-coherent with the CPU: stores sit in this core's D-cache
+/// until a line evicts, which is unordered and reads as flicker. Called from
+/// [`crate::kms::flush_damage`] once per upkeep, matching the virtio-gpu
+/// present. A no-op on x86 (UC/WC GOP) and for a zero-sized rect.
+pub fn publish(x: u32, y: u32, w: u32, h: u32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    SCREEN.with(|slot| {
+        let Some(sc) = slot.as_ref() else { return };
+        let (x, y, w, h) = (
+            x as u64,
+            y as u64,
+            w as u64,
+            h as u64,
+        );
+        if x >= sc.fb_w || y >= sc.fb_h {
+            return;
+        }
+        let w = w.min(sc.fb_w - x);
+        let h = h.min(sc.fb_h - y);
+        let row_bytes = (w * sc.bpp_bytes) as usize;
+        for row in 0..h {
+            let offset = (y + row) * sc.pitch + x * sc.bpp_bytes;
+            crate::arch::dcache_clean(sc.addr + offset as usize, row_bytes);
+        }
+    });
 }
 
 /// Read a rectangle of the live framebuffer back as `0x00RRGGBB` pixels —

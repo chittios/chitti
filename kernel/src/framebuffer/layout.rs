@@ -667,6 +667,11 @@ impl Screen {
             cur_sh: CUR_H,
             wallpaper: None,
             opacity: 255,
+            overlay_saved: Vec::new(),
+            overlay_x: 0,
+            overlay_y: 0,
+            overlay_w: 0,
+            overlay_h: 0,
         };
         // Decode/generate the wallpaper once for this layout (windows blend over
         // it at `opacity`); recomputed on relayout.
